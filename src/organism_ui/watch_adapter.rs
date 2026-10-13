@@ -310,6 +310,27 @@ mod tests {
         );
     }
     #[test]
+    fn reader_reset_retires_rhythm_and_deadline_without_a_late_revival() {
+        let (reader, adapter, epoch) = rig();
+        batch(&reader, epoch, true, 1);
+        assert!(adapter
+            .borrow()
+            .snapshot(Duration::ZERO)
+            .next_deadline
+            .is_some());
+        reader.reset(epoch + Duration::from_secs(1));
+        assert_eq!(adapter.borrow().snapshot(Duration::from_secs(1)), NEUTRAL);
+        assert_eq!(adapter.borrow().snapshot(Duration::from_secs(90)), NEUTRAL);
+        assert_eq!(
+            adapter
+                .borrow_mut()
+                .advance(Duration::from_secs(90), reader.snapshot(), true),
+            NEUTRAL,
+            "a later existing frame cannot restore retired RIS evidence or a deadline"
+        );
+    }
+
+    #[test]
     fn due_snapshot_is_not_lost_and_mutable_cleanup_stops_due_polling() {
         let (reader, adapter, epoch) = rig();
         batch(&reader, epoch, true, 0);

@@ -25,6 +25,7 @@ use jterm_core::organism::{
     VisualGrowthStage, VisualTransition, WatchRhythm,
 };
 use jterm_core::organism_attention::{AttentionArbiter, AttentionCue};
+use jterm_core::organism_clock::{InputActivity, MAX_TICK};
 use jterm_core::organism_daily::behavior_explanation;
 #[cfg(test)]
 use jterm_core::organism_daily::GentleInteraction;
@@ -1315,7 +1316,7 @@ const REST_ONSET: Duration = Duration::from_secs(60);
 pub(crate) struct OrganismActivity {
     session_started: Instant,
     attention: RefCell<AttentionArbiter>,
-    input_at: Cell<Option<Instant>>,
+    input_activity: RefCell<InputActivity>,
     commands_running: Cell<u32>,
     active_at: Cell<Option<Instant>>,
     ticked_at: Cell<Option<Instant>>,
@@ -1343,7 +1344,7 @@ impl OrganismActivity {
         Rc::new(Self {
             session_started: Instant::now(),
             attention: RefCell::new(AttentionArbiter::default()),
-            input_at: Cell::new(None),
+            input_activity: RefCell::new(InputActivity::default()),
             commands_running: Cell::new(0),
             active_at: Cell::new(Some(Instant::now())),
             ticked_at: Cell::new(None),
@@ -1410,8 +1411,14 @@ impl OrganismActivity {
     }
 
     fn note_input(&self, now: Instant) {
-        self.input_at.set(Some(now));
-        self.active_at.set(Some(now));
+        if self.ticked_at.get().is_some_and(|at| now < at) {
+            return;
+        }
+        self.input_activity
+            .borrow_mut()
+            .note_input(now.saturating_duration_since(self.session_started));
+        self.active_at
+            .set(Some(self.active_at.get().map_or(now, |at| at.max(now))));
     }
 
     fn note_output(&self, now: Instant) {
@@ -1428,12 +1435,6 @@ impl OrganismActivity {
         self.commands_running
             .set(self.commands_running.get().saturating_sub(1));
         self.active_at.set(Some(now));
-    }
-
-    fn user_active(&self, now: Instant) -> bool {
-        self.input_at
-            .get()
-            .is_some_and(|at| now.saturating_duration_since(at) < HUMAN_INPUT_RETREAT)
     }
 
     fn resting(&self, now: Instant) -> bool {
@@ -1476,19 +1477,31 @@ impl OrganismActivity {
             .unwrap_or(0.0)
     }
 
-    /// Claim the wall-clock slice since the previous claim, in seconds. The
-    /// clock is shared: with several organism panes ticking, every slice is
-    /// consumed exactly once, so simulated time tracks wall time no matter
-    /// how many bodies the mind wears — while at least one body's frame clock
-    /// runs. A long gap (hidden window, suspend) is claimed whole, and the
-    /// reducer then simulates at most one second of it.
-    fn tick_slice(&self, now: Instant) -> f32 {
-        let dt = match self.ticked_at.get() {
-            Some(previous) => now.saturating_duration_since(previous).as_secs_f32(),
-            None => 0.0,
+    /// Claim this window's bounded interval exactly once, partitioned by the
+    /// union of actual input windows. A late callback consumes only its final
+    /// second; a second body at the same instant consumes nothing.
+    fn tick_slice(&self, now: Instant) -> (f32, f32) {
+        let Some(previous) = self.ticked_at.get() else {
+            self.ticked_at.set(Some(now));
+            self.input_activity
+                .borrow_mut()
+                .trim_before(now.saturating_duration_since(self.session_started));
+            return (0.0, 0.0);
         };
+        if now <= previous {
+            return (0.0, 0.0);
+        }
         self.ticked_at.set(Some(now));
-        dt
+        let elapsed = now.duration_since(previous).min(MAX_TICK);
+        let end = now.saturating_duration_since(self.session_started);
+        let active = self
+            .input_activity
+            .borrow_mut()
+            .active_during(end.saturating_sub(elapsed), end);
+        (
+            active.as_secs_f32(),
+            elapsed.saturating_sub(active).as_secs_f32(),
+        )
     }
 }
 
@@ -3400,15 +3413,17 @@ impl OrganismRuntime {
             // clock and evolve the one shared mind. Persistence is untouched —
             // the evolved state only reaches disk with the next lifecycle
             // event, exactly as before.
-            let dt = runtime.activity.tick_slice(now);
-            if dt > 0.0 {
+            let (active, inactive) = runtime.activity.tick_slice(now);
+            if active + inactive > 0.0 {
                 let mut life = runtime.shared_life.get();
-                life.tick(
-                    dt,
-                    runtime.activity.user_active(now),
-                    runtime.activity.resting(now) || runtime.activity.sleeping_rest(),
-                    runtime.activity.circadian_phase(local.bucket),
-                );
+                let resting = runtime.activity.resting(now) || runtime.activity.sleeping_rest();
+                let phase = runtime.activity.circadian_phase(local.bucket);
+                if active > 0.0 {
+                    life.tick(active, true, resting, phase);
+                }
+                if inactive > 0.0 {
+                    life.tick(inactive, false, resting, phase);
+                }
                 runtime.shared_life.set(life);
                 runtime.refresh_state(life);
             }
@@ -8802,13 +8817,13 @@ mod tests {
     fn shared_activity_clock_hands_out_each_slice_exactly_once() {
         let activity = OrganismActivity::new(None, GrowthProgress::default());
         let start = Instant::now();
-        assert_eq!(activity.tick_slice(start), 0.0);
+        assert_eq!(activity.tick_slice(start), (0.0, 0.0));
         let later = start + Duration::from_millis(250);
         let slice = activity.tick_slice(later);
-        assert!((slice - 0.25).abs() < 0.005);
+        assert_eq!(slice, (0.0, 0.25));
         // A second body asking at the same instant gets nothing: the mind
         // never lives the same moment twice.
-        assert_eq!(activity.tick_slice(later), 0.0);
+        assert_eq!(activity.tick_slice(later), (0.0, 0.0));
     }
 
     #[test]
@@ -9233,15 +9248,104 @@ mod tests {
     }
 
     #[test]
-    fn typing_window_marks_the_user_active_briefly() {
+    fn input_windows_count_expired_overlap_and_just_arrived_input() {
         let activity = OrganismActivity::new(None, GrowthProgress::default());
-        let now = Instant::now();
-        assert!(!activity.user_active(now));
-        activity.note_input(now);
-        assert!(activity.user_active(now + Duration::from_millis(500)));
-        assert!(!activity.user_active(now + Duration::from_millis(1000)));
-        activity.note_output(now + Duration::from_secs(5));
-        assert!(!activity.resting(now + REST_ONSET));
+        let start = activity.session_started;
+        activity.tick_slice(start);
+        activity.note_input(start);
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(900)),
+            (0.9, 0.0)
+        );
+
+        let overlap = OrganismActivity::new(None, GrowthProgress::default());
+        let start = overlap.session_started;
+        overlap.tick_slice(start);
+        overlap.note_input(start);
+        overlap.note_input(start + Duration::from_millis(800));
+        assert_eq!(
+            overlap.tick_slice(start + Duration::from_millis(900)),
+            (0.9, 0.0)
+        );
+
+        let arriving = OrganismActivity::new(None, GrowthProgress::default());
+        let start = arriving.session_started;
+        arriving.tick_slice(start);
+        arriving.note_input(start + Duration::from_millis(900));
+        assert_eq!(
+            arriving.tick_slice(start + Duration::from_secs(1)),
+            (0.1, 0.9)
+        );
+        arriving.note_output(start + Duration::from_secs(5));
+        assert!(!arriving.resting(start + REST_ONSET));
+    }
+
+    #[test]
+    fn out_of_order_input_does_not_rewind_activity_or_extend_its_union() {
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
+        let start = activity.session_started;
+        activity.tick_slice(start);
+        activity.note_input(start + Duration::from_millis(800));
+        activity.note_input(start + Duration::from_millis(500));
+        assert_eq!(
+            activity.active_at.get(),
+            Some(start + Duration::from_millis(800))
+        );
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_secs(1)),
+            (0.2, 0.8)
+        );
+    }
+
+    #[test]
+    fn pending_input_survives_same_time_and_stale_tick_claims() {
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
+        let start = activity.session_started;
+        activity.tick_slice(start);
+        activity.note_input(start + Duration::from_millis(500));
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(400)),
+            (0.0, 0.4)
+        );
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(400)),
+            (0.0, 0.0)
+        );
+        assert_eq!(activity.tick_slice(start), (0.0, 0.0));
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(600)),
+            (0.1, 0.1)
+        );
+        activity.note_input(start + Duration::from_millis(600));
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(600)),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(700)),
+            (0.1, 0.0)
+        );
+    }
+
+    #[test]
+    fn delayed_activity_tick_only_consumes_final_second_and_never_rewinds() {
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
+        let start = activity.session_started;
+        activity.tick_slice(start);
+        activity.note_input(start);
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_secs(5)),
+            (0.0, 1.0)
+        );
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_secs(4)),
+            (0.0, 0.0)
+        );
+        activity.note_input(start + Duration::from_secs(4));
+        assert_eq!(
+            activity.tick_slice(start + Duration::from_millis(5250)),
+            (0.0, 0.25)
+        );
     }
 
     #[test]

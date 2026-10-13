@@ -413,24 +413,7 @@ impl AppModel {
 
     pub(crate) fn refresh_agent_panel(&self) {
         if let Some(view) = self.agent_panel_view() {
-            let pulse = if view.loading {
-                Some(jterm_core::organism::AgentPulse::Working)
-            } else {
-                match view.state {
-                    agent::AgentState::Ready => None,
-                    agent::AgentState::AwaitingModel
-                    | agent::AgentState::AwaitingObservation { .. } => {
-                        Some(jterm_core::organism::AgentPulse::Working)
-                    }
-                    agent::AgentState::AwaitingApproval { .. } => {
-                        Some(jterm_core::organism::AgentPulse::AskingReview)
-                    }
-                    agent::AgentState::Completed | agent::AgentState::TurnLimitReached => {
-                        Some(jterm_core::organism::AgentPulse::Finished)
-                    }
-                    agent::AgentState::Cancelled => Some(jterm_core::organism::AgentPulse::Gone),
-                }
-            };
+            let pulse = jterm_core::organism::agent_state_pulse(view.state, view.loading);
             if let Some(pulse) = pulse {
                 self.organism_hub.agent_signal().note_phase(pulse);
             }
