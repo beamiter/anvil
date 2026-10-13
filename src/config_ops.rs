@@ -154,6 +154,8 @@ impl AppModel {
 
 /// The theme-derived rules loaded into the provider above the static one.
 pub(crate) fn dynamic_css(config: &Config) -> String {
+    let menu_css =
+        crate::font::menu_theme_css(&config.font_desc, &config.background, &config.foreground);
     let bg = &config.background;
     let fg = &config.foreground;
     let br = (bg.red() * 255.0) as u8;
@@ -188,6 +190,7 @@ pub(crate) fn dynamic_css(config: &Config) -> String {
          .top-bar {{ background-color: rgb({br},{bgg},{bb}); color: rgb({fr},{fgg},{fb}); }}
          .top-bar-actions {{ background-color: rgb({br},{bgg},{bb}); }}
          .top-bar button {{ color: rgb({fr},{fgg},{fb}); }}
+         {menu_css}
          .tab-strip {{ background-color: rgb({br},{bgg},{bb}); }}
          .tab-strip-btn {{ color: rgba({fr},{fgg},{fb},0.6); }}
          .tab-strip-btn:checked {{ color: rgb({fr},{fgg},{fb}); }}

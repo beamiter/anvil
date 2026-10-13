@@ -16,6 +16,7 @@ mod command_review;
 mod config;
 mod config_ops;
 mod config_store;
+mod context_menu;
 mod diagnostics;
 mod dialogs;
 mod enter_ownership;

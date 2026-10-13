@@ -188,6 +188,65 @@ pub(crate) fn css_font_stack(family: &str, icon_family: Option<&str>) -> String 
     }
 }
 
+/// Native popup text follows the configured font without inheriting a
+/// selected tab's bold/italic decoration. Pango parses size/style boundaries;
+/// the existing CSS stack encoder quotes family names safely.
+pub(crate) fn menu_font_css(desc: &str) -> String {
+    let font = font_description(desc, None);
+    let family = font.family().unwrap_or_else(|| "sans-serif".into());
+    let stack = family
+        .split(',')
+        .map(str::trim)
+        .map(|family| css_font_stack(family, None))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut css = format!("font-family: {stack}; font-weight: normal; font-style: normal;");
+    if font.size() > 0 {
+        let size = f64::from(font.size()) / f64::from(gtk::pango::SCALE);
+        let unit = if font.is_size_absolute() { "px" } else { "pt" };
+        css.push_str(&format!(" font-size: {size}{unit};"));
+    }
+    css
+}
+
+/// Theme only opted-in popup surfaces; native menus elsewhere retain their
+/// own presentation. The display-wide provider updates an already-open menu.
+pub(crate) fn menu_theme_css(
+    desc: &str,
+    background: &gtk::gdk::RGBA,
+    foreground: &gtk::gdk::RGBA,
+) -> String {
+    let color = |color: &gtk::gdk::RGBA| {
+        format!(
+            "rgb({},{},{})",
+            (color.red() * 255.0) as u8,
+            (color.green() * 255.0) as u8,
+            (color.blue() * 255.0) as u8
+        )
+    };
+    let bg = color(background);
+    let fg = color(foreground);
+    let font = menu_font_css(desc);
+    format!(
+        r#"
+        .terminal-context-menu, .terminal-context-menu label,
+        .terminal-context-menu button, .terminal-context-menu entry {{ {font} }}
+        .terminal-context-menu > contents {{ background-color: {bg}; color: {fg}; border: 1px solid alpha({fg},0.22); }}
+        .terminal-context-menu > arrow {{ background-color: {bg}; border-color: alpha({fg},0.22); }}
+        .terminal-context-menu button {{ color: {fg}; background-color: transparent; background-image: none; box-shadow: none; border-color: transparent; }}
+        .terminal-context-menu button:hover, .terminal-context-menu button:active,
+        .terminal-context-menu button:focus-visible {{ outline-color: alpha({fg},0.5); background-color: alpha({fg},0.12); }}
+        .terminal-context-menu button:disabled {{ color: alpha({fg},0.45); }}
+        .terminal-context-menu separator {{ background-color: alpha({fg},0.18); }}
+        .terminal-context-menu scrolledwindow, .terminal-context-menu viewport,
+        .terminal-context-menu scrollbar, .terminal-context-menu scrollbar trough {{ background-color: transparent; }}
+        .terminal-context-menu scrollbar slider {{ background-color: alpha({fg},0.3); }}
+        .terminal-context-menu scrollbar slider:hover {{ background-color: alpha({fg},0.5); }}
+        .terminal-context-menu entry {{ color: {fg}; background-color: alpha({fg},0.06); caret-color: {fg}; }}
+    "#
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,6 +493,202 @@ mod tests {
             // and the description must then be exactly what the user asked for.
             None => assert_eq!(families, configured),
         }
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn context_menu_tracks_live_theme_and_font_without_parent_emphasis() {
+        gtk::init().expect("GTK display");
+        struct AnimationPreference(gtk::Settings, bool);
+        impl Drop for AnimationPreference {
+            fn drop(&mut self) {
+                self.0.set_gtk_enable_animations(self.1);
+            }
+        }
+        let settings = gtk::Settings::default().unwrap();
+        let _animations =
+            AnimationPreference(settings.clone(), settings.is_gtk_enable_animations());
+        settings.set_gtk_enable_animations(false);
+        let provider = gtk::CssProvider::new();
+        let errors = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let caught = errors.clone();
+        provider
+            .connect_parsing_error(move |_, _, error| caught.borrow_mut().push(error.to_string()));
+        let display = gtk::gdk::Display::default().unwrap();
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+        );
+        let window = gtk::Window::new();
+        // Leave room for the parent tab when its emphasis style is applied.
+        window.set_default_size(640, 480);
+        let tab = gtk::ToggleButton::with_label("Selected tab");
+        tab.add_css_class("tab-strip-btn");
+        tab.set_active(true);
+        window.set_child(Some(&tab));
+        let popover = gtk::Popover::new();
+        popover.add_css_class("terminal-context-menu");
+        popover.set_has_arrow(false);
+        popover.set_parent(&tab);
+        let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let item = gtk::Button::with_label("Rename tab");
+        item.set_has_frame(false);
+        item.add_css_class("flat");
+        menu.append(&item);
+        let scroll = crate::context_menu::scrolled_content(&menu, &tab);
+        popover.set_child(Some(&scroll));
+        window.present();
+        popover.popup();
+        let main = gtk::glib::MainContext::default();
+        for (name, bg, fg, desc, size) in [
+            (
+                "dark",
+                "#16161e",
+                "#c0caf5",
+                "Monospace Bold Italic 18px",
+                18,
+            ),
+            ("light", "#f6f8fa", "#24292f", "Sans Italic 22px", 22),
+            ("custom", "#221122", "#ffddee", "Monospace Bold 16px", 16),
+        ] {
+            let bg = gtk::gdk::RGBA::parse(bg).unwrap();
+            let fg = gtk::gdk::RGBA::parse(fg).unwrap();
+            let css = format!(
+                ".tab-strip-btn {{ font-weight: bold; font-style: italic; }} {}",
+                menu_theme_css(desc, &bg, &fg)
+            );
+            provider.load_from_string(&css);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+            while std::time::Instant::now() < deadline {
+                while main.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let label = item.child().unwrap().downcast::<gtk::Label>().unwrap();
+            let actual = label.pango_context().font_description().unwrap();
+            assert_eq!(
+                actual.family(),
+                FontDescription::from_string(desc).family(),
+                "{name}"
+            );
+            assert_eq!(actual.weight(), gtk::pango::Weight::Normal, "{name}");
+            assert_eq!(actual.style(), gtk::pango::Style::Normal, "{name}");
+            assert_eq!(actual.size(), size * gtk::pango::SCALE, "{name}");
+            let actual_fg = label.color();
+            for (actual, expected) in [
+                (actual_fg.red(), fg.red()),
+                (actual_fg.green(), fg.green()),
+                (actual_fg.blue(), fg.blue()),
+            ] {
+                assert!((actual - expected).abs() < 0.01, "{name}");
+            }
+            let snapshot = gtk::Snapshot::new();
+            gtk::WidgetPaintable::new(Some(&popover)).snapshot(
+                &snapshot,
+                f64::from(popover.width()),
+                f64::from(popover.height()),
+            );
+            let node = snapshot.to_node().expect("mapped popup snapshot");
+            let renderer = gtk::gsk::Renderer::for_surface(&window.surface().unwrap()).unwrap();
+            let texture = renderer.render_texture(&node, None);
+            let stride = texture.width() as usize * 4;
+            let mut pixels = vec![0; stride * texture.height() as usize];
+            texture.download(&mut pixels, stride);
+            let rgb = [
+                (bg.red() * 255.0) as u8,
+                (bg.green() * 255.0) as u8,
+                (bg.blue() * 255.0) as u8,
+            ];
+            let matching = pixels
+                .chunks_exact(4)
+                .filter(|pixel| {
+                    let argb = u32::from_ne_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]);
+                    [
+                        ((argb >> 16) & 255) as u8,
+                        ((argb >> 8) & 255) as u8,
+                        (argb & 255) as u8,
+                    ] == rgb
+                })
+                .count();
+            assert!(
+                matching > 100,
+                "{name}: popup background must use the configured color"
+            );
+            if let Some(directory) = std::env::var_os("JTERM_MENU_SCREENSHOTS") {
+                std::fs::create_dir_all(&directory).unwrap();
+                let path = std::path::Path::new(&directory)
+                    .join(format!("{}-{name}.png", env!("CARGO_PKG_NAME")));
+                texture.save_to_png(path).unwrap();
+            }
+            renderer.unrealize();
+        }
+        assert!(
+            scroll.height() < scroll.max_content_height(),
+            "small menus keep their natural height"
+        );
+        let mut last = item.clone();
+        for index in 1..32 {
+            last = gtk::Button::with_label(&format!(
+                "Remote host {index}: a complete long label remains accessible"
+            ));
+            last.set_has_frame(false);
+            last.add_css_class("flat");
+            menu.append(&last);
+        }
+        provider.load_from_string(&menu_theme_css(
+            "Monospace 48",
+            &gtk::gdk::RGBA::BLACK,
+            &gtk::gdk::RGBA::WHITE,
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while std::time::Instant::now() < deadline {
+            while main.iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let vertical = scroll.vadjustment();
+        assert!(
+            vertical.upper() > vertical.page_size(),
+            "large menus must scroll"
+        );
+        assert!(
+            scroll.height() <= scroll.max_content_height() + 24,
+            "viewport remains monitor-bounded including scrollbar chrome"
+        );
+        vertical.set_value(vertical.upper() - vertical.page_size());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        while std::time::Instant::now() < deadline {
+            while main.iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let last_bounds = last.compute_bounds(&scroll).unwrap();
+        assert!(
+            last_bounds.y() >= 0.0
+                && last_bounds.y() + last_bounds.height() <= scroll.height() as f32 + 1.0,
+            "last item is reachable by scrolling: {last_bounds:?}"
+        );
+        let horizontal = scroll.hadjustment();
+        assert!(
+            horizontal.upper() > horizontal.page_size(),
+            "long labels scroll horizontally instead of being truncated"
+        );
+        assert!(errors.borrow().is_empty(), "{:?}", errors.borrow());
+        popover.popdown();
+        popover.unparent();
+        window.close();
+        gtk::style_context_remove_provider_for_display(&display, &provider);
+    }
+
+    #[test]
+    fn popup_font_uses_pango_family_and_fractional_size_without_tab_emphasis() {
+        let css = menu_font_css("Monospace Bold Italic 13.5");
+        assert!(css.contains("font-family: \"Monospace\";"));
+        assert!(css.contains("font-size: 13.5pt;"));
+        assert!(css.contains("font-weight: normal;"));
+        assert!(css.contains("font-style: normal;"));
+        assert!(menu_font_css("Monospace 17px").contains("font-size: 17px;"));
+        assert!(
+            menu_font_css("Monospace, Serif 12").contains("font-family: \"Monospace\", \"Serif\";")
+        );
     }
 
     #[test]

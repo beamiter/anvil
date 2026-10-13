@@ -37,6 +37,7 @@ impl AppModel {
                 pane.terminal.emit(VteInput::SetFont(desc.clone()));
             }
         }
+        self.apply_dynamic_css();
         self.persist_config();
     }
 

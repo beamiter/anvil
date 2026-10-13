@@ -720,6 +720,7 @@ fn close_hit(button: &gtk::ToggleButton, icon: &gtk::Image, x: f64, y: f64) -> b
 
 fn show_rename(button: &gtk::ToggleButton, id: u64, title: &str, sender: FactorySender<TabRow>) {
     let popover = gtk::Popover::new();
+    popover.add_css_class("terminal-context-menu");
     popover.set_parent(button);
     let entry = gtk::Entry::new();
     entry.set_text(title);
@@ -749,6 +750,7 @@ fn show_context_menu(
     sender: FactorySender<TabRow>,
 ) {
     let popover = gtk::Popover::new();
+    popover.add_css_class("terminal-context-menu");
     popover.set_parent(button);
     popover.set_has_arrow(false);
     popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
@@ -824,7 +826,7 @@ fn show_context_menu(
         }
     }
 
-    popover.set_child(Some(&menu));
+    popover.set_child(Some(&crate::context_menu::scrolled_content(&menu, button)));
     popover.connect_closed(|popover| popover.unparent());
     popover.popup();
 }
