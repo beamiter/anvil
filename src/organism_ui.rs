@@ -1,5 +1,8 @@
 //! Native bodies for the experimental ASCII organism.
 
+mod inline_card;
+#[cfg(all(test, target_os = "linux"))]
+mod surface_probe;
 pub(crate) mod vte_surface;
 mod watch_adapter;
 use watch_adapter::WatchAdapter;
@@ -1925,7 +1928,7 @@ impl OrganismRuntime {
         motion: OrganismMotion,
         persistent: bool,
     ) -> Rc<Self> {
-        let outer = GBox::new(Orientation::Vertical, 0);
+        let outer = inline_card::InlineCard::new();
         outer.add_css_class("block-finished");
         outer.add_css_class("block-organism");
         outer.add_css_class("organism-quiet");
@@ -4971,6 +4974,173 @@ mod tests {
         .outcome
     }
 
+    /// Reuse this fixture's mapped window and inert terminal. No new process,
+    /// display, PTY, timer or production redraw hook is created here.
+    #[cfg(target_os = "linux")]
+    fn assert_inline_card_repaint(window: &gtk::Window, runtime: &OrganismRuntime) {
+        use super::surface_probe::{PaintSerial, PixelRect, SurfaceProbe};
+        assert!(
+            !std::env::var("GSK_DEBUG")
+                .unwrap_or_default()
+                .split([',', ':', ' '])
+                .any(|flag| flag == "full-redraw" || flag == "all"),
+            "incremental regression cannot run with forced full redraw"
+        );
+        assert!(runtime.surface_timer.borrow().is_none());
+        move_native_pointer(window, 0, 0);
+        let main = gtk::glib::MainContext::default();
+        let paint = PaintSerial::new(window).unwrap();
+        let probe = SurfaceProbe::new(window).unwrap();
+        eprintln!(
+            "inline paint renderer: {:?}",
+            window
+                .renderer()
+                .map(|renderer| renderer.type_().name().to_string())
+        );
+        let wait = |ready: &dyn Fn() -> bool| {
+            let started = Instant::now();
+            while !ready() && started.elapsed() < Duration::from_secs(2) {
+                while main.iteration(false) {}
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(ready(), "inline paint fixture did not settle");
+        };
+        let status = runtime.status.text();
+        let state = runtime.state.text();
+        let margin = runtime.card.margin_start();
+        let size = window.default_size();
+        let starting_width = window.width();
+        let provider = gtk::CssProvider::new();
+        const STEADY: &str = ".organism-paint-fixture { transition: none; }";
+        provider.load_from_string(STEADY);
+        struct FixtureStyle(gtk::gdk::Display, gtk::CssProvider);
+        impl Drop for FixtureStyle {
+            fn drop(&mut self) {
+                gtk::style_context_remove_provider_for_display(&self.0, &self.1);
+            }
+        }
+        let display = gtk::prelude::WidgetExt::display(window);
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+        );
+        let _style = FixtureStyle(display, provider.clone());
+        runtime.card.add_css_class("organism-paint-fixture");
+
+        for stage in 0..6 {
+            let old = runtime.card.compute_bounds(window).unwrap();
+            let old_width = window.width();
+            let before = paint.current();
+            match stage {
+                0 => runtime
+                    .status
+                    .set_text("quiet · iiiiiiiiii jjjjj ÍÍÍÍ inspecting"),
+                1 => runtime
+                    .status
+                    .set_text("quiet · waiting for a real Block event"),
+                2 => {
+                    runtime.card.set_margin_start(margin + 9);
+                    runtime.status.set_text("quiet · i");
+                }
+                3 => {
+                    runtime.card.set_margin_start(margin);
+                    window.set_default_size(if old_width > 420 { 360 } else { 700 }, size.1);
+                    runtime.status.set_text("quiet · waiting for a real Block event with iii jjj and a deliberately long explanation that wraps onto the second line");
+                }
+                4 => {
+                    provider.load_from_string(".organism-paint-fixture { transition: none; } .organism-paint-fixture label { font-size: 14.667px; } .organism-paint-fixture .organism-status { color: #d2d9e3; }");
+                    runtime
+                        .status
+                        .set_text("quiet · waiting for a real Block event");
+                    runtime.state.set_text("Quietly keeping you company between commands. · sleepy · subdued · curious · a deliberately long ellipsized state");
+                }
+                _ => {
+                    provider.load_from_string(STEADY);
+                    window.set_default_size(size.0, size.1);
+                    runtime.status.set_text(&status);
+                    runtime.state.set_text(&state);
+                }
+            }
+            wait(&|| {
+                paint.current() > before
+                    && (stage != 3 || window.width() != old_width)
+                    && (stage != 5 || window.width() == starting_width)
+            });
+            let current = runtime.card.compute_bounds(window).unwrap();
+            // GTK's native snapshot adds this offset when drawing into the surface.
+            let (tx, ty) = window.surface_transform();
+            let full = probe.full_rect().unwrap();
+            let rect = |r: gtk::graphene::Rect| {
+                [
+                    f64::from(r.x()),
+                    f64::from(r.y()),
+                    f64::from(r.width()),
+                    f64::from(r.height()),
+                ]
+            };
+            let [left, top, right, bottom] = super::surface_probe::surface_rect(
+                rect(old),
+                rect(current),
+                (tx, ty),
+                probe.scale(),
+                (full.width, full.height),
+            );
+            eprintln!("inline-card-{stage}: native transform=({tx}, {ty})");
+            assert!(right > left && bottom > top);
+            let roi = PixelRect {
+                x: left,
+                y: top,
+                width: (right - left) as u32,
+                height: (bottom - top) as u32,
+            };
+            let name = format!("inline-card-{stage}");
+            probe.log_metadata(&runtime.status, roi, &name);
+            let incremental = probe.capture(roi).unwrap();
+            let before = paint.current();
+            probe.expose_full().unwrap();
+            wait(&|| paint.current() > before);
+            assert_eq!(
+                runtime.card.compute_bounds(window).unwrap(),
+                current,
+                "expose must not change geometry"
+            );
+            let complete = probe.capture(roi).unwrap();
+            if incremental.pixels != complete.pixels {
+                let directory = std::env::temp_dir();
+                incremental
+                    .write_ppm(&directory.join(format!("{name}-incremental.ppm")))
+                    .unwrap();
+                complete
+                    .write_ppm(&directory.join(format!("{name}-complete.ppm")))
+                    .unwrap();
+            }
+            incremental.assert_same_pixels(&complete, &name);
+            inline_card::assert_native_paint_contract(&runtime.card);
+        }
+
+        let before = paint.current();
+        runtime.card.remove_css_class("organism-paint-fixture");
+        probe.expose_full().unwrap();
+        wait(&|| paint.current() > before);
+        let snapshots = inline_card::snapshot_count(&runtime.card);
+        let still_at = Instant::now();
+        while still_at.elapsed() < Duration::from_millis(120) {
+            while main.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            inline_card::snapshot_count(&runtime.card),
+            snapshots,
+            "unchanged inline card must reuse its cached snapshot"
+        );
+        assert!(runtime.surface_timer.borrow().is_none());
+        assert_eq!(runtime.status.text(), status);
+        assert_eq!(runtime.state.text(), state);
+        assert_eq!(runtime.card.margin_start(), margin);
+        assert_eq!(window.default_size(), size);
+    }
+
     #[test]
     #[ignore = "requires DISPLAY"]
     fn live_settings_reuse_body_preserve_focus_and_stop_disabled_timers() {
@@ -5048,6 +5218,8 @@ mod tests {
         }
         assert!(view.widget().is_mapped());
         crate::block_view::organism_settings_test_clean_prompt(&view);
+        #[cfg(target_os = "linux")]
+        assert_inline_card_repaint(&window, &runtime);
         // This is a pane-local description even before live-body ownership.
         // Emit the existing GTK query signal, without synthetic pointer input.
         let tooltip: gtk::Tooltip = gtk::glib::Object::new();
