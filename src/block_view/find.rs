@@ -1965,11 +1965,12 @@ impl TermView {
             return RecordNavigationResult::Navigated;
         }
         self.cross_selection.clear_all();
-        {
+        let unfold_output = {
             let finished = self.finished_blocks.borrow();
-            if !finished.iter().any(|block| block.id == block_id) {
+            let Some(block) = finished.iter().find(|block| block.id == block_id) else {
                 return RecordNavigationResult::NoMatchingRecord;
-            }
+            };
+            let unfold_output = is_output && block.is_output_collapsed();
             replace_finished_block_selection(
                 &finished,
                 &self.selected_block_ids,
@@ -1977,6 +1978,13 @@ impl TermView {
                 &self.selection_anchor_id,
                 Some(block_id),
             );
+            unfold_output
+        };
+        if unfold_output {
+            // An output hit must expose its selected surface. Reuse the pane
+            // action so parked-card geometry stays in sync; command hits and
+            // unrelated folds, filters, and the user's scroll lock stay put.
+            self.toggle_selected_block_collapsed();
         }
         // The selection this just wrote is the stepping cursor for a backend
         // that mounts widgets; the fallback must not shadow it.

@@ -27835,3 +27835,6 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
 
 #[cfg(test)]
 mod fold_geometry_tests;
+
+#[cfg(test)]
+mod search_navigation_tests;
