@@ -53,6 +53,9 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::focus_restore::tests::deferred_pty_focus_respects_newer_owners
+    block_view::focus_restore::tests::deferred_focus_preserves_remaps_and_retires_hidden_targets
+    block_view::focus_restore::tests::popover_focus_return_retires_on_newer_owner
     organism_ui::tests::idle_refresh_skips_unchanged_tooltip_and_non_owner_spatial_render
     block_view::chat::tests::chat_reparents_only_live_clip_and_hides_submit_for_native_takeover
     block_view::chat::tests::chat_raw_takeover_updates_columns_without_resizing_the_window

@@ -38,6 +38,7 @@ mod cross_selection;
 mod css;
 mod export;
 mod find;
+mod focus_restore;
 mod history;
 mod onboarding;
 #[allow(dead_code)]
@@ -8455,13 +8456,7 @@ impl RenderBackend for BlockBackend {
     }
 
     fn focus_live_deferred(&self) {
-        if !self.active_vte.has_focus() {
-            return;
-        }
-        let active_for_focus = self.active_rc.clone();
-        glib::idle_add_local_once(move || {
-            active_for_focus.borrow().grab_focus();
-        });
+        focus_restore::restore_live_focus_deferred(&self.active_vte);
     }
 
     fn sync_geometry_to_pty(&self) {
@@ -9404,17 +9399,7 @@ impl RenderBackend for UnifiedBackend {
     }
 
     fn focus_live_deferred(&self) {
-        // Preserve Anvil's pane-focus invariant: a background pane receiving a
-        // prompt must never steal focus merely because its backend is Unified.
-        if !self.vte.has_focus() {
-            return;
-        }
-        let vte = self.vte.downgrade();
-        glib::idle_add_local_once(move || {
-            if let Some(vte) = vte.upgrade() {
-                vte.grab_focus();
-            }
-        });
+        focus_restore::restore_live_focus_deferred(&self.vte);
     }
 
     fn sync_geometry_to_pty(&self) {
@@ -14948,17 +14933,16 @@ impl TermView {
             // way back. It stays on `Ctrl+Shift+K` and in the palette.
 
             popover.set_child(Some(&vbox));
-            let live_vte = view.active_vte.downgrade();
+            let restore = RefCell::new(focus_restore::FocusRestore::popover(
+                &view.active_vte,
+                &popover,
+            ));
             popover.connect_closed(move |popover| {
+                let restore = restore.borrow_mut().take();
                 popover.unparent();
-                // The popover took focus off the prompt to open. Hand it back
-                // on idle, after GTK has finished tearing the popover down.
-                let live_vte = live_vte.clone();
-                glib::idle_add_local_once(move || {
-                    if let Some(live_vte) = live_vte.upgrade() {
-                        live_vte.grab_focus();
-                    }
-                });
+                if let Some(restore) = restore {
+                    restore.defer();
+                }
             });
             popover.popup();
         });
