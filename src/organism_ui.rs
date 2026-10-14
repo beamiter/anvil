@@ -959,6 +959,38 @@ enum MemoryBadgeState {
     SaveFailed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GrowthTooltip {
+    Persistent(GrowthProgress),
+    Volatile,
+    SaveFailed,
+}
+
+impl GrowthTooltip {
+    fn new(memory: MemoryBadgeState, growth: GrowthProgress) -> Self {
+        match memory {
+            MemoryBadgeState::Persistent => Self::Persistent(growth),
+            MemoryBadgeState::Volatile => Self::Volatile,
+            MemoryBadgeState::SaveFailed => Self::SaveFailed,
+        }
+    }
+
+    fn text(self) -> String {
+        match self {
+            Self::Persistent(growth) => format!(
+                "{} remembered work day(s) · {} recovery episode(s)",
+                growth.days_seen, growth.lifetime_recoveries
+            ),
+            Self::Volatile => {
+                "Growth is unavailable because repository memory could not be loaded".to_string()
+            }
+            Self::SaveFailed => {
+                "Repository memory could not be queued for durable storage".to_string()
+            }
+        }
+    }
+}
+
 fn growth_badge(stage: GrowthStage, memory: MemoryBadgeState) -> &'static str {
     match (stage, memory) {
         (GrowthStage::Juvenile, MemoryBadgeState::Persistent) => "juvenile · repo memory · no LLM",
@@ -1858,6 +1890,11 @@ struct OrganismRuntime {
     pointer_near: Cell<bool>,
     pointer_timer: RefCell<Option<(gtk::glib::SourceId, LiveAttentionTicket)>>,
     memory_badge: Cell<MemoryBadgeState>,
+    growth_tooltip: Cell<Option<GrowthTooltip>>,
+    #[cfg(test)]
+    tooltip_submissions: Cell<u64>,
+    #[cfg(test)]
+    spatial_renders: Cell<u64>,
     shared_life: Rc<Cell<LifeState>>,
     activity: Rc<OrganismActivity>,
     presence: Rc<OrganismPresence>,
@@ -2055,6 +2092,11 @@ impl OrganismRuntime {
             pointer_position: Cell::new(None),
             pointer_near: Cell::new(false),
             pointer_timer: RefCell::new(None),
+            growth_tooltip: Cell::new(None),
+            #[cfg(test)]
+            tooltip_submissions: Cell::new(0),
+            #[cfg(test)]
+            spatial_renders: Cell::new(0),
             memory_badge: Cell::new(if persistent {
                 MemoryBadgeState::Persistent
             } else {
@@ -2812,19 +2854,15 @@ impl OrganismRuntime {
         if self.badge.text().as_str() != badge {
             self.badge.set_text(badge);
         }
-        let tooltip = match memory {
-            MemoryBadgeState::Persistent => format!(
-                "{} remembered work day(s) · {} recovery episode(s)",
-                growth.days_seen, growth.lifetime_recoveries
-            ),
-            MemoryBadgeState::Volatile => {
-                "Growth is unavailable because repository memory could not be loaded".to_string()
-            }
-            MemoryBadgeState::SaveFailed => {
-                "Repository memory could not be queued for durable storage".to_string()
-            }
-        };
-        self.badge.set_tooltip_text(Some(&tooltip));
+        // Cache semantic inputs before formatting or submitting GTK properties.
+        // Error wording does not depend on growth; persistent wording uses both counts.
+        let tooltip = GrowthTooltip::new(memory, growth);
+        if self.growth_tooltip.replace(Some(tooltip)) != Some(tooltip) {
+            #[cfg(test)]
+            self.tooltip_submissions
+                .set(self.tooltip_submissions.get() + 1);
+            self.badge.set_tooltip_text(Some(&tooltip.text()));
+        }
     }
 
     fn refresh_inline_sprite(&self) {
@@ -3082,10 +3120,6 @@ impl OrganismRuntime {
         self.sync_attention_resources(snapshot);
         self.painted_attention.set(snapshot);
         let context = snapshot.map_or(context, |snapshot| snapshot.presentation);
-        let sprite = sprite_frame_with_context(context, sprite_frame);
-        if self.live_body.text().as_str() != sprite.as_ref() {
-            self.live_body.set_text(sprite.as_ref());
-        }
         self.last_live_behavior.set(display_behavior);
         // The sticky one-line form mirrors the same displayed behavior with a
         // fixed-width micro-pose, so scrollback readers see the mood too.
@@ -3107,6 +3141,16 @@ impl OrganismRuntime {
             // spatial overlay participates in one-body focus arbitration.
             self.sticky_avatar.set_visible(mode != SurfaceMode::Typing);
             return;
+        }
+
+        // Reconciliation and pane-local forms above still run for non-owners.
+        // Render spatial pixels only after arbitration, including the first
+        // refresh when focus returns (there is no stale sprite cache).
+        #[cfg(test)]
+        self.spatial_renders.set(self.spatial_renders.get() + 1);
+        let sprite = sprite_frame_with_context(context, sprite_frame);
+        if self.live_body.text().as_str() != sprite.as_ref() {
+            self.live_body.set_text(sprite.as_ref());
         }
 
         if suppress_live_body_for_focus(mode) {
@@ -4645,6 +4689,124 @@ impl Drop for OrganismHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn growth_tooltip_keys_cover_counts_and_memory_transitions() {
+        let initial = GrowthProgress::default();
+        let days = GrowthProgress {
+            days_seen: 1,
+            ..initial
+        };
+        let recovery = GrowthProgress {
+            lifetime_recoveries: 1,
+            ..initial
+        };
+        let key = GrowthTooltip::new(MemoryBadgeState::Persistent, initial);
+        assert_ne!(key, GrowthTooltip::new(MemoryBadgeState::Persistent, days));
+        assert_ne!(
+            key,
+            GrowthTooltip::new(MemoryBadgeState::Persistent, recovery)
+        );
+        for memory in [MemoryBadgeState::Volatile, MemoryBadgeState::SaveFailed] {
+            assert_ne!(key, GrowthTooltip::new(memory, initial));
+            assert_eq!(
+                GrowthTooltip::new(memory, initial),
+                GrowthTooltip::new(memory, days)
+            );
+        }
+        assert_ne!(GrowthTooltip::Volatile, GrowthTooltip::SaveFailed);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn idle_refresh_skips_unchanged_tooltip_and_non_owner_spatial_render() {
+        gtk::init().expect("gtk display");
+        let view = crate::block_view::organism_settings_test_view();
+        let presence = OrganismPresence::new();
+        let token = presence.reserve();
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
+        let runtime = OrganismRuntime::new(
+            Rc::new(Cell::new(LifeState::default())),
+            activity.clone(),
+            presence.clone(),
+            token,
+            OrganismMotion::Full,
+            true,
+        );
+        presence.bind(token, &view, &runtime);
+        runtime.sprite.set_text("stale inline fixture");
+        runtime.sticky_avatar.set_text("stale sticky fixture");
+        let submissions = runtime.tooltip_submissions.get();
+        for _ in 0..4 {
+            runtime.refresh_surface(&view, Instant::now());
+        }
+        assert_eq!(runtime.tooltip_submissions.get(), submissions);
+        assert_eq!(runtime.spatial_renders.get(), 0);
+        assert_ne!(runtime.sprite.text().as_str(), "stale inline fixture");
+        assert_ne!(
+            runtime.sticky_avatar.text().as_str(),
+            "stale sticky fixture"
+        );
+        for growth in [
+            GrowthProgress {
+                days_seen: 1,
+                lifetime_recoveries: 0,
+            },
+            GrowthProgress {
+                days_seen: 1,
+                lifetime_recoveries: 1,
+            },
+        ] {
+            activity.growth.set(growth);
+            let before = runtime.tooltip_submissions.get();
+            runtime.refresh_surface(&view, Instant::now());
+            assert_eq!(runtime.tooltip_submissions.get(), before + 1);
+            assert_eq!(
+                runtime.badge.tooltip_text().as_deref(),
+                Some(GrowthTooltip::Persistent(growth).text().as_str())
+            );
+        }
+        for memory in [
+            MemoryBadgeState::SaveFailed,
+            MemoryBadgeState::Volatile,
+            MemoryBadgeState::Persistent,
+        ] {
+            runtime.memory_badge.set(memory);
+            let before = runtime.tooltip_submissions.get();
+            runtime.refresh_growth_badge();
+            runtime.refresh_growth_badge();
+            assert_eq!(runtime.tooltip_submissions.get(), before + 1);
+            assert_eq!(
+                runtime.badge.tooltip_text().as_deref(),
+                Some(
+                    GrowthTooltip::new(memory, activity.growth())
+                        .text()
+                        .as_str()
+                )
+            );
+        }
+        for motion in [OrganismMotion::Full, OrganismMotion::Calm] {
+            runtime.motion.set(motion);
+            runtime.live_body.set_text("stale fixture");
+            let before = runtime.spatial_renders.get();
+            // Exercise the real focus authority and its synchronous refresh.
+            presence.focus_view(Some(&view));
+            assert_eq!(runtime.spatial_renders.get(), before + 1);
+            assert_ne!(runtime.live_body.text().as_str(), "stale fixture");
+            presence.focus_view(None);
+            runtime.refresh_surface(&view, Instant::now());
+            assert_eq!(runtime.spatial_renders.get(), before + 1);
+        }
+        let before = runtime.spatial_renders.get();
+        runtime.motion.set(OrganismMotion::Static);
+        presence.focus_view(Some(&view));
+        runtime.refresh_surface(&view, Instant::now());
+        assert_eq!(runtime.spatial_renders.get(), before);
+        runtime.enabled.set(false);
+        runtime.motion.set(OrganismMotion::Full);
+        runtime.refresh_surface(&view, Instant::now());
+        assert_eq!(runtime.spatial_renders.get(), before);
+    }
 
     #[test]
     fn state_caption_explains_the_shown_pose_and_falls_back_after_retreat() {
