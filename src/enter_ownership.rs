@@ -358,6 +358,7 @@ mod tests {
             TerminalMode::Vte,
             TerminalMode::Block,
             TerminalMode::Unified,
+            TerminalMode::Chat,
         ] {
             for mode in ["queued", "queued-keypad"] {
                 let fresh = std::env::var_os("ANVIL_QA_FRESH_ENTER").is_some();

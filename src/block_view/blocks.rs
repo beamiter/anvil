@@ -3179,6 +3179,9 @@ pub(crate) fn estimated_cell_height_px(config: &Config) -> i32 {
 // header margins and 3px of bottom CSS padding, for an exact 13px reduction.
 const FINISHED_CARD_ROOMY_VCHROME_PX: i32 = 34;
 const FINISHED_CARD_COMPACT_VCHROME_PX: i32 = 21;
+// Capsule 20px padding + 10px gap, result 20px padding. Added exactly once
+// in both initial estimates and viewport refits; density keeps its old delta.
+const CHAT_CARD_EXTRA_VCHROME_PX: i32 = 50;
 
 const fn finished_card_vchrome_px(compact: bool) -> i32 {
     if compact {
@@ -3195,6 +3198,13 @@ pub(crate) fn estimated_finished_block_height(config: &Config, output_rows: i64)
     rows.saturating_add(3)
         .saturating_mul(cell)
         .saturating_add(finished_card_vchrome_px(config.block_compact))
+        .saturating_add(
+            if config.terminal_mode == crate::config::TerminalMode::Chat {
+                CHAT_CARD_EXTRA_VCHROME_PX
+            } else {
+                0
+            },
+        )
 }
 
 /// Refit metadata uses the card's current density, just like its initial
@@ -3729,6 +3739,7 @@ impl FinishedBlock {
         precomputed: FinishedBlockPrecomputed,
     ) -> Self {
         let is_background = cmd.trim().is_empty();
+        let chat = config.terminal_mode == crate::config::TerminalMode::Chat;
         let cols = cols.clamp(1, MAX_FINISHED_VTE_COLUMNS);
         let estimated_retained_bytes = precomputed.retained_bytes.unwrap_or_else(|| {
             estimated_live_finished_block_retained_bytes(
@@ -3802,6 +3813,13 @@ impl FinishedBlock {
         // block last used them; virtualization owns this request from here on.
         outer.set_hexpand(true);
         outer.set_vexpand(false);
+        // A recycled shell belongs to this pane's current presentation, never
+        // the mutable global preference or its previous pooled record.
+        if chat {
+            outer.add_css_class("chat-turn");
+        } else {
+            outer.remove_css_class("chat-turn");
+        }
         outer.set_height_request(-1);
         // A pooled card may also have been hidden outright by an alt-screen
         // takeover; a new block always starts on screen.
@@ -4156,8 +4174,18 @@ impl FinishedBlock {
         // Allocate every logical command row up front; VTE's post-feed pass
         // adds any further rows caused by soft wrapping or control sequences.
         let cmd_rows = cmd_bytes.iter().filter(|&&b| b == b'\n').count() as i64 + 1;
+        let command_cols = if chat {
+            chat_command_columns(cmd, cols)
+        } else {
+            cols
+        };
         let command_vte =
-            create_finished_terminal(config, cols, cmd_rows.max(1), cmd_rows.max(1), true);
+            create_finished_terminal(config, command_cols, cmd_rows.max(1), cmd_rows.max(1), true);
+        if chat {
+            command_vte.set_hexpand(false);
+            command_vte.add_css_class("chat-command-terminal");
+            command_vte.set_color_background(&RGBA::new(0.0, 0.0, 0.0, 0.0));
+        }
         let command_render_cols = Rc::new(Cell::new(0_i64));
         // Defer feeds until the widget is actually mapped — VTE's internal
         // grid resize from set_size() doesn't take effect until the widget is
@@ -4167,7 +4195,7 @@ impl FinishedBlock {
         // One-shot: re-mapping during scroll must not re-feed.
         {
             let cmd_bytes_for_map = cmd_bytes.clone();
-            let cols_for_map = cols.max(1);
+            let cols_for_map = command_cols.max(1);
             let cmd_rows_for_map = cmd_rows.max(1);
             let command_render_cols = command_render_cols.clone();
             command_vte.connect_map(move |w| {
@@ -4384,8 +4412,17 @@ impl FinishedBlock {
         // from the live pane the user watched it in.
         let cmd_row = gtk::Box::new(Orientation::Horizontal, 0);
         cmd_row.append(&command_vte);
+        if chat {
+            cmd_row.add_css_class("chat-command-capsule");
+            cmd_row.set_halign(gtk::Align::End);
+            cmd_row.set_hexpand(false);
+        }
 
         content.append(&cmd_row);
+        if chat {
+            // Command first, followed by the left-aligned result's metadata.
+            content.reorder_child_after(&cmd_row, None::<&gtk::Widget>);
+        }
         cmd_row.set_visible(!is_background);
         // The per-block scrollbar rides an overlay, never a box sibling.
         //
@@ -4403,6 +4440,9 @@ impl FinishedBlock {
         let output_box = gtk::Overlay::new();
         output_box.set_hexpand(true);
         output_box.set_child(Some(&output_vte));
+        if chat {
+            output_box.add_css_class("chat-result-card");
+        }
         let output_scrollbar =
             gtk::Scrollbar::new(Orientation::Vertical, output_vte.vadjustment().as_ref());
         output_scrollbar.add_css_class("block-output-scrollbar");
@@ -5298,11 +5338,18 @@ impl FinishedBlock {
         let rows_for_height = visible_rows
             .saturating_add(3)
             .saturating_add(command_height_rows.saturating_sub(1));
-        Some(finished_card_refit_height(
-            rows_for_height,
-            cell_height,
-            self.compact.get(),
-        ))
+        Some(
+            finished_card_refit_height(rows_for_height, cell_height, self.compact.get())
+                .saturating_add(if self.widget.has_css_class("chat-turn") {
+                    if self.is_background {
+                        20
+                    } else {
+                        CHAT_CARD_EXTRA_VCHROME_PX
+                    }
+                } else {
+                    0
+                }),
+        )
     }
 
     /// Give a long block first refusal on wheel events while the pointer is over
@@ -5925,4 +5972,26 @@ pub(crate) enum BlockState {
     /// has been seen within the startup grace window. Recovered to block mode if a
     /// PromptStart ever arrives (late-loading integration).
     RawFallback,
+}
+
+/// Right capsules remain bounded even for multi-line commands. The original
+/// text, source identity and read-only VTE are unchanged; only wrapping differs.
+fn chat_command_columns(command: &str, pane_cols: i64) -> i64 {
+    let longest = command
+        .lines()
+        .map(unicode_width::UnicodeWidthStr::width)
+        .max()
+        .unwrap_or(1) as i64;
+    longest.max(12).min((pane_cols * 3 / 4).max(1))
+}
+
+#[cfg(test)]
+mod chat_geometry_tests {
+    #[test]
+    fn capsule_width_is_bounded_for_short_wide_and_multiline_commands() {
+        assert_eq!(super::chat_command_columns("pwd", 80), 12);
+        assert_eq!(super::chat_command_columns(&"x".repeat(200), 80), 60);
+        assert_eq!(super::chat_command_columns("pwd\nprintf '界界界'", 80), 15);
+        assert_eq!(super::chat_command_columns("pwd", 8), 6);
+    }
 }

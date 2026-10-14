@@ -25,6 +25,7 @@ scrollback = 5000
 # Backend and layout.
 # "block": structured command blocks; "vte": compatibility terminal;
 # "unified": experimental continuous OSC 133 surface without block chrome.
+# "chat": right command capsules, output cards, and a docked live shell.
 terminal_mode = "block"     # applies to new/restored local panes
 tab_placement = "sidebar"   # "sidebar" or "top"
 sidebar_view = "tabs"       # "tabs" or "files"

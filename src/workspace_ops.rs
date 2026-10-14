@@ -1161,6 +1161,7 @@ impl AppModel {
                             TerminalMode::Vte => "vte",
                             TerminalMode::Block => "block",
                             TerminalMode::Unified => "unified",
+                            TerminalMode::Chat => "chat",
                         }
                         .to_string(),
                         p.cwd.clone(),
@@ -1473,6 +1474,7 @@ impl AppModel {
                     TerminalMode::Vte => "vte",
                     TerminalMode::Block => "block",
                     TerminalMode::Unified => "unified",
+                    TerminalMode::Chat => "chat",
                 }
                 .to_string(),
             ),

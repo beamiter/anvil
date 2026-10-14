@@ -181,7 +181,7 @@ pub(crate) struct CrossSelection {
 impl CrossSelection {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn install(
-        block_scroll: &gtk::ScrolledWindow,
+        block_scroll: &impl IsA<gtk::Widget>,
         finished_blocks: Rc<RefCell<Vec<FinishedBlock>>>,
         active_vte: vte4::Terminal,
         selected_block_ids: SelectedBlockIds,
@@ -191,6 +191,10 @@ impl CrossSelection {
         bstate: Rc<Cell<BlockState>>,
         mouse_reporting: Rc<Cell<MouseReporting>>,
     ) -> Rc<Self> {
+        // Chat's live terminal is outside its history scroller. Mount the same
+        // native pick-based owner on their common canvas; Block still passes
+        // its original scroller. No synthetic chrome acquires a text origin.
+        let block_scroll = block_scroll.upcast_ref::<gtk::Widget>();
         let this = Rc::new(Self {
             finished_blocks,
             active_vte,
@@ -227,6 +231,14 @@ impl CrossSelection {
             else {
                 return;
             };
+            // A Chat command button must capture the displayed/pressed command
+            // before releasing a selected live feed. Ancestor capture runs first;
+            // clearing selection here could replay old-D/new-A/B/new-C and make
+            // the button accidentally target the new foreground command.
+            if chat_command_control_at(&scroll, x, y) {
+                gesture.set_state(gtk::EventSequenceState::Denied);
+                return;
+            }
             let target = this.vte_at(&scroll, x, y);
             if target.is_some() {
                 this.clear_block_selection();
@@ -250,6 +262,10 @@ impl CrossSelection {
             };
             this.drag_generation
                 .set(this.drag_generation.get().wrapping_add(1));
+            if chat_command_control_at(&scroll, x, y) {
+                gesture.set_state(gtk::EventSequenceState::Denied);
+                return;
+            }
             let start = this.vte_at(&scroll, x, y);
             if start.as_ref() == Some(&this.active_vte)
                 && this.mouse_reporting.get().is_tracking()
@@ -445,7 +461,7 @@ impl CrossSelection {
         }
     }
 
-    fn vte_at(&self, block_scroll: &gtk::ScrolledWindow, x: f64, y: f64) -> Option<vte4::Terminal> {
+    fn vte_at(&self, block_scroll: &gtk::Widget, x: f64, y: f64) -> Option<vte4::Terminal> {
         let picked = block_scroll.pick(x, y, gtk::PickFlags::DEFAULT)?;
         self.ordered_vtes()
             .into_iter()
@@ -631,6 +647,24 @@ fn shift_held(gesture: &gtk::GestureDrag) -> bool {
     gesture
         .current_event_state()
         .contains(gtk::gdk::ModifierType::SHIFT_MASK)
+}
+
+// The command control captures its identity before its own feed release.
+fn chat_command_control_at(root: &gtk::Widget, x: f64, y: f64) -> bool {
+    if !root.has_css_class("chat-mode") {
+        return false;
+    }
+    let mut picked = root.pick(x, y, gtk::PickFlags::DEFAULT);
+    while let Some(widget) = picked {
+        if widget.has_css_class("chat-command-control") {
+            return true;
+        }
+        if widget == *root {
+            break;
+        }
+        picked = widget.parent();
+    }
+    false
 }
 
 /// True if `needle` is `haystack` or one of its descendants. GTK's `pick()`

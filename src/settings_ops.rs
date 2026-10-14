@@ -98,6 +98,7 @@ impl AppModel {
         self.config.borrow_mut().terminal_mode = match mode {
             0 => TerminalMode::Block,
             2 => TerminalMode::Unified,
+            3 => TerminalMode::Chat,
             _ => TerminalMode::Vte,
         };
         self.persist_config();

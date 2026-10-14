@@ -782,6 +782,9 @@ pub(crate) fn apply_snapshot_theme_to_vte(terminal: &Terminal, config: &Config) 
     let mut transparent = config.background;
     transparent.set_alpha(0.0);
     terminal.set_color_cursor(Some(&transparent));
+    if terminal.has_css_class("chat-command-terminal") {
+        terminal.set_color_background(&transparent);
+    }
 }
 
 /// A read-only PTY-less VTE used as the renderer for one finished command or

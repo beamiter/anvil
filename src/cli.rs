@@ -10,6 +10,7 @@ pub(crate) enum Mode {
     Block,
     Vte,
     Unified,
+    Chat,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,8 +70,9 @@ fn parse_mode(value: &str) -> Result<Mode, String> {
         "block" => Ok(Mode::Block),
         "vte" => Ok(Mode::Vte),
         "unified" => Ok(Mode::Unified),
+        "chat" => Ok(Mode::Chat),
         _ => Err(format!(
-            "invalid terminal mode '{value}' (use block, vte or unified)"
+            "invalid terminal mode '{value}' (use block, vte, unified or chat)"
         )),
     }
 }
@@ -170,7 +172,9 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<ParsedAr
                 let mode = args
                     .get(index)
                     .and_then(|value| value.to_str())
-                    .ok_or_else(|| "--mode requires 'block', 'vte' or 'unified'".to_string())?;
+                    .ok_or_else(|| {
+                        "--mode requires 'block', 'vte', 'unified' or 'chat'".to_string()
+                    })?;
                 launch.mode = Some(parse_mode(mode)?);
             }
             "-e" | "--execute" | "--" => {
@@ -308,7 +312,7 @@ Global options:
 Launch options:
   -d, --working-directory DIR  Start in DIR
   -e, --execute COMMAND ...    Run a command instead of the configured shell
-      --mode block|vte|unified
+      --mode block|vte|unified|chat
                                Override the terminal backend for this window
       --no-restore             Start a fresh workspace
       --safe-mode              Use isolated VTE defaults without restore or persistence
@@ -370,6 +374,16 @@ mod tests {
                 mode: Some(Mode::Block),
             })
         );
+    }
+
+    #[test]
+    fn parses_chat_backend_override_case_insensitively() {
+        for spelling in ["chat", "CHAT", "Chat"] {
+            let Command::Run(options) = parse_command(&["--mode", spelling]).unwrap() else {
+                panic!("expected run")
+            };
+            assert_eq!(options.mode, Some(Mode::Chat));
+        }
     }
 
     #[test]

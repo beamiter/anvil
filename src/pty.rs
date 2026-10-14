@@ -381,6 +381,9 @@ pub(crate) fn write_all_fd(fd: RawFd, mut data: &[u8]) -> io::Result<()> {
 struct FdWriterQueue {
     messages: VecDeque<Vec<u8>>,
     bytes: usize,
+    // Protected by the same mutex as dequeue/admission. Queued-byte capacity
+    // intentionally excludes this message, but optional actions must not.
+    in_flight: bool,
     closed: bool,
 }
 
@@ -447,16 +450,60 @@ impl FdWriter {
     /// Stop admission and discard unsent input. The worker owns its descriptor
     /// until it observes cancellation; this does not synchronously join it.
     fn cancel(&self) {
-        self.shared.cancelled.store(true, Ordering::Release);
         let mut queue = self
             .shared
             .queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.shared.cancelled.store(true, Ordering::Release);
         queue.closed = true;
         queue.messages.clear();
         queue.bytes = 0;
         self.shared.ready.notify_one();
+    }
+
+    /// Optional Chat actions never enter the asynchronous FIFO. The queue
+    /// mutex serializes this one syscall with admission, dequeue, in-flight
+    /// completion and cancellation. A busy lock also fails closed on GTK.
+    fn try_dispatch_byte(
+        &self,
+        fd: RawFd,
+        byte: u8,
+        target_is_current: impl FnOnce() -> bool,
+    ) -> Result<(), FdWriterSendError> {
+        let refused = |reason| FdWriterSendError { len: 1, reason };
+        let queue = self
+            .shared
+            .queue
+            .try_lock()
+            .map_err(|_| refused("PTY writer is busy"))?;
+        if queue.closed || self.shared.cancelled.load(Ordering::Acquire) {
+            return Err(refused("PTY writer is closed"));
+        }
+        if queue.in_flight || !queue.messages.is_empty() {
+            return Err(refused("PTY writer has queued or in-flight input"));
+        }
+        // Do not change file flags here. OwnedPty already owns a nonblocking
+        // master; the separate legacy VTE bridge remains a blocking FIFO.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || flags & libc::O_NONBLOCK == 0 || !self.shared.cancellable {
+            return Err(refused("optional action requires a nonblocking PTY"));
+        }
+        if !target_is_current() {
+            return Err(refused("optional action target changed"));
+        }
+        // Exactly one byte, exactly one syscall: no partial protocol, polling,
+        // queue insertion or retry can deliver an action to a later command.
+        let result = write_optional_byte_once(byte, |bytes| {
+            let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+            if written < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(written as usize)
+            }
+        });
+        drop(queue);
+        result
     }
 
     pub(crate) fn send(&self, data: Vec<u8>) -> Result<(), FdWriterSendError> {
@@ -494,6 +541,19 @@ impl FdWriter {
         drop(queue);
         self.shared.ready.notify_one();
         Ok(())
+    }
+}
+
+fn write_optional_byte_once(
+    byte: u8,
+    write: impl FnOnce(&[u8]) -> io::Result<usize>,
+) -> Result<(), FdWriterSendError> {
+    match write(&[byte]) {
+        Ok(1) => Ok(()),
+        _ => Err(FdWriterSendError {
+            len: 1,
+            reason: "optional action was not immediately written",
+        }),
     }
 }
 
@@ -603,6 +663,7 @@ fn spawn_fd_writer_inner(
         queue: Mutex::new(FdWriterQueue {
             messages: VecDeque::new(),
             bytes: 0,
+            in_flight: false,
             closed: false,
         }),
         ready: Condvar::new(),
@@ -632,6 +693,7 @@ fn spawn_fd_writer_inner(
                         break;
                     };
                     queue.bytes = queue.bytes.saturating_sub(data.len());
+                    queue.in_flight = true;
                     data
                 };
                 let result = if cancellable {
@@ -639,6 +701,20 @@ fn spawn_fd_writer_inner(
                 } else {
                     write_all_fd(fd.as_raw_fd(), &data).map(|()| true)
                 };
+                // No empty-queue gap: the direct action path observes busy
+                // until the worker has finished every byte of this message.
+                {
+                    let mut queue = worker_shared
+                        .queue
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    queue.in_flight = false;
+                    if !matches!(result, Ok(true)) {
+                        queue.closed = true;
+                        queue.messages.clear();
+                        queue.bytes = 0;
+                    }
+                }
                 match result {
                     Ok(true) => continue,
                     Ok(false) => break,
@@ -646,13 +722,6 @@ fn spawn_fd_writer_inner(
                         if !worker_shared.cancelled.load(Ordering::Acquire) {
                             log::warn!("{thread_name} stopped: {error}");
                         }
-                        let mut queue = worker_shared
-                            .queue
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        queue.closed = true;
-                        queue.messages.clear();
-                        queue.bytes = 0;
                         break;
                     }
                 }
@@ -1153,7 +1222,7 @@ impl OwnedPty {
 
     /// Filter one outgoing chunk and queue it.
     ///
-    /// Every write to the shell goes through here, which is what covers this
+    /// Every queued write to the shell goes through here, which covers this
     /// repo's ad-hoc writers — the history palette's raw command bytes, the
     /// queued startup command formatted with a bare trailing CR — that never see
     /// [`pty_input::encode_paste`].
@@ -1185,6 +1254,59 @@ impl OwnedPty {
             }
         };
         filter_and_admit_input(&mut guard, &self.input_tx, data, modes)
+    }
+
+    /// Fail-closed, immediate dispatch for Chat's optional Send/Stop only.
+    /// Ordinary typing/paste keeps its existing filtered FIFO path unchanged.
+    /// Guard callbacks must be pure UI identity reads, never nested PTY calls.
+    pub(crate) fn try_dispatch_chat_byte(
+        &self,
+        byte: u8,
+        foreground: i32,
+        require_shell: bool,
+        target_is_current: impl FnOnce() -> bool,
+    ) -> Result<(), FdWriterSendError> {
+        let refused = |reason| FdWriterSendError { len: 1, reason };
+        if !matches!(byte, b'\r' | 3) || foreground <= 0 {
+            return Err(refused("unsupported optional action"));
+        }
+        let guard = self
+            .input_guard
+            .try_lock()
+            .map_err(|_| refused("PTY input filter is busy"))?;
+        if guard.in_frame() {
+            return Err(refused("PTY paste frame is still open"));
+        }
+        // These two plain bytes cannot open a paste frame and do not mutate
+        // InputGuard. Holding it prevents ordinary input from opening one
+        // between this check and the single-byte syscall.
+        let master = self
+            .master
+            .try_lock()
+            .map_err(|_| refused("PTY descriptor is busy"))?;
+        let fd = master
+            .as_ref()
+            .ok_or_else(|| refused("PTY is closed"))?
+            .as_raw_fd();
+        self.input_tx.try_dispatch_byte(fd, byte, || {
+            if self.reader_cancelled.load(Ordering::Acquire) || !target_is_current() {
+                return false;
+            }
+            #[cfg(test)]
+            if self.test_slave.is_some() {
+                return self.test_foreground_group.load(Ordering::Relaxed) == foreground
+                    && (!require_shell || self.test_foreground == Some(true));
+            }
+            if !self.foreground_identity_available {
+                return false;
+            }
+            // Probe the actual locked descriptor immediately before write(1),
+            // not a snapshot taken before async queue admission.
+            let actual = unsafe { libc::tcgetpgrp(fd) };
+            actual == foreground
+                && (!require_shell
+                    || unsafe { libc::getpgid(self.child_lifecycle.pid()) } == actual)
+        })
     }
 
     pub fn write_bytes(&self, data: &[u8]) {
@@ -1676,6 +1798,70 @@ impl OwnedPty {
         })
     }
 
+    /// Observe the real kernel PTY size, rather than repeating the UI's size
+    /// formula in a geometry test. This helper exists only in test builds.
+    pub(crate) fn test_slave_winsize(&self) -> (u16, u16) {
+        let slave = self.test_slave.as_ref().expect("test PTY slave");
+        let mut size = libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: the slave fd is live and size is writable for TIOCGWINSZ.
+        assert_eq!(
+            unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCGWINSZ, &mut size) },
+            0
+        );
+        (size.ws_col, size.ws_row)
+    }
+
+    /// Drive the production PTY reader and parser with bounded fixture output.
+    pub(crate) fn emit_test_output(&self, bytes: &[u8]) {
+        assert!(bytes.len() <= 4096, "bounded fixture output");
+        let slave = self.test_slave.as_ref().expect("test PTY slave");
+        write_all_fd(slave.as_raw_fd(), bytes).expect("write fixture output");
+    }
+
+    /// Reproduce the reviewer's empty-queue/blocked-in-flight transport window.
+    pub(crate) fn test_start_inflight_input(&self) -> usize {
+        self.try_write_bytes(&vec![b'x'; FD_WRITER_MAX_MESSAGE_BYTES])
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let queue = self.input_tx.shared.queue.lock().unwrap();
+            if queue.in_flight && queue.messages.is_empty() {
+                break;
+            }
+            drop(queue);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "writer did not dequeue"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        FD_WRITER_MAX_MESSAGE_BYTES
+    }
+
+    /// Read a complete expected FIFO prefix, including gaps between kernel
+    /// chunks; the short drain helper intentionally stops after one burst.
+    pub(crate) fn drain_test_slave_exact(&self, expected: usize) -> Vec<u8> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut bytes = Vec::new();
+        while bytes.len() < expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "PTY FIFO drain timed out: {}/{}",
+                bytes.len(),
+                expected
+            );
+            bytes.extend(self.drain_test_slave(std::time::Duration::from_millis(10)));
+        }
+        assert_eq!(bytes.len(), expected, "unexpected optional-action bytes");
+        bytes
+    }
+
     pub(crate) fn drain_test_slave(&self, wait: std::time::Duration) -> Vec<u8> {
         let Some(slave) = self.test_slave.as_ref() else {
             return Vec::new();
@@ -1743,6 +1929,231 @@ impl Drop for OwnedPty {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn guarded_chat_dispatch_refuses_inflight_without_delaying_actions_and_keeps_fifo() {
+        let pty = OwnedPty::from_openpty(Some(true)).unwrap();
+        pty.set_test_foreground_group(Some(101));
+        let earlier = pty.test_start_inflight_input();
+        {
+            let queue = pty.input_tx.shared.queue.lock().unwrap();
+            assert!(queue.in_flight && queue.messages.is_empty() && queue.bytes == 0);
+        }
+        for byte in [3, b'\r'] {
+            assert!(pty
+                .try_dispatch_chat_byte(byte, 101, false, || true)
+                .is_err());
+        }
+        // The exact old-probe barrier: old actions must not have entered the
+        // raw queue even though its full capacity is now available.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(pty
+            .input_tx
+            .shared
+            .queue
+            .lock()
+            .unwrap()
+            .messages
+            .is_empty());
+        pty.set_test_foreground_group(Some(202));
+        pty.try_write_bytes(b"ordinary FIFO tail").unwrap();
+        let bytes = pty.drain_test_slave_exact(earlier + b"ordinary FIFO tail".len());
+        assert!(bytes[..earlier].iter().all(|byte| *byte == b'x'));
+        assert_eq!(&bytes[earlier..], b"ordinary FIFO tail");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pty.input_tx.shared.queue.lock().unwrap().in_flight {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        pty.try_dispatch_chat_byte(3, 202, false, || true).unwrap();
+        pty.try_dispatch_chat_byte(b'\r', 202, true, || true)
+            .unwrap();
+        assert_eq!(pty.drain_test_slave(Duration::from_millis(20)), [3, b'\r']);
+    }
+
+    #[test]
+    fn guarded_chat_dispatch_refuses_queue_and_lock_contention() {
+        let pty = OwnedPty::from_openpty(Some(true)).unwrap();
+        pty.set_test_foreground_group(Some(101));
+        // Same real mutex that admission, dequeue and completion use.
+        let queue = pty.input_tx.shared.queue.lock().unwrap();
+        assert!(pty
+            .try_dispatch_chat_byte(3, 101, false, || true)
+            .unwrap_err()
+            .to_string()
+            .contains("busy"));
+        drop(queue);
+        let master = pty.master.lock().unwrap();
+        assert!(pty.try_dispatch_chat_byte(3, 101, false, || true).is_err());
+        drop(master);
+        let filter = pty.input_guard.lock().unwrap();
+        assert!(pty.try_dispatch_chat_byte(3, 101, false, || true).is_err());
+        drop(filter);
+        pty.test_start_inflight_input();
+        pty.try_write_bytes(&vec![b'y'; FD_WRITER_MAX_MESSAGE_BYTES])
+            .unwrap();
+        assert!(!pty
+            .input_tx
+            .shared
+            .queue
+            .lock()
+            .unwrap()
+            .messages
+            .is_empty());
+        assert!(pty.try_dispatch_chat_byte(3, 101, false, || true).is_err());
+        pty.kill();
+    }
+
+    #[test]
+    fn guarded_chat_dispatch_kernel_eagain_never_queues_or_retries() {
+        let pty = OwnedPty::from_openpty(Some(true)).unwrap();
+        pty.set_test_foreground_group(Some(101));
+        let fd = pty.master_fd_raw();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut ordinary = 0;
+        let mut accepted = 0;
+        loop {
+            assert!(Instant::now() < deadline, "kernel input did not saturate");
+            // Test-only kernel filling while the production writer is idle.
+            let bytes = [b'x'; 4096];
+            loop {
+                let count = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+                if count > 0 {
+                    ordinary += count as usize;
+                } else {
+                    assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+                    break;
+                }
+            }
+            // The line discipline may briefly make room between the fill and
+            // write(1). Count any real success; the first refusal must be final.
+            if pty.try_dispatch_chat_byte(3, 101, false, || true).is_err() {
+                break;
+            }
+            accepted += 1;
+        }
+        {
+            let queue = pty.input_tx.shared.queue.lock().unwrap();
+            assert!(!queue.in_flight && queue.messages.is_empty());
+        }
+        pty.set_test_foreground_group(Some(202));
+        std::thread::sleep(Duration::from_millis(100));
+        let received = pty.drain_test_slave_exact(ordinary + accepted);
+        assert_eq!(received.iter().filter(|byte| **byte == 3).count(), accepted);
+        assert_eq!(
+            received.iter().filter(|byte| **byte == b'x').count(),
+            ordinary
+        );
+        assert!(pty.drain_test_slave(Duration::from_millis(30)).is_empty());
+    }
+
+    #[test]
+    fn guarded_chat_dispatch_checks_real_shell_foreground_at_write() {
+        ensure_inherited_environment_captured();
+        let pty = OwnedPty::spawn(&["/bin/sh", "-i"], None, &[("PS1", "guarded-ready> ")])
+            .expect("spawn real job-control shell");
+        let ready = b"guarded-ready> ";
+        let output = read_until(pty.master_fd_raw(), ready, Duration::from_secs(5));
+        assert!(output.windows(ready.len()).any(|part| part == ready));
+        let shell = pty.foreground_group().expect("shell foreground");
+        assert_eq!(pty.shell_is_foreground(), Some(true));
+        pty.try_write_bytes(b"sleep 2\r").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let child = loop {
+            if let Some(group) = pty.foreground_group().filter(|group| *group != shell) {
+                break group;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shell did not hand foreground to sleep"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(pty.shell_is_foreground(), Some(false));
+        // A captured ready-prompt token cannot send Enter to the new real
+        // foreground job, even when its UI generation callback still agrees.
+        assert!(pty
+            .try_dispatch_chat_byte(b'\r', shell, true, || true)
+            .is_err());
+        assert!(pty
+            .try_dispatch_chat_byte(3, shell, false, || true)
+            .is_err());
+        // Even matching foreground is insufficient for the Send shell guard.
+        assert!(pty
+            .try_dispatch_chat_byte(b'\r', child, true, || true)
+            .is_err());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if pty.try_dispatch_chat_byte(3, child, false, || true).is_ok() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "idle immediate interrupt was not accepted"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let output = read_until(pty.master_fd_raw(), ready, Duration::from_secs(1));
+        assert!(output.windows(ready.len()).any(|part| part == ready));
+        assert_eq!(pty.foreground_group(), Some(shell));
+        assert!(pty
+            .try_dispatch_chat_byte(3, child, false, || true)
+            .is_err());
+        pty.kill();
+    }
+
+    #[test]
+    fn guarded_chat_dispatch_rechecks_identity_foreground_fd_frame_and_close() {
+        let pty = OwnedPty::from_openpty(Some(true)).unwrap();
+        pty.set_test_foreground_group(Some(101));
+        assert!(pty.try_dispatch_chat_byte(3, 101, false, || false).is_err());
+        // Change the ownership at the last guard, rather than at button paint.
+        assert!(pty
+            .try_dispatch_chat_byte(3, 101, false, || {
+                pty.set_test_foreground_group(Some(202));
+                true
+            })
+            .is_err());
+        assert!(pty.drain_test_slave(Duration::from_millis(10)).is_empty());
+        let fd = pty.master_fd_raw();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(flags & libc::O_NONBLOCK != 0);
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) },
+            0
+        );
+        assert!(pty.try_dispatch_chat_byte(3, 202, false, || true).is_err());
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) }, 0);
+        *pty.input_guard.lock().unwrap() = input_guard_with_frame(true);
+        assert!(pty.try_dispatch_chat_byte(3, 202, false, || true).is_err());
+        *pty.input_guard.lock().unwrap() = input_guard_with_frame(false);
+        assert!(pty
+            .try_dispatch_chat_byte(b'X', 202, false, || true)
+            .is_err());
+        pty.kill();
+        assert!(pty.try_dispatch_chat_byte(3, 202, false, || true).is_err());
+        assert!(pty.drain_test_slave(Duration::from_millis(10)).is_empty());
+    }
+
+    #[test]
+    fn optional_byte_syscall_is_once_and_only_exact_success_accepts() {
+        for outcome in [
+            Ok(0),
+            Err(io::ErrorKind::WouldBlock),
+            Err(io::ErrorKind::Interrupted),
+            Ok(2),
+        ] {
+            let calls = std::cell::Cell::new(0);
+            assert!(write_optional_byte_once(3, |bytes| {
+                calls.set(calls.get() + 1);
+                assert_eq!(bytes, [3]);
+                outcome.map_err(io::Error::from)
+            })
+            .is_err());
+            assert_eq!(calls.get(), 1);
+        }
+        assert!(write_optional_byte_once(3, |_| Ok(1)).is_ok());
+    }
 
     #[test]
     fn killed_pane_rejects_late_clipboard_completion() {
@@ -2381,6 +2792,7 @@ mod tests {
                 queue: Mutex::new(FdWriterQueue {
                     messages: VecDeque::new(),
                     bytes: queued_bytes,
+                    in_flight: false,
                     closed,
                 }),
                 ready: Condvar::new(),

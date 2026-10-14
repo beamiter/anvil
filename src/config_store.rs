@@ -1781,7 +1781,7 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         &mut report,
         table,
         "terminal_mode",
-        &["block", "vte", "unified"],
+        &["block", "vte", "unified", "chat"],
     );
     check_enum(
         &mut report,
@@ -2111,6 +2111,25 @@ mod tests {
         assert!(!reload.contains("load_config()"));
         assert!(!reload.contains("current_revision()"));
         assert!(!reload.contains("validate_current_config()"));
+    }
+
+    #[test]
+    fn chat_mode_is_valid_and_saved_as_chat() {
+        let directory = temporary_directory("chat-mode");
+        let path = directory.join("config.toml");
+        let mut config = config::load_safe_config().0;
+        config.terminal_mode = config::TerminalMode::Chat;
+        save_config_to_path(&path, &config, Some(&ConfigRevision::Missing)).unwrap();
+        let table = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml::Table>()
+            .unwrap();
+        assert_eq!(
+            table.get("terminal_mode").and_then(toml::Value::as_str),
+            Some("chat")
+        );
+        assert!(validate_table(&path, &table).healthy());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

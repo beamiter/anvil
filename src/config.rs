@@ -35,6 +35,8 @@ pub enum TerminalMode {
     /// One long-lived full-size VTE driven by the same OSC 133 lifecycle as
     /// Block, but without per-command block widgets. Experimental.
     Unified,
+    /// Chat transcript and docked live shell, on the existing Block engine.
+    Chat,
 }
 
 impl TerminalMode {
@@ -43,6 +45,7 @@ impl TerminalMode {
             Self::Block => "block",
             Self::Vte => "vte",
             Self::Unified => "unified",
+            Self::Chat => "chat",
         }
     }
 
@@ -51,6 +54,7 @@ impl TerminalMode {
             "block" => Some(Self::Block),
             "vte" => Some(Self::Vte),
             "unified" => Some(Self::Unified),
+            "chat" => Some(Self::Chat),
             _ => None,
         }
     }
@@ -58,7 +62,7 @@ impl TerminalMode {
     /// Block and Unified share the OSC 133 `TermView`; only their render
     /// backends differ. Conventional VTE panes use the other component.
     pub(crate) fn uses_term_view(self) -> bool {
-        matches!(self, Self::Block | Self::Unified)
+        matches!(self, Self::Block | Self::Unified | Self::Chat)
     }
 
     pub(crate) fn is_unified(self) -> bool {
@@ -2395,6 +2399,7 @@ mod tests {
             ("block", TerminalMode::Block),
             ("vte", TerminalMode::Vte),
             ("unified", TerminalMode::Unified),
+            ("chat", TerminalMode::Chat),
         ] {
             assert_eq!(TerminalMode::parse(text), Some(mode));
             assert_eq!(TerminalMode::parse(&text.to_uppercase()), Some(mode));
@@ -2404,6 +2409,8 @@ mod tests {
         assert_eq!(TerminalMode::parse("warp"), None);
         assert!(TerminalMode::Unified.uses_term_view());
         assert!(TerminalMode::Block.uses_term_view());
+        assert!(TerminalMode::Chat.uses_term_view());
+        assert!(!TerminalMode::Chat.is_unified());
         assert!(!TerminalMode::Vte.uses_term_view());
     }
 

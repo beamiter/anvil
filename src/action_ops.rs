@@ -353,6 +353,7 @@ impl AppModel {
                             TerminalMode::Block => 0,
                             TerminalMode::Vte => 1,
                             TerminalMode::Unified => 2,
+                            TerminalMode::Chat => 3,
                         },
                         block_compact: config.block_compact,
                         command_history: config.command_history_enabled,

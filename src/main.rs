@@ -582,7 +582,7 @@ fn create_pane(
         VteOutput::FixBlockWithAgent => AppMsg::FixBlockWithAgent(pane_id),
     };
     let terminal = match mode {
-        TerminalMode::Block | TerminalMode::Unified => {
+        TerminalMode::Block | TerminalMode::Unified | TerminalMode::Chat => {
             let controller = BlockTerminal::builder()
                 .launch(init)
                 .forward(sender.input_sender(), forward);
@@ -811,6 +811,7 @@ impl SimpleComponent for AppModel {
                     cli::Mode::Block => TerminalMode::Block,
                     cli::Mode::Vte => TerminalMode::Vte,
                     cli::Mode::Unified => TerminalMode::Unified,
+                    cli::Mode::Chat => TerminalMode::Chat,
                 };
             }
         }
@@ -1026,6 +1027,7 @@ impl SimpleComponent for AppModel {
                         TerminalMode::Block => 0,
                         TerminalMode::Vte => 1,
                         TerminalMode::Unified => 2,
+                        TerminalMode::Chat => 3,
                     },
                     block_compact: config.borrow().block_compact,
                     command_history: config.borrow().command_history_enabled,

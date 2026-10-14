@@ -923,6 +923,56 @@ fn block_css(config: &Config) -> String {
             padding: 0;
             box-shadow: none;
         }}
+        /* Chat has its own transcript rhythm and live composer. These rules
+           never match unchanged Block or managed-remote Block panes. */
+        .chat-mode .block-list {{ background-color: {bg_hex}; }}
+        .chat-turn.block-finished {{
+            border: none;
+            outline: none;
+            background-color: transparent;
+            box-shadow: none;
+        }}
+        .chat-turn.block-selected {{
+            outline: 1px solid rgba({acc_r},{acc_g},{acc_b},0.85);
+            outline-offset: -1px;
+        }}
+        .chat-command-capsule {{
+            margin: 0 0 10px 36px;
+            padding: 10px 16px;
+            border-radius: 22px 22px 5px 22px;
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.75);
+        }}
+        .chat-command-terminal {{ background-color: transparent; }}
+        .chat-result-card {{
+            padding: 8px 1px 12px 0;
+            border-radius: 6px 18px 18px 18px;
+            background-color: {block_bg_hex};
+        }}
+        .chat-composer {{
+            margin: 4px 8px;
+            padding: 3px 1px 3px 3px;
+            border-radius: 18px;
+            outline: 1px solid rgba({acc_r},{acc_g},{acc_b},0.4);
+            outline-offset: -1px;
+            background-color: {bg_hex};
+        }}
+        .chat-input-hint {{ color: {dim_fg}; font-size: 0.8em; padding: 4px 8px; }}
+        .chat-send {{
+            min-height: 24px;
+            min-width: 24px;
+            padding: 0;
+            border-radius: 999px;
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.75);
+            margin: 3px 6px;
+        }}
+        .chat-mode .block-active.chat-empty-anchor {{
+            min-height: 0;
+            margin: 0;
+            padding: 0;
+            border: none;
+            outline: none;
+            box-shadow: none;
+        }}
         .block-output-scrollbar {{
             min-width: 10px;
             margin: 1px 3px 1px 1px;

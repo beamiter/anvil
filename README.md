@@ -255,6 +255,11 @@ The command preserves the replaced live file as `config.toml.before-restore`.
 
 ## Terminal modes
 
+Chat mode is an independent opt-in presentation with right command capsules,
+wide result cards, and a bottom-docked live shell. Select `--mode chat` or
+`terminal_mode = "chat"`; see [Chat mode](docs/chat-mode.md). It applies to
+new/restored local panes and never replaces a running shell.
+
 Block mode is the default. It keeps a live VTE input cell at the bottom and
 promotes each finished command into a separate block:
 
