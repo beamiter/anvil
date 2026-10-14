@@ -3448,6 +3448,17 @@ fn emit_human_input(callbacks: &HumanInputCallbacks, kind: HumanInputKind) {
     }
 }
 
+/// Keep accepted-input observers and editor/UI effects behind the same queue
+/// admission. Releasing a selection feed hold or cancelling a local UI action
+/// belongs before this boundary: that cleanup must still happen on refusal.
+fn with_accepted_pty_input(pty: &OwnedPty, bytes: &[u8], accepted: impl FnOnce()) {
+    if let Err(error) = pty.try_write_bytes(bytes) {
+        log::warn!("PTY input queue rejected {} byte(s): {error}", error.len());
+        return;
+    }
+    accepted();
+}
+
 fn emit_alt_screen_transition(callbacks: &AltScreenCallbacks, transition: AltScreenTransition) {
     for callback in callbacks.borrow().iter() {
         callback(transition);
@@ -12842,8 +12853,9 @@ impl TermView {
             let selection_feed_hold = selection_feed_hold.clone();
             sticky_stop_btn.connect_clicked(move |_| {
                 selection_feed_hold.flush_now();
-                pty.write_bytes(b"\x03");
-                emit_human_input(&human_input, HumanInputKind::StickyStop);
+                with_accepted_pty_input(&pty, b"\x03", || {
+                    emit_human_input(&human_input, HumanInputKind::StickyStop);
+                });
             });
         }
         {
@@ -12855,8 +12867,9 @@ impl TermView {
             let selection_feed_hold = selection_feed_hold.clone();
             running_pill_stop.connect_clicked(move |_| {
                 selection_feed_hold.flush_now();
-                pty.write_bytes(b"\x03");
-                emit_human_input(&human_input, HumanInputKind::StickyStop);
+                with_accepted_pty_input(&pty, b"\x03", || {
+                    emit_human_input(&human_input, HumanInputKind::StickyStop);
+                });
             });
         }
         // ── Sticky finished-block scan: event-driven ─────────────────────
@@ -13224,83 +13237,87 @@ impl TermView {
                         return;
                     }
                     LiveCommit::Encoded(encoded) => {
-                        pty_for_commit.write_bytes(&encoded);
-                        emit_human_input(&human_input_for_commit, HumanInputKind::Keyboard);
+                        with_accepted_pty_input(&pty_for_commit, &encoded, || {
+                            emit_human_input(&human_input_for_commit, HumanInputKind::Keyboard);
+                        });
                         return;
                     }
                     LiveCommit::Typed(bytes) => bytes,
                 };
-                // Typing is a statement about where the user is. Leaving the
-                // viewport parked in history means watching your own keystrokes
-                // land somewhere off screen — the scroll-on-keystroke rule every
-                // other terminal applies, expressed against the history canvas
-                // because that is what scrolls here. The flag is read first so
-                // the ordinary at-the-bottom keystroke costs one `Cell` read.
-                // Unified is excluded: there `user_scrolled_up` belongs to the
-                // VTE adjustment detector, and releasing the lock would hide the
-                // FAB while its scrollback is still parked above the prompt.
-                if user_scrolled_up_for_commit.get()
-                    && !unified_for_commit
-                    && bstate_for_commit.get() != BlockState::AltScreen
-                {
-                    if let (Some(scroll), Some(fab)) =
-                        (scroll_for_commit.upgrade(), fab_for_commit.upgrade())
-                    {
-                        return_to_live_prompt(
-                            &debouncer_for_commit,
-                            &scroll,
-                            &fab,
-                            &unread_for_commit,
-                        );
-                    }
-                }
-
-                // Real terminal input exits historical block selection. Without
-                // this, Enter can recall an old selection after the user has
-                // already begun editing a new command at the live prompt.
-                if selected_block_id_for_commit.get().is_some() {
-                    let finished = finished_blocks_for_commit.borrow();
-                    clear_finished_block_selection(
-                        &finished,
-                        &selected_block_ids_for_commit,
-                        &selected_block_id_for_commit,
-                        &selection_anchor_id_for_commit,
-                    );
-                }
-
                 // One write, so an Alt chord's ESC and key arrive together.
-                pty_for_commit.write_bytes(&bytes);
-                emit_human_input(&human_input_for_commit, HumanInputKind::Keyboard);
-                // The finished-block command text comes from a live-VTE
-                // text_range read at CommandStart (see PromptEnd / CommandStart
-                // handlers), so this shadow buffer is only used to size the
-                // input cell while idle (line count). We do not need to track
-                // escape sequences or replay deletes — newline count is what
-                // drives `update_input_height`.
-                if bstate_for_commit.get() == BlockState::AwaitingCommand {
-                    idle_input_dirty_for_commit.set(true);
-                    if bytes.iter().any(|&byte| byte != b'\r' && byte != b'\n') {
-                        // A later history recall must replace this readline
-                        // buffer, not append to it.
-                        pty_synced_for_commit.set(true);
-                    }
-                    // The commit, with a joined Alt ESC in front: still UTF-8.
-                    let typed = String::from_utf8_lossy(&bytes);
-                    let mut cmd = typed_cmd_for_commit.borrow_mut();
-                    for ch in typed.chars() {
-                        if ch == '\r' || ch == '\n' {
-                            // Submitted — leave whatever is in the buffer; it
-                            // is cleared at PromptEnd for the next prompt.
-                        } else if ch == '\x7f' || ch == '\x08' {
-                            pop_typed_command_shadow(&mut cmd);
-                        } else if (ch as u32) < 0x20 {
-                            // Control bytes: ignore.
-                        } else {
-                            let mut encoded = [0; 4];
-                            append_typed_command_shadow(&mut cmd, ch.encode_utf8(&mut encoded));
+                // Refusal must not claim typing, move the viewport, clear the
+                // historical selection, or change the shell editor shadow.
+                with_accepted_pty_input(&pty_for_commit, &bytes, || {
+                    // Typing is a statement about where the user is. Leaving the
+                    // viewport parked in history means watching your own keystrokes
+                    // land somewhere off screen — the scroll-on-keystroke rule every
+                    // other terminal applies, expressed against the history canvas
+                    // because that is what scrolls here. The flag is read first so
+                    // the ordinary at-the-bottom keystroke costs one `Cell` read.
+                    // Unified is excluded: there `user_scrolled_up` belongs to the
+                    // VTE adjustment detector, and releasing the lock would hide the
+                    // FAB while its scrollback is still parked above the prompt.
+                    if user_scrolled_up_for_commit.get()
+                        && !unified_for_commit
+                        && bstate_for_commit.get() != BlockState::AltScreen
+                    {
+                        if let (Some(scroll), Some(fab)) =
+                            (scroll_for_commit.upgrade(), fab_for_commit.upgrade())
+                        {
+                            return_to_live_prompt(
+                                &debouncer_for_commit,
+                                &scroll,
+                                &fab,
+                                &unread_for_commit,
+                            );
                         }
                     }
-                }
+
+                    // Real terminal input exits historical block selection. Without
+                    // this, Enter can recall an old selection after the user has
+                    // already begun editing a new command at the live prompt.
+                    if selected_block_id_for_commit.get().is_some() {
+                        let finished = finished_blocks_for_commit.borrow();
+                        clear_finished_block_selection(
+                            &finished,
+                            &selected_block_ids_for_commit,
+                            &selected_block_id_for_commit,
+                            &selection_anchor_id_for_commit,
+                        );
+                    }
+
+                    emit_human_input(&human_input_for_commit, HumanInputKind::Keyboard);
+                    // The finished-block command text comes from a live-VTE
+                    // text_range read at CommandStart (see PromptEnd / CommandStart
+                    // handlers), so this shadow buffer is only used to size the
+                    // input cell while idle (line count). We do not need to track
+                    // escape sequences or replay deletes — newline count is what
+                    // drives `update_input_height`.
+                    if bstate_for_commit.get() == BlockState::AwaitingCommand {
+                        idle_input_dirty_for_commit.set(true);
+                        if bytes.iter().any(|&byte| byte != b'\r' && byte != b'\n') {
+                            // A later history recall must replace this readline
+                            // buffer, not append to it.
+                            pty_synced_for_commit.set(true);
+                        }
+                        // The commit, with a joined Alt ESC in front: still UTF-8.
+                        let typed = String::from_utf8_lossy(&bytes);
+                        let mut cmd = typed_cmd_for_commit.borrow_mut();
+                        for ch in typed.chars() {
+                            if ch == '\r' || ch == '\n' {
+                                // Submitted — leave whatever is in the buffer; it
+                                // is cleared at PromptEnd for the next prompt.
+                            } else if ch == '\x7f' || ch == '\x08' {
+                                pop_typed_command_shadow(&mut cmd);
+                            } else if (ch as u32) < 0x20 {
+                                // Control bytes: ignore.
+                            } else {
+                                let mut encoded = [0; 4];
+                                append_typed_command_shadow(&mut cmd, ch.encode_utf8(&mut encoded));
+                            }
+                        }
+                    }
+                });
             });
         }
 
@@ -13361,8 +13378,11 @@ impl TermView {
                     kitty_flags_for_root_key.get(),
                 )
                 .unwrap_or_else(|| legacy.to_vec());
-                hold_for_root_key.flush_then(|| pty_for_root_key.write_bytes(&bytes));
-                emit_human_input(&human_input_for_root_key, HumanInputKind::ProcessControl);
+                hold_for_root_key.flush_then(|| {
+                    with_accepted_pty_input(&pty_for_root_key, &bytes, || {
+                        emit_human_input(&human_input_for_root_key, HumanInputKind::ProcessControl);
+                    });
+                });
                 glib::Propagation::Stop
             });
             root.add_controller(root_key);
@@ -25608,6 +25628,136 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             },
             observed,
         )
+    }
+
+    fn direct_human_input_cases() -> [(super::HumanInputKind, &'static [u8]); 7] {
+        use super::HumanInputKind::{Keyboard, ProcessControl, StickyStop};
+        [
+            (Keyboard, b"status"),
+            (Keyboard, "你好".as_bytes()),
+            (Keyboard, b"\x1bx"),      // joined Alt chord
+            (Keyboard, b"\x1b[99;5u"), // kitty-rewritten Ctrl+C
+            (ProcessControl, b"\x03"),
+            (ProcessControl, b"\x04"),
+            (StickyStop, b"\x03"), // both native Stop controls
+        ]
+    }
+
+    #[test]
+    fn admitted_human_input_runs_effects_and_observers_once_after_queue_admission() {
+        for (kind, bytes) in direct_human_input_cases() {
+            let pty = crate::pty::OwnedPty::from_openpty(Some(true)).unwrap();
+            let effects = Cell::new(0);
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let observed = seen.clone();
+            let callbacks: super::HumanInputCallbacks =
+                Rc::new(RefCell::new(vec![Box::new(move |kind| {
+                    observed.borrow_mut().push(kind)
+                })]));
+            super::with_accepted_pty_input(&pty, bytes, || {
+                assert_eq!(pty.drain_test_slave(Duration::from_millis(20)), bytes);
+                effects.set(effects.get() + 1);
+                super::emit_human_input(&callbacks, kind);
+            });
+            assert_eq!(effects.get(), 1, "{kind:?}");
+            assert_eq!(*seen.borrow(), vec![kind]);
+            assert!(pty.drain_test_slave(Duration::from_millis(10)).is_empty());
+        }
+    }
+
+    #[test]
+    fn closed_pty_human_input_preserves_accepted_effects_and_observers() {
+        let (sink, observed) = paste_test_sink();
+        sink.pty.kill();
+        for (kind, bytes) in direct_human_input_cases() {
+            super::with_accepted_pty_input(&sink.pty, bytes, || {
+                sink.typed_cmd.borrow_mut().push_str("unexpected");
+                sink.pty_synced.set(true);
+                sink.idle_input_dirty.set(true);
+                super::emit_human_input(&sink.human_input, kind);
+            });
+        }
+        assert_eq!(&*sink.typed_cmd.borrow(), "git ");
+        assert!(!sink.pty_synced.get());
+        assert!(!sink.idle_input_dirty.get());
+        assert_eq!(observed.get(), 0);
+        assert!(sink
+            .pty
+            .drain_test_slave(Duration::from_millis(10))
+            .is_empty());
+    }
+
+    #[test]
+    fn oversized_human_input_preserves_accepted_effects_and_observers() {
+        let (sink, observed) = paste_test_sink();
+        let oversized = vec![b'x'; crate::pty::FD_WRITER_MAX_MESSAGE_BYTES + 1];
+        let selected = Cell::new(Some(42));
+        super::with_accepted_pty_input(&sink.pty, &oversized, || {
+            selected.set(None);
+            sink.typed_cmd.borrow_mut().push_str("unexpected");
+            sink.pty_synced.set(true);
+            sink.idle_input_dirty.set(true);
+            super::emit_human_input(&sink.human_input, super::HumanInputKind::Keyboard);
+        });
+        assert_eq!(selected.get(), Some(42));
+        assert_eq!(&*sink.typed_cmd.borrow(), "git ");
+        assert!(!sink.pty_synced.get());
+        assert!(!sink.idle_input_dirty.get());
+        assert_eq!(observed.get(), 0);
+        assert!(sink
+            .pty
+            .drain_test_slave(Duration::from_millis(10))
+            .is_empty());
+    }
+
+    #[test]
+    fn backpressured_human_input_preserves_effects_but_releases_selection_feed() {
+        let (sink, observed) = paste_test_sink();
+        // No shell or GTK display: the synthetic slave remains undrained.
+        // Wait for TWO maximum-size chunks to be admitted. The first must
+        // then be blocked in the kernel, and the second fills the queue. One
+        // refusal alone could race with the writer taking its first chunk.
+        let chunk = vec![b'x'; crate::pty::FD_WRITER_MAX_MESSAGE_BYTES];
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut admitted = 0;
+        while admitted < 2 {
+            assert!(Instant::now() < deadline, "fixture writer made no progress");
+            if sink.pty.try_write_bytes(&chunk).is_ok() {
+                admitted += 1;
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let selected = Cell::new(Some(42));
+        let hold = super::SelectionFeedHold::new();
+        let flushed = Rc::new(RefCell::new(Vec::new()));
+        let flushed_cb = flushed.clone();
+        hold.set_flush(move |bytes| flushed_cb.borrow_mut().extend(bytes));
+        let released = Rc::new(Cell::new(0));
+        let released_cb = released.clone();
+        hold.set_release_listener(move || released_cb.set(released_cb.get() + 1));
+        for (kind, bytes) in direct_human_input_cases() {
+            hold.begin_drag();
+            assert!(hold.try_buffer(b"tail"));
+            // Stop/control cleanup remains outside the admission boundary.
+            hold.flush_then(|| {
+                super::with_accepted_pty_input(&sink.pty, bytes, || {
+                    selected.set(None);
+                    sink.typed_cmd.borrow_mut().push_str("unexpected");
+                    sink.pty_synced.set(true);
+                    sink.idle_input_dirty.set(true);
+                    super::emit_human_input(&sink.human_input, kind);
+                });
+            });
+            assert!(!hold.try_buffer(b"fresh"));
+        }
+        assert_eq!(&*flushed.borrow(), &b"tail".repeat(7));
+        assert_eq!(released.get(), 7);
+        assert_eq!(selected.get(), Some(42));
+        assert_eq!(&*sink.typed_cmd.borrow(), "git ");
+        assert!(!sink.pty_synced.get());
+        assert!(!sink.idle_input_dirty.get());
+        assert_eq!(observed.get(), 0);
     }
 
     #[test]
