@@ -122,7 +122,27 @@ fn fold_actions_update_visible_and_parked_geometry() {
             .build();
         window.set_child(Some(&view.root));
         window.present();
+        // A fresh recorder has no shell prompt. Chat deliberately treats Idle
+        // as native passthrough and hides history, so establish the same real
+        // OSC 133 prompt lifecycle as the other display-backed Chat fixtures.
+        assert_eq!(view.finished_blocks.borrow().len(), 32);
+        view.pty.set_test_foreground_group(Some(101));
+        view.pty.emit_test_output(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while view.bstate.get() != BlockState::AwaitingCommand || !view.block_scroll.is_mapped() {
+            assert!(
+                Instant::now() < deadline,
+                "prompt must expose the history transcript"
+            );
+            settle();
+        }
         settle();
+        assert_eq!(
+            view.finished_blocks.borrow().len(),
+            32,
+            "establishing a prompt must not create an extra completed card"
+        );
+        assert!(view.block_scroll.is_mapped());
         view.scroll_debouncer.user_scrolled_up.set(true);
         view.block_scroll.vadjustment().set_value(0.0);
         view.update_viewport();
@@ -133,6 +153,7 @@ fn fold_actions_update_visible_and_parked_geometry() {
             -1
         );
         assert!(view.finished_blocks.borrow()[0].widget().height() > 1);
+        assert!(view.finished_blocks.borrow()[0].widget().is_mapped());
         assert!(view.finished_blocks.borrow()[31].widget().height_request() > 0);
         // A pane-filtered card remains absent from the document even when its
         // cached fold state changes for a later reveal.
@@ -187,6 +208,10 @@ fn fold_actions_update_visible_and_parked_geometry() {
         // fold must not immediately write that allocation over the new estimate.
         view.selected_block_id.set(Some(1));
         for collapsed in [true, false] {
+            assert!(
+                view.finished_blocks.borrow()[0].widget().is_mapped(),
+                "selected visible card must remain in the mapped transcript"
+            );
             trace_first_card(&view, &window, "before selected toggle", collapsed);
             let old_height = view.finished_blocks.borrow()[0].widget().height();
             assert!(view.toggle_selected_block_collapsed());
@@ -202,6 +227,10 @@ fn fold_actions_update_visible_and_parked_geometry() {
             trace_first_card(&view, &window, "immediate selected toggle", collapsed);
             settle();
             trace_first_card(&view, &window, "settled selected toggle", collapsed);
+            assert!(
+                view.finished_blocks.borrow()[0].widget().is_mapped(),
+                "folding must retain the visible card in the mapped transcript"
+            );
             let new_height = view.finished_blocks.borrow()[0].widget().height();
             assert!(
                 if collapsed {
