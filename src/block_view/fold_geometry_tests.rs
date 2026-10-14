@@ -11,6 +11,45 @@ fn settle() {
     }
 }
 
+// Read-only evidence for CI: distinguish a changed fold from a stale or
+// virtualized allocation without altering the assertion or settling interval.
+fn trace_first_card(view: &TermView, window: &gtk::Window, stage: &str, collapsed: bool) {
+    let cards = view.finished_blocks.borrow();
+    let card = &cards[0];
+    let widget = card.widget();
+    let content = widget.first_child();
+    let output = card.output_vte.parent();
+    let visibility = |widget: &gtk::Widget| {
+        (
+            widget.get_visible(),
+            widget.is_visible(),
+            widget.is_mapped(),
+        )
+    };
+    let adjustment = view.block_scroll.vadjustment();
+    let mut visible: Vec<_> = view.visible_indices.borrow().iter().copied().collect();
+    visible.sort_unstable();
+    let focus = gtk::prelude::GtkWindowExt::focus(window)
+        .map(|widget| (widget.widget_name(), widget.type_().name().to_string()));
+    let animations = gtk::Settings::default().map(|settings| settings.is_gtk_enable_animations());
+    // A size query can refresh GTK's requisition cache. Do it only after the
+    // original settling interval, never before the fold gets its layout turn.
+    let measured = (stage == "settled selected toggle")
+        .then(|| widget.measure(gtk::Orientation::Vertical, widget.width()));
+    eprintln!(
+        "fold geometry stage={stage} mode={:?} requested_fold={collapsed} actual_fold={} selected={:?} \
+         own/effective/mapped={:?} content={:?} output={:?} height={} request={} measure={:?} \
+         bounds={:?} metadata={} scroll=({},{},{}) visible={visible:?} locked={} \
+         focus={focus:?} focus_visible={} widget_flags={:?} animations={animations:?}",
+        view.config.borrow().terminal_mode, card.is_output_collapsed(), view.selected_block_id.get(),
+        visibility(widget.upcast_ref()), content.as_ref().map(visibility), output.as_ref().map(visibility),
+        widget.height(), widget.height_request(), measured,
+        widget.compute_bounds(&view.block_scroll), view.block_data.borrow()[0].estimated_height,
+        adjustment.value(), adjustment.upper(), adjustment.page_size(),
+        view.scroll_debouncer.user_scrolled_up.get(), window.gets_focus_visible(), widget.state_flags(),
+    );
+}
+
 #[test]
 #[ignore = "requires an isolated GTK process and display"]
 fn fold_actions_update_visible_and_parked_geometry() {
@@ -148,6 +187,7 @@ fn fold_actions_update_visible_and_parked_geometry() {
         // fold must not immediately write that allocation over the new estimate.
         view.selected_block_id.set(Some(1));
         for collapsed in [true, false] {
+            trace_first_card(&view, &window, "before selected toggle", collapsed);
             let old_height = view.finished_blocks.borrow()[0].widget().height();
             assert!(view.toggle_selected_block_collapsed());
             let expected = {
@@ -159,7 +199,9 @@ fn fold_actions_update_visible_and_parked_geometry() {
                 view.finished_blocks.borrow()[0].widget().height_request(),
                 -1
             );
+            trace_first_card(&view, &window, "immediate selected toggle", collapsed);
             settle();
+            trace_first_card(&view, &window, "settled selected toggle", collapsed);
             let new_height = view.finished_blocks.borrow()[0].widget().height();
             assert!(
                 if collapsed {
