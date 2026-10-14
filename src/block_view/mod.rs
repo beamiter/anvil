@@ -10208,6 +10208,21 @@ fn live_content_extent(
         cursor_high.set(cursor_row);
         return None;
     }
+    // A coalesced prompt/command frame can leave the provisional baseline
+    // below the actual screen top. Recover the displayed origin before using
+    // it to clip output, including a cursor on an otherwise empty input row.
+    // Keep the no-output compact baseline above: it prevents stale VTE state
+    // from expanding an ordinary command before that command emits anything.
+    if visible_baseline_rows < vte.row_count()
+        && origin.get().is_none_or(|row| {
+            live_content_extent_for(row, cursor_high.get().max(cursor_row), vte.row_count())
+                < vte.row_count()
+        })
+    {
+        if let Some(displayed_origin) = displayed_live_origin(vte) {
+            origin.set(Some(displayed_origin));
+        }
+    }
     let origin_row = origin.get().unwrap_or_else(|| {
         // Defensive fallback for a backend which admitted output without the
         // synchronous CommandStart layout. Block's production path always
@@ -10219,6 +10234,42 @@ fn live_content_extent(
     let high = cursor_high.get().max(cursor_row).max(origin_row);
     cursor_high.set(high);
     Some(live_content_extent_for(origin_row, high, vte.row_count()))
+}
+
+/// Recover the absolute ring row displayed at screen row zero without mixing
+/// VTE's rebased adjustment with its absolute cursor. The viewport snapshot
+/// identifies the last drawn screen row; a bounded ring probe identifies that
+/// same last drawn row in absolute coordinates. The cursor can be above a
+/// footer or below the last text on an empty input line, so probe both sides.
+/// This is only needed while the running card is shorter than the viewport.
+fn displayed_live_origin(vte: &Terminal) -> Option<i64> {
+    // The snapshot is the user's displayed viewport, but the cursor belongs
+    // to the active screen. Never combine them while the user reads history.
+    if vte
+        .vadjustment()
+        .is_some_and(|adj| adj.value() + adj.page_size() + 0.5 < adj.upper())
+    {
+        return None;
+    }
+    let text = vte.text_format(vte4::Format::Text)?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    let rows = vte.row_count().max(1);
+    let drawn = drawn_rows_in_displayed_text(&text, rows);
+    let cursor = vte.cursor_position().1;
+    let cols = vte.column_count().max(1);
+    for row in (cursor.saturating_sub(rows - 1)..=cursor.saturating_add(rows - 1)).rev() {
+        let (line, _) = vte.text_range_format(vte4::Format::Text, row, 0, row, cols - 1);
+        if line.is_some_and(|line| !line.trim().is_empty()) {
+            return Some(displayed_origin_from_last_text(row, drawn));
+        }
+    }
+    None
+}
+
+fn displayed_origin_from_last_text(last_ring_row: i64, drawn_rows: i64) -> i64 {
+    last_ring_row.saturating_sub(drawn_rows.saturating_sub(1))
 }
 
 fn live_visible_baseline_origin(cursor_row: i64, visible_rows: i64) -> i64 {
@@ -16909,6 +16960,184 @@ mod tests {
         assert_eq!(live_content_extent_for(expanded_origin, 9_042, 40), 11);
         assert_eq!(live_visible_rows(11, 40), 11);
         assert_eq!(live_visible_baseline_origin(i64::MIN, 6), i64::MIN);
+    }
+
+    #[test]
+    fn late_ssh_baseline_is_recovered_without_double_subtracting_compact_rows() {
+        // The compact baseline can be sampled after a long wrapped command.
+        // Six allocated rows do not prove that its last row is screen row 5.
+        let guessed = live_visible_baseline_origin(5008, 6);
+        assert_eq!(guessed, 5003);
+        let actual = super::displayed_origin_from_last_text(5009, 10);
+        assert_eq!(actual, 5000);
+        assert_eq!(live_content_extent_for(guessed, 5010, 32), 8);
+        assert_eq!(live_content_extent_for(actual, 5010, 32), 11);
+        // If the original baseline was correct, calibration leaves it alone.
+        assert_eq!(super::displayed_origin_from_last_text(5010, 11), actual);
+        assert_eq!(live_content_extent_for(actual, 5005, 32), 6);
+        assert_eq!(super::displayed_origin_from_last_text(200_009, 10), 200_000);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn ssh_remote_prompt_cursor_stays_inside_live_clip_without_clear() {
+        use relm4::gtk;
+        use relm4::gtk::prelude::*;
+        use vte4::TerminalExt;
+        gtk::init().expect("gtk init");
+        let settle = || {
+            let context = glib::MainContext::default();
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < deadline {
+                while context.iteration(false) {}
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        for mode in [
+            crate::config::TerminalMode::Block,
+            crate::config::TerminalMode::Chat,
+        ] {
+            for (wrapped, integrated) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let view = super::TermView::new_with_spawner(
+                    &Config::safe_defaults(),
+                    &mode,
+                    &["sh".to_string()],
+                    None,
+                    false,
+                    None,
+                    "ssh-viewport-test",
+                    &[],
+                    &[],
+                    |_argv, _cwd, _env, _token| crate::pty::OwnedPty::from_openpty(Some(false)),
+                )
+                .expect("nonexecuting SSH fixture PTY");
+                let window = gtk::Window::builder()
+                    .default_width(900)
+                    .default_height(900)
+                    .child(&view.widget())
+                    .build();
+                window.present();
+                settle();
+                view.active_vte
+                    .feed("old history\r\n".repeat(120).as_bytes());
+                settle();
+                view.pty
+                    .emit_test_output(b"\x1b]133;A\x07local@host ~\r\n> \x1b]133;B\x07");
+                settle();
+                assert_eq!(view.bstate.get(), BlockState::AwaitingCommand);
+                let command = if wrapped {
+                    format!(
+                        "ssh root@{}",
+                        "h".repeat(view.active_vte.column_count() as usize + 20)
+                    )
+                } else {
+                    "command ssh remote".to_string()
+                };
+                // Command and the initial remote output arrive in one PTY
+                // write, so no extra input is available to rescue the layout.
+                let start = if integrated { "\x1b]133;A\x07" } else { "" };
+                let end = if integrated { "\x1b]133;B\x07" } else { "" };
+                view.pty.emit_test_output(format!(
+                    "{command}\r\n\x1b]133;C\x07jsh: bringing jsh for this session\r\nbash: warning: setlocale\r\nwarning two\r\nwarning three\r\n{start}root@remote ~\r\n> {end}"
+                ).as_bytes());
+                settle();
+                assert_eq!(view.bstate.get(), BlockState::CollectingOutput);
+                let winsize = view.pty.test_slave_winsize();
+                let replies = Rc::new(RefCell::new(Vec::<String>::new()));
+                let captured = replies.clone();
+                let signal = view.active_vte.connect_commit(move |_, text, _| {
+                    captured.borrow_mut().push(text.to_string());
+                });
+                let assert_cursor_visible = || {
+                    replies.borrow_mut().clear();
+                    // Ask VTE itself for the screen-relative cursor. This
+                    // bypasses our parser's CPR implementation and avoids
+                    // using the very origin calculation being tested.
+                    view.active_vte.feed(b"\x1b[6n");
+                    settle();
+                    let row = replies
+                        .borrow()
+                        .iter()
+                        .find_map(|reply| {
+                            reply
+                                .strip_prefix("\x1b[")?
+                                .strip_suffix('R')?
+                                .split_once(';')?
+                                .0
+                                .parse::<i64>()
+                                .ok()
+                        })
+                        .expect("native VTE cursor-position response");
+                    // Deterministic coordinate regression, separate from the
+                    // real PTY stream above: reproduce a late compact-baseline
+                    // sample without claiming to reproduce scheduler timing.
+                    // The native CPR is an independent screen-row oracle.
+                    assert!(row > 6 && row < view.active_vte.row_count());
+                    let cursor = view.active_vte.cursor_position().1;
+                    let late_origin = Cell::new(Some(live_visible_baseline_origin(cursor, 6)));
+                    let late_high = Cell::new(cursor);
+                    let old_extent = live_content_extent_for(
+                        late_origin.get().unwrap(),
+                        cursor,
+                        view.active_vte.row_count(),
+                    );
+                    assert!(
+                        old_extent < row,
+                        "old late-origin formula must undercount this fixture"
+                    );
+                    let corrected = super::live_content_extent(
+                        &view.active_vte,
+                        &late_origin,
+                        &late_high,
+                        true,
+                        6,
+                    )
+                    .expect("displayed origin is measurable");
+                    assert!(
+                        corrected >= row,
+                        "late-origin recovery must include native cursor row"
+                    );
+                    let clip = view.active.borrow().live_clip();
+                    let offset = view
+                        .active_vte
+                        .compute_point(&clip, &gtk::graphene::Point::new(0.0, 0.0))
+                        .expect("terminal is inside live clip");
+                    #[allow(deprecated)]
+                    // Inspect the actual VTE content inset in this GTK fixture.
+                    let padding = view.active_vte.style_context().padding();
+                    let bottom = f64::from(offset.y())
+                        + f64::from(padding.top())
+                        + (row * view.active_vte.char_height()) as f64;
+                    assert!(bottom <= f64::from(clip.height()) + 1.0,
+                        "{mode:?} wrapped={wrapped} integrated={integrated}: cursor bottom {bottom} exceeds clip {} (row {row})", clip.height());
+                    assert_eq!(view.bstate.get(), BlockState::CollectingOutput);
+                    assert_eq!(view.pty.test_slave_winsize(), winsize);
+                };
+                assert_cursor_visible();
+                for _ in 0..2 {
+                    let nested = if integrated {
+                        "\x1b]133;C\x07\x1b]133;D;0\x07"
+                    } else {
+                        ""
+                    };
+                    view.pty.emit_test_output(
+                        format!("\r\n{nested}{start}root@remote ~\r\n> {end}").as_bytes(),
+                    );
+                    settle();
+                    assert_cursor_visible();
+                }
+                // A blank input row must count even though text measurement
+                // alone ends on the preceding prompt-header line.
+                view.pty.emit_test_output(b"\r\nroot@remote ~\r\n");
+                settle();
+                assert_cursor_visible();
+                view.active_vte.disconnect(signal);
+                window.close();
+                settle();
+            }
+        }
     }
 
     #[test]
