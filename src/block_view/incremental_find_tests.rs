@@ -65,7 +65,12 @@ impl Fixture {
 
     fn with_second_output(mode: crate::config::TerminalMode, second_output: &str) -> Self {
         super::alt_screen::set_find_render_trace(true);
-        crate::child_env::capture_inherited_environment().expect("test child environment");
+        // A single native test can create several independent windows. Capture
+        // before GTK once per process, never recapture toolkit-mutated state.
+        static CHILD_ENV: std::sync::Once = std::sync::Once::new();
+        CHILD_ENV.call_once(|| {
+            crate::child_env::capture_inherited_environment().expect("test child environment");
+        });
         gtk::init().expect("GTK display");
         let mut config = Config::safe_defaults();
         config.terminal_mode = mode;
@@ -302,12 +307,16 @@ impl Fixture {
         );
     }
 
-    fn assert_output_viewport_contains(&self, id: u64, expected: &str) {
+    fn assert_output_viewport_contains(&self, id: u64, expected: &str) -> gtk::glib::GString {
         self.assert_ownership();
         let cards = self.view.finished_blocks.borrow();
         let card = cards.iter().find(|card| card.id == id).unwrap();
         let terminal = &card.output_vte;
         assert!(terminal.is_mapped());
+        assert!(
+            (1..=256).contains(&terminal.row_count()),
+            "native displayed grid must stay bounded",
+        );
         let adjustment = terminal.vadjustment().expect("native output adjustment");
         let lower = adjustment.lower();
         let upper = adjustment.upper();
@@ -317,10 +326,8 @@ impl Fixture {
             .iter()
             .all(|number| number.is_finite()));
         assert!(page > 0.0);
-        // VTE's adjustment and text-range API use absolute ring rows. Only
-        // extract fully visible rows; rounded-out boundaries could count a
-        // clipped match as visible. These are native coordinates, not line
-        // numbers inferred from the ANSI/tab/wide-character source text.
+        // Bound the native viewport dimensions before extracting its text.
+        // These adjustment rows are relative to the retained ring's start.
         let first_row = value.ceil().max(lower.ceil()) as i64;
         let after_last_row = (value + page).floor().min(upper.floor()) as i64;
         let rows = after_last_row - first_row;
@@ -333,26 +340,22 @@ impl Fixture {
             (1..=512).contains(&columns),
             "fixture viewport columns must stay bounded"
         );
-        // column_count is the half-open right boundary, as exercised by the
-        // existing native bounded_vte_capture half-open-column regression.
+        // VTE 0.76's widget.cc normalizes GtkAdjustment to the ring's start,
+        // but text_range_format uses absolute ring rows. A reset advances that
+        // hidden start. text_format reads only VTE's actual displayed rows and
+        // avoids mixing those coordinate spaces after a snapshot replay.
         let visible = terminal
-            .text_range_format(
-                vte4::Format::Text,
-                first_row,
-                0,
-                after_last_row - 1,
-                columns,
-            )
-            .0
+            .text_format(vte4::Format::Text)
             .expect("native visible output text");
         eprintln!(
-            "FIND_FIXTURE visible id={id} expected={expected:?} ring_rows={first_row}..{after_last_row} adjustment(lower,upper,value,page)={:?}",
+            "FIND_FIXTURE visible id={id} expected={expected:?} adjustment_rows={first_row}..{after_last_row} adjustment(lower,upper,value,page)={:?}",
             (lower, upper, value, page),
         );
         assert!(
             visible.contains(expected),
             "selected hit must remain in the actual native viewport after layout and deferred pins; visible={visible:?}",
         );
+        visible
     }
 
     fn trace_native_selection(&self, stage: &str, id: u64, output: bool) {
@@ -517,6 +520,18 @@ fn navigation_reveals_exact_occurrence(mode: crate::config::TerminalMode) {
     fixture.step(false, 3, 5, 2, true, "needle-C");
     fixture.step(false, 2, 5, 2, true, "needle-B");
     fixture.step(false, 1, 5, 1, false, "needle-A");
+    // A single-hit no-op must also restore a native selection lost to another
+    // selection owner, not trust the logical occurrence cache.
+    assert_eq!(
+        fixture.search("needle-A", false),
+        find::FindSearchResult::Matches(progress(1, 1)),
+    );
+    let command = fixture.view.finished_blocks.borrow()[0].command_vte.clone();
+    for next in [true, false] {
+        command.unselect_all();
+        assert!(!command.has_selection());
+        fixture.step(next, 1, 1, 1, false, "needle-A");
+    }
     fixture.assert_scroll_stays_parked();
 }
 
@@ -745,6 +760,11 @@ fn pending_replay_tracks_latest_navigation(mode: crate::config::TerminalMode) {
     // The earlier output's native selection was reset while needle-E owned
     // the logical cursor. Its old vte_cursor must not yield AlreadySelected.
     fixture.step(false, 4, 5, 2, true, "needle-D");
+    let output = fixture.view.finished_blocks.borrow()[1].output_vte.clone();
+    output.unselect_all();
+    assert!(!output.has_selection());
+    // Restarting a lost native cursor must reach the requested second hit,
+    // not merely find any matching string or reset the counter to the first.
     fixture.step(false, 3, 5, 2, true, "needle-C");
     fixture.step(true, 4, 5, 2, true, "needle-D");
     fixture.assert_scroll_stays_parked();
@@ -993,6 +1013,11 @@ fn large_replay_preserves_narrowed_native_cursor(mode: crate::config::TerminalMo
     assert!(card.render_stamp().0 < wide_stamp.0);
     assert_eq!(fixture.searchable_output(2), output);
     fixture.step(false, 4, 5, 2, true, "needle-D");
+    let head_viewport = fixture.assert_output_viewport_contains(2, "needle-D");
+    assert!(
+        !head_viewport.contains("needle-F"),
+        "the visible-text API must exclude the tail sentinel after navigating to the head",
+    );
     fixture.step(true, 5, 5, 2, true, "needle-F");
     fixture.assert_output_viewport_contains(2, "needle-F");
     fixture.assert_scroll_stays_parked();

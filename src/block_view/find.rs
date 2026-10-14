@@ -2175,7 +2175,14 @@ impl TermView {
         } else {
             None
         };
-        let restart = restart || (surface.pending_replay.is_some() && pending_replay.is_none());
+        // A different native surface can take the selection while this surface
+        // retains its logical cursor. Returning to that ordinal must actually
+        // select it again rather than treating the cached cursor as proof.
+        let lost_selection =
+            !surface.is_live && surface.vte_cursor.is_some() && !vte.has_selection();
+        let restart = restart
+            || lost_selection
+            || (surface.pending_replay.is_some() && pending_replay.is_none());
         let wrap_once = if restart {
             if surface.is_live
                 || occurrence >= surface.count
