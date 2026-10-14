@@ -53,6 +53,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::chat::tests::native_ime_commit_cancel_and_independent_ptys
     block_view::focus_restore::tests::deferred_pty_focus_respects_newer_owners
     block_view::focus_restore::tests::deferred_focus_preserves_remaps_and_retires_hidden_targets
     block_view::focus_restore::tests::popover_focus_return_retires_on_newer_owner
@@ -166,7 +167,11 @@ for test_name in "${tests[@]}"; do
     if [[ "${test_name}" == organism_ui::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers ]]; then
         fixture_a11y="test"
     fi
-    GTK_A11Y="${fixture_a11y}" run_case "${test_name}" \
+    fixture_im_module="${GTK_IM_MODULE-}"
+    if [[ "${test_name}" == block_view::chat::tests::native_ime_commit_cancel_and_independent_ptys ]]; then
+        fixture_im_module=simple
+    fi
+    GTK_IM_MODULE="${fixture_im_module}" GTK_A11Y="${fixture_a11y}" run_case "${test_name}" \
         dbus-run-session "${dbus_run_args[@]}" -- \
         xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
         cargo test --locked "${test_name}" -- --ignored --exact --nocapture

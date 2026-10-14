@@ -1653,4 +1653,6 @@ mod tests {
         window.close();
         view.pty.kill();
     }
+
+    include!("ime_tests.rs");
 }

@@ -18,6 +18,7 @@ RUNNER = Path(__file__).with_name("test-gtk-display.sh")
 ENTER = "enter_ownership::tests::queued_review_write_claims_enter_at_both_backend_boundaries"
 HELD = "block_view::tests::held_enter_history_recall_does_not_submit_the_recalled_command"
 A11Y = "organism_ui::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers"
+IME = "block_view::chat::tests::native_ime_commit_cancel_and_independent_ptys"
 VARIANT_KEYS = (
     "ANVIL_ENTER_MODE", "ANVIL_QA_PREWARM_ENTER", "ANVIL_QA_INHERITED_ENTER",
     "ANVIL_QA_FILE_DROP", "ANVIL_QA_DUAL_ENTER", "ANVIL_QA_FRESH_ENTER",
@@ -36,7 +37,7 @@ with open(env["CONTRACT_LOG"], "a") as log:
     log.write(json.dumps({"command": name, "args": args, "pid": os.getpid(),
                          "env": {key: value for key, value in env.items()
                                  if key.startswith(("XDG_", "ANVIL_QA_")) or key in
-                                 ["ANVIL_ENTER_MODE", "GTK_A11Y", "RUST_TEST_THREADS",
+                                 ["ANVIL_ENTER_MODE", "GTK_A11Y", "GTK_IM_MODULE", "RUST_TEST_THREADS",
                                   "GDK_BACKEND", "GSK_RENDERER", "LIBGL_ALWAYS_SOFTWARE",
                                   "NO_AT_BRIDGE"]}}) + "\n")
 if name == "dbus-run-session":
@@ -93,7 +94,7 @@ def expected_cases(tests):
 def main():
     source = RUNNER.read_text()
     tests = re.search(r"^tests=\(\n(.*?)\n\)", source, re.M | re.S).group(1).split()
-    assert len(tests) == len(set(tests)) and {ENTER, HELD, A11Y}.issubset(tests)
+    assert len(tests) == len(set(tests)) and {ENTER, HELD, A11Y, IME}.issubset(tests)
     expected = expected_cases(tests)
     assert len(expected) == len(tests) + 11
     bash = shutil.which("bash")
@@ -118,7 +119,7 @@ def main():
         inventory.write_text(json.dumps(tests))
         env = {key: value for key, value in os.environ.items() if key not in VARIANT_KEYS}
         env.pop("BASH_ENV", None)
-        env.update(PATH=str(bindir), CONTRACT_TESTS=str(inventory), TMPDIR=str(root))
+        env.update(GTK_IM_MODULE="contract-inherited", PATH=str(bindir), CONTRACT_TESTS=str(inventory), TMPDIR=str(root))
 
         for mode, status in (("success", 0), ("failures", 1), ("missing-test", 1),
                              ("list-failure", 31), ("missing-wrapper", 1)):
@@ -142,6 +143,7 @@ def main():
                     actual = {key: call["env"][key] for key in VARIANT_KEYS if key in call["env"]}
                     assert actual == variant, (test, actual, variant)
                     for key, value in {"GTK_A11Y": "test" if test == A11Y else "none",
+                                       "GTK_IM_MODULE": "simple" if test == IME else "contract-inherited",
                                        "RUST_TEST_THREADS": "1", "GDK_BACKEND": "x11",
                                        "GSK_RENDERER": "cairo", "LIBGL_ALWAYS_SOFTWARE": "1",
                                        "NO_AT_BRIDGE": "1"}.items():
