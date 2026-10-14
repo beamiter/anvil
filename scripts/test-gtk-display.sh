@@ -70,6 +70,7 @@ tests=(
     block_view::chat::tests::chat_native_activation_never_rebinds_send_to_a_new_prompt
     font::tests::context_menu_tracks_live_theme_and_font_without_parent_emphasis
     dialogs::settings::organism_preview::tests::preview_lifecycle_keeps_motion_local_and_stops_hidden_sources
+    organism_ui::tests::deferred_agent_loss_retires_closed_panes_but_keeps_hidden_outcomes
     organism_ui::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers
     block_view::history::tests::block_history_retry_handles_failed_and_repaired_files_without_panicking
     sidebar::tests::long_breadcrumbs_do_not_expand_the_sidebar_minimum_width

@@ -3680,6 +3680,76 @@ impl OrganismRuntime {
         self.refresh_growth_badge();
     }
 
+    fn install_agent_execution_lost_observer(runtime: &Rc<Self>, view: &Rc<TermView>) {
+        let runtime = runtime.clone();
+        let view_weak = Rc::downgrade(view);
+        view.connect_agent_execution_lost(move |_generation, _reason| {
+            if !runtime.enabled.get() {
+                return;
+            }
+            if !runtime.command_running.get() {
+                // Nothing is running: either nothing ever started, or the
+                // finish was already consumed with correct attribution.
+                return;
+            }
+            if !runtime.agent_watching.get() {
+                // The running command is not agent-attributed (e.g. the
+                // human pressed Enter on an inserted reviewed command and
+                // the verification poll aborted afterwards): the agent's
+                // command never ran, and the human's live command must
+                // keep its slot and its outcome.
+                return;
+            }
+            OrganismRuntime::defer_agent_execution_lost(&runtime, view_weak.clone());
+        });
+    }
+
+    /// Defer correlation loss so an authoritative finish in this parser turn wins.
+    /// A queued task must not keep a closed pane alive or change shared life
+    /// after its view is gone. Hidden-but-live panes still own their outcomes.
+    fn defer_agent_execution_lost(runtime: &Rc<Self>, view_weak: std::rc::Weak<TermView>) {
+        let observed_generation = runtime.generation.get();
+        let runtime_weak = Rc::downgrade(runtime);
+        gtk::glib::idle_add_local_once(move || {
+            let (Some(runtime), Some(view)) = (runtime_weak.upgrade(), view_weak.upgrade()) else {
+                return;
+            };
+            // A finish (or a fresh start) in the meantime owns the
+            // outcome; only a still-unresolved running command falls
+            // to this restrained warning.
+            if runtime.generation.get() != observed_generation || !runtime.command_running.get() {
+                return;
+            }
+            if runtime.command_running.replace(false) {
+                runtime.activity.command_finished(Instant::now());
+            }
+            runtime.command_started_at.set(None);
+            runtime.agent_watching.set(false);
+            runtime.reset_watch_rhythm_at_boundary(Instant::now());
+            runtime.visible_watch_rhythm.set(WatchRhythm::Steady);
+            runtime.offered_watch_rhythm.set(WatchRhythm::Steady);
+            runtime.output_activity.set(false);
+            runtime.command_origin_behavior.set(None);
+            let generation = runtime.bump_generation();
+            let reaction = {
+                let mut organism = runtime.organism.borrow_mut();
+                organism.sync_state(runtime.shared_life.get());
+                let reaction = organism.agent_execution_lost();
+                runtime.shared_life.set(organism.state());
+                reaction
+            };
+            runtime.render(&reaction);
+            runtime.refresh_surface(&view, Instant::now());
+            view.insert_inline_notice(&runtime.card);
+            OrganismRuntime::settle_later(
+                &runtime,
+                view_weak,
+                generation,
+                reaction.hold_duration(),
+            );
+        });
+    }
+
     fn settle_later(
         runtime: &Rc<Self>,
         view: std::rc::Weak<TermView>,
@@ -4632,70 +4702,7 @@ impl OrganismHub {
             // handle, so defer one main-loop turn and let an arriving finish
             // win — it carries the verified outcome and, because nothing is
             // cleared here, the correct agent attribution.
-            let runtime = runtime.clone();
-            let view_weak = Rc::downgrade(view);
-            let shared_life = self.organism_life.clone();
-            view.connect_agent_execution_lost(move |_generation, _reason| {
-                if !runtime.enabled.get() {
-                    return;
-                }
-                if !runtime.command_running.get() {
-                    // Nothing is running: either nothing ever started, or the
-                    // finish was already consumed with correct attribution.
-                    return;
-                }
-                if !runtime.agent_watching.get() {
-                    // The running command is not agent-attributed (e.g. the
-                    // human pressed Enter on an inserted reviewed command and
-                    // the verification poll aborted afterwards): the agent's
-                    // command never ran, and the human's live command must
-                    // keep its slot and its outcome.
-                    return;
-                }
-                let runtime = runtime.clone();
-                let view_weak = view_weak.clone();
-                let shared_life = shared_life.clone();
-                let observed_generation = runtime.generation.get();
-                gtk::glib::idle_add_local_once(move || {
-                    // A finish (or a fresh start) in the meantime owns the
-                    // outcome; only a still-unresolved running command falls
-                    // to this restrained warning.
-                    if runtime.generation.get() != observed_generation
-                        || !runtime.command_running.get()
-                    {
-                        return;
-                    }
-                    if runtime.command_running.replace(false) {
-                        runtime.activity.command_finished(Instant::now());
-                    }
-                    runtime.command_started_at.set(None);
-                    runtime.agent_watching.set(false);
-                    runtime.reset_watch_rhythm_at_boundary(Instant::now());
-                    runtime.visible_watch_rhythm.set(WatchRhythm::Steady);
-                    runtime.offered_watch_rhythm.set(WatchRhythm::Steady);
-                    runtime.output_activity.set(false);
-                    runtime.command_origin_behavior.set(None);
-                    let generation = runtime.bump_generation();
-                    let reaction = {
-                        let mut organism = runtime.organism.borrow_mut();
-                        organism.sync_state(shared_life.get());
-                        let reaction = organism.agent_execution_lost();
-                        shared_life.set(organism.state());
-                        reaction
-                    };
-                    runtime.render(&reaction);
-                    if let Some(view) = view_weak.upgrade() {
-                        runtime.refresh_surface(&view, Instant::now());
-                        view.insert_inline_notice(&runtime.card);
-                    }
-                    OrganismRuntime::settle_later(
-                        &runtime,
-                        view_weak,
-                        generation,
-                        reaction.hold_duration(),
-                    );
-                });
-            });
+            OrganismRuntime::install_agent_execution_lost_observer(&runtime, view);
         }
 
         {
@@ -5430,6 +5437,115 @@ mod tests {
         assert_eq!(runtime.state.text(), state);
         assert_eq!(runtime.card.margin_start(), margin);
         assert_eq!(window.default_size(), size);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn deferred_agent_loss_retires_closed_panes_but_keeps_hidden_outcomes() {
+        gtk::init().expect("gtk display");
+        let main = gtk::glib::MainContext::default();
+        let drain = || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while main.pending() {
+                assert!(Instant::now() < deadline, "bounded native event drain");
+                main.iteration(false);
+            }
+        };
+        let snapshot = |state: LifeState| {
+            [
+                state.energy,
+                state.mood,
+                state.curiosity,
+                state.boredom,
+                state.stress,
+                state.social_need,
+                state.attachment,
+                state.confidence,
+            ]
+        };
+        for case in 0..4 {
+            let view = crate::block_view::organism_settings_test_view();
+            let presence = OrganismPresence::new();
+            let token = presence.reserve();
+            let life = Rc::new(Cell::new(LifeState::default()));
+            let before = life.get();
+            let activity = OrganismActivity::new(None, GrowthProgress::default());
+            let runtime = OrganismRuntime::new(
+                life.clone(),
+                activity.clone(),
+                presence.clone(),
+                token,
+                OrganismMotion::Static,
+                false,
+            );
+            presence.bind(token, &view, &runtime);
+            // Install the production signal closure: the view owns runtime,
+            // never the reverse. The deferred task must add no strong owner.
+            OrganismRuntime::install_agent_execution_lost_observer(&runtime, &view);
+            runtime.command_running.set(true);
+            runtime.agent_watching.set(true);
+            activity.command_started(Instant::now());
+            let view_weak = Rc::downgrade(&view);
+            let runtime_owners = Rc::strong_count(&runtime);
+            OrganismRuntime::defer_agent_execution_lost(&runtime, view_weak.clone());
+            assert_eq!(
+                Rc::strong_count(&runtime),
+                runtime_owners,
+                "queued loss must not retain runtime"
+            );
+            match case {
+                0 => {
+                    drop(runtime); // Do not let the test itself mask a leaked task owner.
+                    drop(view);
+                    assert!(view_weak.upgrade().is_none());
+                    drain();
+                    assert_eq!(snapshot(life.get()), snapshot(before));
+                }
+                1 => {
+                    // A temporary external runtime reference must not permit
+                    // loss to mutate life after the actual view has closed.
+                    drop(view);
+                    assert!(view_weak.upgrade().is_none());
+                    drain();
+                    assert_eq!(snapshot(life.get()), snapshot(before));
+                    assert!(runtime.settle_timer.borrow().is_none());
+                    drop(runtime);
+                }
+                2 => {
+                    // No focused owner models a hidden/background pane, not
+                    // closure. Its genuine loss must still settle exactly once.
+                    assert!(!presence.is_owner(token));
+                    drain();
+                    let mut expected = NativeOrganism::from_persisted_state(before);
+                    expected.agent_execution_lost();
+                    assert_eq!(snapshot(life.get()), snapshot(expected.state()));
+                    assert!(!runtime.command_running.get());
+                    assert_eq!(activity.commands_running.get(), 0);
+                    assert!(runtime.settle_timer.borrow().is_some());
+                    drop(runtime);
+                    drop(view);
+                }
+                _ => {
+                    // The production finish path advances this generation and
+                    // returns the running slot before the queued idle executes.
+                    runtime.bump_generation_for_command_finish();
+                    runtime.command_running.set(false);
+                    activity.command_finished(Instant::now());
+                    let mut finished = before;
+                    finished.curiosity = 0.42;
+                    life.set(finished);
+                    drain();
+                    assert_eq!(
+                        snapshot(life.get()),
+                        snapshot(finished),
+                        "deferred loss overwrote authoritative finish"
+                    );
+                    assert!(runtime.settle_timer.borrow().is_none());
+                    drop(runtime);
+                    drop(view);
+                }
+            }
+        }
     }
 
     #[test]
