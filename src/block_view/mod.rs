@@ -15916,17 +15916,30 @@ impl TermView {
         if self.fullscreen.get() || !self.render_backend.supports_block_mutation() {
             return false;
         }
-        let moved = {
+        let target = {
             let finished = self.finished_blocks.borrow();
-            let selected = self.selected_block_id.get();
-            let Some(index) = selected
+            self.selected_block_id
+                .get()
                 .and_then(|id| finished.iter().position(|card| card.id == id))
                 .or_else(|| finished.len().checked_sub(1))
-            else {
+                .map(|index| (finished[index].id, !finished[index].is_output_collapsed()))
+        };
+        target.is_some_and(|(id, collapsed)| self.set_block_collapsed(id, collapsed))
+    }
+
+    /// Change one exact card without moving keyboard focus or block selection.
+    /// Find uses this instead of the selected-card action so its entry remains
+    /// active and a vanished target cannot unfold an unrelated newest card.
+    fn set_block_collapsed(&self, block_id: u64, collapsed: bool) -> bool {
+        if self.fullscreen.get() || !self.render_backend.supports_block_mutation() {
+            return false;
+        }
+        let moved = {
+            let finished = self.finished_blocks.borrow();
+            let Some(index) = finished.iter().position(|card| card.id == block_id) else {
                 return false;
             };
             let card = &finished[index];
-            let collapsed = !card.is_output_collapsed();
             if !card.set_collapsed(collapsed) {
                 return false;
             }
@@ -27838,3 +27851,6 @@ mod fold_geometry_tests;
 
 #[cfg(test)]
 mod search_navigation_tests;
+
+#[cfg(test)]
+mod incremental_find_tests;

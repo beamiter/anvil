@@ -122,8 +122,55 @@ struct FindCursor {
     global: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FindQuery {
+    text: String,
+    use_regex: bool,
+    case_sensitive: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FindResume {
+    block_id: u64,
+    is_output: bool,
+    occurrence: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FindFocusResult {
+    Selected,
+    Invalidated,
+    /// Only our own fold reveal changed an otherwise-current render stamp.
+    Revealed,
+}
+
+/// Incremental counts admit up to FIND_MATCH_LIMIT, independently of the
+/// smaller palette jump budget. Callers clear the find pass on a partial miss.
+fn step_incremental_occurrence_exact(occurrence: usize, mut step: impl FnMut() -> bool) -> bool {
+    occurrence < FIND_MATCH_LIMIT && (0..=occurrence).all(|_| step())
+}
+
+fn resumed_find_cursor(surfaces: &[FindSurface], resume: FindResume) -> Option<FindCursor> {
+    let mut global = 0;
+    for (index, surface) in surfaces.iter().enumerate() {
+        if !surface.is_live
+            && surface.block_id == resume.block_id
+            && surface.is_output == resume.is_output
+        {
+            return (resume.occurrence < surface.count).then_some(FindCursor {
+                surface: index,
+                occurrence: resume.occurrence,
+                global: global + resume.occurrence,
+            });
+        }
+        global += surface.count;
+    }
+    None
+}
+
 #[derive(Default)]
 pub(crate) struct FindState {
+    query: Option<FindQuery>,
     pub(crate) surfaces: Vec<FindSurface>,
     cursor: FindCursor,
     total: usize,
@@ -1334,6 +1381,20 @@ impl TermView {
         use_regex: bool,
         case_sensitive: bool,
     ) -> FindSearchResult {
+        self.find_in_blocks_at(query, use_regex, case_sensitive, None, true)
+    }
+
+    /// A reveal may synchronously re-feed VTE when its hidden output maps.
+    /// Recount once, then restore the requested logical occurrence rather than
+    /// treating a reset native cursor as if it still named the old match.
+    fn find_in_blocks_at(
+        &self,
+        query: &str,
+        use_regex: bool,
+        case_sensitive: bool,
+        resume: Option<FindResume>,
+        allow_rebuild: bool,
+    ) -> FindSearchResult {
         self.clear_find();
         if query.is_empty() || find_scope(self.bstate.get()) == FindScope::LiveScreen {
             return FindSearchResult::NoMatches;
@@ -1577,6 +1638,11 @@ impl TermView {
         {
             let mut st = self.find_state.borrow_mut();
             st.surfaces = surfaces;
+            st.query = Some(FindQuery {
+                text: query.to_string(),
+                use_regex,
+                case_sensitive,
+            });
             st.cursor = FindCursor::default();
             st.total = total;
             st.capped = capped;
@@ -1584,17 +1650,74 @@ impl TermView {
             st.highlighted_terminals = highlighted_terminals;
             st.live_anchor = live_anchor;
         }
-        if !self.focus_current_match() {
-            self.clear_find();
-            return FindSearchResult::NoMatches;
+        if let Some(resume) = resume {
+            let cursor = resumed_find_cursor(&self.find_state.borrow().surfaces, resume);
+            let Some(cursor) = cursor else {
+                self.clear_find();
+                return FindSearchResult::NoMatches;
+            };
+            self.find_state.borrow_mut().cursor = cursor;
+        }
+        let cursor = self.find_state.borrow().cursor;
+        match self.focus_surface_occurrence(
+            cursor.surface,
+            cursor.occurrence,
+            FindDirection::Next,
+            resume.is_some(),
+        ) {
+            FindFocusResult::Selected => {}
+            FindFocusResult::Revealed if allow_rebuild => {
+                return self.rebuild_find_after_reveal(cursor);
+            }
+            FindFocusResult::Invalidated | FindFocusResult::Revealed => {
+                self.clear_find();
+                return FindSearchResult::NoMatches;
+            }
         }
         self.scroll_to_current_match();
         FindSearchResult::Matches(FindProgress {
-            current: 1,
+            current: cursor.global + 1,
             total,
             capped,
             scan_limited,
         })
+    }
+
+    fn rebuild_find_after_reveal(&self, cursor: FindCursor) -> FindSearchResult {
+        let target = {
+            let state = self.find_state.borrow();
+            state.query.clone().zip(
+                state
+                    .surfaces
+                    .get(cursor.surface)
+                    .map(|surface| FindResume {
+                        block_id: surface.block_id,
+                        is_output: surface.is_output,
+                        occurrence: cursor.occurrence,
+                    }),
+            )
+        };
+        let Some((query, resume)) = target else {
+            self.clear_find();
+            return FindSearchResult::NoMatches;
+        };
+        self.find_in_blocks_at(
+            &query.text,
+            query.use_regex,
+            query.case_sensitive,
+            Some(resume),
+            false,
+        )
+    }
+
+    fn rebuild_find_navigation(&self, cursor: FindCursor) -> FindNavigationResult {
+        match self.rebuild_find_after_reveal(cursor) {
+            FindSearchResult::Matches(progress) => FindNavigationResult::Progress(progress),
+            _ => {
+                self.clear_find();
+                FindNavigationResult::Invalidated
+            }
+        }
     }
 
     /// Step to the next match. Exact result sets wrap; capped sets stop at the
@@ -1637,16 +1760,33 @@ impl TermView {
             (current, next, current_progress)
         };
         if next == current {
-            if !self.focus_surface_occurrence(next.surface, next.occurrence, direction) {
-                self.clear_find();
-                return FindNavigationResult::Invalidated;
+            match self.focus_surface_occurrence(next.surface, next.occurrence, direction, false) {
+                FindFocusResult::Selected => {}
+                FindFocusResult::Revealed => return self.rebuild_find_navigation(next),
+                FindFocusResult::Invalidated => {
+                    self.clear_find();
+                    return FindNavigationResult::Invalidated;
+                }
+            }
+            if self
+                .find_state
+                .borrow()
+                .surfaces
+                .get(next.surface)
+                .is_some_and(|surface| surface.is_output && !surface.is_live)
+            {
+                self.scroll_to_current_match();
             }
             return FindNavigationResult::Progress(current_progress);
         }
 
-        if !self.focus_surface_occurrence(next.surface, next.occurrence, direction) {
-            self.clear_find();
-            return FindNavigationResult::Invalidated;
+        match self.focus_surface_occurrence(next.surface, next.occurrence, direction, false) {
+            FindFocusResult::Selected => {}
+            FindFocusResult::Revealed => return self.rebuild_find_navigation(next),
+            FindFocusResult::Invalidated => {
+                self.clear_find();
+                return FindNavigationResult::Invalidated;
+            }
         }
         {
             let mut state = self.find_state.borrow_mut();
@@ -1678,11 +1818,12 @@ impl TermView {
         surface_index: usize,
         occurrence: usize,
         direction: FindDirection,
-    ) -> bool {
+        restart: bool,
+    ) -> FindFocusResult {
         let surface = {
             let state = self.find_state.borrow();
             let Some(surface) = state.surfaces.get(surface_index) else {
-                return false;
+                return FindFocusResult::Invalidated;
             };
             surface.clone()
         };
@@ -1693,23 +1834,53 @@ impl TermView {
                 .render_backend
                 .record_search_target(surface.block_id, surface.is_output)
             else {
-                return false;
+                return FindFocusResult::Invalidated;
             };
-            // A resize, expand/collapse or output filter changed this card's
-            // native row domain after it was counted. Stepping the old cursor
-            // would silently select a different occurrence; invalidate the
-            // pass so the adapter can rebuild it from the retained query.
+            if target.render_stamp != surface.render_stamp {
+                return FindFocusResult::Invalidated;
+            }
+            let query_before = self.find_state.borrow().query.clone();
+            let revealed = surface.is_output
+                && !surface.is_live
+                && self.set_block_collapsed(surface.block_id, false);
+            let Some(target) = self
+                .render_backend
+                .record_search_target(surface.block_id, surface.is_output)
+            else {
+                return FindFocusResult::Invalidated;
+            };
+            if revealed {
+                let state = self.find_state.borrow();
+                if state.surfaces.get(surface_index) != Some(&surface)
+                    || state.query != query_before
+                {
+                    return FindFocusResult::Invalidated;
+                }
+                if target.render_stamp != surface.render_stamp {
+                    return FindFocusResult::Revealed;
+                }
+            }
             (target.terminal, Some(target.render_stamp))
         };
-        let wrap_once = match validated_native_cursor_action(
-            &surface,
-            occurrence,
-            direction,
-            current_render_stamp,
-        ) {
-            Some(NativeCursorAction::AlreadySelected) => return true,
-            Some(NativeCursorAction::Step { wrap_once }) => wrap_once,
-            None => return false,
+        let wrap_once = if restart {
+            if surface.is_live
+                || occurrence >= surface.count
+                || current_render_stamp != Some(surface.render_stamp)
+            {
+                return FindFocusResult::Invalidated;
+            }
+            false
+        } else {
+            match validated_native_cursor_action(
+                &surface,
+                occurrence,
+                direction,
+                current_render_stamp,
+            ) {
+                Some(NativeCursorAction::AlreadySelected) => return FindFocusResult::Selected,
+                Some(NativeCursorAction::Step { wrap_once }) => wrap_once,
+                None => return FindFocusResult::Invalidated,
+            }
         };
         if surface.is_live && surface.block_id == 0 && surface.vte_cursor.is_none() {
             let anchor = self.find_state.borrow().live_anchor;
@@ -1718,33 +1889,33 @@ impl TermView {
             }
         }
         vte.search_set_wrap_around(wrap_once);
-        let found = match direction {
-            FindDirection::Next => vte.search_find_next(),
-            FindDirection::Previous => vte.search_find_previous(),
+        let found = if restart {
+            vte.unselect_all();
+            step_incremental_occurrence_exact(occurrence, || vte.search_find_next())
+        } else {
+            match direction {
+                FindDirection::Next => vte.search_find_next(),
+                FindDirection::Previous => vte.search_find_previous(),
+            }
         };
         vte.search_set_wrap_around(false);
         if !found {
-            return false;
+            return FindFocusResult::Invalidated;
         }
 
         let mut state = self.find_state.borrow_mut();
         let Some(target) = state.surfaces.get_mut(surface_index) else {
-            return false;
+            return FindFocusResult::Invalidated;
         };
         if target.block_id != surface.block_id
             || target.is_output != surface.is_output
             || target.is_live != surface.is_live
             || target.count != surface.count
         {
-            return false;
+            return FindFocusResult::Invalidated;
         }
         target.vte_cursor = Some(occurrence);
-        true
-    }
-
-    /// Move VTE's search cursor to the very first match of the current pass.
-    fn focus_current_match(&self) -> bool {
-        self.focus_surface_occurrence(0, 0, FindDirection::Next)
+        FindFocusResult::Selected
     }
 
     fn scroll_to_current_match(&self) {
@@ -2203,6 +2374,105 @@ mod tests {
             wrap_before: complete.then_some(0),
             render_stamp: crate::block_view::blocks::NEUTRAL_RENDER_STAMP,
         }
+    }
+
+    #[test]
+    fn incremental_reveal_resume_uses_its_own_full_match_budget() {
+        for occurrence in [0, 4095, 4096, super::FIND_MATCH_LIMIT - 1] {
+            let mut calls = 0;
+            assert!(super::step_incremental_occurrence_exact(occurrence, || {
+                calls += 1;
+                true
+            }));
+            assert_eq!(calls, occurrence + 1);
+        }
+        let mut calls = 0;
+        assert!(!super::step_incremental_occurrence_exact(
+            super::FIND_MATCH_LIMIT,
+            || {
+                calls += 1;
+                true
+            }
+        ));
+        assert_eq!(calls, 0);
+        assert!(!super::step_incremental_occurrence_exact(8, || {
+            calls += 1;
+            calls < 3
+        }));
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn reveal_rebuild_restores_exact_surface_occurrence_and_global_index() {
+        let mut command = surface(2, true);
+        command.block_id = 7;
+        command.is_output = false;
+        let mut output = surface(4, true);
+        output.block_id = 7;
+        output.is_output = true;
+        let resume = super::FindResume {
+            block_id: 7,
+            is_output: true,
+            occurrence: 3,
+        };
+        assert_eq!(
+            super::resumed_find_cursor(&[command.clone(), output.clone()], resume),
+            Some(FindCursor {
+                surface: 1,
+                occurrence: 3,
+                global: 5
+            })
+        );
+        command.count = 1;
+        assert_eq!(
+            super::resumed_find_cursor(&[command, output], resume),
+            Some(FindCursor {
+                surface: 1,
+                occurrence: 3,
+                global: 4
+            })
+        );
+    }
+
+    #[test]
+    fn reveal_rebuild_never_substitutes_another_surface_or_occurrence() {
+        let mut output = surface(2, true);
+        output.block_id = 7;
+        output.is_output = true;
+        for resume in [
+            super::FindResume {
+                block_id: 8,
+                is_output: true,
+                occurrence: 0,
+            },
+            super::FindResume {
+                block_id: 7,
+                is_output: false,
+                occurrence: 0,
+            },
+            super::FindResume {
+                block_id: 7,
+                is_output: true,
+                occurrence: 2,
+            },
+        ] {
+            assert_eq!(
+                super::resumed_find_cursor(std::slice::from_ref(&output), resume),
+                None
+            );
+        }
+        output.is_live = true;
+        assert_eq!(
+            super::resumed_find_cursor(
+                &[output],
+                super::FindResume {
+                    block_id: 7,
+                    is_output: true,
+                    occurrence: 0
+                }
+            ),
+            None
+        );
     }
 
     #[test]
