@@ -10022,7 +10022,7 @@ fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
     } else {
         chrome
     };
-    let usable = (page - chrome).max(cell_h);
+    let usable = (page - chrome - blocks::terminal_vertical_insets(vte)).max(cell_h);
     Some(((usable / cell_h).max(1)) as i64)
 }
 
@@ -12102,7 +12102,9 @@ impl TermView {
                         vte.row_count(),
                     );
                     live_rows_high_water.set(next_high_water);
-                    holder.set_height_request((visible_rows as i32) * cell_h);
+                    holder.set_height_request(
+                        (visible_rows as i32) * cell_h + blocks::terminal_vertical_insets(&vte),
+                    );
                     if let Ok(active_block) = active_block.try_borrow() {
                         active_block.set_live_geometry(cell_h, viewport_rows, visible_rows);
                     }
@@ -12189,7 +12191,9 @@ impl TermView {
                     vte.set_size(cols, grid_rows);
                     last_size_target.set(target);
                 }
-                holder.set_height_request((card_rows as i32) * cell_h);
+                holder.set_height_request(
+                    (card_rows as i32) * cell_h + blocks::terminal_vertical_insets(&vte),
+                );
                 // Same clip the running card uses: the grid keeps every row the
                 // child was promised while the card shows the prompt area only.
                 if let Ok(live) = active_block.try_borrow() {
@@ -12225,7 +12229,9 @@ impl TermView {
                     vte.set_size(target.0, target.1);
                     last_size_target.set(target);
                 }
-                holder.set_height_request((viewport_rows as i32) * cell_h);
+                holder.set_height_request(
+                    (viewport_rows as i32) * cell_h + blocks::terminal_vertical_insets(&vte),
+                );
                 // Unified has one surface and one height; the clip is a no-op
                 // here, but the terminal still needs its size request or the
                 // Fixed would allocate it its bare minimum.
@@ -17020,13 +17026,30 @@ mod tests {
                     .build();
                 window.present();
                 settle();
-                view.active_vte
-                    .feed("old history\r\n".repeat(120).as_bytes());
-                settle();
-                view.pty
-                    .emit_test_output(b"\x1b]133;A\x07local@host ~\r\n> \x1b]133;B\x07");
+                // Prewarm through a real prompt/background-output lifecycle.
+                // The next PromptStart finalizes that output and uses the
+                // production reset_active path BEFORE SSH begins. Feeding
+                // history directly before the very first prompt would leave
+                // its cursor at the bottom of an unrelated full screen.
+                const LOCAL_PROMPT: &[u8] = b"\x1b]133;A\x07local@host ~\r\n> \x1b]133;B\x07";
+                view.pty.emit_test_output(LOCAL_PROMPT);
                 settle();
                 assert_eq!(view.bstate.get(), BlockState::AwaitingCommand);
+                view.pty
+                    .emit_test_output("old history\r\n".repeat(120).as_bytes());
+                settle();
+                view.pty.emit_test_output(LOCAL_PROMPT);
+                settle();
+                assert_eq!(view.bstate.get(), BlockState::AwaitingCommand);
+                assert_eq!(
+                    view.finished_blocks.borrow().len(),
+                    1,
+                    "background output must cross the production finalization/reset path"
+                );
+                assert!(
+                    view.active_vte.cursor_position().1 > view.active_vte.row_count(),
+                    "prewarm must retain nonzero absolute ring coordinates"
+                );
                 let command = if wrapped {
                     format!(
                         "ssh root@{}",
@@ -17104,15 +17127,32 @@ mod tests {
                         .active_vte
                         .compute_point(&clip, &gtk::graphene::Point::new(0.0, 0.0))
                         .expect("terminal is inside live clip");
-                    #[allow(deprecated)]
-                    // Inspect the actual VTE content inset in this GTK fixture.
-                    let padding = view.active_vte.style_context().padding();
-                    let bottom = f64::from(offset.y())
-                        + f64::from(padding.top())
-                        + (row * view.active_vte.char_height()) as f64;
-                    assert!(bottom <= f64::from(clip.height()) + 1.0,
+                    assert_eq!(
+                        view.active_vte.yalign(),
+                        vte4::Align::Start,
+                        "the cursor oracle assumes no internal vertical alignment offset"
+                    );
+                    // GTK4 widget coordinates start at the CSS content
+                    // origin. compute_point already accounts for CSS padding;
+                    // adding style_context.padding() here counts it twice.
+                    // https://docs.gtk.org/gtk4/coordinates.html#widgets
+                    #[allow(deprecated)] // Diagnostics only, not cursor arithmetic.
+                    let css_padding = view.active_vte.style_context().padding();
+                    let scroll_border = gtk::prelude::ScrollableExt::border(&view.active_vte);
+                    let cell_height = view.active_vte.char_height();
+                    let bottom = f64::from(offset.y()) + (row * cell_height) as f64;
+                    eprintln!("SSH cursor geometry: mode={mode:?} wrapped={wrapped} integrated={integrated} row={row} grid={} char_height={cell_height} terminal_offset_y={} css_padding_top={} scroll_border_top={:?} terminal_height={} clip_height={} requested_visible={} bottom={bottom}",
+                        view.active_vte.row_count(), offset.y(), css_padding.top(),
+                        scroll_border.as_ref().map(|border| border.top()), view.active_vte.height(),
+                        clip.height(), view.active.borrow().live_visible_height_px());
+                    assert!(bottom <= f64::from(clip.height()),
                         "{mode:?} wrapped={wrapped} integrated={integrated}: cursor bottom {bottom} exceeds clip {} (row {row})", clip.height());
                     assert_eq!(view.bstate.get(), BlockState::CollectingOutput);
+                    assert_eq!(
+                        view.finished_blocks.borrow().len(),
+                        1,
+                        "remote nested markers must not finalize a local card"
+                    );
                     assert_eq!(view.pty.test_slave_winsize(), winsize);
                 };
                 assert_cursor_visible();
@@ -17266,7 +17306,8 @@ mod tests {
         );
         assert_eq!(
             active.borrow().live_visible_height_px(),
-            (settled_visible_rows as i32) * cell_height,
+            (settled_visible_rows as i32) * cell_height
+                + super::blocks::terminal_vertical_insets(&terminal),
             "the ActiveBlock clip request must cover the settled row extent"
         );
         assert!(!pending.get(), "the one-shot frame request must retire");

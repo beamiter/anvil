@@ -53,6 +53,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::blocks::tests::live_clip_reserves_css_insets_without_an_extra_grid_row
     block_view::tests::ssh_remote_prompt_cursor_stays_inside_live_clip_without_clear
     block_view::chat::tests::native_ime_commit_cancel_and_independent_ptys
     block_view::focus_restore::tests::deferred_pty_focus_respects_newer_owners

@@ -1315,6 +1315,90 @@ fn scroll_target(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_clip_pixels_include_insets_without_adding_a_terminal_row() {
+        for insets in [0, 2, 14, 60] {
+            for cell_h in [1, 12, 25] {
+                for rows in [1, 6, 31] {
+                    let visible = super::live_rows_height_px(cell_h, rows, insets);
+                    assert_eq!(visible - insets, rows as i32 * cell_h);
+                    let grid = visible + cell_h - 1;
+                    assert_eq!((grid - insets) / cell_h, rows as i32);
+                    // Before the fix, 31 rows of 25px clipped the default
+                    // 1px top inset. Both zero and nonzero CSS boxes fit now.
+                    assert!(insets / 2 + rows as i32 * cell_h <= visible);
+                }
+            }
+        }
+        assert_eq!(super::live_rows_height_px(25, 31, 2), 777);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn live_clip_reserves_css_insets_without_an_extra_grid_row() {
+        use gtk::prelude::*;
+        use vte4::TerminalExt;
+        gtk::init().expect("gtk init");
+        let active = super::ActiveBlock::new(
+            &crate::config::Config::safe_defaults(),
+            Rc::new(RefCell::new(std::collections::VecDeque::new())),
+        );
+        active.active_vte.add_css_class("ssh-inset-fixture");
+        assert_eq!(active.active_vte.yalign(), vte4::Align::Start);
+        let display = gtk::prelude::WidgetExt::display(&active.active_vte);
+        let provider = gtk::CssProvider::new();
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_USER,
+        );
+        let window = gtk::Window::builder()
+            .default_width(800)
+            .default_height(700)
+            .child(active.widget())
+            .build();
+        window.present();
+        let settle = || {
+            let context = gtk::glib::MainContext::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+            while std::time::Instant::now() < deadline {
+                while context.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        for padding in [0, 7] {
+            provider.load_from_string(&format!(
+                ".ssh-inset-fixture {{ padding: {padding}px; border: 0; margin: 0; }}"
+            ));
+            settle();
+            let insets = super::terminal_vertical_insets(&active.active_vte);
+            assert_eq!(insets, 2 * padding);
+            let cell_h = active.active_vte.char_height() as i32;
+            for visible_rows in [6, 12, 24] {
+                active.set_live_geometry(cell_h, 24, visible_rows);
+                settle();
+                assert_eq!(
+                    active.active_vte.row_count(),
+                    24,
+                    "CSS must not create or remove a PTY grid row"
+                );
+                let origin = active
+                    .active_vte
+                    .compute_point(&active.live_clip(), &gtk::graphene::Point::new(0.0, 0.0))
+                    .expect("shared clip ancestor");
+                assert!(
+                    origin.y() + (visible_rows as i32 * cell_h) as f32
+                        <= active.live_clip().height() as f32,
+                    "padding={padding}, origin={}, rows={visible_rows}, cell={cell_h}, clip={}",
+                    origin.y(),
+                    active.live_clip().height()
+                );
+            }
+        }
+        window.close();
+        gtk::style_context_remove_provider_for_display(&display, &provider);
+    }
+
     use super::*;
 
     #[test]
@@ -5592,6 +5676,32 @@ pub(super) fn append_bounded_output(buffer: &mut VecDeque<u8>, bytes: &[u8], lim
     overflow > 0
 }
 
+/// GTK4 allocates a widget's CSS box but reports content coordinates to VTE.
+/// Reserve those insets once in the enclosing clip and grid request. Otherwise
+/// the final row extends past a clip sized only as `rows * char_height`.
+#[allow(deprecated)] // GTK4 has no replacement getters for the computed CSS box.
+pub(super) fn terminal_vertical_insets(vte: &Terminal) -> i32 {
+    let style = vte.style_context();
+    let padding = style.padding();
+    let border = style.border();
+    let margin = style.margin();
+    (i32::from(padding.top())
+        + i32::from(padding.bottom())
+        + i32::from(border.top())
+        + i32::from(border.bottom())
+        + i32::from(margin.top())
+        + i32::from(margin.bottom())
+        + vte.margin_top()
+        + vte.margin_bottom())
+    .max(0)
+}
+
+fn live_rows_height_px(cell_h: i32, rows: i64, insets: i32) -> i32 {
+    (rows.clamp(1, i32::MAX as i64) as i32)
+        .saturating_mul(cell_h.max(1))
+        .saturating_add(insets.max(0))
+}
+
 impl ActiveBlock {
     /// `pub(super)`: only `TermView::new` constructs the live block, and it is
     /// the owner of the engine-side `raw_output` ring passed in here.
@@ -5789,20 +5899,20 @@ impl ActiveBlock {
         let grid_rows = grid_rows.max(1);
         let visible_rows = visible_rows.clamp(1, grid_rows);
         let width_px = self.live_clip.width();
+        let insets = terminal_vertical_insets(&self.active_vte);
+        let visible_px = live_rows_height_px(cell_h, visible_rows, insets);
         if width_px <= 0 {
             // Before the first allocation there is no width to hand out, but
             // the card height does not depend on one and the caller has already
             // moved the holder's request: leave the two in step.
-            self.live_spacer
-                .set_height_request((visible_rows as i32).saturating_mul(cell_h));
+            self.live_spacer.set_height_request(visible_px);
             return false;
         }
         // Ask for a sliver more than the grid needs. The terminal takes its row
         // count from the allocation, and a container that hands back a pixel or
         // two less than requested would cost a whole row; anything under one
         // cell cannot add one.
-        let grid_px = (grid_rows as i32).saturating_mul(cell_h) + cell_h - 1;
-        let visible_px = (visible_rows as i32).saturating_mul(cell_h);
+        let grid_px = live_rows_height_px(cell_h, grid_rows, insets).saturating_add(cell_h - 1);
         let geometry = (width_px, grid_px, visible_px);
         if self.live_geometry.get() == geometry {
             return false;
