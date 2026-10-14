@@ -2399,20 +2399,61 @@ impl OrganismRuntime {
             && !view.live_organism_surface_metrics().alt_screen
     }
 
+    fn pointer_body_bounds(&self, view: &TermView) -> Option<(f64, f64, f64, f64)> {
+        if !self.live_body.is_mapped() {
+            return None;
+        }
+        let bounds = self.live_body.compute_bounds(&view.widget())?;
+        let (x, y, width, height) = (
+            f64::from(bounds.x()),
+            f64::from(bounds.y()),
+            f64::from(bounds.width()),
+            f64::from(bounds.height()),
+        );
+        if ![x, y, width, height].into_iter().all(f64::is_finite) || width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        Some((x, y, x + width, y + height))
+    }
+
+    fn pointer_contains(bounds: Option<(f64, f64, f64, f64)>, point: Option<(f64, f64)>) -> bool {
+        let (Some((left, top, right, bottom)), Some((x, y))) = (bounds, point) else {
+            return false;
+        };
+        x.is_finite()
+            && y.is_finite()
+            && x >= left - POINTER_GREETING_RADIUS
+            && x <= right + POINTER_GREETING_RADIUS
+            && y >= top - POINTER_GREETING_RADIUS
+            && y <= bottom + POINTER_GREETING_RADIUS
+    }
+
+    fn pointer_motion_state(
+        bounds: Option<(f64, f64, f64, f64)>,
+        previous: Option<(f64, f64)>,
+        current: (f64, f64),
+    ) -> (bool, bool) {
+        (
+            Self::pointer_contains(bounds, previous),
+            Self::pointer_contains(bounds, Some(current)),
+        )
+    }
+
+    #[cfg(test)]
     fn pointer_within_body(&self, view: &TermView, x: f64, y: f64) -> bool {
-        self.live_body.is_mapped()
-            && self
-                .live_body
-                .compute_bounds(&view.widget())
-                .is_some_and(|bounds| {
-                    x >= f64::from(bounds.x()) - POINTER_GREETING_RADIUS
-                        && x <= f64::from(bounds.x() + bounds.width()) + POINTER_GREETING_RADIUS
-                        && y >= f64::from(bounds.y()) - POINTER_GREETING_RADIUS
-                        && y <= f64::from(bounds.y() + bounds.height()) + POINTER_GREETING_RADIUS
-                })
+        Self::pointer_contains(self.pointer_body_bounds(view), Some((x, y)))
     }
 
     fn live_attention_input(&self, view: &TermView, now: Instant) -> LiveAttentionInput {
+        self.live_attention_input_with_bounds(view, now, self.pointer_body_bounds(view))
+    }
+
+    fn live_attention_input_with_bounds(
+        &self,
+        view: &TermView,
+        now: Instant,
+        bounds: Option<(f64, f64, f64, f64)>,
+    ) -> LiveAttentionInput {
         LiveAttentionInput {
             base_context: self.live_context.get(),
             activity: if self.command_running.get() {
@@ -2421,12 +2462,8 @@ impl OrganismRuntime {
                 view.organism_activity_knowledge()
             },
             hard_eligible: self.live_greeting_allowed(view, now),
-            hover_available: self.live_body.is_mapped()
-                && self.live_body.compute_bounds(&view.widget()).is_some(),
-            pointer_inside: self
-                .pointer_position
-                .get()
-                .is_some_and(|(x, y)| self.pointer_within_body(view, x, y)),
+            hover_available: bounds.is_some(),
+            pointer_inside: Self::pointer_contains(bounds, self.pointer_position.get()),
         }
     }
 
@@ -2575,12 +2612,15 @@ impl OrganismRuntime {
     }
 
     fn observe_pointer(runtime: &Rc<Self>, view: &Rc<TermView>, x: f64, y: f64, dragging: bool) {
-        let was_near = runtime.pointer_near.get();
-        let near = runtime.pointer_within_body(view, x, y);
+        // GTK may allocate between refresh and motion. Compare both positions
+        // against this one current allocation, never a cached previous edge.
+        let bounds = runtime.pointer_body_bounds(view);
+        let (was_near, near) =
+            Self::pointer_motion_state(bounds, runtime.pointer_position.get(), (x, y));
         runtime.pointer_position.set(Some((x, y)));
         runtime.pointer_near.set(near);
         let now = Instant::now();
-        let mut input = runtime.live_attention_input(view, now);
+        let mut input = runtime.live_attention_input_with_bounds(view, now, bounds);
         input.hard_eligible &= !dragging;
         // Dragging denies admission, but its real exit still releases the
         // physical visit. Do not swallow the edge before it reaches core.
@@ -9962,6 +10002,61 @@ mod tests {
             None,
             "a fired callback owns the vacant slot and will reschedule itself"
         );
+    }
+
+    #[test]
+    fn pointer_motion_uses_current_allocation_for_both_positions() {
+        let shifted = Some((250.0, 100.0, 350.0, 140.0));
+        // Previously outside the old allocation; now both points are inside.
+        assert_eq!(
+            OrganismRuntime::pointer_motion_state(shifted, Some((300.0, 120.0)), (301.0, 120.0)),
+            (true, true)
+        );
+        assert_eq!(
+            OrganismRuntime::pointer_motion_state(shifted, Some((300.0, 120.0)), (300.0, 120.0)),
+            (true, true),
+            "resize alone must not create entry"
+        );
+        assert_eq!(
+            OrganismRuntime::pointer_motion_state(shifted, Some((200.0, 120.0)), (300.0, 120.0)),
+            (false, true),
+            "real outside-to-inside motion must enter"
+        );
+        assert_eq!(
+            OrganismRuntime::pointer_motion_state(None, Some((300.0, 120.0)), (301.0, 120.0)),
+            (false, false),
+            "hidden geometry must fail closed"
+        );
+    }
+
+    #[test]
+    fn pointer_motion_reuses_one_allocation_without_capturing_input() {
+        let source = include_str!("organism_ui.rs");
+        let motion = source
+            .split_once(concat!("    fn observe_", "pointer("))
+            .unwrap()
+            .1
+            .split_once("    fn schedule_pointer_candidate(")
+            .unwrap()
+            .0;
+        assert_eq!(
+            motion.matches("runtime.pointer_body_bounds(view)").count(),
+            1
+        );
+        assert!(motion.contains("Self::pointer_motion_state("));
+        assert!(motion.contains("runtime.pointer_position.get()"));
+        assert!(!motion.contains("pointer_near.get()"));
+        assert!(motion.contains("runtime.live_attention_input_with_bounds(view, now, bounds)"));
+        let observer = source
+            .split_once(concat!("    fn install_pointer_", "observer("))
+            .unwrap()
+            .1
+            .split_once("    fn hide_live_body(")
+            .unwrap()
+            .0;
+        assert!(observer.contains("gtk::glib::Propagation::Proceed"));
+        assert!(!observer.contains("Propagation::Stop"));
+        assert!(observer.contains("runtime.cancel_pointer_greeting()"));
     }
 
     fn accepted_core_snapshot(
