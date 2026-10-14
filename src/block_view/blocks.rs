@@ -5307,6 +5307,23 @@ impl FinishedBlock {
         }
     }
 
+    /// Adopt a fold-state estimate before GTK allocates the changed contents.
+    /// Keep the parked widget and its saved placeholder in the same geometry
+    /// as the document; visible cards converge to measured height after layout.
+    pub(crate) fn set_placeholder_height(&self, height: i32) -> i32 {
+        self.remember_allocated_height(height)
+    }
+
+    /// Save a raw card height, already including Chat chrome when measured.
+    pub(crate) fn remember_allocated_height(&self, height: i32) -> i32 {
+        let height = height.max(1);
+        self.virtualized_height.set(height);
+        if self.virtualized.get() {
+            self.widget.set_height_request(height);
+        }
+        height
+    }
+
     /// Whether this card's output is currently folded away.
     pub(crate) fn is_output_collapsed(&self) -> bool {
         self.collapsed_state.get()

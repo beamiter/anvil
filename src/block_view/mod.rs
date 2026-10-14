@@ -10627,6 +10627,12 @@ fn apply_visible_indices_with_measurement(
         } else {
             block.set_virtualized_preserving_height(!should_render)
         };
+        // A fold/density change already updated its affected metadata. Other
+        // visible cards may have newer measured heights than their saved
+        // off-screen cache, so preserving allocations must preserve them too.
+        if should_render && !measure_allocations {
+            continue;
+        }
         let height = if should_render && measure_allocations {
             // Keep the metadata document converged on real allocations for
             // rendered cards: the font-metric estimate drifts from what GTK
@@ -10634,7 +10640,7 @@ fn apply_visible_indices_with_measurement(
             // drift until the boundary lands on a card that is still on screen.
             let allocated = block.widget().height();
             if allocated > 1 {
-                allocated
+                block.remember_allocated_height(allocated)
             } else {
                 continue;
             }
@@ -15881,16 +15887,15 @@ impl TermView {
                             // Zero is the filtered-document sentinel: such a card
                             // contributes no pixels and must not regain a height
                             // because its fold state changed.
-                            data.estimated_height = if data.estimated_height == 0 {
-                                0
-                            } else {
-                                collapsed_aware_block_height(
-                                    &config,
-                                    data,
-                                    collapsed,
-                                    fallback_cols,
-                                )
-                            };
+                            let height = card.set_placeholder_height(collapsed_aware_block_height(
+                                &config,
+                                data,
+                                collapsed,
+                                fallback_cols,
+                            ));
+                            if data.estimated_height != 0 {
+                                data.estimated_height = height;
+                            }
                         }
                     }
                 },
@@ -15899,7 +15904,7 @@ impl TermView {
         };
         if moved > 0 {
             self.update_viewport();
-            self.update_block_visibility();
+            self.update_block_visibility_preserving_heights();
             self.block_list.queue_allocate();
         }
         moved
@@ -15933,11 +15938,15 @@ impl TermView {
                 self.failure_marker_redraw.as_ref(),
                 |block_data| {
                     if let Some(data) = block_data.get_mut(index) {
-                        data.estimated_height = if data.estimated_height == 0 {
-                            0
-                        } else {
-                            collapsed_aware_block_height(&config, data, collapsed, fallback_cols)
-                        };
+                        let height = card.set_placeholder_height(collapsed_aware_block_height(
+                            &config,
+                            data,
+                            collapsed,
+                            fallback_cols,
+                        ));
+                        if data.estimated_height != 0 {
+                            data.estimated_height = height;
+                        }
                     }
                 },
             );
@@ -15945,7 +15954,7 @@ impl TermView {
         };
         if moved {
             self.update_viewport();
-            self.update_block_visibility();
+            self.update_block_visibility_preserving_heights();
             self.block_list.queue_allocate();
         }
         moved
@@ -27823,3 +27832,6 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         assert!(agent_prompt_boundary_is_trusted(None, Some(false)));
     }
 }
+
+#[cfg(test)]
+mod fold_geometry_tests;
