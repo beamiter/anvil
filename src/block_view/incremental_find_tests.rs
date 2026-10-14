@@ -48,6 +48,7 @@ impl Fixture {
     }
 
     fn with_second_output(mode: crate::config::TerminalMode, second_output: &str) -> Self {
+        super::alt_screen::set_find_render_trace(true);
         crate::child_env::capture_inherited_environment().expect("test child environment");
         gtk::init().expect("GTK display");
         let mut config = Config::safe_defaults();
@@ -228,12 +229,47 @@ impl Fixture {
         let result = self
             .view
             .find_in_blocks(self.query.text().as_str(), regex, false);
+        eprintln!("FIND_FIXTURE search query={query:?} regex={regex} result={result:?}");
+        for (id, output) in [(1, false), (2, true), (3, true)] {
+            self.trace_native_selection("search immediate", id, output);
+        }
         self.assert_ownership();
         result
     }
 
+    fn trace_native_selection(&self, stage: &str, id: u64, output: bool) {
+        let cards = self.view.finished_blocks.borrow();
+        let card = cards.iter().find(|card| card.id == id).unwrap();
+        let terminal = if output {
+            &card.output_vte
+        } else {
+            &card.command_vte
+        };
+        let adjustment = terminal.vadjustment().map(|adjustment| {
+            (
+                adjustment.lower(),
+                adjustment.upper(),
+                adjustment.value(),
+                adjustment.page_size(),
+            )
+        });
+        eprintln!(
+            "FIND_FIXTURE {stage} id={id} output={output} selected={:?} stamp={:?} rows={} cols={} mapped={} allocation={}x{} adjustment(lower,upper,value,page)={adjustment:?}",
+            terminal.text_selected(vte4::Format::Text),
+            card.render_stamp(),
+            terminal.row_count(),
+            terminal.column_count(),
+            terminal.is_mapped(),
+            terminal.width(),
+            terminal.height(),
+        );
+    }
+
     fn assert_match(&self, id: u64, output: bool, expected: &str) {
+        eprintln!("FIND_FIXTURE assert_match id={id} output={output} expected={expected:?}");
+        self.trace_native_selection("before settle", id, output);
         settle();
+        self.trace_native_selection("after settle", id, output);
         self.assert_ownership();
         let cards = self.view.finished_blocks.borrow();
         let card = cards.iter().find(|card| card.id == id).unwrap();
@@ -261,6 +297,8 @@ impl Fixture {
         } else {
             self.view.find_prev()
         };
+        eprintln!("FIND_FIXTURE step next={next} expected={current}/{total} result={result:?}");
+        self.trace_native_selection("step immediate", id, output);
         assert_eq!(
             result,
             find::FindNavigationResult::Progress(progress(current, total))

@@ -292,6 +292,32 @@ fn finished_content_rows(first_row: f64, cursor_row: i64, fallback_rows: i64) ->
     (cursor_row - first as i64).saturating_add(1).max(1)
 }
 
+#[cfg(test)]
+thread_local! {
+    static FIND_RENDER_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_find_render_trace(enabled: bool) {
+    FIND_RENDER_TRACE.with(|trace| trace.set(enabled));
+}
+
+#[cfg(test)]
+pub(crate) fn trace_find_render(event: &str, terminal: &Terminal) {
+    if !FIND_RENDER_TRACE.with(std::cell::Cell::get) {
+        return;
+    }
+    let adjustment = terminal
+        .vadjustment()
+        .map(|a| (a.lower(), a.value(), a.upper(), a.page_size()));
+    eprintln!(
+        "FIND-RENDER {event} terminal={terminal:?} mapped={} selected={:?} grid={}x{} pixel={}x{} adjustment={adjustment:?}",
+        terminal.is_mapped(),
+        terminal.text_selected(vte4::Format::Text),
+        terminal.column_count(), terminal.row_count(), terminal.width(), terminal.height(),
+    );
+}
+
 /// Fit a read-only finished VTE to the rows its snapshot actually occupies:
 /// never below `floor_rows` (the caller's own row estimate, which still counts
 /// rows a cursor-up sequence left below the cursor) and never above `max_rows`
@@ -309,6 +335,9 @@ pub(crate) fn fit_finished_terminal_to_content(
     floor_rows: i64,
     max_rows: i64,
 ) {
+    #[cfg(test)]
+    trace_find_render("fit-before", terminal);
+
     let floor_rows = floor_rows.max(1);
     let max_rows = max_rows.max(floor_rows);
     let first_row = terminal
@@ -334,6 +363,8 @@ pub(crate) fn fit_finished_terminal_to_content(
     if let Some(adj) = terminal.vadjustment() {
         adj.set_value(adj.lower());
     }
+    #[cfg(test)]
+    trace_find_render("fit-after", terminal);
 }
 
 /// Settle a finished snapshot after bytes have been fed. VTE parses `feed()`

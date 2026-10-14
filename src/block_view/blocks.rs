@@ -3700,6 +3700,9 @@ pub(crate) fn render_bytes_into_finished_vte(
     capture_rows: i64,
     expand_to_buffer: bool,
 ) {
+    #[cfg(test)]
+    super::alt_screen::trace_find_render("render-before-reset-feed", vte);
+
     let display_text = output_display_text(text);
     // Start from a small measuring grid. If we allocate the estimated full
     // height before feeding, VTE's adjustment cannot distinguish rows that
@@ -3723,6 +3726,8 @@ pub(crate) fn render_bytes_into_finished_vte(
     vte.set_size(cols.max(1), visible_rows);
     vte.set_scrollback_lines(scrollback);
     feed_snapshot_bytes(vte, display_text.as_bytes());
+    #[cfg(test)]
+    super::alt_screen::trace_find_render("render-after-queued-feed", vte);
     if expand_to_buffer {
         settle_finished_terminal_after_feed(vte, visible_rows, viewport_cap.max(visible_rows));
     }
@@ -3774,6 +3779,9 @@ fn rewindow_finished_vte(
     requested_scrollback: i64,
     settle_cap: Option<i64>,
 ) {
+    #[cfg(test)]
+    super::alt_screen::trace_find_render("rewindow-before", vte);
+
     let (cols, visible_rows, scrollback) =
         bounded_finished_vte_geometry(cols, visible_rows.max(1), requested_scrollback.max(64));
     vte.set_scrollback_lines(bounded_finished_vte_max_rows(cols));
@@ -3795,6 +3803,8 @@ fn rewindow_finished_vte(
         adj.set_value(adj.lower());
     }
     settle_vte_to_top(vte);
+    #[cfg(test)]
+    super::alt_screen::trace_find_render("rewindow-after", vte);
 }
 
 /// Convert logical line breaks to terminal line breaks before feeding a VTE.
@@ -4483,7 +4493,13 @@ impl FinishedBlock {
                     cap,
                     displayed_generation_for_map.get(),
                 );
-                if render_stamp_for_map.replace(stamp) == stamp {
+                let previous_stamp = render_stamp_for_map.replace(stamp);
+                #[cfg(test)]
+                super::alt_screen::trace_find_render(
+                    &format!("output-map stamp={previous_stamp:?} -> {stamp:?}"),
+                    w,
+                );
+                if previous_stamp == stamp {
                     return;
                 }
                 let visible_rows = snapshot_visible_rows(rows, cap);
@@ -5416,6 +5432,11 @@ impl FinishedBlock {
     /// [`fitted_output_rows_for_viewport`]. Virtualized (unmapped) cards are
     /// left alone; their own `connect_map` handler fits them on the way back in.
     pub(crate) fn refit_output_to_viewport(&self) -> Option<i32> {
+        #[cfg(test)]
+        super::alt_screen::trace_find_render(
+            &format!("output-refit-entry stamp={:?}", self.render_stamp()),
+            &self.output_vte,
+        );
         // This method is called for every retained block on a pane resize.
         // Reject parked cards before borrowing their output or counting visual
         // rows: `connect_map` recomputes the cap when a card becomes visible,
@@ -5464,6 +5485,11 @@ impl FinishedBlock {
         // snapshot as it is: re-feeding it in the same main-loop iteration as the
         // map-time render is what made block output appear twice.
         let previous_stamp = self.render_stamp.replace(stamp);
+        #[cfg(test)]
+        super::alt_screen::trace_find_render(
+            &format!("output-refit stamp={previous_stamp:?} -> {stamp:?}"),
+            &self.output_vte,
+        );
         if previous_stamp != stamp {
             // Same columns and same displayed generation means VTE already
             // holds exactly these bytes wrapped exactly this way; only the
