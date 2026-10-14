@@ -913,7 +913,7 @@ mod tests {
         );
     }
 
-    fn press_capture(widget: &impl IsA<gtk::Widget>, x: f64, y: f64) {
+    fn emit_primary_capture(widget: &impl IsA<gtk::Widget>, signal: &str, x: f64, y: f64) {
         let controllers = widget.observe_controllers();
         let mut count = 0;
         for index in 0..controllers.n_items() {
@@ -921,12 +921,22 @@ mod tests {
                 if click.propagation_phase() == gtk::PropagationPhase::Capture
                     && click.button() == gtk::gdk::BUTTON_PRIMARY
                 {
-                    click.emit_by_name::<()>("pressed", &[&1_i32, &x, &y]);
+                    click.emit_by_name::<()>(signal, &[&1_i32, &x, &y]);
                     count += 1;
                 }
             }
         }
         assert!(count > 0, "production capture owner must be installed");
+    }
+
+    fn press_capture(widget: &impl IsA<gtk::Widget>, x: f64, y: f64) {
+        emit_primary_capture(widget, "pressed", x, y);
+    }
+
+    fn release_capture(widget: &impl IsA<gtk::Widget>, x: f64, y: f64) {
+        // GtkButton's own PRIMARY/Capture gesture participates too: an inside
+        // release synchronously emits clicked, just as a real release would.
+        emit_primary_capture(widget, "released", x, y);
     }
 
     fn assert_finished_long_output(view: &TermView, expected_count: usize) {
@@ -1369,22 +1379,42 @@ mod tests {
         assert_eq!(feedback.get(), 1);
         // Old release cleanup must not erase the newer held press's identity.
         press_capture(&stop, 2.0, 2.0);
-        let controllers = stop.observe_controllers();
-        for index in 0..controllers.n_items() {
-            if let Some(click) = controllers.item(index).and_downcast::<gtk::GestureClick>() {
-                if click.propagation_phase() == gtk::PropagationPhase::Capture {
-                    click.emit_by_name::<()>("released", &[&1_i32, &2.0_f64, &2.0_f64]);
-                }
-            }
-        }
+        release_capture(&stop, 2.0, 2.0);
+        // The old command is still current at release, so GtkButton sends a
+        // legitimate interrupt now. Account for that exact byte before the
+        // next press; drain_test_slave does not pump the pending GTK idle.
+        assert_eq!(
+            view.pty.drain_test_slave(Duration::from_millis(30)),
+            b"\x03"
+        );
+        assert_eq!(feedback.get(), 2);
         press_capture(&stop, 2.0, 2.0);
         drive(&view, &next_start, BlockState::CollectingOutput);
         stop.emit_clicked();
-        assert!(view
-            .pty
-            .drain_test_slave(Duration::from_millis(30))
-            .is_empty());
-        assert_eq!(feedback.get(), 1);
+        assert_eq!(
+            view.pty.drain_test_slave(Duration::from_millis(30)),
+            b"",
+            "the newer press must not interrupt a replacement command"
+        );
+        assert_eq!(feedback.get(), 2);
+        // Also prove the newer token survives old idle cleanup, rather than
+        // passing the refusal above merely because every token was erased.
+        press_capture(&stop, 2.0, 2.0);
+        release_capture(&stop, 2.0, 2.0);
+        assert_eq!(
+            view.pty.drain_test_slave(Duration::from_millis(30)),
+            b"\x03"
+        );
+        assert_eq!(feedback.get(), 3);
+        press_capture(&stop, 2.0, 2.0);
+        pump_for(Duration::from_millis(20));
+        stop.emit_clicked();
+        assert_eq!(
+            view.pty.drain_test_slave(Duration::from_millis(30)),
+            b"\x03",
+            "old release cleanup must preserve the newer same-command press"
+        );
+        assert_eq!(feedback.get(), 4);
         press_capture(&stop, 2.0, 2.0);
         view.pty.set_test_foreground_group(Some(202));
         stop.emit_clicked();
@@ -1392,21 +1422,21 @@ mod tests {
             .pty
             .drain_test_slave(Duration::from_millis(30))
             .is_empty());
-        assert_eq!(feedback.get(), 1);
+        assert_eq!(feedback.get(), 4);
         press_capture(&stop, 2.0, 2.0);
         stop.emit_clicked();
         assert_eq!(
             view.pty.drain_test_slave(Duration::from_millis(30)),
             b"\x03"
         );
-        assert_eq!(feedback.get(), 2);
+        assert_eq!(feedback.get(), 5);
         drive(&view, b"\x1b[?1049h", BlockState::AltScreen);
         stop.emit_clicked();
         assert!(view
             .pty
             .drain_test_slave(Duration::from_millis(30))
             .is_empty());
-        assert_eq!(feedback.get(), 2);
+        assert_eq!(feedback.get(), 5);
         window.close();
         view.pty.kill();
     }

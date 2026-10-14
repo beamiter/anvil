@@ -1938,7 +1938,7 @@ mod tests {
         assert!(script.contains("export GTK_A11Y=none"));
         assert!(!script.contains("export GTK_A11Y=test"));
         assert!(script.contains("if [[ \"${test_name}\" == organism_ui::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers ]]; then\n        fixture_a11y=\"test\""));
-        assert!(script.contains("GTK_A11Y=\"${fixture_a11y}\" dbus-run-session"));
+        assert!(script.contains("GTK_A11Y=\"${fixture_a11y}\" run_case"));
         let paint = production.split("let painted =").nth(1).unwrap();
         assert!(!paint.contains("candidate.set_text"));
         assert!(!paint.contains("candidate.set_visible"));

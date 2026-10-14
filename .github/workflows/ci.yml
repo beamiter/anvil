@@ -90,6 +90,9 @@ jobs:
         shell: bash
         run: xvfb-run --auto-servernum cargo test --all-targets --locked --no-fail-fast 2>&1 | tee test.log
 
+      - name: Check GTK runner failure aggregation
+        run: python3 scripts/test-gtk-display-contract.py
+
       - name: Run display-backed GTK/VTE regressions
         run: GTK_PAINT_DIAGNOSTICS_DIR="$PWD/gtk-paint-diagnostics" ANVIL_XTEST_DRIVER="$PWD/scripts/qa-cross-selection-pointer.py" bash scripts/test-gtk-display.sh
 

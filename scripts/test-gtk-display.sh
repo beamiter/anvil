@@ -132,8 +132,29 @@ for test_name in "${tests[@]}"; do
     fi
 done
 
+case_count=0
+passed_count=0
+failed_cases=()
+failed_statuses=()
+
+run_case() {
+    local case_name="$1" status
+    shift
+    case_count=$((case_count + 1))
+    printf 'GTK display regression: %s\n' "${case_name}"
+    # Keep test failures out of errexit so every isolated case can report its
+    # result. Setup and registration checks above remain fail-fast.
+    if "$@"; then
+        passed_count=$((passed_count + 1))
+    else
+        status=$?
+        failed_cases+=("${case_name}")
+        failed_statuses+=("${status}")
+        printf 'GTK display regression failed (exit %d): %s\n' "${status}" "${case_name}" >&2
+    fi
+}
+
 for test_name in "${tests[@]}"; do
-    printf 'GTK display regression: %s\n' "${test_name}"
     # GTK caches its accessibility backend on first use. Only the existing
     # companion fixture needs TestATContext for exact decorative Hidden values;
     # all other invocations retain the original disabled accessibility backend.
@@ -141,13 +162,14 @@ for test_name in "${tests[@]}"; do
     if [[ "${test_name}" == organism_ui::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers ]]; then
         fixture_a11y="test"
     fi
-    GTK_A11Y="${fixture_a11y}" dbus-run-session "${dbus_run_args[@]}" -- \
+    GTK_A11Y="${fixture_a11y}" run_case "${test_name}" \
+        dbus-run-session "${dbus_run_args[@]}" -- \
         xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
         cargo test --locked "${test_name}" -- --ignored --exact --nocapture
     if [[ "${test_name}" == block_view::tests::held_enter_history_recall_does_not_submit_the_recalled_command ]]; then
         for mode in review-mouse-only-fresh review-mouse-only-keypad-fresh review-mouse-only-keypad-pane-fresh; do
-            printf 'GTK display regression: settled release then outside-focus Enter (%s)\n' "${mode}"
             ANVIL_ENTER_MODE="${mode}" ANVIL_QA_PREWARM_ENTER=1 ANVIL_QA_INHERITED_ENTER=1 \
+                run_case "${test_name} (settled release then outside-focus Enter: ${mode})" \
                 dbus-run-session "${dbus_run_args[@]}" -- \
                 xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
                 cargo test --locked "${test_name}" -- --ignored --exact --nocapture
@@ -156,25 +178,25 @@ for test_name in "${tests[@]}"; do
     if [[ "${test_name}" == enter_ownership::tests::queued_review_write_claims_enter_at_both_backend_boundaries ]]; then
         for inherited in 0 1; do
             for dual in 0 1; do
-                printf 'GTK display regression: file-drop Enter ownership inherited=%s dual=%s\n' "${inherited}" "${dual}"
                 ANVIL_QA_FILE_DROP=1 ANVIL_QA_INHERITED_ENTER="${inherited}" ANVIL_QA_DUAL_ENTER="${dual}" \
+                    run_case "${test_name} (file-drop Enter ownership: inherited=${inherited} dual=${dual})" \
                     dbus-run-session "${dbus_run_args[@]}" -- \
                     xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
                     cargo test --locked "${test_name}" -- --ignored --exact --nocapture
             done
         done
-        printf 'GTK display regression: file-drop fresh Enter after release\n'
         ANVIL_QA_FILE_DROP=1 ANVIL_QA_FRESH_ENTER=1 \
+            run_case "${test_name} (file-drop fresh Enter after release)" \
             dbus-run-session "${dbus_run_args[@]}" -- \
             xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
             cargo test --locked "${test_name}" -- --ignored --exact --nocapture
-        printf 'GTK display regression: simultaneous main/keypad Enter ownership\n'
-        ANVIL_QA_DUAL_ENTER=1 dbus-run-session "${dbus_run_args[@]}" -- \
+        ANVIL_QA_DUAL_ENTER=1 run_case "${test_name} (simultaneous main/keypad Enter ownership)" \
+            dbus-run-session "${dbus_run_args[@]}" -- \
             xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
             cargo test --locked "${test_name}" -- --ignored --exact --nocapture
         for dual in 0 1; do
-            printf 'GTK display regression: outside-origin Enter, dual=%s\n' "${dual}"
             ANVIL_QA_INHERITED_ENTER=1 ANVIL_QA_DUAL_ENTER="${dual}" \
+                run_case "${test_name} (outside-origin Enter: dual=${dual})" \
                 dbus-run-session "${dbus_run_args[@]}" -- \
                 xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
                 cargo test --locked "${test_name}" -- --ignored --exact --nocapture
@@ -182,4 +204,11 @@ for test_name in "${tests[@]}"; do
     fi
 done
 
-printf 'GTK display regressions passed: %d/%d.\n' "${#tests[@]}" "${#tests[@]}"
+printf 'GTK display regressions passed: %d/%d.\n' "${passed_count}" "${case_count}"
+if (( ${#failed_cases[@]} > 0 )); then
+    printf 'Failed GTK display regressions (%d):\n' "${#failed_cases[@]}" >&2
+    for index in "${!failed_cases[@]}"; do
+        printf '  %s (exit %d)\n' "${failed_cases[index]}" "${failed_statuses[index]}" >&2
+    done
+    exit 1
+fi
