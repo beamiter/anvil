@@ -68,7 +68,8 @@ Native GTK interaction must be checked separately from headless unit tests:
 
 The explicit `scripts/test-gtk-display.sh` CI gate constructs real TermViews in
 presented GTK windows, drives the production reader/parser with a nonexecuting
-PTY recorder, inspects kernel PTY winsize after height-only changes, and clicks
+PTY recorder, verifies native-takeover columns before any window resize,
+inspects kernel PTY winsize after height-only changes, and clicks
 the production Send/Stop controls. It covers Closed/full-queue/in-flight refusal,
 held-boundary replay, command/foreground identity, dock selection and background
 focus. Headless transport tests separately cover kernel EAGAIN, full FIFO

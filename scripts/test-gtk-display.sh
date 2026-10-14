@@ -54,6 +54,7 @@ fi
 
 tests=(
     block_view::chat::tests::chat_reparents_only_live_clip_and_hides_submit_for_native_takeover
+    block_view::chat::tests::chat_raw_takeover_updates_columns_without_resizing_the_window
     block_view::chat::tests::chat_submit_uses_one_native_commit_and_refuses_a_stale_button
     block_view::chat::tests::chat_buttons_preserve_input_and_feedback_when_writer_refuses
     block_view::chat::tests::chat_stop_is_bound_to_displayed_command_and_foreground

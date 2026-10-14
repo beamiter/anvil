@@ -14022,6 +14022,14 @@ impl TermView {
         if let Some(observer) = chat_resize_observer {
             let kick = resize_kick.clone();
             observer.connect_resize(move |_, _, _| kick());
+            // Chat can move the live clip from its inset composer to the
+            // full-width native overlay without resizing the canvas. Raw
+            // fallback has no shell-boundary geometry push, and its hidden
+            // history adjustments cannot wake the tick. Remapping must arm
+            // the same bounded settle so the new allocation reaches the PTY
+            // without waiting for more output or an external window resize.
+            let kick = resize_kick.clone();
+            active.borrow().live_clip().connect_map(move |_| kick());
         }
 
         let term_view = TermView {

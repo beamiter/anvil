@@ -1124,6 +1124,64 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DISPLAY; real native reparent allocation and PTY winsize"]
+    fn chat_raw_takeover_updates_columns_without_resizing_the_window() {
+        let (view, window, other) = fixture();
+        other.grab_focus();
+        drive(&view, PROMPT, BlockState::AwaitingCommand);
+        let terminal = view.active_vte.clone();
+        let clip = view.active.borrow().live_clip();
+        let fd = view.pty.master_fd_raw();
+        let window_size = (window.width(), window.height());
+        let prompt_width = clip.width();
+        let prompt_grid = view.pty.test_slave_winsize();
+        // Border bounds include VTE's native CSS padding; Widget::width()
+        // reports only its content and is not the allocation given by the clip.
+        let terminal_width = || terminal.compute_bounds(&clip).expect("mapped VTE").width();
+        assert_eq!(terminal_width(), prompt_width as f32);
+        assert_eq!(terminal.column_count(), i64::from(prompt_grid.0));
+
+        // RIS invalidates the prompt. The only stimulus is this one reader
+        // batch: no sync/layout call, extra output or window resize may rescue
+        // the old inset-composer width after native takeover.
+        drive(&view, b"\x1bcplain output\r\n", BlockState::RawFallback);
+        wait_for(
+            "native remap reaches the real VTE and PTY without resize",
+            || {
+                let native_grid = view.pty.test_slave_winsize();
+                clip.width() > prompt_width
+                    && terminal_width() == clip.width() as f32
+                    && native_grid.0 > prompt_grid.0
+                    && terminal.column_count() == i64::from(native_grid.0)
+                    && terminal.row_count() == i64::from(native_grid.1)
+                    && view.resize_tick_id.borrow().is_none()
+            },
+        );
+        assert_eq!((window.width(), window.height()), window_size);
+        assert!(owns_focus(&other), "background fallback cannot steal focus");
+        assert!(!button(&view, "chat-send").is_visible());
+        assert!(!button(&view, "chat-stop").is_visible());
+        height_roundtrip(&view, &window, true);
+
+        drive(&view, PROMPT, BlockState::AwaitingCommand);
+        wait_for(
+            "prompt restores its original allocated width and PTY grid",
+            || {
+                clip.width() == prompt_width
+                    && terminal_width() == prompt_width as f32
+                    && view.pty.test_slave_winsize() == prompt_grid
+                    && view.resize_tick_id.borrow().is_none()
+            },
+        );
+        assert_eq!((window.width(), window.height()), window_size);
+        assert_eq!(view.active_vte, terminal);
+        assert_eq!(view.pty.master_fd_raw(), fd);
+        assert!(owns_focus(&other));
+        window.close();
+        view.pty.kill();
+    }
+
+    #[test]
     #[ignore = "requires DISPLAY; production commit/admission and real PTY recorder"]
     fn chat_submit_uses_one_native_commit_and_refuses_a_stale_button() {
         let (view, window, _) = fixture();
