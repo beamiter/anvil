@@ -923,6 +923,44 @@ mod tests {
         assert!(count > 0, "production capture owner must be installed");
     }
 
+    fn assert_finished_long_output(view: &TermView, expected_count: usize) {
+        let terminal = {
+            let blocks = view.finished_blocks.borrow();
+            assert_eq!(blocks.len(), expected_count, "command became a real card");
+            let block = blocks.last().expect("completed output card");
+            assert_eq!(
+                block.with_searchable_output(|text| text.matches("history output").count()),
+                80,
+                "the complete output is retained in the record"
+            );
+            block.output_vte.clone()
+        };
+        wait_for("long output is scrollable inside its mapped card", || {
+            terminal.is_mapped()
+                && terminal.vadjustment().is_some_and(|adjustment| {
+                    adjustment.upper() - adjustment.lower() > adjustment.page_size()
+                })
+        });
+        wait_for(
+            "all long-output rows survive in native VTE scrollback",
+            || {
+                let stream = gtk::gio::MemoryOutputStream::new_resizable();
+                terminal
+                    .write_contents_sync(
+                        &stream,
+                        vte4::WriteFlags::Default,
+                        gtk::gio::Cancellable::NONE,
+                    )
+                    .expect("VTE writes its complete buffer");
+                stream.close(gtk::gio::Cancellable::NONE).expect("close");
+                String::from_utf8_lossy(&stream.steal_as_bytes())
+                    .matches("history output")
+                    .count()
+                    == 80
+            },
+        );
+    }
+
     #[test]
     #[ignore = "requires DISPLAY; production window, parser and real PTY winsize"]
     fn chat_reparents_only_live_clip_and_hides_submit_for_native_takeover() {
@@ -997,16 +1035,53 @@ mod tests {
         other.grab_focus();
         drive(&view, b"\x1b[?1049l", BlockState::CollectingOutput);
         assert!(owns_focus(&other), "background alt exit cannot steal focus");
+        let completed_before = view.finished_blocks.borrow().len();
         drive(
             &view,
             "history output\r\n".repeat(80).as_bytes(),
             BlockState::CollectingOutput,
         );
         drive(&view, NEXT, BlockState::AwaitingCommand);
+        assert_finished_long_output(&view, completed_before + 1);
+        // A single long card is deliberately viewport-capped, with overflow
+        // retained in its own VTE. Complete several real commands to exercise
+        // outer history scrolling independently of that inner scrollback.
+        for completed in 2..=3 {
+            drive(&view, START, BlockState::CollectingOutput);
+            drive(
+                &view,
+                "history output\r\n".repeat(80).as_bytes(),
+                BlockState::CollectingOutput,
+            );
+            drive(&view, NEXT, BlockState::AwaitingCommand);
+            assert_finished_long_output(&view, completed_before + completed);
+        }
         assert!(owns_focus(&other));
         assert!(send.is_visible() && !stop.is_visible());
         assert_eq!(holder.parent().as_ref(), Some(view.block_list.upcast_ref()));
         assert_eq!(terminal, view.active_vte);
+        let adjustment = view.block_scroll.vadjustment();
+        wait_for("real finished cards overflow the outer history", || {
+            adjustment.upper() - adjustment.lower() > adjustment.page_size()
+        });
+        let clock = view.block_scroll.frame_clock().expect("mapped frame clock");
+        let painted = Rc::new(Cell::new(0_u64));
+        let painted_cb = painted.clone();
+        let handler = clock.connect_after_paint(move |_| painted_cb.set(painted_cb.get() + 1));
+        let before = painted.get();
+        adjustment.set_value(adjustment.upper() - adjustment.page_size());
+        view.block_scroll.queue_draw();
+        wait_for(
+            "outer history bottom has been allocated and painted",
+            || {
+                painted.get() > before
+                    && (adjustment.value() - (adjustment.upper() - adjustment.page_size())).abs()
+                        < 0.5
+            },
+        );
+        let bottom = adjustment.value();
+        assert!(bottom > adjustment.lower(), "history reached its bottom");
+        let history_y = view.block_list.compute_bounds(&view.root).unwrap().y();
         let dock_y = view
             .active
             .borrow()
@@ -1014,13 +1089,21 @@ mod tests {
             .compute_bounds(&view.root)
             .unwrap()
             .y();
-        let adjustment = view.block_scroll.vadjustment();
-        assert!(
-            adjustment.upper() > adjustment.page_size(),
-            "real finished output scrolls"
-        );
+        let before = painted.get();
         adjustment.set_value(adjustment.lower());
-        pump_for(Duration::from_millis(100));
+        view.block_scroll.queue_draw();
+        wait_for("outer history really moves from bottom to top", || {
+            painted.get() > before
+                && adjustment.value() == adjustment.lower()
+                && view.block_list.compute_bounds(&view.root).unwrap().y() > history_y
+        });
+        clock.disconnect(handler);
+        assert_eq!(adjustment.value(), adjustment.lower());
+        assert!(adjustment.value() < bottom, "outer history really scrolled");
+        assert!(
+            view.block_list.compute_bounds(&view.root).unwrap().y() > history_y,
+            "finished cards moved with the outer history viewport"
+        );
         assert_eq!(
             view.active
                 .borrow()
