@@ -62,6 +62,12 @@ tests=(
     block_view::incremental_find_tests::chat_filtered_single_hit_reopens_without_taking_focus
     block_view::incremental_find_tests::block_resized_reveal_restores_last_filtered_occurrence
     block_view::incremental_find_tests::chat_resized_reveal_restores_last_filtered_occurrence
+    block_view::incremental_find_tests::block_pending_replay_tracks_latest_navigation
+    block_view::incremental_find_tests::chat_pending_replay_tracks_latest_navigation
+    block_view::incremental_find_tests::block_pending_replay_retires_after_interruption
+    block_view::incremental_find_tests::chat_pending_replay_retires_after_interruption
+    block_view::incremental_find_tests::block_large_replay_preserves_narrowed_native_cursor
+    block_view::incremental_find_tests::chat_large_replay_preserves_narrowed_native_cursor
     block_view::blocks::tests::live_clip_reserves_css_insets_without_an_extra_grid_row
     block_view::tests::ssh_remote_prompt_cursor_stays_inside_live_clip_without_clear
     block_view::chat::tests::native_ime_commit_cancel_and_independent_ptys

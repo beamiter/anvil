@@ -226,6 +226,7 @@ impl Component for SearchModel {
                 #[name(case_mode)]
                 gtk::ToggleButton {
                     set_label: "Aa",
+                    set_focus_on_click: false,
                     add_css_class: "flat",
                     set_tooltip_text: Some("Match case"),
                     update_property: &[
@@ -248,6 +249,7 @@ impl Component for SearchModel {
                 #[name(previous_button)]
                 gtk::Button {
                     set_icon_name: "go-up-symbolic",
+                    set_focus_on_click: false,
                     set_tooltip_text: Some("Previous match (Shift+Enter)"),
                     set_sensitive: false,
                     add_css_class: "flat",
@@ -261,6 +263,7 @@ impl Component for SearchModel {
                 #[name(next_button)]
                 gtk::Button {
                     set_icon_name: "go-down-symbolic",
+                    set_focus_on_click: false,
                     set_tooltip_text: Some("Next match (Enter)"),
                     set_sensitive: false,
                     add_css_class: "flat",

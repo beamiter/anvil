@@ -747,7 +747,7 @@ pub(crate) struct FinishedBlock {
     dynamic_viewport_rows: Rc<Cell<i64>>,
     /// Render geometry plus filtered-text generation. A remap at the same
     /// geometry must not re-feed and transiently reset the card height.
-    render_stamp: Rc<Cell<RenderStamp>>,
+    render_stamp: Rc<RenderStampState>,
     /// Cost cache for deriving wrapped rows from the displayed transcript.
     /// This is deliberately separate from `render_stamp`: equal row counts do
     /// not prove that VTE already contains the right bytes or geometry.
@@ -1262,6 +1262,9 @@ fn bounded_finished_viewport_rows(cols: i64, requested_rows: i64) -> i64 {
 }
 
 fn pin_vte_to_top(vte: &vte4::Terminal) {
+    if vte.search_get_regex().is_some() && vte.has_selection() {
+        return;
+    }
     if let Some(adj) = vte.vadjustment() {
         adj.set_value(adj.lower());
     }
@@ -3040,6 +3043,55 @@ mod tests {
     }
 
     #[test]
+    fn pending_render_revision_tracks_only_queued_feeds() {
+        let first = super::output_render_stamp(80, 3, 3, 0);
+        let second = super::output_render_stamp(66, 3, 3, 0);
+        let state = super::RenderStampState::new(first);
+        assert_eq!(state.pending_revision(), None);
+        state.set(first);
+        assert_eq!(state.pending_revision(), None);
+        state.mark_feed_pending();
+        assert_eq!(state.pending_revision(), Some(1));
+        assert_eq!(state.replace(first), first);
+        assert_eq!(state.pending_revision(), Some(1));
+
+        // Re-windowing does not claim a feed or erase one already in the queue.
+        assert_eq!(state.replace(second), first);
+        assert_eq!(state.pending_revision(), Some(1));
+        state.mark_feed_pending();
+        assert_eq!(state.pending_revision(), Some(2));
+        state.acknowledge_contents_changed();
+        assert_eq!(state.pending_revision(), None);
+        assert_eq!(state.revision(), 2);
+    }
+
+    #[test]
+    fn render_revision_distinguishes_refeeds_and_stamp_aba() {
+        let first = super::output_render_stamp(80, 3, 3, 0);
+        let second = super::output_render_stamp(66, 3, 3, 0);
+        let state = super::RenderStampState::new(first);
+        assert_eq!(state.get(), first);
+        assert_eq!(state.revision(), 0);
+
+        // An unchanged map/refit probe is not another render.
+        assert_eq!(state.replace(first), first);
+        assert_eq!(state.revision(), 0);
+
+        // Explicit re-feeds invalidate outstanding work even at the same stamp.
+        state.set(first);
+        assert_eq!(state.get(), first);
+        assert_eq!(state.revision(), 1);
+
+        assert_eq!(state.replace(second), first);
+        assert_eq!(state.revision(), 2);
+        assert_eq!(state.replace(first), second);
+        assert_eq!(state.get(), first);
+        assert_eq!(state.revision(), 3);
+        assert_eq!(state.replace(first), first);
+        assert_eq!(state.revision(), 3);
+    }
+
+    #[test]
     fn a_cap_that_does_not_change_the_rows_on_screen_keeps_the_same_render() {
         // The regression that doubled `ls` output: a block is rendered on map
         // against the configured viewport cap, then the layout's first fitted pass
@@ -3655,6 +3707,63 @@ fn snapshot_visible_rows(content_rows: i64, viewport_cap: i64) -> i64 {
 /// which moves every native search position inside that VTE.
 pub(crate) type RenderStamp = (i64, i64, bool, u64);
 
+/// Keep render identity even when geometry/text stamps repeat. Explicit feeds
+/// advance the revision; map/refit probes that leave the stamp alone do not.
+pub(crate) struct RenderStampState {
+    stamp: Cell<RenderStamp>,
+    revision: Cell<u64>,
+    pending_feed: Cell<Option<u64>>,
+}
+
+impl RenderStampState {
+    fn new(stamp: RenderStamp) -> Self {
+        Self {
+            stamp: Cell::new(stamp),
+            revision: Cell::new(0),
+            pending_feed: Cell::new(None),
+        }
+    }
+
+    fn get(&self) -> RenderStamp {
+        self.stamp.get()
+    }
+
+    fn set(&self, stamp: RenderStamp) {
+        // Never wrap back to a revision an outstanding callback could hold.
+        self.revision.set(
+            self.revision
+                .get()
+                .checked_add(1)
+                .expect("finished-output render revision exhausted"),
+        );
+        self.stamp.set(stamp);
+    }
+
+    fn replace(&self, stamp: RenderStamp) -> RenderStamp {
+        let previous = self.get();
+        if previous != stamp {
+            self.set(stamp);
+        }
+        previous
+    }
+
+    fn revision(&self) -> u64 {
+        self.revision.get()
+    }
+
+    fn mark_feed_pending(&self) {
+        self.pending_feed.set(Some(self.revision()));
+    }
+
+    fn pending_revision(&self) -> Option<u64> {
+        self.pending_feed.get()
+    }
+
+    fn acknowledge_contents_changed(&self) {
+        self.pending_feed.set(None);
+    }
+}
+
 /// The stamp reported by a surface with no independently re-rendered snapshot.
 /// Real card stamps always have positive columns and rows, so they cannot alias
 /// this value.
@@ -3691,6 +3800,8 @@ pub(crate) fn output_render_stamp_for_test(
 /// than VTE's real result for cursor movement, CR redraws, combining glyphs and
 /// other terminal semantics. Short blocks expand to their exact buffer height;
 /// long blocks keep that scrollback inside their configured viewport.
+// Keep the existing geometry arguments explicit; render_state only tracks ownership.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_bytes_into_finished_vte(
     vte: &vte4::Terminal,
     text: &str,
@@ -3699,6 +3810,7 @@ pub(crate) fn render_bytes_into_finished_vte(
     viewport_cap: i64,
     capture_rows: i64,
     expand_to_buffer: bool,
+    render_state: &RenderStampState,
 ) {
     #[cfg(test)]
     super::alt_screen::trace_find_render("render-before-reset-feed", vte);
@@ -3726,6 +3838,7 @@ pub(crate) fn render_bytes_into_finished_vte(
     vte.set_size(cols.max(1), visible_rows);
     vte.set_scrollback_lines(scrollback);
     feed_snapshot_bytes(vte, display_text.as_bytes());
+    render_state.mark_feed_pending();
     #[cfg(test)]
     super::alt_screen::trace_find_render("render-after-queued-feed", vte);
     if expand_to_buffer {
@@ -4432,7 +4545,17 @@ impl FinishedBlock {
         // Tracks whether the user has toggled this block to its expanded
         // height. Survives unmap/remap so re-feeding picks the right cap.
         let expanded: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let render_stamp: Rc<Cell<RenderStamp>> = Rc::new(Cell::new(NEUTRAL_RENDER_STAMP));
+        let render_stamp = Rc::new(RenderStampState::new(NEUTRAL_RENDER_STAMP));
+        {
+            let render_stamp = Rc::downgrade(&render_stamp);
+            output_vte.connect_contents_changed(move |_| {
+                if let Some(render_stamp) = render_stamp.upgrade() {
+                    // Finished outputs have no PTY. Supported VTE versions drain
+                    // queued app-fed bytes before emitting this signal.
+                    render_stamp.acknowledge_contents_changed();
+                }
+            });
+        }
         let displayed_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         // Construction already paid for the initial transcript scan. Seed the
         // cache so a first map at the recorded width, and every same-width
@@ -4511,6 +4634,7 @@ impl FinishedBlock {
                     cap,
                     capture_rows,
                     rows <= cap,
+                    &render_stamp_for_map,
                 );
                 // Pin a minimum pixel height so GTK's vertical Box layout cannot
                 // shrink this VTE below what set_size requested. Without this,
@@ -4580,6 +4704,7 @@ impl FinishedBlock {
                     cap,
                     capture_rows,
                     rows <= cap,
+                    &render_stamp_for_btn,
                 );
                 let ch = output_vte_for_btn.char_height() as i32;
                 if ch > 0 {
@@ -5026,6 +5151,7 @@ impl FinishedBlock {
                                     active_cap,
                                     capture_rows,
                                     shown_visual_rows <= active_cap,
+                                    &render_stamp,
                                 );
                                 let ch = output_vte.char_height() as i32;
                                 if ch > 0 {
@@ -5425,6 +5551,16 @@ impl FinishedBlock {
         self.render_stamp.get()
     }
 
+    /// Identity of the latest output render, including equal-stamp re-feeds.
+    pub(crate) fn render_revision(&self) -> u64 {
+        self.render_stamp.revision()
+    }
+
+    /// A queued output replay not yet observed at VTE's contents-change boundary.
+    pub(crate) fn pending_render_revision(&self) -> Option<u64> {
+        self.render_stamp.pending_revision()
+    }
+
     /// Re-fit this block's output to the pane's current geometry.
     ///
     /// The cap comes from the pane the block hangs in, not from a value the
@@ -5512,6 +5648,7 @@ impl FinishedBlock {
                     fitted_rows,
                     self.capture_rows,
                     output_rows <= fitted_rows,
+                    &self.render_stamp,
                 );
             }
         }

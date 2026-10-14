@@ -360,11 +360,19 @@ pub(crate) fn fit_finished_terminal_to_content(
     let cell_height = (terminal.char_height() as i32).max(1);
     terminal.set_height_request(finished_vte_height_px(rows, cell_height));
 
+    pin_finished_terminal_top(terminal);
+    #[cfg(test)]
+    trace_find_render("fit-after", terminal);
+}
+
+fn pin_finished_terminal_top(terminal: &Terminal) {
+    // Preserve native find's viewport while deferred render settling finishes.
+    if terminal.search_get_regex().is_some() && terminal.has_selection() {
+        return;
+    }
     if let Some(adj) = terminal.vadjustment() {
         adj.set_value(adj.lower());
     }
-    #[cfg(test)]
-    trace_find_render("fit-after", terminal);
 }
 
 /// Settle a finished snapshot after bytes have been fed. VTE parses `feed()`
@@ -386,9 +394,7 @@ pub(crate) fn settle_finished_terminal_after_feed(
             fit_finished_terminal_to_content(&terminal, floor_rows, max_rows);
             let terminal = terminal.clone();
             glib::idle_add_local_once(move || {
-                if let Some(adj) = terminal.vadjustment() {
-                    adj.set_value(adj.lower());
-                }
+                pin_finished_terminal_top(&terminal);
             });
         });
     });

@@ -9,7 +9,9 @@
 use gtk::glib;
 use gtk::prelude::*;
 use relm4::gtk;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
+use std::rc::Rc;
 use vte4::TerminalExt;
 
 use super::{
@@ -92,6 +94,9 @@ pub(crate) struct FindSurface {
     pub(crate) count: usize,
     /// Native VTE cursor position last confirmed by a successful search call.
     vte_cursor: Option<usize>,
+    /// Replay queued when this native cursor was confirmed. Once that revision
+    /// drains, returning navigation must restart the exact ordinal.
+    pending_replay: Option<u64>,
     /// False when the match or scan budget stopped inside this surface.
     complete: bool,
     /// The first native step must wrap from a deliberately reset viewport
@@ -168,8 +173,63 @@ fn resumed_find_cursor(surfaces: &[FindSurface], resume: FindResume) -> Option<F
     None
 }
 
+/// A single own-reveal replay, never a general selection-loss listener.
+/// Signal closures hold weak references; dropping the find pass disconnects all
+/// handlers even when the view disappears before VTE processes its queued feed.
+struct FindReplayRepair {
+    active: Cell<bool>,
+    terminal: glib::WeakRef<vte4::Terminal>,
+    contents_handler: RefCell<Option<glib::SignalHandlerId>>,
+    window: glib::WeakRef<gtk::Window>,
+    focus_handler: RefCell<Option<glib::SignalHandlerId>>,
+    editable: glib::WeakRef<gtk::Editable>,
+    edit_handler: RefCell<Option<glib::SignalHandlerId>>,
+}
+
+impl FindReplayRepair {
+    fn retire(&self) {
+        self.active.set(false);
+        if let (Some(object), Some(handler)) = (
+            self.terminal.upgrade(),
+            self.contents_handler.borrow_mut().take(),
+        ) {
+            object.disconnect(handler);
+        }
+        if let (Some(object), Some(handler)) = (
+            self.window.upgrade(),
+            self.focus_handler.borrow_mut().take(),
+        ) {
+            object.disconnect(handler);
+        }
+        if let (Some(object), Some(handler)) = (
+            self.editable.upgrade(),
+            self.edit_handler.borrow_mut().take(),
+        ) {
+            object.disconnect(handler);
+        }
+    }
+}
+
+struct RetireFindReplay(Rc<FindReplayRepair>);
+
+impl Drop for RetireFindReplay {
+    fn drop(&mut self) {
+        self.0.retire();
+    }
+}
+
+impl Drop for FindReplayRepair {
+    fn drop(&mut self) {
+        self.retire();
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct FindState {
+    /// An asynchronous exact step failed; the next action must rebuild rather
+    /// than falling through to an unrelated live-terminal search.
+    invalidated: bool,
+    replay_repair: Option<Rc<FindReplayRepair>>,
     query: Option<FindQuery>,
     pub(crate) surfaces: Vec<FindSurface>,
     cursor: FindCursor,
@@ -1483,6 +1543,7 @@ impl TermView {
                     is_live: backend_surface.is_live,
                     count: plan.count,
                     vte_cursor: None,
+                    pending_replay: None,
                     complete: !plan.incomplete,
                     initial_wrap: plan.initial_wrap,
                     wrap_before: plan.wrap_before,
@@ -1533,6 +1594,7 @@ impl TermView {
                         is_live: fallback.is_live,
                         count: 1,
                         vte_cursor: Some(0),
+                        pending_replay: None,
                         complete: false,
                         initial_wrap: false,
                         wrap_before: None,
@@ -1609,6 +1671,7 @@ impl TermView {
                     is_live: true,
                     count: live.count,
                     vte_cursor: None,
+                    pending_replay: None,
                     complete: true,
                     initial_wrap: false,
                     wrap_before: Some(0),
@@ -1675,6 +1738,7 @@ impl TermView {
             }
         }
         self.scroll_to_current_match();
+        self.arm_find_replay_repair();
         FindSearchResult::Matches(FindProgress {
             current: cursor.global + 1,
             total,
@@ -1710,6 +1774,235 @@ impl TermView {
         )
     }
 
+    /// VTE 0.76 and current upstream drain the app-fed incoming queue before
+    /// emitting contents-changed (vte.cc, process_incoming). Finished outputs
+    /// have no PTY. This one-shot boundary repairs a selection confirmed before
+    /// our own reveal's queued replay; it is not a public VTE completion API.
+    fn arm_find_replay_repair(&self) {
+        let (surface, query) = {
+            let state = self.find_state.borrow();
+            let Some(surface) = state.surfaces.get(state.cursor.surface) else {
+                return;
+            };
+            let Some(query) = state.query.clone() else {
+                return;
+            };
+            if surface.is_live || !surface.is_output {
+                return;
+            }
+            (surface.clone(), query)
+        };
+        let (terminal, revision) = {
+            let blocks = self.finished_blocks.borrow();
+            let Some(block) = blocks.iter().find(|block| block.id == surface.block_id) else {
+                return;
+            };
+            let Some(revision) = block.pending_render_revision() else {
+                return;
+            };
+            (block.output_vte.clone(), revision)
+        };
+        let Some(window) = terminal
+            .root()
+            .and_then(|root| root.downcast::<gtk::Window>().ok())
+        else {
+            return;
+        };
+        let Some(focus) = gtk::prelude::GtkWindowExt::focus(&window) else {
+            return;
+        };
+        // GtkSearchEntry focuses its internal GtkText, which implements Editable.
+        // Without a retained query owner, asynchronous selection is fail-closed.
+        let Ok(editable) = focus.clone().dynamic_cast::<gtk::Editable>() else {
+            return;
+        };
+        let entry_text = editable.text();
+        let parsed_regex = entry_text
+            .strip_prefix('/')
+            .and_then(|text| text.strip_suffix('/'))
+            .filter(|text| !text.is_empty());
+        let matches_query = match parsed_regex {
+            Some(pattern) => query.use_regex && pattern == query.text,
+            None => !query.use_regex && entry_text.as_str() == query.text,
+        };
+        if !matches_query {
+            return;
+        }
+        let repair = Rc::new(FindReplayRepair {
+            active: Cell::new(true),
+            terminal: terminal.downgrade(),
+            contents_handler: RefCell::new(None),
+            window: window.downgrade(),
+            focus_handler: RefCell::new(None),
+            editable: editable.downgrade(),
+            edit_handler: RefCell::new(None),
+        });
+        let weak = Rc::downgrade(&repair);
+        *repair.focus_handler.borrow_mut() = Some(window.connect_focus_widget_notify(move |_| {
+            if let Some(repair) = weak.upgrade() {
+                repair.retire();
+            }
+        }));
+        let weak = Rc::downgrade(&repair);
+        *repair.edit_handler.borrow_mut() = Some(editable.connect_changed(move |_| {
+            // Retire immediately, before the find bar's query debounce fires.
+            if let Some(repair) = weak.upgrade() {
+                repair.retire();
+            }
+        }));
+        let weak = Rc::downgrade(&repair);
+        let state = Rc::downgrade(&self.find_state);
+        let blocks = Rc::downgrade(&self.finished_blocks);
+        let active_vte = self.active_vte.downgrade();
+        *repair.contents_handler.borrow_mut() =
+            Some(terminal.connect_contents_changed(move |terminal| {
+                let Some(repair) = weak.upgrade() else {
+                    return;
+                };
+                if !repair.active.get() {
+                    return;
+                }
+                // Disconnect contents before native search can queue another signal,
+                // but keep focus/edit retirement live during synchronous callbacks.
+                if let Some(handler) = repair.contents_handler.borrow_mut().take() {
+                    terminal.disconnect(handler);
+                }
+                let _retire = RetireFindReplay(repair.clone());
+                let (Some(state), Some(blocks)) = (state.upgrade(), blocks.upgrade()) else {
+                    return;
+                };
+                let (cursor, expected) = {
+                    let Ok(state) = state.try_borrow() else {
+                        return;
+                    };
+                    if state.query.as_ref() != Some(&query)
+                        || !state
+                            .replay_repair
+                            .as_ref()
+                            .is_some_and(|current| Rc::ptr_eq(current, &repair))
+                    {
+                        return;
+                    }
+                    let cursor = state.cursor;
+                    let Some(expected) = state.surfaces.get(cursor.surface) else {
+                        return;
+                    };
+                    if expected.block_id != surface.block_id
+                        || !expected.is_output
+                        || expected.is_live
+                        || expected.render_stamp != surface.render_stamp
+                        || expected.vte_cursor != Some(cursor.occurrence)
+                    {
+                        return;
+                    }
+                    (cursor, expected.clone())
+                };
+                {
+                    let Ok(blocks) = blocks.try_borrow() else {
+                        return;
+                    };
+                    let Some(block) = blocks.iter().find(|block| block.id == surface.block_id)
+                    else {
+                        return;
+                    };
+                    if block.render_revision() != revision
+                        || block.render_stamp() != surface.render_stamp
+                        || block.output_vte != *terminal
+                        || block.is_output_collapsed()
+                        || !terminal.is_mapped()
+                    {
+                        return;
+                    }
+                }
+                // A reentrant older emission can arrive before this feed. If the
+                // confirmed selection survived, do not interpret it as replay loss.
+                if terminal
+                    .text_selected(vte4::Format::Text)
+                    .is_some_and(|text| !text.is_empty())
+                {
+                    return;
+                }
+                let still_current = || {
+                    if !repair.active.get() {
+                        return false;
+                    }
+                    let Ok(state) = state.try_borrow() else {
+                        return false;
+                    };
+                    if state.query.as_ref() != Some(&query)
+                        || state.cursor != cursor
+                        || state.surfaces.get(cursor.surface) != Some(&expected)
+                        || !state
+                            .replay_repair
+                            .as_ref()
+                            .is_some_and(|current| Rc::ptr_eq(current, &repair))
+                    {
+                        return false;
+                    }
+                    let Ok(blocks) = blocks.try_borrow() else {
+                        return false;
+                    };
+                    blocks.iter().any(|block| {
+                        block.id == surface.block_id
+                            && block.render_revision() == revision
+                            && block.render_stamp() == surface.render_stamp
+                            && block.output_vte == *terminal
+                            && !block.is_output_collapsed()
+                            && terminal.is_mapped()
+                    })
+                };
+                if !still_current() {
+                    return;
+                }
+                if let Some(adj) = terminal.vadjustment() {
+                    adj.set_value(adj.lower());
+                }
+                if !still_current() {
+                    return;
+                }
+                terminal.unselect_all();
+                if !still_current() {
+                    return;
+                }
+                terminal.search_set_wrap_around(false);
+                let found = step_incremental_occurrence_exact(cursor.occurrence, || {
+                    still_current() && terminal.search_find_next()
+                });
+                terminal.search_set_wrap_around(false);
+                if !still_current() {
+                    return;
+                }
+                if !found {
+                    // Never leave a partial earlier occurrence painted while the
+                    // counter still names the requested hit. The normal next
+                    // user action can rebuild the retired pass.
+                    if let Some(active_vte) = active_vte.upgrade() {
+                        clear_find_state(&state, &active_vte);
+                        state.borrow_mut().invalidated = true;
+                    } else {
+                        terminal.unselect_all();
+                    }
+                    return;
+                }
+                let Ok(mut state) = state.try_borrow_mut() else {
+                    return;
+                };
+                if state.cursor == cursor && state.surfaces.get(cursor.surface) == Some(&expected) {
+                    state.surfaces[cursor.surface].vte_cursor = found.then_some(cursor.occurrence);
+                    state.surfaces[cursor.surface].pending_replay = None;
+                }
+                #[cfg(test)]
+                super::alt_screen::trace_find_render(
+                    &format!(
+                        "find-replay-repair found={found} occurrence={}",
+                        cursor.occurrence
+                    ),
+                    terminal,
+                );
+            }));
+        self.find_state.borrow_mut().replay_repair = Some(repair);
+    }
+
     fn rebuild_find_navigation(&self, cursor: FindCursor) -> FindNavigationResult {
         match self.rebuild_find_after_reveal(cursor) {
             FindSearchResult::Matches(progress) => FindNavigationResult::Progress(progress),
@@ -1733,6 +2026,9 @@ impl TermView {
     }
 
     fn step_find(&self, direction: FindDirection) -> FindNavigationResult {
+        if std::mem::take(&mut self.find_state.borrow_mut().invalidated) {
+            return FindNavigationResult::Invalidated;
+        }
         // Hits found before an alternate-screen app took the pane are on
         // cards it hid; stepping to them would scroll to nothing.
         if find_scope(self.bstate.get()) == FindScope::LiveScreen {
@@ -1776,6 +2072,7 @@ impl TermView {
                 .is_some_and(|surface| surface.is_output && !surface.is_live)
             {
                 self.scroll_to_current_match();
+                self.arm_find_replay_repair();
             }
             return FindNavigationResult::Progress(current_progress);
         }
@@ -1798,6 +2095,7 @@ impl TermView {
             state.cursor = next;
         }
         self.scroll_to_current_match();
+        self.arm_find_replay_repair();
         let progress = {
             let state = self.find_state.borrow();
             find_progress(&state)
@@ -1820,12 +2118,12 @@ impl TermView {
         direction: FindDirection,
         restart: bool,
     ) -> FindFocusResult {
-        let surface = {
+        let (surface, query_at_start, cursor_at_start) = {
             let state = self.find_state.borrow();
             let Some(surface) = state.surfaces.get(surface_index) else {
                 return FindFocusResult::Invalidated;
             };
-            surface.clone()
+            (surface.clone(), state.query.clone(), state.cursor)
         };
         let (vte, current_render_stamp) = if surface.is_live && surface.block_id == 0 {
             (self.active_vte.clone(), None)
@@ -1862,6 +2160,22 @@ impl TermView {
             }
             (target.terminal, Some(target.render_stamp))
         };
+        let pending_replay = if surface.is_output && !surface.is_live {
+            let blocks = self.finished_blocks.borrow();
+            let Some(block) = blocks.iter().find(|block| block.id == surface.block_id) else {
+                return FindFocusResult::Invalidated;
+            };
+            if surface
+                .pending_replay
+                .is_some_and(|revision| revision != block.render_revision())
+            {
+                return FindFocusResult::Invalidated;
+            }
+            block.pending_render_revision()
+        } else {
+            None
+        };
+        let restart = restart || (surface.pending_replay.is_some() && pending_replay.is_none());
         let wrap_once = if restart {
             if surface.is_live
                 || occurrence >= surface.count
@@ -1890,10 +2204,25 @@ impl TermView {
         }
         #[cfg(test)]
         super::alt_screen::trace_find_render(&format!("find-before-select block={} output={} occurrence={occurrence} stamp={current_render_stamp:?}", surface.block_id, surface.is_output), &vte);
+        let still_current = || {
+            self.find_state.try_borrow().is_ok_and(|state| {
+                state.query == query_at_start
+                    && state.cursor == cursor_at_start
+                    && state.surfaces.get(surface_index) == Some(&surface)
+            })
+        };
         vte.search_set_wrap_around(wrap_once);
         let found = if restart {
+            if let Some(adj) = vte.vadjustment() {
+                adj.set_value(adj.lower());
+            }
+            if !still_current() {
+                return FindFocusResult::Invalidated;
+            }
             vte.unselect_all();
-            step_incremental_occurrence_exact(occurrence, || vte.search_find_next())
+            step_incremental_occurrence_exact(occurrence, || {
+                still_current() && vte.search_find_next()
+            })
         } else {
             match direction {
                 FindDirection::Next => vte.search_find_next(),
@@ -1903,7 +2232,7 @@ impl TermView {
         vte.search_set_wrap_around(false);
         #[cfg(test)]
         super::alt_screen::trace_find_render(&format!("find-after-select found={found}"), &vte);
-        if !found {
+        if !found || !still_current() {
             return FindFocusResult::Invalidated;
         }
 
@@ -1919,6 +2248,7 @@ impl TermView {
             return FindFocusResult::Invalidated;
         }
         target.vte_cursor = Some(occurrence);
+        target.pending_replay = pending_replay;
         FindFocusResult::Selected
     }
 
@@ -2373,6 +2703,7 @@ mod tests {
             is_live: false,
             count,
             vte_cursor: None,
+            pending_replay: None,
             complete,
             initial_wrap: false,
             wrap_before: complete.then_some(0),

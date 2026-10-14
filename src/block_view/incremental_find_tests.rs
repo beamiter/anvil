@@ -36,6 +36,22 @@ fn find_search_entry(widget: &gtk::Widget) -> Option<gtk::SearchEntry> {
     None
 }
 
+fn find_toggle_button(widget: &gtk::Widget, label: &str) -> Option<gtk::ToggleButton> {
+    if let Ok(button) = widget.clone().downcast::<gtk::ToggleButton>() {
+        if button.label().as_deref() == Some(label) {
+            return Some(button);
+        }
+    }
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        if let Some(button) = find_toggle_button(&current, label) {
+            return Some(button);
+        }
+        child = current.next_sibling();
+    }
+    None
+}
+
 struct Fixture {
     view: TermView,
     window: gtk::Window,
@@ -224,17 +240,119 @@ impl Fixture {
     }
 
     fn search(&self, query: &str, regex: bool) -> find::FindSearchResult {
-        self.query.set_text(query);
+        self.query.set_text(&if regex {
+            format!("/{query}/")
+        } else {
+            query.to_string()
+        });
         self.focus_query();
-        let result = self
-            .view
-            .find_in_blocks(self.query.text().as_str(), regex, false);
+        let result = self.view.find_in_blocks(query, regex, false);
         eprintln!("FIND_FIXTURE search query={query:?} regex={regex} result={result:?}");
         for (id, output) in [(1, false), (2, true), (3, true)] {
             self.trace_native_selection("search immediate", id, output);
         }
         self.assert_ownership();
         result
+    }
+
+    /// Deliberately do not iterate the main loop: the caller is exercising the
+    /// interval between a reveal's queued VTE feed and its completion signal.
+    fn search_now(&self, query: &str, regex: bool) -> find::FindSearchResult {
+        self.assert_ownership();
+        self.query.set_text(&if regex {
+            format!("/{query}/")
+        } else {
+            query.to_string()
+        });
+        let result = self.view.find_in_blocks(query, regex, false);
+        eprintln!("FIND_FIXTURE search without settle query={query:?} result={result:?}");
+        self.trace_native_selection("search without settle", 2, true);
+        self.assert_ownership();
+        result
+    }
+
+    fn step_now(&self, next: bool, current: usize, total: usize) {
+        self.assert_ownership();
+        let result = if next {
+            self.view.find_next()
+        } else {
+            self.view.find_prev()
+        };
+        eprintln!("FIND_FIXTURE step without settle next={next} result={result:?}");
+        self.trace_native_selection("step without settle", 2, true);
+        assert_eq!(
+            result,
+            find::FindNavigationResult::Progress(progress(current, total)),
+        );
+        self.assert_ownership();
+    }
+
+    fn assert_output_selection_empty(&self, id: u64) {
+        self.assert_ownership();
+        let cards = self.view.finished_blocks.borrow();
+        let card = cards.iter().find(|card| card.id == id).unwrap();
+        assert!(card.output_vte.is_mapped());
+        assert!(
+            card.output_vte
+                .text_selected(vte4::Format::Text)
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty(),
+            "retired replay must not restore its old output selection",
+        );
+    }
+
+    fn assert_output_viewport_contains(&self, id: u64, expected: &str) {
+        self.assert_ownership();
+        let cards = self.view.finished_blocks.borrow();
+        let card = cards.iter().find(|card| card.id == id).unwrap();
+        let terminal = &card.output_vte;
+        assert!(terminal.is_mapped());
+        let adjustment = terminal.vadjustment().expect("native output adjustment");
+        let lower = adjustment.lower();
+        let upper = adjustment.upper();
+        let value = adjustment.value();
+        let page = adjustment.page_size();
+        assert!([lower, upper, value, page]
+            .iter()
+            .all(|number| number.is_finite()));
+        assert!(page > 0.0);
+        // VTE's adjustment and text-range API use absolute ring rows. Only
+        // extract fully visible rows; rounded-out boundaries could count a
+        // clipped match as visible. These are native coordinates, not line
+        // numbers inferred from the ANSI/tab/wide-character source text.
+        let first_row = value.ceil().max(lower.ceil()) as i64;
+        let after_last_row = (value + page).floor().min(upper.floor()) as i64;
+        let rows = after_last_row - first_row;
+        let columns = terminal.column_count();
+        assert!(
+            (1..=256).contains(&rows),
+            "fixture viewport read must stay bounded"
+        );
+        assert!(
+            (1..=512).contains(&columns),
+            "fixture viewport columns must stay bounded"
+        );
+        // column_count is the half-open right boundary, as exercised by the
+        // existing native bounded_vte_capture half-open-column regression.
+        let visible = terminal
+            .text_range_format(
+                vte4::Format::Text,
+                first_row,
+                0,
+                after_last_row - 1,
+                columns,
+            )
+            .0
+            .expect("native visible output text");
+        eprintln!(
+            "FIND_FIXTURE visible id={id} expected={expected:?} ring_rows={first_row}..{after_last_row} adjustment(lower,upper,value,page)={:?}",
+            (lower, upper, value, page),
+        );
+        assert!(
+            visible.contains(expected),
+            "selected hit must remain in the actual native viewport after layout and deferred pins; visible={visible:?}",
+        );
     }
 
     fn trace_native_selection(&self, stage: &str, id: u64, output: bool) {
@@ -580,4 +698,339 @@ fn block_filtered_single_hit_reopens_without_taking_focus() {
 #[ignore = "requires an isolated GTK process and display"]
 fn chat_filtered_single_hit_reopens_without_taking_focus() {
     filtered_single_hit_reopens(crate::config::TerminalMode::Chat);
+}
+
+fn pending_replay_tracks_latest_navigation(mode: crate::config::TerminalMode) {
+    {
+        let fixture = Fixture::new(mode);
+        assert_eq!(
+            fixture.search_now("needle-[BCD]", true),
+            find::FindSearchResult::Matches(progress(1, 3)),
+        );
+        // Every step occurs before a main-loop iteration. The repair must use the
+        // latest cursor (the second output hit), not the original reveal's first
+        // hit or the third hit selected by an earlier queued Next.
+        fixture.step_now(true, 2, 3);
+        fixture.step_now(true, 3, 3);
+        fixture.step_now(false, 2, 3);
+        fixture.assert_open_outputs(&[2]);
+        fixture.assert_match(2, true, "needle-C");
+        fixture.step(false, 1, 3, 2, true, "needle-B");
+        fixture.step(true, 2, 3, 2, true, "needle-C");
+        fixture.assert_scroll_stays_parked();
+    }
+
+    // Keep the later output already open before this query, so entering it
+    // cannot reveal/rebuild and accidentally discard the earlier surface's
+    // cached cursor. That earlier output must finish parsing while a DIFFERENT
+    // surface is current, then be selected again at its old last occurrence.
+    let fixture = Fixture::new(mode);
+    let later = fixture.view.finished_blocks.borrow()[2].clone();
+    assert!(later.set_collapsed(false));
+    fixture.focus_query();
+    assert!(later.output_vte.is_mapped());
+    let later_stamp = later.render_stamp();
+    fixture.assert_open_outputs(&[3]);
+    assert_eq!(
+        fixture.search_now("needle-[A-E]", true),
+        find::FindSearchResult::Matches(progress(1, 5)),
+    );
+    fixture.step_now(true, 2, 5);
+    fixture.step_now(true, 3, 5);
+    fixture.step_now(true, 4, 5);
+    fixture.step_now(true, 5, 5);
+    fixture.assert_open_outputs(&[2, 3]);
+    fixture.assert_match(3, true, "needle-E");
+    assert_eq!(later.render_stamp(), later_stamp);
+    // The earlier output's native selection was reset while needle-E owned
+    // the logical cursor. Its old vte_cursor must not yield AlreadySelected.
+    fixture.step(false, 4, 5, 2, true, "needle-D");
+    fixture.step(false, 3, 5, 2, true, "needle-C");
+    fixture.step(true, 4, 5, 2, true, "needle-D");
+    fixture.assert_scroll_stays_parked();
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ReplayInterruption {
+    ReplaceQuery,
+    ReplaceQueryOnSameOutput,
+    ClearFind,
+    EditBeforeDebounce,
+    FocusLeaveAndReturn,
+    OutputRevision,
+}
+
+fn pending_replay_retires_after_interruption(mode: crate::config::TerminalMode) {
+    for interruption in [
+        ReplayInterruption::ReplaceQuery,
+        ReplayInterruption::ReplaceQueryOnSameOutput,
+        ReplayInterruption::ClearFind,
+        ReplayInterruption::EditBeforeDebounce,
+        ReplayInterruption::FocusLeaveAndReturn,
+        ReplayInterruption::OutputRevision,
+    ] {
+        let revision_output = format!(
+            "keep needle-B\r\nkeep needle-C\r\ndrop needle-D\r\n{}",
+            "keep revision filler\r\n".repeat(60),
+        );
+        let fixture = if matches!(interruption, ReplayInterruption::OutputRevision) {
+            Fixture::with_second_output(mode, &revision_output)
+        } else {
+            Fixture::new(mode)
+        };
+        // Put the competing focus owner in the real window before the reveal,
+        // so adding it cannot introduce a geometry change during the race.
+        let other_entry = gtk::Entry::new();
+        other_entry.set_text("independent focus owner");
+        fixture
+            .window
+            .child()
+            .unwrap()
+            .downcast::<gtk::Box>()
+            .unwrap()
+            .append(&other_entry);
+        let revision_controls = if matches!(interruption, ReplayInterruption::OutputRevision) {
+            let card = fixture.view.finished_blocks.borrow()[1].clone();
+            card.set_collapsed(false);
+            (card.toggle_filter)();
+            let filter = find_search_entry(card.widget().upcast_ref())
+                .expect("prebuilt per-card output filter");
+            let case = find_toggle_button(card.widget().upcast_ref(), "Aa")
+                .expect("filter case-sensitive control");
+            wait_until(
+                || card.output_vte.is_mapped(),
+                "prepare the original full output before revision-race setup",
+            );
+            fixture.collapse_all();
+            let old_height = fixture.view.block_scroll.height();
+            let old_stamp = card.render_stamp();
+            fixture.window.set_default_size(760, 720);
+            fixture.window.queue_resize();
+            wait_until(
+                || {
+                    assert!(!card.output_vte.is_mapped());
+                    fixture.view.block_scroll.height() > old_height + 100
+                },
+                "force a real own-reveal replay before the independent filter revision",
+            );
+            assert_eq!(card.render_stamp(), old_stamp);
+            Some((filter, case, old_stamp))
+        } else {
+            None
+        };
+        fixture.focus_query();
+        assert_eq!(
+            fixture.search_now("needle-[BCD]", true),
+            find::FindSearchResult::Matches(progress(1, 3)),
+        );
+        if let Some((_, _, old_stamp)) = revision_controls.as_ref() {
+            assert_ne!(
+                fixture.view.finished_blocks.borrow()[1].render_stamp(),
+                *old_stamp,
+                "revision interruption must begin with a genuine own-reveal render",
+            );
+        }
+        fixture.step_now(true, 2, 3);
+        let output = fixture.view.finished_blocks.borrow()[1].output_vte.clone();
+        eprintln!("FIND_FIXTURE interrupt pending replay: {interruption:?}");
+        match interruption {
+            ReplayInterruption::ReplaceQuery => {
+                // Applying another query retires the old callback even when
+                // its output still has a contents-changed emission queued.
+                assert_eq!(
+                    fixture.search_now("needle-A", false),
+                    find::FindSearchResult::Matches(progress(1, 1)),
+                );
+                fixture.assert_match(1, false, "needle-A");
+            }
+            ReplayInterruption::ReplaceQueryOnSameOutput => {
+                // The new query owns the same still-parsing terminal. Retiring
+                // the old repair must not also discard the replacement's hit.
+                assert_eq!(
+                    fixture.search_now("needle-D", false),
+                    find::FindSearchResult::Matches(progress(1, 1)),
+                );
+            }
+            ReplayInterruption::ClearFind => {
+                fixture.query.set_text("");
+                fixture.view.clear_find();
+                assert_eq!(
+                    fixture.view.find_next(),
+                    find::FindNavigationResult::Inactive
+                );
+                settle();
+                assert_eq!(
+                    fixture.view.find_next(),
+                    find::FindNavigationResult::Inactive
+                );
+            }
+            ReplayInterruption::EditBeforeDebounce => {
+                // The native entry changes before the debounced new query has
+                // run. Explicitly clear the old native selection to make its
+                // resurrection observable independently of VTE parser timing.
+                fixture.query.set_text("replacement awaiting debounce");
+                output.unselect_all();
+                settle();
+                assert_eq!(
+                    fixture.query.text().as_str(),
+                    "replacement awaiting debounce"
+                );
+            }
+            ReplayInterruption::OutputRevision => {
+                let card = fixture.view.finished_blocks.borrow()[1].clone();
+                let before = card.render_stamp();
+                let (filter, case, _) = revision_controls.as_ref().unwrap();
+                filter.set_text("keep");
+                // Option changes apply immediately, unlike search-changed's
+                // debounce. Neither operation moves native focus away from
+                // the find entry, so focus retirement cannot mask this case.
+                case.set_active(true);
+                fixture.assert_ownership();
+                assert_ne!(card.render_stamp().3, before.3);
+                let filtered = fixture.searchable_output(2);
+                assert!(filtered.contains("needle-B") && filtered.contains("needle-C"));
+                assert!(!filtered.contains("needle-D"));
+                // The new revision still has the old second hit. A callback
+                // which wrongly survives could reselect it successfully; an
+                // assertion only about differing stamps would miss that bug.
+                output.unselect_all();
+                settle();
+                assert_eq!(filter.text().as_str(), "keep");
+                assert_eq!(fixture.query.text().as_str(), "/needle-[BCD]/");
+                assert_eq!(fixture.searchable_output(2), filtered);
+            }
+            ReplayInterruption::FocusLeaveAndReturn => {
+                assert!(other_entry.grab_focus());
+                let focused = gtk::prelude::RootExt::focus(&fixture.window)
+                    .expect("the competing entry must own native focus");
+                assert!(
+                    focused == other_entry.clone().upcast::<gtk::Widget>()
+                        || focused.is_ancestor(&other_entry),
+                );
+                // A later owner's cleared selection must win even if the
+                // original search entry has focus again when parsing ends.
+                output.unselect_all();
+                assert!(fixture.query.grab_focus());
+                fixture.assert_ownership();
+                settle();
+            }
+        }
+        fixture.trace_native_selection("after replay interruption", 2, true);
+        if matches!(interruption, ReplayInterruption::ReplaceQueryOnSameOutput) {
+            fixture.assert_match(2, true, "needle-D");
+        } else {
+            fixture.assert_output_selection_empty(2);
+        }
+        fixture.assert_open_outputs(&[2]);
+        fixture.assert_scroll_stays_parked();
+    }
+}
+
+fn large_replay_preserves_narrowed_native_cursor(mode: crate::config::TerminalMode) {
+    let repeated_tail =
+        "repeat\t\x1b[36m界 wide retained replay payload across a narrowed terminal column boundary\x1b[0m\r\n";
+    let output = format!(
+        "head needle-B\r\nhead needle-C\r\nhead needle-D\r\n{}tail needle-F\r\n",
+        repeated_tail.repeat(160),
+    );
+    assert!(
+        output.len() > 8 * 1024,
+        "the native replay must exceed 8 KiB"
+    );
+    let fixture = Fixture::with_second_output(mode, &output);
+    let card = fixture.view.finished_blocks.borrow()[1].clone();
+    card.set_collapsed(false);
+    wait_until(
+        || card.output_vte.is_mapped(),
+        "the long decorated transcript must first be rendered",
+    );
+    let wide_stamp = card.render_stamp();
+    assert!(wide_stamp.0 > 0);
+    fixture.window.set_default_size(520, 480);
+    fixture.window.queue_resize();
+    wait_until(
+        || card.render_stamp().0 < wide_stamp.0,
+        "a real narrower allocation must rewrap the ANSI/tab/wide-character transcript",
+    );
+    assert_eq!(fixture.searchable_output(2), output);
+
+    // Settle the new width while mapped, then change height while folded. The
+    // reveal now genuinely replays the long, already-narrowed native document
+    // without relying on a hidden widget receiving a fresh width allocation.
+    fixture.collapse_all();
+    let before_reveal = card.render_stamp();
+    let old_height = fixture.view.block_scroll.height();
+    fixture.window.set_default_size(520, 720);
+    fixture.window.queue_resize();
+    wait_until(
+        || {
+            assert!(!card.output_vte.is_mapped());
+            fixture.view.block_scroll.height() > old_height + 100
+        },
+        "the larger viewport must settle with the narrowed output still folded",
+    );
+    assert_eq!(card.render_stamp(), before_reveal);
+    fixture.focus_query();
+    assert_eq!(
+        fixture.search_now("needle-[A-DF]", true),
+        find::FindSearchResult::Matches(progress(1, 5)),
+    );
+    fixture.step_now(false, 5, 5);
+    assert_ne!(
+        card.render_stamp(),
+        before_reveal,
+        "reveal must start a new native render"
+    );
+    fixture.step_now(false, 4, 5);
+    fixture.step_now(true, 5, 5);
+    fixture.step_now(false, 4, 5);
+    fixture.step_now(true, 5, 5);
+    fixture.assert_open_outputs(&[2]);
+    // Finish at the sentinel beyond the >8 KiB repeated tail BEFORE the first
+    // settle, so a repair which observes only a parsed prefix cannot pass.
+    fixture.assert_match(2, true, "needle-F");
+    fixture.assert_output_viewport_contains(2, "needle-F");
+    assert!(card.render_stamp().0 < wide_stamp.0);
+    assert_eq!(fixture.searchable_output(2), output);
+    fixture.step(false, 4, 5, 2, true, "needle-D");
+    fixture.step(true, 5, 5, 2, true, "needle-F");
+    fixture.assert_output_viewport_contains(2, "needle-F");
+    fixture.assert_scroll_stays_parked();
+    fixture.assert_output_viewport_contains(2, "needle-F");
+}
+
+#[test]
+#[ignore = "requires an isolated GTK process and display"]
+fn block_pending_replay_tracks_latest_navigation() {
+    pending_replay_tracks_latest_navigation(crate::config::TerminalMode::Block);
+}
+
+#[test]
+#[ignore = "requires an isolated GTK process and display"]
+fn chat_pending_replay_tracks_latest_navigation() {
+    pending_replay_tracks_latest_navigation(crate::config::TerminalMode::Chat);
+}
+
+#[test]
+#[ignore = "requires an isolated GTK process and display"]
+fn block_pending_replay_retires_after_interruption() {
+    pending_replay_retires_after_interruption(crate::config::TerminalMode::Block);
+}
+
+#[test]
+#[ignore = "requires an isolated GTK process and display"]
+fn chat_pending_replay_retires_after_interruption() {
+    pending_replay_retires_after_interruption(crate::config::TerminalMode::Chat);
+}
+
+#[test]
+#[ignore = "requires an isolated GTK process and display"]
+fn block_large_replay_preserves_narrowed_native_cursor() {
+    large_replay_preserves_narrowed_native_cursor(crate::config::TerminalMode::Block);
+}
+
+#[test]
+#[ignore = "requires an isolated GTK process and display"]
+fn chat_large_replay_preserves_narrowed_native_cursor() {
+    large_replay_preserves_narrowed_native_cursor(crate::config::TerminalMode::Chat);
 }
