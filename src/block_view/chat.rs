@@ -780,7 +780,13 @@ mod tests {
     }
 
     fn fixture() -> (Rc<TermView>, gtk::Window, gtk::Entry) {
-        crate::child_env::capture_inherited_environment().expect("test child environment");
+        // Freeze the process environment before GTK, not once per window.
+        // The refusal test creates separate full-queue and Closed PTYs in the
+        // same process; neither fixture may recapture toolkit-mutated state.
+        static CHILD_ENV: std::sync::Once = std::sync::Once::new();
+        CHILD_ENV.call_once(|| {
+            crate::child_env::capture_inherited_environment().expect("test child environment");
+        });
         gtk::init().expect("GTK display");
         let view: Rc<TermView> = TermView::new_with_spawner(
             &crate::config::Config::safe_defaults(),
