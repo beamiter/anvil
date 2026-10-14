@@ -14939,9 +14939,10 @@ impl TermView {
             ));
             popover.connect_closed(move |popover| {
                 let restore = restore.borrow_mut().take();
-                popover.unparent();
                 if let Some(restore) = restore {
-                    restore.defer();
+                    restore.close_popover(popover);
+                } else {
+                    popover.unparent();
                 }
             });
             popover.popup();

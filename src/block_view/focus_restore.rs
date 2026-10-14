@@ -9,6 +9,7 @@ use std::rc::Rc;
 pub(super) struct FocusRestore {
     target: glib::WeakRef<Widget>,
     window: glib::WeakRef<Window>,
+    transient: Option<glib::WeakRef<Widget>>,
     superseded: Rc<Cell<bool>>,
     observer: Option<glib::SignalHandlerId>,
     root_observer: Option<glib::SignalHandlerId>,
@@ -41,6 +42,7 @@ impl FocusRestore {
             return None;
         }
         let transient = transient.map(|widget| widget.downgrade());
+        let observed_transient = transient.clone();
         let target_weak = target.downgrade();
         let superseded = Rc::new(Cell::new(false));
         let superseded_notify = superseded.clone();
@@ -49,7 +51,7 @@ impl FocusRestore {
                 return;
             };
             let target = target_weak.upgrade();
-            let transient = transient.as_ref().and_then(glib::WeakRef::upgrade);
+            let transient = observed_transient.as_ref().and_then(glib::WeakRef::upgrade);
             if target.as_ref() != Some(&focus)
                 && !transient
                     .as_ref()
@@ -75,10 +77,38 @@ impl FocusRestore {
         Some(Self {
             target: target.downgrade(),
             window: window.downgrade(),
+            transient,
             superseded,
             observer: Some(observer),
             root_observer: Some(root_observer),
         })
+    }
+
+    /// A focused popup's hide/unparent queues GTK focus repair after paint.
+    /// Return its still-owned focus before unparenting, so that automatic
+    /// fallback cannot look like a newer user choice and cancel this return.
+    /// The observer remains armed through the idle: a later real choice wins.
+    pub(super) fn close_popover(self, popover: &gtk::Popover) {
+        if let (Some(target), Some(window), Some(transient)) = (
+            self.target.upgrade(),
+            self.window.upgrade(),
+            self.transient.as_ref().and_then(glib::WeakRef::upgrade),
+        ) {
+            let focus = gtk::prelude::GtkWindowExt::focus(&window);
+            if !self.superseded.get()
+                && &transient == popover.upcast_ref::<Widget>()
+                && target.is_mapped()
+                && window.is_mapped()
+                && target.root().as_ref() == Some(window.upcast_ref())
+                && focus.as_ref().is_none_or(|owner| {
+                    owner == &target || owner == &transient || owner.is_ancestor(&transient)
+                })
+            {
+                target.grab_focus();
+            }
+        }
+        popover.unparent();
+        self.defer();
     }
 
     pub(super) fn defer(self) {
@@ -178,20 +208,41 @@ mod tests {
         let pane = vte4::Terminal::new();
         let find = gtk::Entry::new();
         let history = vte4::Terminal::new();
+        for terminal in [&pane, &history] {
+            vte4::TerminalExt::set_size(terminal, 20, 3);
+            terminal.set_vexpand(false);
+        }
         let peers: Vec<Widget> = vec![pane.upcast(), find.upcast(), history.upcast()];
         let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
         column.append(&view.root);
+        // Focus peers must not consume three full terminal heights and starve
+        // Chat's initially non-measuring native overlay of its first allocation.
+        let peer_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        peer_row.set_vexpand(false);
         for peer in &peers {
-            column.append(peer);
+            peer_row.append(peer);
         }
+        column.append(&peer_row);
         let window = Window::builder()
             .default_width(640)
             .default_height(600)
             .build();
         window.set_child(Some(&column));
         window.present();
-        wait_for(|| view.active_vte.is_mapped() && view.root.height() > 30);
+        // A real shell can print its first prompt before the first allocation.
+        // Establish that lifecycle before requiring the docked VTE to be mapped.
         feed(&view, PROMPT);
+        let end = Instant::now() + Duration::from_secs(3);
+        while !view.active_vte.is_mapped() || view.root.height() <= 30 {
+            assert!(
+                Instant::now() < end,
+                "{mode:?} fixture: state={:?}, mapped={}, root_height={}",
+                view.bstate.get(),
+                view.active_vte.is_mapped(),
+                view.root.height()
+            );
+            pump();
+        }
         pump();
         (view, window, column, peers)
     }
@@ -250,9 +301,23 @@ mod tests {
                     if remap {
                         view.active_vte.set_visible(false);
                         view.active_vte.set_visible(true);
+                        // Mapping may synchronously restore this same terminal.
+                        // Reject any unrelated owner before recreating the empty
+                        // focus precondition that the queued idle must repair.
+                        let remapped_owner = gtk::prelude::GtkWindowExt::focus(&window);
+                        assert!(
+                            remapped_owner.as_ref().is_none_or(|owner| {
+                                owner == view.active_vte.upcast_ref::<Widget>()
+                            }),
+                            "remap selected another owner (alt_exit={alt_exit}): {remapped_owner:?}"
+                        );
+                        gtk::prelude::GtkWindowExt::set_focus(&window, Widget::NONE);
                     }
                     assert!(view.active_vte.is_mapped());
-                    assert!(gtk::prelude::GtkWindowExt::focus(&window).is_none());
+                    assert!(
+                        gtk::prelude::GtkWindowExt::focus(&window).is_none(),
+                        "fixture must clear focus before idle (alt_exit={alt_exit}, remap={remap})"
+                    );
                     pump();
                     assert!(
                         view.active_vte.has_focus(),
@@ -387,33 +452,70 @@ mod tests {
             peers[2].clone(),
         ];
         for owner in &owners {
-            for supersede in [false, true] {
-                owner.grab_focus();
+            for takeover in [
+                "none",
+                "before_close",
+                "before_close_then_none",
+                "after_close",
+            ] {
+                assert!(owner.grab_focus());
+                assert!(owns_focus(owner));
                 let popover = gtk::Popover::new();
                 popover.set_autohide(false);
                 popover.set_parent(&view.block_scroll);
                 let action = gtk::Button::with_label("Copy");
                 popover.set_child(Some(&action));
                 let restore = FocusRestore::popover(&view.active_vte, &popover).unwrap();
+                let observer_state = Rc::downgrade(&restore.superseded);
+                let restore = std::cell::RefCell::new(Some(restore));
+                let closed = Rc::new(Cell::new(false));
+                let closed_signal = closed.clone();
+                // Mirror the production closed callback, including its ordering
+                // relative to hide/unparent and GTK's after-paint focus repair.
+                popover.connect_closed(move |popover| {
+                    closed_signal.set(true);
+                    restore.borrow_mut().take().unwrap().close_popover(popover);
+                });
                 popover.popup();
                 pump();
-                action.grab_focus();
+                assert!(action.grab_focus());
                 assert!(owns_focus(&action));
-                if supersede {
-                    peers[0].grab_focus();
+                if takeover.starts_with("before_close") {
+                    assert!(peers[0].grab_focus());
+                    assert!(owns_focus(&peers[0]));
+                    if takeover == "before_close_then_none" {
+                        gtk::prelude::GtkWindowExt::set_focus(&window, Widget::NONE);
+                    }
                 }
                 popover.popdown();
-                popover.unparent();
-                restore.defer();
-                pump();
-                if supersede {
-                    assert!(owns_focus(&peers[0]), "closed menu stole newer pane focus");
-                } else {
+                assert!(closed.get(), "production close callback must run");
+                if takeover == "none" || takeover == "after_close" {
                     assert!(
                         owns_focus(owner),
-                        "ordinary menu return must preserve the original owner"
+                        "eligible close returns focus before unparent"
                     );
                 }
+                if takeover == "after_close" {
+                    assert!(peers[0].grab_focus());
+                }
+                pump();
+                match takeover {
+                    "none" => assert!(
+                        owns_focus(owner),
+                        "ordinary menu return preserves its owner"
+                    ),
+                    "before_close_then_none" => {
+                        assert!(gtk::prelude::GtkWindowExt::focus(&window).is_none())
+                    }
+                    _ => assert!(
+                        owns_focus(&peers[0]),
+                        "closed menu stole newer pane focus ({takeover})"
+                    ),
+                }
+                assert!(
+                    observer_state.upgrade().is_none(),
+                    "closed menu leaked tracking handlers"
+                );
             }
         }
         window.close();
