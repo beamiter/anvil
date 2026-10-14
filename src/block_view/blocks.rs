@@ -1067,14 +1067,47 @@ pub(crate) fn output_visual_row_count(text: &str, cols: i64) -> i64 {
 
     text.split('\n')
         .map(|line| {
-            let mut width = 0usize;
-            for ch in line.trim_end_matches('\r').chars() {
-                width += match ch {
-                    '\t' => 8 - (width % 8),
-                    _ => UnicodeWidthChar::width(ch).unwrap_or(0),
-                };
+            // Preserve the existing conservative estimate for a degenerate
+            // one-column grid, where a two-cell glyph cannot fit at all.
+            if cols == 1 {
+                let mut width = 0usize;
+                for ch in line.trim_end_matches('\r').chars() {
+                    width += match ch {
+                        '\t' => 8 - (width % 8),
+                        _ => UnicodeWidthChar::width(ch).unwrap_or(0),
+                    };
+                }
+                return width.max(1) as i64;
             }
-            width.max(1).div_ceil(cols) as i64
+
+            let mut rows = 1i64;
+            let mut column = 0usize;
+            for ch in line.trim_end_matches('\r').chars() {
+                if ch == '\t' {
+                    // VTE's default tab stops are eight columns apart. HT
+                    // stops at the right margin and never triggers autowrap;
+                    // after a full row it leaves the pending wrap untouched.
+                    // Custom tab-stop escape sequences are outside this
+                    // stripped-text estimate, as are custom cursor margins.
+                    if column < cols {
+                        column = (column + 8 - column % 8).min(cols - 1);
+                    }
+                    continue;
+                }
+                let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if width == 0 {
+                    continue;
+                }
+                // VTE wraps a wide glyph as a unit when only one cell remains.
+                // A full last row wraps only upon the next positive-width
+                // character, never a combining mark or trailing tab.
+                if column + width > cols {
+                    rows += 1;
+                    column = 0;
+                }
+                column += width;
+            }
+            rows
         })
         .sum::<i64>()
         .max(1)
@@ -2770,6 +2803,64 @@ mod tests {
     #[test]
     fn output_row_count_preserves_intentional_blank_lines_before_final_ending() {
         assert_eq!(output_row_count("a\n\n"), 2);
+    }
+
+    #[test]
+    fn visual_row_count_wraps_wide_glyphs_before_the_last_cell() {
+        assert_eq!(output_visual_row_count(&"界".repeat(401), 81), 11);
+        assert_eq!(output_visual_row_count("界界界", 3), 3);
+        assert_eq!(output_visual_row_count("a界界", 2), 3);
+        assert_eq!(output_visual_row_count("界界界", 4), 2);
+        assert_eq!(output_visual_row_count("abc界", 4), 2);
+        assert_eq!(output_visual_row_count("界\u{301}界\u{200d}界", 3), 3);
+        assert_eq!(output_visual_row_count("🙂🙂🙂", 3), 3);
+    }
+
+    #[test]
+    fn visual_row_count_preserves_control_and_degenerate_boundaries() {
+        for cols in [1, 2, 3, 4, 81] {
+            let plain = "界界界\n界界界";
+            assert_eq!(
+                output_visual_row_count(plain, cols),
+                output_visual_row_count(&format!("\x1b[32m{plain}\x1b[0m"), cols),
+            );
+        }
+        assert_eq!(output_visual_row_count("old\r\x1b[K界界界\r\n", 3), 3);
+        assert_eq!(output_visual_row_count("abc\u{301}", 3), 1);
+        assert_eq!(output_visual_row_count("\u{301}\u{200d}\0", 3), 1);
+        assert_eq!(output_visual_row_count("界\n界\n", 3), 2);
+        assert_eq!(output_visual_row_count("a\tb", 4), 1);
+        assert_eq!(output_visual_row_count("界界", 1), 4);
+        assert_eq!(output_visual_row_count("界界", 0), 4);
+        assert_eq!(output_visual_row_count("", 3), 1);
+    }
+
+    #[test]
+    fn visual_row_count_tabs_stop_at_the_margin_without_wrapping() {
+        for (text, cols, expected) in [
+            ("界界界\t", 3, 3),
+            ("abc\t", 3, 1),
+            ("abcd\tX", 4, 2),
+            ("abc\tX", 4, 1),
+            ("abc\t界", 3, 2),
+            ("abc\t\u{301}", 3, 1),
+            ("\t\t\t", 3, 1),
+            ("\t界", 3, 2),
+            ("a\tb", 4, 1),
+            ("a\tb", 8, 1),
+            ("a\tb", 9, 1),
+            ("a\tb界", 9, 2),
+            ("a\tb\n界界界\t", 3, 4),
+            ("old\r\x1b[Ka\tb\r\n", 4, 1),
+        ] {
+            assert_eq!(
+                output_visual_row_count(text, cols),
+                expected,
+                "{text:?} at {cols} columns"
+            );
+        }
+        // The single-column fallback remains deliberately conservative.
+        assert_eq!(output_visual_row_count("a\tb", 1), 9);
     }
 
     #[test]
