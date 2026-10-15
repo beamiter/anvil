@@ -7844,6 +7844,7 @@ impl RenderBackend for BlockBackend {
         block_id: u64,
     ) {
         review::install(self, &finished_menu_clone);
+        let more_button = finished_menu_clone.more_btn.clone();
         let block_data_for_export = self.block_data_for_cb.clone();
         let finished_blocks_for_menu = Rc::downgrade(&self.finished_blocks_for_cb);
         let vte_for_copy = self.active_vte.clone();
@@ -8588,6 +8589,10 @@ impl RenderBackend for BlockBackend {
         });
         actions.add_action(&show_menu);
         finished_widget.insert_action_group("block", Some(&actions));
+        // First create the action helper with the entire ancestor chain and
+        // its owning group already present. Do not force sensitivity: GTK
+        // derives it from the installed action's availability.
+        more_button.set_action_name(Some("block.show-menu"));
     }
 
     fn feed_live(&self, bytes: &[u8]) {
@@ -25814,6 +25819,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         let actions = gtk::gio::SimpleActionGroup::new();
         actions.add_action(&gtk::gio::SimpleAction::new("show-menu", None));
         block.widget().insert_action_group("block", Some(&actions));
+        block.more_btn.set_action_name(Some("block.show-menu"));
         super::blocks::reveal_block_actions(&block.action_box, true);
         let window = gtk::Window::new();
         window.set_default_size(900, 300);
@@ -25875,6 +25881,12 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             spot.0,
             spot.1
         ));
+        block
+            .widget()
+            .insert_action_group("block", None::<&gtk::gio::SimpleActionGroup>);
+        assert!(!more.is_sensitive(), "removing the owner disables More");
+        block.widget().insert_action_group("block", Some(&actions));
+        assert!(more.is_sensitive(), "restoring the owner re-enables More");
         window.close();
         while context.iteration(false) {}
     }

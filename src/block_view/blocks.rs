@@ -756,6 +756,7 @@ pub(crate) struct FinishedBlock {
     pub(crate) review_shelf: gtk::Box,
     pub(crate) header_row: gtk::Box,
     pub(crate) action_box: gtk::Box,
+    pub(super) more_btn: gtk::Button,
     /// Visible keyboard contract for the active edge of a Block selection.
     /// It sits before the expanding spacer so showing it consumes slack rather
     /// than shifting timestamp/status metadata.
@@ -842,6 +843,7 @@ impl Clone for FinishedBlock {
             review_shelf: self.review_shelf.clone(),
             header_row: self.header_row.clone(),
             action_box: self.action_box.clone(),
+            more_btn: self.more_btn.clone(),
             selection_hint: self.selection_hint.clone(),
             selection_hint_steady: self.selection_hint_steady.clone(),
             selection_feedback_generation: self.selection_feedback_generation.clone(),
@@ -2840,7 +2842,8 @@ mod tests {
         let more = more
             .downcast::<gtk::Button>()
             .expect("block actions button");
-        assert_eq!(more.action_name().as_deref(), Some("block.show-menu"));
+        assert!(more.action_name().is_none());
+        assert!(!more.is_sensitive(), "an unbound card cannot open a menu");
         assert_eq!(more.tooltip_text().as_deref(), Some("Block actions"));
         assert!(card.details_btn.is_sensitive());
         assert!(
@@ -4401,7 +4404,10 @@ impl FinishedBlock {
         more.set_focus_on_click(false);
         more.add_css_class("flat");
         more.add_css_class("block-action-btn");
-        more.set_action_name(Some("block.show-menu"));
+        // Bind only after the backend has installed the card action group.
+        // Creating an action helper while this button is still unparented can
+        // leave its muxer disconnected across the intermediate plain Boxes.
+        more.set_sensitive(false);
         let details_btn = gtk::Button::with_label("Review block details");
         details_btn.set_tooltip_text(Some("Review block details"));
         action_box.append(&more);
@@ -5362,6 +5368,7 @@ impl FinishedBlock {
             review_shelf,
             header_row,
             action_box,
+            more_btn: more,
             selection_hint,
             selection_hint_steady: Rc::new(RefCell::new(String::new())),
             selection_feedback_generation: Rc::new(Cell::new(0)),
