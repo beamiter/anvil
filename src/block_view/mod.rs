@@ -7845,7 +7845,7 @@ impl RenderBackend for BlockBackend {
     ) {
         review::install(self, &finished_menu_clone);
         let block_data_for_export = self.block_data_for_cb.clone();
-        let finished_blocks_for_menu = self.finished_blocks_for_cb.clone();
+        let finished_blocks_for_menu = Rc::downgrade(&self.finished_blocks_for_cb);
         let vte_for_copy = self.active_vte.clone();
         let bracketed_paste_for_rerun_menu = self.bracketed_paste_rc.clone();
         let verified_submission_for_rerun_menu = self.verified_submission.clone();
@@ -7865,8 +7865,33 @@ impl RenderBackend for BlockBackend {
         let right_click = gtk::GestureClick::new();
         right_click.set_button(3);
 
-        right_click.connect_pressed(move |gesture, _n_press, x, y| {
-            gesture.set_state(gtk::EventSequenceState::Claimed);
+        let card_for_menu = finished_widget.downgrade();
+        let open_popover = Rc::new(RefCell::new(glib::WeakRef::<gtk::Popover>::new()));
+        let open_menu: Rc<dyn Fn(f64, f64)> = Rc::new(move |x, y| {
+            let (Some(card), Some(finished_blocks_for_menu)) =
+                (card_for_menu.upgrade(), finished_blocks_for_menu.upgrade())
+            else {
+                return;
+            };
+            let Some(finished_menu_clone) = finished_blocks_for_menu
+                .borrow()
+                .iter()
+                .find(|block| block.id == block_id && block.widget() == &card)
+                .cloned()
+            else {
+                return;
+            };
+            if !block_data_for_export
+                .borrow()
+                .iter()
+                .any(|record| record.id == block_id)
+            {
+                return;
+            }
+            if let Some(popover) = open_popover.borrow().upgrade() {
+                popover.popup();
+                return;
+            }
 
             // Read the painted text selection BEFORE anything below touches it.
             // Right-clicking a selected error line is how anyone would try to
@@ -7899,6 +7924,7 @@ impl RenderBackend for BlockBackend {
             }
 
             let popover = gtk::Popover::new();
+            *open_popover.borrow_mut() = popover.downgrade();
             let widget: &gtk::Widget =
                 &finished_menu_clone.widget().clone().upcast::<gtk::Widget>();
             popover.set_parent(widget);
@@ -7909,6 +7935,21 @@ impl RenderBackend for BlockBackend {
             vbox.add_css_class("menu");
 
             let make_item = menu_item;
+
+            {
+                let item = make_item("Review block details");
+                let details = finished_menu_clone.details_btn.downgrade();
+                let menu = popover.downgrade();
+                item.connect_clicked(move |_| {
+                    if let Some(menu) = menu.upgrade() {
+                        menu.popdown();
+                    }
+                    if let Some(details) = details.upgrade() {
+                        details.emit_clicked();
+                    }
+                });
+                vbox.append(&item);
+            }
 
             match selected_text {
                 Ok(Some(text)) => {
@@ -8289,8 +8330,24 @@ impl RenderBackend for BlockBackend {
                 });
                 vbox.append(&item);
             }
+            if finished_menu_clone.expand_btn.get_visible() {
+                let expand = &finished_menu_clone.expand_btn;
+                let item = make_item(expand.tooltip_text().as_deref().unwrap_or("Expand block"));
+                let expand = expand.downgrade();
+                let menu = popover.downgrade();
+                item.connect_clicked(move |_| {
+                    if let Some(menu) = menu.upgrade() {
+                        menu.popdown();
+                    }
+                    if let Some(expand) = expand.upgrade() {
+                        expand.emit_clicked();
+                    }
+                });
+                vbox.append(&item);
+            }
             {
                 let item = make_item("Toggle Output Filter");
+                item.set_sensitive(finished_menu_clone.filter_btn.is_sensitive());
                 let popover_c = popover.clone();
                 let finished_for_filter = finished_menu_clone.clone();
                 item.connect_clicked(move |_| {
@@ -8483,13 +8540,54 @@ impl RenderBackend for BlockBackend {
                 vbox.append(&item);
             }
 
-            popover.set_child(Some(&vbox));
+            let menu_scroll = gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .vscrollbar_policy(gtk::PolicyType::Automatic)
+                .propagate_natural_height(true)
+                .max_content_height(420)
+                .child(&vbox)
+                .build();
+            popover.set_child(Some(&menu_scroll));
+            let restore = RefCell::new(focus_restore::FocusRestore::popover(&card, &popover));
+            finished_menu_clone
+                .action_box
+                .add_css_class("block-actions-open");
+            blocks::sync_block_actions(&card, &finished_menu_clone.action_box);
+            let actions_for_close = finished_menu_clone.action_box.downgrade();
+            let card_for_close = card.downgrade();
+            let slot = open_popover.clone();
             popover.connect_closed(move |p| {
-                p.unparent();
+                slot.borrow_mut().set(None);
+                if let (Some(card), Some(actions)) =
+                    (card_for_close.upgrade(), actions_for_close.upgrade())
+                {
+                    actions.remove_css_class("block-actions-open");
+                    blocks::sync_block_actions(&card, &actions);
+                }
+                if let Some(restore) = restore.borrow_mut().take() {
+                    restore.close_popover(p);
+                } else {
+                    p.unparent();
+                }
             });
             popover.popup();
         });
+        let pointer_menu = open_menu.clone();
+        right_click.connect_pressed(move |gesture, _, x, y| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            pointer_menu(x, y);
+        });
         finished_widget.add_controller(right_click);
+        let actions = gtk::gio::SimpleActionGroup::new();
+        let show_menu = gtk::gio::SimpleAction::new("show-menu", None);
+        let card = finished_widget.downgrade();
+        show_menu.connect_activate(move |_, _| {
+            if let Some(card) = card.upgrade() {
+                open_menu(f64::from(card.width().saturating_sub(24)), 24.0);
+            }
+        });
+        actions.add_action(&show_menu);
+        finished_widget.insert_action_group("block", Some(&actions));
     }
 
     fn feed_live(&self, bytes: &[u8]) {
@@ -28181,3 +28279,6 @@ mod command_reuse_menu_label_tests {
         assert_eq!(super::command_reuse_menu_label(128), "Review commands…");
     }
 }
+
+#[cfg(test)]
+mod more_menu_tests;

@@ -751,6 +751,7 @@ pub(crate) struct FinishedBlock {
     pub(crate) rerun_btn: gtk::Button,
     pub(crate) review_btn: gtk::Button,
     pub(crate) details_btn: gtk::Button,
+    pub(crate) filter_btn: gtk::Button,
     pub(crate) clear_review_btn: gtk::Button,
     pub(crate) review_shelf: gtk::Box,
     pub(crate) header_row: gtk::Box,
@@ -805,7 +806,7 @@ pub(crate) struct FinishedBlock {
     max_expanded_cap: i64,
     output_rows: i64,
     expanded: Rc<Cell<bool>>,
-    expand_btn: gtk::Button,
+    pub(super) expand_btn: gtk::Button,
     /// True only when this block has more output rows than can be shown at once.
     pub(crate) output_scrollable: bool,
     /// Whether this block is tall enough to expose long-block navigation.
@@ -836,6 +837,7 @@ impl Clone for FinishedBlock {
             rerun_btn: self.rerun_btn.clone(),
             review_btn: self.review_btn.clone(),
             details_btn: self.details_btn.clone(),
+            filter_btn: self.filter_btn.clone(),
             clear_review_btn: self.clear_review_btn.clone(),
             review_shelf: self.review_shelf.clone(),
             header_row: self.header_row.clone(),
@@ -2835,13 +2837,16 @@ mod tests {
             child = widget.next_sibling();
         }
         let more = card.action_box.last_child().expect("overflow");
-        let more = more.downcast::<gtk::MenuButton>().expect("menu button");
-        let popover = more.popover().expect("output actions");
-        let actions = popover.child().expect("action list");
-        let details = actions.first_child().expect("details");
-        assert!(details.is_sensitive());
-        let filter = details.next_sibling().expect("filter");
-        assert!(!filter.is_sensitive());
+        let more = more
+            .downcast::<gtk::Button>()
+            .expect("block actions button");
+        assert_eq!(more.action_name().as_deref(), Some("block.show-menu"));
+        assert_eq!(more.tooltip_text().as_deref(), Some("Block actions"));
+        assert!(card.details_btn.is_sensitive());
+        assert!(
+            !card.filter_btn.is_sensitive(),
+            "empty output has no filter action"
+        );
         let collapse = card.header_row.last_child().expect("fold button");
         let collapse = collapse.downcast::<gtk::Button>().expect("fold button");
         assert!(!collapse.gets_focus_on_click());
@@ -4392,55 +4397,15 @@ impl FinishedBlock {
         }
         // Less frequent output tools live in a keyboard-accessible overflow,
         // leaving the three copy/reuse actions stable in narrow split panes.
-        let more = gtk::MenuButton::new();
+        let more = icon_button("view-more-symbolic", "Block actions");
         more.set_focus_on_click(false);
-        more.set_icon_name("view-more-symbolic");
-        more.set_tooltip_text(Some("More output actions"));
-        more.update_property(&[gtk::accessible::Property::Label("More output actions")]);
         more.add_css_class("flat");
         more.add_css_class("block-action-btn");
-        let popover = gtk::Popover::new();
-        let overflow = gtk::Box::new(Orientation::Vertical, 4);
-        overflow.set_margin_top(6);
-        overflow.set_margin_bottom(6);
-        overflow.set_margin_start(6);
-        overflow.set_margin_end(6);
+        more.set_action_name(Some("block.show-menu"));
         let details_btn = gtk::Button::with_label("Review block details");
         details_btn.set_tooltip_text(Some("Review block details"));
-        for btn in [&details_btn, &filter_btn, &jump_bottom_btn, &expand_btn] {
-            btn.add_css_class("flat");
-            btn.set_focus_on_click(false);
-            btn.set_label(btn.tooltip_text().as_deref().unwrap_or(""));
-            btn.set_halign(gtk::Align::Fill);
-            btn.connect_tooltip_text_notify(|button| {
-                button.set_label(button.tooltip_text().as_deref().unwrap_or(""));
-            });
-            overflow.append(btn);
-            let popover_weak = popover.downgrade();
-            btn.connect_clicked(move |_| {
-                if let Some(popover) = popover_weak.upgrade() {
-                    popover.popdown();
-                }
-            });
-        }
-        popover.set_child(Some(&overflow));
-        more.set_popover(Some(&popover));
         action_box.append(&more);
         header_row.append(&action_box);
-        {
-            let actions = action_box.downgrade();
-            let card = outer.downgrade();
-            popover.connect_visible_notify(move |popover| {
-                if let (Some(actions), Some(card)) = (actions.upgrade(), card.upgrade()) {
-                    if popover.is_visible() {
-                        actions.add_css_class("block-actions-open");
-                    } else {
-                        actions.remove_css_class("block-actions-open");
-                    }
-                    sync_block_actions(&card, &actions);
-                }
-            });
-        }
         let focus = gtk::EventControllerFocus::new();
         {
             let actions = action_box.downgrade();
@@ -5392,6 +5357,7 @@ impl FinishedBlock {
             rerun_btn,
             review_btn,
             details_btn,
+            filter_btn,
             clear_review_btn,
             review_shelf,
             header_row,
