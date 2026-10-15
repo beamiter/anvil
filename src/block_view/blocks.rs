@@ -10,6 +10,51 @@ use std::rc::Rc;
 use vte4::Terminal;
 use vte4::TerminalExt;
 
+/// A compact native reveal target. The preview is display-only and ellipsized;
+/// its width must never become the minimum width of a narrow split pane.
+fn set_folded_summary(button: &gtk::Button, summary: &str, preview: Option<&str>) {
+    let body = button
+        .child()
+        .and_then(|child| child.downcast::<gtk::Box>().ok());
+    let body = body.unwrap_or_else(|| {
+        let body = gtk::Box::new(Orientation::Vertical, 2);
+        for class in ["block-output-summary-title", "block-output-preview"] {
+            let label = gtk::Label::new(None);
+            label.add_css_class(class);
+            label.set_xalign(0.0);
+            label.set_hexpand(true);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            label.set_single_line_mode(true);
+            label.set_width_chars(1);
+            label.set_max_width_chars(72);
+            if class == "block-output-preview" {
+                label.add_css_class("dim-label");
+            }
+            body.append(&label);
+        }
+        button.set_child(Some(&body));
+        button.set_halign(gtk::Align::Fill);
+        button.set_hexpand(true);
+        body
+    });
+    let title = body.first_child().and_downcast::<gtk::Label>().unwrap();
+    let detail = body.last_child().and_downcast::<gtk::Label>().unwrap();
+    title.set_text(summary);
+    if let Some(preview) = preview {
+        detail.set_text(&format!("Preview: {preview}"));
+        detail.set_visible(!preview.is_empty());
+    }
+    let accessible = if detail.get_visible() {
+        format!("{summary}. {}", detail.text())
+    } else {
+        summary.to_string()
+    };
+    button.update_property(&[gtk::accessible::Property::Label(&accessible)]);
+    button.set_tooltip_text(Some(
+        "Show output. Preview shows the last non-empty retained line.",
+    ));
+}
+
 /// Conservative per-pane estimated-memory budget for completed-block objects.
 ///
 /// The configurable count limit is not a memory limit: a few ANSI-heavy cards
@@ -3452,8 +3497,9 @@ fn finished_card_refit_height(rows: i64, cell_height: i32, compact: bool) -> i32
 /// Recomputing them inside the constructor walked a 1.3 MB transcript a second
 /// and third time for numbers the caller was already holding. `None` keeps the
 /// old self-sufficient behavior for restore paths and tests.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct FinishedBlockPrecomputed {
+    pub(crate) output_preview: Option<String>,
     pub(crate) output_rows: Option<i64>,
     pub(crate) retained_bytes: Option<usize>,
 }
@@ -4822,6 +4868,11 @@ impl FinishedBlock {
             Some(ib)
         };
 
+        let original_preview = Rc::new(
+            precomputed
+                .output_preview
+                .unwrap_or_else(|| super::fold_preview::from_plain(&strip_ansi(output))),
+        );
         let collapsed_summary = gtk::Button::with_label(&collapsed_output_summary(
             output_rows,
             !output.trim().is_empty(),
@@ -4835,6 +4886,8 @@ impl FinishedBlock {
         collapsed_summary.set_margin_end(8);
         collapsed_summary.set_margin_bottom(4);
         collapsed_summary.set_tooltip_text(Some("Show block output"));
+        let summary_title = collapsed_summary.label().unwrap_or_default();
+        set_folded_summary(&collapsed_summary, &summary_title, Some(&original_preview));
         collapsed_summary.set_visible(false);
         content.append(&collapsed_summary);
 
@@ -4998,6 +5051,7 @@ impl FinishedBlock {
             let expand_btn = expand_btn.downgrade();
             let output_scrollbar = output_scrollbar.downgrade();
             let collapsed_summary = collapsed_summary.downgrade();
+            let original_preview = original_preview.clone();
             let build_filter_row: Rc<FilterRowBuilder> = {
                 let full_output = full_output.clone();
                 let displayed_output = displayed_output.clone();
@@ -5060,6 +5114,7 @@ impl FinishedBlock {
                         let expanded = expanded.clone();
                         let dynamic_viewport_rows = dynamic_viewport_rows.clone();
                         let collapsed_summary = collapsed_summary.clone();
+                        let original_preview = original_preview.clone();
                         let filter_enabled = filter_enabled.clone();
                         let render_stamp = render_stamp.clone();
                         let displayed_generation = displayed_generation.clone();
@@ -5181,11 +5236,18 @@ impl FinishedBlock {
                             }
                             expand_btn.set_visible(shown_visual_rows > dynamic_viewport_rows.get());
                             output_scrollbar.set_visible(shown_visual_rows > active_cap);
-                            collapsed_summary.set_label(&collapsed_output_summary(
-                                shown_rows,
-                                true,
-                                image_count,
-                            ));
+                            let preview = display_changed.then(|| {
+                                if next_display.is_none() {
+                                    original_preview.as_ref().clone()
+                                } else {
+                                    super::fold_preview::from_plain(&strip_ansi(shown))
+                                }
+                            });
+                            set_folded_summary(
+                                &collapsed_summary,
+                                &collapsed_output_summary(shown_rows, true, image_count),
+                                preview.as_deref(),
+                            );
                             if display_changed {
                                 *displayed_output.borrow_mut() = next_display;
                             }
@@ -6376,3 +6438,7 @@ mod chat_geometry_tests {
         assert_eq!(super::chat_command_columns("pwd", 8), 6);
     }
 }
+
+#[cfg(test)]
+#[path = "fold_preview_tests.rs"]
+mod fold_preview_tests;

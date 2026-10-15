@@ -39,6 +39,7 @@ mod css;
 mod export;
 mod find;
 mod focus_restore;
+mod fold_preview;
 pub(crate) use focus_restore::restore_live_focus_deferred;
 mod history;
 mod onboarding;
@@ -462,9 +463,9 @@ fn mutate_block_data_and_redraw<R>(
 
 /// A card's virtualization height for the folded state it is in.
 ///
-/// A folded card shows its header and command and nothing else, so its
-/// contribution to the document is the same as a command with no output. The
-/// estimator's own convention for that is zero output rows.
+/// A folded card retains a compact summary and one preview line when it has
+/// output. Reserve two rows for that reveal target; an empty card retains the
+/// estimator's ordinary zero-output convention.
 fn collapsed_aware_block_height(
     config: &Config,
     data: &BlockData,
@@ -477,7 +478,11 @@ fn collapsed_aware_block_height(
         fallback_cols
     };
     if collapsed {
-        estimated_finished_block_height_for_rows(config, 0, cols)
+        estimated_finished_block_height_for_rows(
+            config,
+            if data.output.is_empty() { 0 } else { 2 },
+            cols,
+        )
     } else {
         estimated_finished_block_height_for_text(config, &data.output, cols)
     }
@@ -9041,6 +9046,7 @@ impl RenderBackend for BlockBackend {
             recycled,
             FinishedBlockPrecomputed {
                 output_rows: Some(output_rows),
+                output_preview: Some(fold_preview::from_plain(output_plain)),
                 retained_bytes: Some(newest_estimated_bytes),
             },
         );
