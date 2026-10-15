@@ -492,6 +492,7 @@ struct AppModel {
 #[allow(clippy::too_many_arguments)]
 fn create_pane(
     config: &Rc<RefCell<Config>>,
+    keybindings: &Rc<RefCell<KeybindingMap>>,
     organism_hub: &Rc<organism_ui::OrganismHub>,
     shell_argv: &Rc<Vec<String>>,
     tab_id: u64,
@@ -587,6 +588,7 @@ fn create_pane(
                 .launch(init)
                 .forward(sender.input_sender(), forward);
             if let Some(view) = controller.model().term_view() {
+                view.set_menu_keybindings(keybindings.clone());
                 organism_hub.attach_ascii_organism_to_view(&view, cwd_external);
             }
             TermCtl::Block(controller)

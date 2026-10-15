@@ -40,6 +40,7 @@ mod export;
 mod find;
 mod focus_restore;
 mod fold_preview;
+mod shortcut_hints;
 pub(crate) use focus_restore::restore_live_focus_deferred;
 mod history;
 mod onboarding;
@@ -4201,6 +4202,7 @@ fn long_block_notification_exit_code(reported: Option<i32>) -> Option<i32> {
 }
 
 pub struct TermView {
+    menu_keybindings: shortcut_hints::MenuKeybindings,
     root: gtk::Box,
     block_scroll: ScrolledWindow,
     block_list: gtk::Box,
@@ -5264,6 +5266,7 @@ fn schedule_prompt_anchor_settle(args: AnchorSettleArgs) {
 /// `ReaderCtx` holds — finished-block actions and the context menu rebind
 /// them when the user re-runs a command from history.
 struct BlockBackend {
+    menu_keybindings: shortcut_hints::MenuKeybindings,
     active_rc: Rc<RefCell<ActiveBlock>>,
     /// The live VTE — every byte is fed here; alt-screen toggles feed it 1049h/l.
     active_vte: Terminal,
@@ -7847,6 +7850,7 @@ impl RenderBackend for BlockBackend {
         let fix_block_cbs_for_menu = self.fix_block_with_agent_cbs.clone();
         let delete_selected_cbs_for_menu = self.delete_selected_cbs.clone();
         let current_cwd_for_menu = self.current_cwd_for_menu.clone();
+        let menu_keybindings = self.menu_keybindings.clone();
         let cross_selection_for_menu = self.cross_selection_slot.clone();
 
         let right_click = gtk::GestureClick::new();
@@ -8263,6 +8267,11 @@ impl RenderBackend for BlockBackend {
                 } else {
                     "Fold Output"
                 });
+                shortcut_hints::decorate(
+                    &item,
+                    &menu_keybindings,
+                    crate::keybindings::Action::ToggleBlockCollapsed,
+                );
                 let popover_c = popover.clone();
                 let finished_for_fold = finished_menu_clone.clone();
                 item.connect_clicked(move |_| {
@@ -8448,6 +8457,11 @@ impl RenderBackend for BlockBackend {
                     "Delete Block".to_string()
                 };
                 let item = make_item(&delete_label);
+                shortcut_hints::decorate(
+                    &item,
+                    &menu_keybindings,
+                    crate::keybindings::Action::DeleteSelectedBlocks,
+                );
                 let popover_c = popover.clone();
                 let delete_selected_cbs_for_delete = delete_selected_cbs_for_menu.clone();
                 item.connect_clicked(move |_| {
@@ -12521,6 +12535,7 @@ impl TermView {
         // integration is live.
         let ftcs_seen: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let current_cwd: Rc<RefCell<String>> = Rc::new(RefCell::new(cwd.unwrap_or("").to_string()));
+        let menu_keybindings = shortcut_hints::MenuKeybindings::default();
         let current_cwd_external = Rc::new(Cell::new(cwd_external));
 
         // CWD updates come from VTE's native OSC 7 signal (the parser passes
@@ -12719,6 +12734,7 @@ impl TermView {
                     fix_block_with_agent_cbs: fix_block_with_agent_callbacks.clone(),
                     delete_selected_cbs: delete_selected_callbacks.clone(),
                     current_cwd_for_menu: current_cwd.clone(),
+                    menu_keybindings: menu_keybindings.clone(),
                     bstate_rc: bstate_rc.clone(),
                     typed_cmd_rc: typed_cmd_rc.clone(),
                     armed_agent_execution_rc: armed_agent_execution.clone(),
@@ -14177,6 +14193,7 @@ impl TermView {
             sticky_organism_slot,
             find_state,
             current_cwd: current_cwd.clone(),
+            menu_keybindings,
             resize_tick_id,
             resize_kick,
             pty_winsize,
@@ -14984,6 +15001,11 @@ impl TermView {
             }
             {
                 let item = menu_item("Paste");
+                shortcut_hints::decorate(
+                    &item,
+                    &view.menu_keybindings,
+                    crate::keybindings::Action::Paste,
+                );
                 let popover_c = popover.clone();
                 let view = Rc::downgrade(&view);
                 item.connect_clicked(move |_| {
@@ -15002,6 +15024,11 @@ impl TermView {
             {
                 vbox.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
                 let item = menu_item("Select All Blocks");
+                shortcut_hints::decorate(
+                    &item,
+                    &view.menu_keybindings,
+                    crate::keybindings::Action::SelectAllBlocks,
+                );
                 let popover_c = popover.clone();
                 let view = Rc::downgrade(&view);
                 item.connect_clicked(move |_| {
@@ -28127,3 +28154,10 @@ mod search_navigation_tests;
 
 #[cfg(test)]
 mod incremental_find_tests;
+
+impl TermView {
+    /// Share the same mutable map as key dispatch; menu rebuilds see reloads.
+    pub(crate) fn set_menu_keybindings(&self, map: Rc<RefCell<crate::keybindings::KeybindingMap>>) {
+        *self.menu_keybindings.borrow_mut() = Some(map);
+    }
+}

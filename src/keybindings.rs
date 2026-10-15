@@ -799,6 +799,30 @@ impl KeybindingMap {
         chords.join(", ")
     }
 
+    /// Compact menu hints reflect only the current map, never default fallbacks.
+    pub(crate) fn menu_binding_display(&self, action: &Action) -> String {
+        let mut chords: Vec<_> = self
+            .bindings
+            .iter()
+            .filter(|(_, bound)| *bound == action)
+            .map(|(chord, _)| chord.display())
+            .collect();
+        chords.sort();
+        chords.dedup();
+        let more = chords.len() > 3;
+        chords.truncate(3);
+        let mut label = chords.join(" / ");
+        if more {
+            label.push_str(" / …");
+        }
+        let mut chars = label.chars();
+        let mut bounded: String = chars.by_ref().take(96).collect();
+        if chars.next().is_some() {
+            bounded.push('…');
+        }
+        bounded
+    }
+
     pub(crate) fn all_bound_actions(&self) -> Vec<(Action, String)> {
         let mut result = Vec::new();
         for action in Action::all_actions() {
@@ -1476,5 +1500,28 @@ toggle_block_collapsed = "F10"
             assert!(bindings.binding_display(&action).is_empty());
             assert!(actions.contains(&action));
         }
+    }
+}
+
+#[cfg(test)]
+mod menu_hint_tests {
+    use super::*;
+
+    #[test]
+    fn menu_bindings_are_current_sorted_bounded_and_optional() {
+        let mut map = KeybindingMap::from_defaults();
+        let mut overrides = toml::Table::new();
+        overrides.insert("paste".into(), toml::Value::String("none".into()));
+        map.apply_user_overrides(&overrides).unwrap();
+        assert_eq!(map.menu_binding_display(&Action::Paste), "");
+        for key in ["F9", "F6", "F8", "F7"] {
+            map.bindings.insert(parse(key).unwrap(), Action::Paste);
+        }
+        assert_eq!(map.menu_binding_display(&Action::Paste), "F6 / F7 / F8 / …");
+        overrides.insert("paste".into(), toml::Value::String("F10".into()));
+        map.apply_user_overrides(&overrides).unwrap();
+        assert_eq!(map.menu_binding_display(&Action::Paste), "F10");
+        assert_eq!(map.lookup(&parse("F10").unwrap()), Some(Action::Paste));
+        assert_eq!(map.lookup(&parse("F6").unwrap()), None);
     }
 }

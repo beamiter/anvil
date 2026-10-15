@@ -846,6 +846,7 @@ impl AppModel {
         let title_cwd = working_directory.clone();
         let pane = create_pane(
             &self.config,
+            &self.kbmap,
             &self.organism_hub,
             &shell_argv,
             id,
@@ -991,6 +992,7 @@ impl AppModel {
                             let shell_argv = Rc::new(shell_argv);
                             let pane = create_pane(
                                 &self.config,
+                                &self.kbmap,
                                 &self.organism_hub,
                                 &shell_argv,
                                 tab_id,
@@ -1055,6 +1057,7 @@ impl AppModel {
                 }
                 let pane = create_pane(
                     &self.config,
+                    &self.kbmap,
                     &self.organism_hub,
                     &self.shell_argv,
                     tab_id,
@@ -1570,6 +1573,7 @@ impl AppModel {
         let mode = TerminalMode::Block;
         let pane = create_pane(
             &self.config,
+            &self.kbmap,
             &self.organism_hub,
             &argv,
             id,
@@ -1738,6 +1742,7 @@ impl AppModel {
         let mode = TerminalMode::Block;
         let pane = create_pane(
             &self.config,
+            &self.kbmap,
             &self.organism_hub,
             &argv,
             self.tabs[idx].id,
@@ -2279,6 +2284,7 @@ impl AppModel {
         let mode = self.config.borrow().terminal_mode;
         let pane = create_pane(
             &self.config,
+            &self.kbmap,
             &self.organism_hub,
             &self.shell_argv,
             id,
@@ -2474,12 +2480,14 @@ impl AppModel {
         let pane_id = self.next_pane_id;
         self.next_pane_id += 1;
         let config = self.config.clone();
+        let keybindings = self.kbmap.clone();
         let organism_hub = self.organism_hub.clone();
         let shell_argv = self.shell_argv.clone();
         let split = prepare_then_commit(
             || {
                 let pane = create_pane(
                     &config,
+                    &keybindings,
                     &organism_hub,
                     &shell_argv,
                     tab_id,
