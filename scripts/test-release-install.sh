@@ -70,7 +70,7 @@ desktop="${applications}/io.github.beamiter.anvil.desktop"
 assert_no_staging_files "${root}"
 
 # First-run publication creates a private file, while later installs preserve
-# the user's exact bytes. Directory symlinks are existing choices too.
+# the user's exact bytes in a backup. Directory symlinks are existing choices too.
 root="${TEST_ROOT}/fresh"
 run_install "${root}" >"${TEST_ROOT}/fresh.log" 2>&1
 config="${root}/config/anvil/config.toml"
@@ -78,7 +78,11 @@ config="${root}/config/anvil/config.toml"
 [[ "$(stat -c '%a' -- "${config}")" == 600 ]] || fail "initial config mode is not 0600"
 printf 'keep user configuration\n' >"${config}"
 run_install "${root}" >>"${TEST_ROOT}/fresh.log" 2>&1
-[[ "$(<"${config}")" == 'keep user configuration' ]] || fail "reinstall replaced user config"
+cmp "${bundle}/share/doc/anvil/config.toml.example" "${config}" || fail "reinstall did not update config"
+shopt -s nullglob
+config_backups=("${config}".backup.*)
+((${#config_backups[@]} == 1)) || fail "reinstall did not save one config backup"
+[[ "$(<"${config_backups[0]}")" == 'keep user configuration' ]] || fail "backup lost user config"
 assert_no_staging_files "${root}"
 
 # A valid configuration symlink is also preserved byte-for-byte.

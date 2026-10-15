@@ -5,6 +5,24 @@ set -Eeuo pipefail
 umask 077
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# The helper is bundled under libexec by package-release.sh.
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../scripts/install-config.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/libexec/install-config.sh"
+# Consumed by the bundled config helper.
+# shellcheck disable=SC2034
+DRY_RUN=0
+INSTALL_CONFIG=1
+for option in "$@"; do
+    case "${option}" in
+        --no-config) INSTALL_CONFIG=0 ;;
+        -h|--help)
+            printf 'Usage: ./install.sh [--no-config]\nDefault: install to ~/.local/bin; back up and replace config.toml.\n'
+            exit 0 ;;
+        *) printf 'Unknown option: %s\n' "${option}" >&2; exit 1 ;;
+    esac
+done
 INSTALL_DIR="${HOME}/.local/bin"
 CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
 DATA_HOME="${XDG_DATA_HOME:-${HOME}/.local/share}"
@@ -69,6 +87,11 @@ reserve_install_temp() {
 # publishes without replacing an existing file, dangling link, or race winner.
 install_config_if_absent() {
     local source="$1" dest="$2"
+    ((INSTALL_CONFIG == 1)) || return 0
+    if [[ -f "${dest}" && ! -L "${dest}" ]]; then
+        install_config_with_backup "${source}" "${dest}" "${dest}"
+        return
+    fi
     if [[ -e "${dest}" || -L "${dest}" ]]; then
         printf 'Keeping existing configuration: %s\n' "${dest}"
         return 0
@@ -90,14 +113,28 @@ install_config_if_absent() {
     fi
 }
 
+install_release_binary() {
+    local source="$1" dest="$2"
+    [[ -f "${source}" && ! -L "${source}" && -s "${source}" ]] \
+        || die "release binary must be a nonempty regular file: ${source}"
+    install -d -m 0755 "${dest%/*}"
+    reserve_install_temp "${dest}"
+    cat -- "${source}" >&"${INSTALL_TEMP_FD}"
+    chmod 0755 -- "/proc/self/fd/${INSTALL_TEMP_FD}"
+    install_temp_is_owned || die "binary staging file changed: ${dest}"
+    mv -fT -- "${INSTALL_TEMP}" "${dest}"
+    INSTALL_TEMP=""
+    cleanup_install_temp
+}
+
 if [[ ! -x "${SCRIPT_DIR}/bin/anvil" ]]; then
     echo "Error: ${SCRIPT_DIR}/bin/anvil is missing or not executable." >&2
     exit 1
 fi
 
 printf 'Installing anvil for %s...\n' "${USER:-the current user}"
-install -Dm755 "${SCRIPT_DIR}/bin/anvil" "${INSTALL_DIR}/anvil"
-install -Dm755 "${SCRIPT_DIR}/bin/anvil-support-bundle" \
+install_release_binary "${SCRIPT_DIR}/bin/anvil" "${INSTALL_DIR}/anvil"
+install_release_binary "${SCRIPT_DIR}/bin/anvil-support-bundle" \
     "${INSTALL_DIR}/anvil-support-bundle"
 
 install -d -m 0700 "${CONFIG_DIR}"

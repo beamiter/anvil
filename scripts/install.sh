@@ -7,6 +7,11 @@ umask 077
 APP_ID="io.github.beamiter.anvil"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=install-config.sh
+# The helper is checked separately by the installer regression suite.
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/install-config.sh"
 HOME_DIR="${HOME:-}"
 DESTDIR="${DESTDIR:-}"
 DESTDIR_ACTIVE=0
@@ -36,10 +41,13 @@ Options:
   --backend auto|nix|cargo
                          Build backend (default: auto; prefers Nix)
   --binary PATH          Install a prebuilt anvil binary instead of building
-  --no-config            Do not install config.toml.example
+  --no-config            Keep the existing config unchanged
   --no-desktop           Do not install desktop, AppStream, or icon files
   --dry-run              Print commands without changing files
   -h, --help             Show this help
+
+By default, replace config.toml with bundled defaults after saving a private
+config.toml.backup.* copy. Use --no-config to keep your current settings.
 
 Environment:
   DESTDIR                Optional staging root for packaging
@@ -192,38 +200,6 @@ install_file_atomic() {
     INSTALL_TEMP=""
 }
 
-# Publish a first-run config without a check-then-copy race. The temporary and
-# destination are in the same directory, so link(2) is atomic and cannot cross
-# filesystems; EEXIST means a concurrent writer won and must be preserved.
-install_config_if_absent() {
-    local source="$1" dest="$2" runtime_dest="$3" directory basename
-    if [[ -e "${dest}" || -L "${dest}" ]]; then
-        printf 'Keeping existing config: %s\n' "${runtime_dest}"
-        return 0
-    fi
-    printf '  install -m 0600 %q %q && ln -- %q %q\n' \
-        "${source}" "${dest}.<temporary>" "${dest}.<temporary>" "${dest}"
-    ((DRY_RUN == 0)) || return 0
-    directory="${dest%/*}"
-    basename="${dest##*/}"
-    INSTALL_TEMP="$(mktemp "${directory}/.${basename}.install.XXXXXX")" \
-        || die "cannot create temporary config beside ${dest}"
-    if ! install -m 0600 "${source}" "${INSTALL_TEMP}"; then
-        cleanup_install_temp
-        die "cannot stage initial config for ${dest}"
-    fi
-    if ln -- "${INSTALL_TEMP}" "${dest}" 2>/dev/null; then
-        cleanup_install_temp
-        return 0
-    fi
-    if [[ -e "${dest}" || -L "${dest}" ]]; then
-        cleanup_install_temp
-        printf 'Keeping concurrently created config: %s\n' "${runtime_dest}"
-        return 0
-    fi
-    cleanup_install_temp
-    die "cannot atomically create initial config at ${dest}"
-}
 
 install_binary_atomic() {
     local source="$1" dest="$2"
@@ -557,6 +533,12 @@ if ((INSTALL_CONFIG == 1)); then
     require_source_file "${PROJECT_ROOT}/config.toml.example"
 fi
 
+if ((INSTALL_CONFIG == 1)); then
+    for command in cp cmp stat chmod ln; do
+        require_command "${command}"
+    done
+fi
+
 require_command install
 require_command mktemp
 require_command mv
@@ -667,7 +649,7 @@ fi
 
 if ((INSTALL_CONFIG == 1)); then
     run install -d -m 0700 "${STAGED_CONFIG_DIR}"
-    install_config_if_absent "${PROJECT_ROOT}/config.toml.example" \
+    install_config_with_backup "${PROJECT_ROOT}/config.toml.example" \
         "${STAGED_CONFIG_DIR}/config.toml" "${CONFIG_DIR}/config.toml"
 fi
 

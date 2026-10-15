@@ -37,6 +37,7 @@ trap 'rm -rf -- "${STAGE_DIR}"' EXIT
 install -Dm755 "${BINARY}" "${PACKAGE_ROOT}/bin/anvil"
 install -Dm755 scripts/support-bundle.sh "${PACKAGE_ROOT}/bin/anvil-support-bundle"
 install -Dm755 packaging/install-release.sh "${PACKAGE_ROOT}/install.sh"
+install -Dm0644 scripts/install-config.sh "${PACKAGE_ROOT}/libexec/install-config.sh"
 install -Dm755 scripts/uninstall.sh "${PACKAGE_ROOT}/uninstall.sh"
 install -Dm644 packaging/RELEASE_README.md "${PACKAGE_ROOT}/README.txt"
 printf '%s\n' "${VERSION}" > "${PACKAGE_ROOT}/VERSION"

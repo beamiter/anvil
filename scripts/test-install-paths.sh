@@ -509,3 +509,6 @@ assert_regular_file "binary after rejected root-symlink purge" "${root_binary}"
     || fail "root-symlink purge removed outside config"
 
 printf 'install/uninstall path contract: ok\n'
+
+# Exercise the shared repeat-install and recoverable configuration policy.
+bash "${SCRIPT_DIR}/test-install-upgrade.sh"

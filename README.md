@@ -1475,3 +1475,20 @@ anvil is dual-licensed under **MIT OR Apache-2.0**; pick either at your option.
 Full texts are in [`LICENSE-MIT`](LICENSE-MIT) and
 [`LICENSE-APACHE`](LICENSE-APACHE). Contributions are accepted under the same
 dual terms.
+
+### Source install upgrades
+
+`./scripts/install.sh` installs the executable to `~/.local/bin` by default.
+`--prefix PATH` selects `PATH/bin`; `--bin-dir PATH` overrides only the binary
+directory. Existing binaries are replaced atomically.
+
+The configuration is installed to `${XDG_CONFIG_HOME:-$HOME/.config}/anvil/config.toml`.
+An existing regular config is backed up as `config.toml.backup.<unique suffix>`
+before replacing it with the bundled defaults. Identical configs do not create
+extra backups. Use `--no-config` to retain all custom settings, or copy selected
+settings back from the private backup after installation. Symlinked configs are
+left unchanged. `--dry-run` does not write binaries, configs, or backups.
+
+An already-running terminal keeps its current process; restart it to use the new
+binary and configuration. If an older copy comes first in PATH, the installer
+prints the conflicting path.
