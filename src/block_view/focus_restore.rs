@@ -141,7 +141,7 @@ impl Drop for FocusRestore {
     }
 }
 
-pub(super) fn restore_live_focus_deferred(target: &impl IsA<Widget>) {
+pub(crate) fn restore_live_focus_deferred(target: &impl IsA<Widget>) {
     if let Some(restore) = FocusRestore::live(target) {
         restore.defer();
     }

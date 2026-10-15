@@ -27,6 +27,22 @@ use crate::search::{invalid_regex_message, SearchStatus};
 
 // ─── Terminal widget construction (ported from forge terminal.rs) ──────────
 
+/// Immediate explicit focus followed by an ownership-scoped remap repair.
+/// A reopened search or another pane chosen before idle always wins.
+fn focus_terminal(terminal: &Terminal) {
+    terminal.grab_focus();
+    if terminal.is_mapped() && terminal.has_focus() {
+        crate::block_view::restore_live_focus_deferred(terminal);
+    } else {
+        // Preserve the initial-map retry; mapped focus returns above must
+        // not carry this unconditional startup authority.
+        let terminal = terminal.clone();
+        gtk::glib::idle_add_local_once(move || {
+            terminal.grab_focus();
+        });
+    }
+}
+
 pub(crate) fn create_terminal(config: &Config) -> Terminal {
     let font_scale = config.default_font_scale;
     let terminal = Terminal::builder()
@@ -755,11 +771,7 @@ impl Component for VteTerminal {
                 }
             }
             VteInput::GrabFocus => {
-                self.terminal.grab_focus();
-                let terminal = self.terminal.clone();
-                gtk::glib::idle_add_local_once(move || {
-                    terminal.grab_focus();
-                });
+                focus_terminal(&self.terminal);
             }
             VteInput::Copy | VteInput::CopyOutputOnly => {
                 if let Some(message) = copy_empty_notice(self.terminal.has_selection()) {
@@ -1090,6 +1102,57 @@ fn search_status_for_vte(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn explicit_focus_return_respects_reopened_search() {
+        use gtk::prelude::*;
+        use relm4::gtk;
+        use std::time::{Duration, Instant};
+        gtk::init().unwrap();
+        let terminal = vte4::Terminal::new();
+        let search = gtk::SearchEntry::new();
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.append(&terminal);
+        root.append(&search);
+        let window = gtk::Window::builder().child(&root).build();
+        window.present();
+        let context = gtk::glib::MainContext::default();
+        let until = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < until {
+            while context.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(terminal.is_mapped());
+        for transient_owner in [false, true] {
+            // This is the production entry point used when closing Find.
+            super::focus_terminal(&terminal);
+            assert!(terminal.has_focus());
+            assert!(search.grab_focus());
+            if transient_owner {
+                GtkWindowExt::set_focus(&window, None::<&gtk::Widget>);
+            }
+            while context.iteration(false) {}
+            assert!(!terminal.has_focus(), "newer search ownership wins at idle");
+            if !transient_owner {
+                let owner = GtkWindowExt::focus(&window).unwrap();
+                assert!(owner == *search.upcast_ref::<gtk::Widget>() || owner.is_ancestor(&search));
+            }
+        }
+        // A temporary absence of focus without a newer owner still repairs.
+        super::focus_terminal(&terminal);
+        GtkWindowExt::set_focus(&window, None::<&gtk::Widget>);
+        while context.iteration(false) {}
+        assert!(terminal.has_focus());
+        // Pending repair does not keep a removed terminal alive.
+        super::focus_terminal(&terminal);
+        let weak = terminal.downgrade();
+        root.remove(&terminal);
+        drop(terminal);
+        assert!(weak.upgrade().is_none());
+        window.close();
+        while context.iteration(false) {}
+    }
+
     use super::{
         ask_ai_empty_notice, compile_count_regex, copy_empty_notice, launch_failure_message,
         search_pattern, search_pcre2_flags, search_status_for_vte, vte_block_mode_only_notice,

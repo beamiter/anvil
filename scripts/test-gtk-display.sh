@@ -58,6 +58,7 @@ tests=(
     dialogs::tasks_panel::tests::dashboard_filter_counts_follow_search_not_selected_view
     dialogs::tasks_panel::tests::task_terminal_buttons_only_emit_focus_for_existing_bindings
     dialogs::tasks_panel::tests::task_reason_updates_and_disappears_without_retargeting
+    terminal::vte::tests::explicit_focus_return_respects_reopened_search
     block_view::fold_geometry_tests::fold_actions_update_visible_and_parked_geometry
     block_view::search_navigation_tests::block_output_search_unfolds_only_target
     block_view::search_navigation_tests::chat_output_search_unfolds_only_target

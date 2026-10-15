@@ -39,6 +39,7 @@ mod css;
 mod export;
 mod find;
 mod focus_restore;
+pub(crate) use focus_restore::restore_live_focus_deferred;
 mod history;
 mod onboarding;
 #[allow(dead_code)]
