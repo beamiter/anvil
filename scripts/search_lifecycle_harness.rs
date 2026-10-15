@@ -198,3 +198,62 @@ fn open_pane_transition_replays_current_query() {
         matches!(s.outputs.borrow().as_slice(),[SearchOutput::Changed{query,..}] if query=="needle")
     );
 }
+
+#[test]
+fn queued_controls_after_either_close_path_leave_search_idle() {
+    for close in [SearchMsg::Close, SearchMsg::Toggle] {
+        let (mut m, mut w, s, r) = setup();
+        w.entry.set_text("needle");
+        apply(&mut m, &mut w, &s, &r, close);
+        s.outputs.borrow_mut().clear();
+        for message in [
+            SearchMsg::CaseSensitive(true),
+            SearchMsg::Next,
+            SearchMsg::Previous,
+            SearchMsg::Status(SearchStatus::results(1, 3)),
+        ] {
+            apply(&mut m, &mut w, &s, &r, message);
+            assert!(s.outputs.borrow().is_empty(), "closed search emitted work");
+            assert!(w.status_label.text.borrow().is_empty());
+            assert!(!w.next_button.0.get());
+            assert!(!w.previous_button.0.get());
+        }
+        // The queued option is retained, but only reopening may apply it.
+        apply(&mut m, &mut w, &s, &r, SearchMsg::Toggle);
+        assert!(
+            matches!(s.outputs.borrow().as_slice(),
+            [SearchOutput::Changed { query, case_sensitive: true }] if query == "needle")
+        );
+        assert_eq!(*w.status_label.text.borrow(), "Searching…");
+    }
+}
+
+#[test]
+fn open_search_still_accepts_options_status_and_navigation() {
+    let (mut m, mut w, s, r) = setup();
+    w.entry.set_text("needle");
+    apply(&mut m, &mut w, &s, &r, SearchMsg::CaseSensitive(true));
+    assert!(
+        matches!(s.outputs.borrow().as_slice(),
+        [SearchOutput::Changed { query, case_sensitive: true }] if query == "needle")
+    );
+    s.outputs.borrow_mut().clear();
+    apply(&mut m, &mut w, &s, &r, SearchMsg::CaseSensitive(true));
+    assert!(s.outputs.borrow().is_empty());
+    apply(
+        &mut m,
+        &mut w,
+        &s,
+        &r,
+        SearchMsg::Status(SearchStatus::results(1, 3)),
+    );
+    assert_eq!(*w.status_label.text.borrow(), "1 of 3");
+    assert!(w.next_button.0.get());
+    assert!(w.previous_button.0.get());
+    apply(&mut m, &mut w, &s, &r, SearchMsg::Next);
+    apply(&mut m, &mut w, &s, &r, SearchMsg::Previous);
+    assert!(matches!(
+        s.outputs.borrow().as_slice(),
+        [SearchOutput::Next, SearchOutput::Previous]
+    ));
+}

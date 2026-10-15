@@ -347,6 +347,11 @@ impl Component for SearchModel {
                     return;
                 }
                 self.case_sensitive = case_sensitive;
+                // A queued toggle can arrive after Close. Retain the option
+                // for reopening, but never restart a hidden backend search.
+                if !root.is_search_mode() {
+                    return;
+                }
                 let query = widgets.entry.text().to_string();
                 if !query.is_empty() {
                     apply_status(widgets, &SearchStatus::Searching);
@@ -362,12 +367,20 @@ impl Component for SearchModel {
                     emit_changed(&sender, query, self.case_sensitive);
                 }
             }
-            SearchMsg::Status(status) => apply_status(widgets, &status),
+            SearchMsg::Status(status) => {
+                if root.is_search_mode() {
+                    apply_status(widgets, &status);
+                }
+            }
             SearchMsg::Next => {
-                let _ = sender.output(SearchOutput::Next);
+                if root.is_search_mode() {
+                    let _ = sender.output(SearchOutput::Next);
+                }
             }
             SearchMsg::Previous => {
-                let _ = sender.output(SearchOutput::Previous);
+                if root.is_search_mode() {
+                    let _ = sender.output(SearchOutput::Previous);
+                }
             }
             SearchMsg::Close => {
                 apply_status(widgets, &SearchStatus::Idle);
