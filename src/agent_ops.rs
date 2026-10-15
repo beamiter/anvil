@@ -249,13 +249,15 @@ impl AppModel {
             previous.cancel();
         }
         // A snapshot persisted by the previous run is restored one-shot and
-        // rebound to the pane the user reopened the Agent on.
+        // retained as read-only history until the user starts a new task.
         let snapshot_file = Self::agent_snapshot_path();
         let restored = restore_agent_snapshot_once(&snapshot_file);
         let (mut session, was_restored) = match restored {
             Some(inner) => match agent::AgentSession::from_restored(inner, tab_id, pane_id) {
                 Some(session) => {
-                    self.show_toast("Restored the previous agent session.");
+                    self.show_toast(
+                        "Restored Agent history for review. Start a new task for this pane.",
+                    );
                     (session, true)
                 }
                 None => {
@@ -314,7 +316,7 @@ impl AppModel {
         if was_restored {
             self.agent_append_activity(
                 "Agent",
-                "Restored the previous Agent session from your last run.",
+                "Restored the previous Agent transcript for review only. Start a new task to bind this pane.",
             );
             let transcript = self
                 .active_agent
@@ -327,27 +329,29 @@ impl AppModel {
 
         // Keep the readiness chip live while the card is open without
         // rebuilding the editable proposal or transcript every tick.
-        let active_agent = self.active_agent.clone();
-        let live_generation = self.agent_panel_generation.clone();
+        let active_agent = Rc::downgrade(&self.active_agent);
+        let live_generation = Rc::downgrade(&self.agent_panel_generation);
         let prompt_sender = sender.clone();
         gtk::glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
-            if live_generation.get() != panel_generation {
+            let (Some(active_agent), Some(live_generation)) =
+                (active_agent.upgrade(), live_generation.upgrade())
+            else {
+                return gtk::glib::ControlFlow::Break;
+            };
+            if live_generation.get() != panel_generation || active_agent.borrow().is_none() {
                 return gtk::glib::ControlFlow::Break;
             }
             let epoch = active_agent
                 .borrow()
                 .as_ref()
                 .and_then(|session| (!session.is_cancelled()).then_some(session.epoch()));
-            let Some(epoch) = epoch else {
-                return gtk::glib::ControlFlow::Break;
-            };
-            prompt_sender.input(AppMsg::AgentRefreshPrompt(epoch));
+            // A restored read-only session can start a fresh task in this
+            // same card. Keep its existing readiness timer available.
+            if let Some(epoch) = epoch {
+                prompt_sender.input(AppMsg::AgentRefreshPrompt(epoch));
+            }
             gtk::glib::ControlFlow::Continue
         });
-        // A restored session may have died mid-request; resume it.
-        if self.agent_is_awaiting_model() {
-            self.agent_kick_llm(sender);
-        }
     }
 
     pub(crate) fn agent_panel_view(&self) -> Option<agent::AgentPanelView> {
@@ -1300,6 +1304,38 @@ mod snapshot_tests {
         let mut session = jterm_core::agent::AgentSession::new(4);
         session.submit_user("persist this session").unwrap();
         session.snapshot().expect("non-empty session snapshots")
+    }
+
+    #[test]
+    fn readiness_timer_retires_on_close_replacement_or_drop() {
+        let source = include_str!("agent_ops.rs")
+            .split("mod snapshot_tests")
+            .next()
+            .unwrap();
+        let timer = source
+            .split("let active_agent = Rc::downgrade")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn agent_panel_view")
+            .next()
+            .unwrap();
+        assert!(timer.contains("active_agent.upgrade(), live_generation.upgrade()"));
+        assert!(timer.contains(
+            "live_generation.get() != panel_generation || active_agent.borrow().is_none()"
+        ));
+        assert!(timer.contains("if let Some(epoch) = epoch"));
+        assert!(!timer.contains("agent_kick_llm"));
+        let reset = source
+            .split("pub(crate) fn agent_new_task")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn agent_stop_request")
+            .next()
+            .unwrap();
+        assert!(!reset.contains("timeout_add"));
+        let close = source.split("pub(crate) fn agent_close").nth(1).unwrap();
+        assert!(close.contains("self.agent_panel_generation.get().wrapping_add(1)"));
+        assert!(close.contains("self.active_agent.borrow_mut().take()"));
     }
 
     #[test]

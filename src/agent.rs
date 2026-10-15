@@ -169,8 +169,8 @@ impl AgentSession {
         Self::wrap(CoreSession::new(max_turns), bound_tab, bound_pane)
     }
 
-    /// Rebind a session restored from a cross-restart snapshot to the pane
-    /// the user reopened the Agent on.
+    /// Preserve restored history for review without transferring authority to
+    /// the newly opened pane: snapshots carry no terminal or cwd provenance.
     pub(crate) fn from_restored(
         inner: CoreSession,
         bound_tab: u64,
@@ -188,6 +188,7 @@ impl AgentSession {
                     "Earlier activity was omitted to keep the saved session within its size limit",
                 );
             let mut session = Self::wrap(inner, bound_tab, bound_pane);
+            session.cancel();
             session.restored_history_notice = notice;
             session
         })
@@ -505,7 +506,11 @@ impl AgentSession {
         // A queued New task action can arrive while a model request or an
         // approved command is still live. Preserve its handle/correlation if
         // the protocol refuses the transition.
-        self.inner.start_new_task()?;
+        if self.inner.state() == AgentState::Cancelled {
+            self.inner = CoreSession::new(self.inner.max_turns());
+        } else {
+            self.inner.start_new_task()?;
+        }
         self.active_request = None;
         self.restored_history_notice = None;
         if let Some(handle) = self.in_flight.take() {
@@ -1077,7 +1082,7 @@ impl AgentPanelModel {
             !can_follow_up
                 && matches!(
                     self.view.state,
-                    AgentState::Completed | AgentState::TurnLimitReached
+                    AgentState::Completed | AgentState::Cancelled | AgentState::TurnLimitReached
                 ),
         );
         widgets
@@ -1385,25 +1390,52 @@ mod tests {
     }
 
     #[test]
-    fn restored_history_notice_survives_failed_reset_and_followup_until_new_task() {
+    fn restored_history_is_review_only_until_a_fresh_task() {
         let mut session =
             AgentSession::from_restored(legacy_omitted_history_session(), 1, 2).unwrap();
-        let notice = session
-            .restored_history_notice
-            .expect("old omitted snapshots must disclose history loss");
-        assert!(session.start_new_task().is_err());
-        assert_eq!(session.restored_history_notice, Some(notice));
-        session
-            .accept_model_reply(r#"{"action":"done","message":"finished"}"#)
-            .unwrap();
-        session.continue_after_completion().unwrap();
-        assert_eq!(session.restored_history_notice, Some(notice));
-        session.submit_user("follow up").unwrap();
-        session
-            .accept_model_reply(r#"{"action":"done","message":"finished"}"#)
-            .unwrap();
+        assert!(session.restored_history_notice.is_some());
+        assert_eq!(session.state(), AgentState::Cancelled);
+        assert!(!session.transcript().is_empty());
+        assert!(session.submit_user("follow up").is_err());
+        let old_epoch = session.epoch();
         session.start_new_task().unwrap();
+        assert_ne!(session.epoch(), old_epoch);
+        assert_eq!(session.state(), AgentState::Ready);
+        assert!(session.transcript().is_empty());
         assert!(session.restored_history_notice.is_none());
+        session.submit_user("fresh task").unwrap();
+    }
+
+    #[test]
+    fn restored_pending_proposal_cannot_run_in_the_new_pane() {
+        let mut core = CoreSession::new(10);
+        core.submit_user("old task").unwrap();
+        let id = match core
+            .accept_model_reply(r#"{"action":"run","command":"pwd"}"#)
+            .unwrap()
+        {
+            ModelOutcome::Proposal { id, .. } => id,
+            other => panic!("expected proposal: {other:?}"),
+        };
+        let mut session = AgentSession::from_restored(core, 10, 20).unwrap();
+        assert!(session.approve(id).is_err());
+        let old_epoch = session.epoch();
+        let stale = AgentProposalRef {
+            epoch: old_epoch,
+            id,
+        };
+        session.start_new_task().unwrap();
+        assert_ne!(session.epoch(), old_epoch);
+        session.submit_user("new task").unwrap();
+        let new_id = match session
+            .accept_model_reply(r#"{"action":"run","command":"pwd"}"#)
+            .unwrap()
+        {
+            ModelOutcome::Proposal { id, .. } => id,
+            other => panic!("expected proposal: {other:?}"),
+        };
+        assert!(session.resolve_proposal(stale).is_none());
+        assert!(session.approve(new_id).is_ok());
     }
 
     #[test]
