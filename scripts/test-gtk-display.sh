@@ -84,6 +84,7 @@ tests=(
     block_view::focus_restore::tests::deferred_focus_preserves_remaps_and_retires_hidden_targets
     block_view::focus_restore::tests::popover_focus_return_retires_on_newer_owner
     organism_ui::tests::idle_refresh_skips_unchanged_tooltip_and_non_owner_spatial_render
+    organism_ui::tests::hidden_sticky_heartbeat_catches_up_on_map_without_retaining_pane
     block_view::chat::tests::chat_reparents_only_live_clip_and_hides_submit_for_native_takeover
     block_view::chat::tests::chat_raw_takeover_updates_columns_without_resizing_the_window
     block_view::chat::tests::chat_submit_uses_one_native_commit_and_refuses_a_stale_button

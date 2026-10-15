@@ -3030,6 +3030,19 @@ impl OrganismRuntime {
         self.render(&idle);
     }
 
+    /// Hidden panes keep their semantic heartbeat, but need no sticky glyph
+    /// writes. Mapping catches presentation up synchronously without changing
+    /// presence ownership, timers, or the physiology clock.
+    fn install_map_observer(runtime: &Rc<Self>, view: &Rc<TermView>) {
+        let runtime_weak = Rc::downgrade(runtime);
+        let view_weak = Rc::downgrade(view);
+        view.widget().connect_map(move |_| {
+            if let (Some(runtime), Some(view)) = (runtime_weak.upgrade(), view_weak.upgrade()) {
+                runtime.refresh_surface(&view, Instant::now());
+            }
+        });
+    }
+
     fn refresh_surface(&self, view: &TermView, now: Instant) {
         self.refresh_surface_with_attention(view, now, true);
     }
@@ -3187,7 +3200,7 @@ impl OrganismRuntime {
                 .with_watch_rhythm(rhythm),
             baseline_frame,
         );
-        if self.sticky_avatar.text().as_str() != glyph.as_ref() {
+        if view.widget().is_mapped() && self.sticky_avatar.text().as_str() != glyph.as_ref() {
             self.sticky_avatar.set_text(glyph.as_ref());
         }
 
@@ -4098,6 +4111,7 @@ impl OrganismHub {
             .awaiting_unobserved_work
             .set(!view.organism_activity_settled());
         self.organism_presence.bind(presence_token, view, &runtime);
+        OrganismRuntime::install_map_observer(&runtime, view);
         OrganismRuntime::install_pointer_observer(&runtime, view);
         install_card_tooltip_proxy(
             &view.widget(),
@@ -4782,6 +4796,91 @@ mod tests {
 
     #[test]
     #[ignore = "requires DISPLAY"]
+    fn hidden_sticky_heartbeat_catches_up_on_map_without_retaining_pane() {
+        gtk::init().expect("gtk display");
+        let view = crate::block_view::organism_settings_test_view();
+        let root = view.widget();
+        let presence = OrganismPresence::new();
+        let token = presence.reserve();
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
+        let runtime = OrganismRuntime::new(
+            Rc::new(Cell::new(LifeState::default())),
+            activity,
+            presence.clone(),
+            token,
+            OrganismMotion::Full,
+            true,
+        );
+        presence.bind(token, &view, &runtime);
+        OrganismRuntime::install_map_observer(&runtime, &view);
+        view.insert_inline_notice(&runtime.card);
+        view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0);
+        view.put_sticky_organism_avatar(runtime.sticky_avatar.upcast_ref());
+        let window = gtk::Window::new();
+        window.set_default_size(640, 480);
+        window.set_child(Some(&root));
+        window.present();
+        let main = gtk::glib::MainContext::default();
+        let start = Instant::now();
+        while !root.is_mapped() && start.elapsed() < Duration::from_secs(3) {
+            while main.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(root.is_mapped());
+        presence.focus_view(Some(&view));
+        presence.focus_view(None);
+        root.set_visible(false);
+        assert!(!root.is_mapped());
+        runtime.sticky_avatar.set_text("hidden stale fixture");
+        let frames = runtime.surface_frame.get();
+        OrganismRuntime::schedule_surface_frame(&runtime, &view, Duration::from_millis(1));
+        let start = Instant::now();
+        while runtime.surface_frame.get() == frames && start.elapsed() < Duration::from_secs(3) {
+            while main.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            runtime.surface_frame.get() > frames,
+            "hidden heartbeat still advances"
+        );
+        assert_eq!(
+            runtime.sticky_avatar.text().as_str(),
+            "hidden stale fixture"
+        );
+        assert!(!presence.is_owner(token));
+        root.set_visible(true);
+        assert!(root.is_mapped());
+        // No timer or main-loop turn may be needed to repair the hidden glyph.
+        assert_ne!(
+            runtime.sticky_avatar.text().as_str(),
+            "hidden stale fixture"
+        );
+        let caught_up = runtime.sticky_avatar.text();
+        runtime.refresh_surface(&view, Instant::now());
+        assert_eq!(runtime.sticky_avatar.text(), caught_up);
+        assert!(
+            !presence.is_owner(token),
+            "mapping cannot claim live presence"
+        );
+        presence.focus_view(Some(&view));
+        assert!(presence.is_owner(token));
+        let weak_runtime = Rc::downgrade(&runtime);
+        let weak_view = Rc::downgrade(&view);
+        window.set_child(None::<&gtk::Widget>);
+        drop(runtime);
+        drop(view);
+        assert!(weak_runtime.upgrade().is_none());
+        assert!(weak_view.upgrade().is_none());
+        // Keep the signal owner alive after its pane/runtime have gone away.
+        // A remap invokes the same production weak callback and must be inert.
+        window.set_child(Some(&root));
+        assert!(weak_runtime.upgrade().is_none());
+        assert!(weak_view.upgrade().is_none());
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
     fn idle_refresh_skips_unchanged_tooltip_and_non_owner_spatial_render() {
         gtk::init().expect("gtk display");
         let view = crate::block_view::organism_settings_test_view();
@@ -4806,7 +4905,9 @@ mod tests {
         assert_eq!(runtime.tooltip_submissions.get(), submissions);
         assert_eq!(runtime.spatial_renders.get(), 0);
         assert_ne!(runtime.sprite.text().as_str(), "stale inline fixture");
-        assert_ne!(
+        // This fixture never maps: sticky presentation deliberately waits for
+        // the map observer, while inline semantics and tooltip caching remain live.
+        assert_eq!(
             runtime.sticky_avatar.text().as_str(),
             "stale sticky fixture"
         );
