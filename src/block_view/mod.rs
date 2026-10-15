@@ -25809,6 +25809,11 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             None,
             80,
         );
+        // This isolated card has no backend. Supply the action that the real
+        // backend installs so GTK enables the action-backed More button.
+        let actions = gtk::gio::SimpleActionGroup::new();
+        actions.add_action(&gtk::gio::SimpleAction::new("show-menu", None));
+        block.widget().insert_action_group("block", Some(&actions));
         super::blocks::reveal_block_actions(&block.action_box, true);
         let window = gtk::Window::new();
         window.set_default_size(900, 300);
@@ -25843,7 +25848,10 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         ));
 
         let more = block.action_box.last_child().expect("overflow control");
-        assert!(more.is::<gtk::MenuButton>());
+        let more = more.downcast::<gtk::Button>().expect("More action button");
+        assert_eq!(more.action_name().as_deref(), Some("block.show-menu"));
+        assert!(!more.gets_focus_on_click());
+        assert!(more.is_sensitive());
         let bounds = more.compute_bounds(&card).expect("overflow is laid out");
         assert!(super::press_lands_on_header_button(
             &card,

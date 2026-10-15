@@ -90,7 +90,13 @@ fn more_opens_complete_menu_preserves_selection_and_retires_stale_cards() {
                 settle();
                 view.pty.drain_test_slave(Duration::from_millis(20));
             }
+            // Selecting a range keeps the live prompt focused and does not
+            // scroll history. Reveal the target through the production jump
+            // path first: a parked card deliberately hides its controls.
+            view.scroll_to_block(1);
+            settle();
             view.select_all_blocks();
+            settle();
             let selected = view.selected_block_ids.borrow().clone();
             let card = view.finished_blocks.borrow().last().unwrap().clone();
             let more = card
@@ -100,7 +106,14 @@ fn more_opens_complete_menu_preserves_selection_and_retires_stale_cards() {
                 .downcast::<gtk::Button>()
                 .unwrap();
             assert_eq!(more.action_name().as_deref(), Some("block.show-menu"));
-            assert!(more.grab_focus());
+            assert!(more.is_mapped(), "the target header must be on screen");
+            assert!(more.is_sensitive(), "the active edge owns enabled actions");
+            assert!(more.grab_focus(), "visible More must accept keyboard focus");
+            assert_eq!(
+                gtk::prelude::GtkWindowExt::focus(&window),
+                Some(more.clone().upcast()),
+                "More is the actual keyboard focus owner"
+            );
             more.emit_clicked();
             settle();
             assert_eq!(*view.selected_block_ids.borrow(), selected);
@@ -142,7 +155,11 @@ fn more_opens_complete_menu_preserves_selection_and_retires_stale_cards() {
                     .is_some_and(|focus| widget_is_within(&focus, outside.upcast_ref())),
                 "close cannot take a newer focus owner"
             );
-            more.grab_focus();
+            assert!(more.is_mapped());
+            assert!(
+                more.grab_focus(),
+                "More remains keyboard reachable after close"
+            );
             more.emit_clicked();
             settle();
             let menu = popovers(card.widget()).pop().unwrap();
