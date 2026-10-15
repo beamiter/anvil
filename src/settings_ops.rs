@@ -53,6 +53,7 @@ impl AppModel {
         self.config.borrow_mut().default_font_scale = scale;
         self.sync_terminal_configs();
         self.set_font_scale_all(scale);
+        self.apply_dynamic_css();
     }
 
     /// Hotkey / Ctrl+wheel path: apply immediately, write the config once the

@@ -53,6 +53,8 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::chat::tests::live_font_updates_align_chat_block_and_window_text
+    font::tests::window_text_tracks_terminal_size_on_startup_and_live_updates
     dialogs::tasks_panel::tests::dashboard_filters_preserve_selection_without_retargeting
     dialogs::tasks_panel::tests::dashboard_search_activate_selects_current_visible_result_only
     dialogs::tasks_panel::tests::dashboard_filter_counts_follow_search_not_selected_view

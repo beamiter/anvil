@@ -188,6 +188,37 @@ pub(crate) fn css_font_stack(family: &str, icon_family: Option<&str>) -> String 
     }
 }
 
+/// Match the VTE's Pango size and zoom without rounding fractional points or
+/// interpreting an absolute pixel size as points. CSS and terminal text share
+/// this source; widget icons retain their explicit pixel sizes.
+pub(crate) fn effective_font_size_css(desc: &str, scale: f64) -> String {
+    let font = FontDescription::from_string(desc);
+    let base = if font.size() > 0 {
+        f64::from(font.size()) / f64::from(gtk::pango::SCALE)
+    } else {
+        14.0
+    };
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let unit = if font.is_size_absolute() { "px" } else { "pt" };
+    format!("{}{unit}", base * scale)
+}
+
+/// Scope display-wide CSS to this application's window. Explicit text-node
+/// rules override desktop heading/caption sizes and fixed pane-header sizes;
+/// images and decorative connection dots keep their own icon sizing.
+pub(crate) fn window_font_css(config: &Config) -> String {
+    let size = effective_font_size_css(&config.font_desc, config.default_font_scale);
+    format!(
+        "window.anvil-font-sync, window.anvil-font-sync label:not(.conn-dot),
+         window.anvil-font-sync entry, window.anvil-font-sync text,
+         window.anvil-font-sync textview, window.anvil-font-sync treeview {{ font-size: {size}; }}"
+    )
+}
+
 /// Native popup text follows the configured font without inheriting a
 /// selected tab's bold/italic decoration. Pango parses size/style boundaries;
 /// the existing CSS stack encoder quotes family names safely.
@@ -250,6 +281,168 @@ pub(crate) fn menu_theme_css(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_size_preserves_pango_units_and_fractional_zoom() {
+        assert_eq!(
+            effective_font_size_css("Monospace Bold Italic 12.5", 1.2),
+            "15pt"
+        );
+        assert_eq!(effective_font_size_css("Monospace 17px", 1.5), "25.5px");
+        assert_eq!(effective_font_size_css("Monospace 12", 0.75), "9pt");
+    }
+
+    #[test]
+    fn font_updates_reach_window_css_and_every_terminal() {
+        let settings = include_str!("settings_ops.rs");
+        let stage = settings
+            .split("pub(crate) fn stage_font_scale")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn apply_font_scale_step")
+            .next()
+            .unwrap();
+        assert!(stage.contains("default_font_scale = scale"));
+        assert!(stage.contains("self.set_font_scale_all(scale)"));
+        assert!(stage.contains("self.apply_dynamic_css()"));
+        let startup = include_str!("main.rs");
+        assert!(startup.contains("add_css_class: \"anvil-font-sync\""));
+        assert!(startup.contains("model.apply_dynamic_css()"));
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn window_text_tracks_terminal_size_on_startup_and_live_updates() {
+        use relm4::prelude::*;
+        use vte4::TerminalExt;
+        gtk::init().unwrap();
+        crate::startup_ui::install_static_css();
+        let provider = crate::startup_ui::install_dynamic_css_provider();
+        let errors = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let caught = errors.clone();
+        provider
+            .connect_parsing_error(move |_, _, error| caught.borrow_mut().push(error.to_string()));
+        let window = gtk::Window::new();
+        window.add_css_class("anvil-font-sync");
+        window.set_default_size(1000, 700);
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        window.set_child(Some(&root));
+        let (_, tab_scroll) = crate::startup_ui::build_tab_scrolls();
+        let top_label = gtk::Label::new(Some("Top tab"));
+        tab_scroll.set_child(Some(&top_label));
+        tab_scroll.set_visible(true);
+        let top = crate::top_bar::TopBarModel::builder()
+            .launch(tab_scroll.clone())
+            .detach();
+        root.append(top.widget());
+        let labels: Vec<_> = [
+            "top-bar",
+            "tab-strip",
+            "pane-header",
+            "bottom-bar",
+            "block-cmd",
+            "chat-status",
+        ]
+        .iter()
+        .map(|class| {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            row.add_css_class(class);
+            let label = gtk::Label::new(Some("Text size stays aligned"));
+            row.append(&label);
+            root.append(&row);
+            label
+        })
+        .collect();
+        let entry = gtk::Entry::new();
+        root.append(&entry);
+        let icon = gtk::Image::from_icon_name("window-close-symbolic");
+        icon.set_pixel_size(16);
+        root.append(&icon);
+        let outside = gtk::Label::new(Some("Unscoped text"));
+        let outside_before = outside.pango_context().font_description().unwrap().size();
+        let mut config = Config::safe_defaults();
+        config.font_desc = "Monospace 16px".into();
+        config.default_font_scale = 0.75;
+        let terminals: Vec<_> = (0..2)
+            .map(|_| {
+                let terminal = crate::terminal::vte::create_terminal(&config);
+                terminal.set_vexpand(false);
+                terminal.set_size(40, 3);
+                root.append(&terminal);
+                terminal
+            })
+            .collect();
+        // Install before mapping, then change the same live provider twice.
+        provider.load_from_string(&crate::config_ops::dynamic_css(&config));
+        window.present();
+        for (desc, scale) in [
+            ("Monospace 16px", 0.75),
+            ("Monospace 16px", 1.5),
+            ("Monospace 40px", 1.5),
+        ] {
+            config.font_desc = desc.into();
+            config.default_font_scale = scale;
+            for terminal in &terminals {
+                terminal.set_font(Some(&terminal_font_description(desc, &config)));
+                terminal.set_font_scale(scale);
+            }
+            crate::block_view::install_block_css(&config);
+            provider.load_from_string(&crate::config_ops::dynamic_css(&config));
+            let main = gtk::glib::MainContext::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
+            while std::time::Instant::now() < deadline {
+                while main.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let expected =
+                (FontDescription::from_string(desc).size() as f64 * scale).round() as i32;
+            for label in &labels {
+                assert_eq!(
+                    label.pango_context().font_description().unwrap().size(),
+                    expected
+                );
+                let (_, height) = label.layout().pixel_size();
+                assert!(
+                    label.height() >= height,
+                    "text must not be vertically clipped"
+                );
+            }
+            assert_eq!(
+                entry.pango_context().font_description().unwrap().size(),
+                expected
+            );
+            assert_eq!(
+                top_label.pango_context().font_description().unwrap().size(),
+                expected
+            );
+            assert!(
+                tab_scroll.height() >= top_label.layout().pixel_size().1,
+                "real overlay tab row must grow with its font"
+            );
+            assert_eq!(icon.pixel_size(), 16);
+            assert_eq!(
+                outside.pango_context().font_description().unwrap().size(),
+                outside_before
+            );
+            for terminal in &terminals {
+                assert_eq!(terminal.font_scale(), scale);
+                assert_eq!(
+                    terminal.font().unwrap().size(),
+                    FontDescription::from_string(desc).size()
+                );
+            }
+        }
+        assert!(
+            errors.borrow().is_empty(),
+            "CSS errors: {:?}",
+            errors.borrow()
+        );
+        window.destroy();
+        gtk::style_context_remove_provider_for_display(
+            &gtk::gdk::Display::default().unwrap(),
+            &provider,
+        );
+    }
 
     fn default_description() -> String {
         Config::safe_defaults().font_desc

@@ -978,6 +978,70 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires DISPLAY"]
+    fn live_font_updates_align_chat_block_and_window_text() {
+        let (chat, window, entry) = fixture();
+        window.add_css_class("anvil-font-sync");
+        window.set_default_size(1000, 900);
+        let block = TermView::new_with_spawner(
+            &crate::config::Config::safe_defaults(),
+            &crate::config::TerminalMode::Block,
+            &["sh".to_string()],
+            None,
+            false,
+            None,
+            "font-test",
+            &[],
+            &[],
+            |_, _, _, _| crate::pty::OwnedPty::from_openpty(Some(true)),
+        )
+        .expect("nonexecuting block PTY");
+        window
+            .child()
+            .unwrap()
+            .downcast::<gtk::Box>()
+            .unwrap()
+            .append(&block.root);
+        drive(&chat, PROMPT, BlockState::AwaitingCommand);
+        let provider = crate::startup_ui::install_dynamic_css_provider();
+        let mut config = crate::config::Config::safe_defaults();
+        for (desc, scale) in [("Monospace 16px", 1.25), ("Monospace 24px", 1.5)] {
+            config.font_desc = desc.into();
+            config.default_font_scale = scale;
+            provider.load_from_string(&crate::config_ops::dynamic_css(&config));
+            for view in [&*chat, &block] {
+                view.set_font(desc);
+                view.set_font_scale(scale);
+            }
+            pump_for(Duration::from_millis(250));
+            let expected =
+                (gtk::pango::FontDescription::from_string(desc).size() as f64 * scale) as i32;
+            assert_eq!(
+                entry.pango_context().font_description().unwrap().size(),
+                expected
+            );
+            for view in [&*chat, &block] {
+                assert_eq!(view.active_vte.font_scale(), scale);
+                assert_eq!(
+                    view.active_vte.font().unwrap().size(),
+                    gtk::pango::FontDescription::from_string(desc).size()
+                );
+            }
+            let hint = widget_with_class(&chat.root, "chat-input-hint");
+            assert_eq!(
+                hint.pango_context().font_description().unwrap().size(),
+                expected
+            );
+            assert_footer_inside_pane(&chat, &button(&chat, "chat-send"));
+        }
+        window.destroy();
+        gtk::style_context_remove_provider_for_display(
+            &gtk::gdk::Display::default().unwrap(),
+            &provider,
+        );
+    }
+
+    #[test]
     #[ignore = "requires DISPLAY; production window, parser and real PTY winsize"]
     fn chat_reparents_only_live_clip_and_hides_submit_for_native_takeover() {
         let (view, window, other) = fixture();

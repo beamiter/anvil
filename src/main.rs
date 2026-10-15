@@ -744,6 +744,7 @@ impl SimpleComponent for AppModel {
 
     view! {
         adw::ApplicationWindow {
+            add_css_class: "anvil-font-sync",
             set_title: Some("anvil"),
             set_default_width: 800,
             set_default_height: 600,

@@ -215,6 +215,9 @@ impl Component for TopBarModel {
         let model = Self { tab_scroll };
         let tab_scroll = &model.tab_scroll;
         let widgets = view_output!();
+        // The tab row is an overlay: include its natural height so enlarged
+        // text can grow the bar instead of being clipped to the old 40px floor.
+        root.set_measure_overlay(tab_scroll, true);
         ComponentParts { model, widgets }
     }
 

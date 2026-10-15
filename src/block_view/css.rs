@@ -394,21 +394,8 @@ fn block_css(config: &Config) -> String {
         (bg_b as f32 + (fg_b as f32 - bg_b as f32) * 0.03) as u8,
     );
 
-    // Parse font description to extract font family and size
-    // Format: "FontName Style Size" e.g. "SauceCodePro Nerd Font Mono 14"
-    let parts: Vec<&str> = config.font_desc.split_whitespace().collect();
-    let (font_family, base_size) = if parts.len() >= 2 {
-        // Last part is usually the size. Pango allows float sizes ("Fira Code 12.5"),
-        // so parse as f64 and round rather than rejecting non-integer sizes.
-        if let Ok(size) = parts[parts.len() - 1].parse::<f64>() {
-            let family = parts[..parts.len() - 1].join(" ");
-            (family, size.round().max(1.0) as i32)
-        } else {
-            (config.font_desc.clone(), 14)
-        }
-    } else {
-        (config.font_desc.clone(), 14)
-    };
+    let font = crate::font::font_description(&config.font_desc, None);
+    let font_family = font.family().unwrap_or_else(|| "Monospace".into());
     // Block chrome draws command text through GTK labels, so it needs the same
     // icon fallback the VTE surfaces get; otherwise a prompt's Nerd-Font glyph
     // lands on whichever font fontconfig happens to sort first. The stack also
@@ -416,11 +403,8 @@ fn block_css(config: &Config) -> String {
     // surrounding CSS string and silently disable the whole stylesheet.
     let font_stack = crate::font::css_font_stack(&font_family, crate::font::icon_family(config));
 
-    // Apply font scale to the base size
-    let scaled_size = (base_size as f64 * config.default_font_scale)
-        .round()
-        .max(1.0) as i32;
-    let font_size = format!("{}pt", scaled_size);
+    let font_size =
+        crate::font::effective_font_size_css(&config.font_desc, config.default_font_scale);
 
     let css = format!(
         r#"
@@ -1458,6 +1442,22 @@ pub(crate) fn install_block_css(config: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_text_uses_the_same_fractional_size_and_units_as_window_text() {
+        let mut config = Config::safe_defaults();
+        for (desc, scale, expected) in [
+            ("Monospace Bold 12.5", 1.2, "font-size: 15pt;"),
+            ("Monospace 17px", 1.5, "font-size: 25.5px;"),
+        ] {
+            config.font_desc = desc.into();
+            config.default_font_scale = scale;
+            let css = block_css(&config);
+            assert!(rule_body(&css, ".block-cmd").contains(expected));
+            assert!(rule_body(&css, ".block-prompt").contains(expected));
+            assert!(crate::font::window_font_css(&config).contains(expected));
+        }
+    }
 
     fn rule_body<'a>(css: &'a str, selector: &str) -> &'a str {
         let marker = format!("{selector} {{");
