@@ -850,8 +850,21 @@ impl AppModel {
         } else {
             String::new()
         };
+        let dashboard = crate::agent_task::DashboardSnapshot::project(
+            self.task_manager
+                .tasks()
+                .iter()
+                .filter(|task| task.status != crate::agent_task::TaskStatus::Archived),
+            |id| crate::agent_task::DashboardActivity {
+                has_active_agent_stream: self.task_manager.has_active_agent_event_stream(id),
+                native_preparing: self.agent_runtime.has_preparing(id),
+                ..Default::default()
+            },
+            Default::default(),
+        );
         let sync = TasksPanelSync {
             rows,
+            dashboard,
             selected,
             detail: detail.map(Box::new),
             create_enabled: true,

@@ -6,7 +6,7 @@
 //! panel stages. Provider-controlled text arrives already display-safe; every
 //! widget here treats it as plain text.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -47,6 +47,7 @@ fn task_page_toggle_request(
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TasksPanelSync {
     pub(crate) rows: Vec<TaskRowSnapshot>,
+    pub(crate) dashboard: crate::agent_task::DashboardSnapshot,
     pub(crate) selected: Option<TaskId>,
     pub(crate) detail: Option<Box<TaskDetailSync>>,
     pub(crate) create_enabled: bool,
@@ -113,9 +114,11 @@ const ACTION_KINDS: [(ActionKind, &str); 8] = [
 #[derive(Debug)]
 pub(crate) enum TasksPanelMsg {
     Sync(Box<TasksPanelSync>),
-    /// Row index into the model's current row table; the model maps it to the
-    /// stable `TaskId`, so a list rebuild mid-gesture cannot retarget it.
-    SelectRow(i32),
+    DashboardQuery(String),
+    DashboardView(crate::agent_task::DashboardView),
+    /// Stable identity captured when the row gesture occurs. A later filter
+    /// change may hide it, but must never retarget a queued gesture.
+    SelectRow(TaskId),
     FollowUpChanged(String),
     SendFollowUp,
     Create,
@@ -132,6 +135,11 @@ pub(crate) enum TasksPanelOutput {
 
 pub(crate) struct TasksPanelModel {
     sync: TasksPanelSync,
+    unfiltered_sync: TasksPanelSync,
+    dashboard_query: String,
+    dashboard_view: crate::agent_task::DashboardView,
+    dashboard_summary: String,
+    dashboard_buttons: Vec<(crate::agent_task::DashboardView, gtk::Button)>,
     /// Per-task follow-up drafts; the app never sees keystrokes, only the
     /// final text carried by `TaskPanelAction::FollowUp`.
     follow_up_drafts: HashMap<TaskId, String>,
@@ -146,6 +154,7 @@ pub(crate) struct TasksPanelModel {
     /// Set while refresh applies a programmatic selection, so the resulting
     /// `row-selected` emission is not mistaken for a user gesture.
     selection_guard: Rc<Cell<bool>>,
+    selection_ids: Rc<RefCell<Vec<TaskId>>>,
     page: &'static str,
     /// Programmatic toggle synchronization must not enqueue stale ShowPage
     /// messages after newer user selections already waiting in the queue.
@@ -153,6 +162,43 @@ pub(crate) struct TasksPanelModel {
 }
 
 impl TasksPanelModel {
+    fn apply_dashboard_filters(&mut self) {
+        let mut sync = self.unfiltered_sync.clone();
+        let dashboard = crate::agent_task::DashboardSnapshot::filter_rows(
+            &sync.dashboard.rows,
+            &self.dashboard_query,
+            self.dashboard_view,
+        );
+        let mut by_id: HashMap<_, _> = sync.rows.into_iter().map(|row| (row.id, row)).collect();
+        sync.rows = dashboard
+            .rows
+            .iter()
+            .filter_map(|projected| {
+                let mut row = by_id.remove(&projected.id)?;
+                row.title.clone_from(&projected.title);
+                row.branch.clone_from(&projected.branch);
+                row.status_detail.clone_from(&projected.status_detail);
+                row.needs_attention = projected.needs_attention;
+                Some(row)
+            })
+            .collect();
+        if dashboard.selected_index(sync.selected).is_none() {
+            sync.detail = None;
+        }
+        self.dashboard_summary = format!(
+            "{} tasks · {} need you · {} awaiting approval{}",
+            dashboard.counts.total,
+            dashboard.counts.attention,
+            dashboard.counts.pending_approval,
+            if sync.rows.is_empty() {
+                " · No matching tasks"
+            } else {
+                ""
+            }
+        );
+        self.sync = sync;
+    }
+
     fn emit_action(&self, action: TaskPanelAction, sender: &ComponentSender<Self>) {
         if sender.output(TasksPanelOutput::Action(action)).is_err() {
             log::warn!("tasks panel output channel closed");
@@ -174,6 +220,8 @@ impl TasksPanelModel {
             self.sync.selected,
         );
         if plan.rebuild_rows {
+            self.selection_guard.set(true);
+            *self.selection_ids.borrow_mut() = self.sync.rows.iter().map(|row| row.id).collect();
             while let Some(child) = widgets.task_list.first_child() {
                 widgets.task_list.remove(&child);
             }
@@ -214,6 +262,7 @@ impl TasksPanelModel {
             self.selection_guard.set(false);
         }
         if plan.rebuild_rows || plan.apply_selection {
+            self.selection_guard.set(false);
             self.rendered_selected = self.sync.selected;
         }
     }
@@ -335,6 +384,25 @@ impl Component for TasksPanelModel {
                 add_css_class: "dim-label",
                 add_css_class: "caption",
                 set_visible: false,
+            },
+
+            gtk::Entry {
+                set_placeholder_text: Some("Search tasks, providers or repositories"),
+                set_max_length: 256,
+                update_property: &[gtk::accessible::Property::Label("Search agent tasks")],
+                connect_changed[sender] => move |entry| {
+                    sender.input(TasksPanelMsg::DashboardQuery(entry.text().to_string()));
+                },
+            },
+            #[name(dashboard_filters)]
+            gtk::FlowBox {
+                set_selection_mode: gtk::SelectionMode::None,
+                set_max_children_per_line: 3,
+            },
+            #[name(dashboard_summary)]
+            gtk::Label {
+                set_wrap: true,
+                add_css_class: "caption",
             },
 
             gtk::Paned {
@@ -511,15 +579,22 @@ impl Component for TasksPanelModel {
     ) -> ComponentParts<Self> {
         let mut action_buttons = Vec::new();
         let selection_guard = Rc::new(Cell::new(false));
+        let selection_ids = Rc::new(RefCell::new(Vec::<TaskId>::new()));
         let page_guard = Rc::new(Cell::new(false));
         let model = Self {
             sync: TasksPanelSync::default(),
+            unfiltered_sync: TasksPanelSync::default(),
+            dashboard_query: String::new(),
+            dashboard_view: crate::agent_task::DashboardView::All,
+            dashboard_summary: String::new(),
+            dashboard_buttons: Vec::new(),
             follow_up_drafts: HashMap::new(),
             action_buttons: Vec::new(),
             rendered_rows: Vec::new(),
             rendered_selected: None,
             rendered_approvals: Vec::new(),
             selection_guard: selection_guard.clone(),
+            selection_ids: selection_ids.clone(),
             page: STREAM_PAGE,
             page_guard: page_guard.clone(),
         };
@@ -542,6 +617,7 @@ impl Component for TasksPanelModel {
         widgets.task_list.connect_row_selected({
             let sender = sender.clone();
             let selection_guard = selection_guard.clone();
+            let selection_ids = selection_ids.clone();
             move |_, row| {
                 // Only genuine gestures may queue SelectRow; programmatic
                 // selection applied by refresh runs behind the guard.
@@ -549,7 +625,12 @@ impl Component for TasksPanelModel {
                     return;
                 }
                 if let Some(row) = row {
-                    sender.input(TasksPanelMsg::SelectRow(row.index()));
+                    let id = usize::try_from(row.index())
+                        .ok()
+                        .and_then(|index| selection_ids.borrow().get(index).copied());
+                    if let Some(id) = id {
+                        sender.input(TasksPanelMsg::SelectRow(id));
+                    }
                 }
             }
         });
@@ -590,8 +671,26 @@ impl Component for TasksPanelModel {
             }
         });
 
+        let mut dashboard_buttons = Vec::new();
+        use crate::agent_task::DashboardView;
+        for (view, label) in [
+            (DashboardView::All, "All"),
+            (DashboardView::NeedsAttention, "Needs you"),
+            (DashboardView::Running, "Running"),
+            (DashboardView::NotStarted, "Not started"),
+            (DashboardView::Review, "Review"),
+            (DashboardView::Finished, "Finished"),
+        ] {
+            let button = gtk::Button::with_label(label);
+            button.add_css_class("caption");
+            let sender = sender.clone();
+            button.connect_clicked(move |_| sender.input(TasksPanelMsg::DashboardView(view)));
+            widgets.dashboard_filters.insert(&button, -1);
+            dashboard_buttons.push((view, button));
+        }
         let model = Self {
             action_buttons,
+            dashboard_buttons,
             ..model
         };
         ComponentParts { model, widgets }
@@ -609,17 +708,20 @@ impl Component for TasksPanelModel {
         let show_diff = matches!(&message, TasksPanelMsg::Act(ActionKind::ReviewDiff));
         match message {
             TasksPanelMsg::Sync(sync) => {
-                self.sync = *sync;
+                self.unfiltered_sync = *sync;
+                self.apply_dashboard_filters();
             }
-            TasksPanelMsg::SelectRow(index) => {
-                if let Some(row) = self
-                    .sync
-                    .rows
-                    .get(usize::try_from(index).unwrap_or(usize::MAX))
-                {
-                    if self.sync.selected != Some(row.id) {
-                        self.emit_action(TaskPanelAction::Select(row.id), &sender);
-                    }
+            TasksPanelMsg::DashboardQuery(query) => {
+                self.dashboard_query = query.chars().take(256).collect();
+                self.apply_dashboard_filters();
+            }
+            TasksPanelMsg::DashboardView(view) => {
+                self.dashboard_view = view;
+                self.apply_dashboard_filters();
+            }
+            TasksPanelMsg::SelectRow(id) => {
+                if self.sync.selected != Some(id) && self.sync.rows.iter().any(|row| row.id == id) {
+                    self.emit_action(TaskPanelAction::Select(id), &sender);
                 }
             }
             TasksPanelMsg::FollowUpChanged(text) => {
@@ -697,6 +799,14 @@ impl TasksPanelModel {
             widgets.create_hint.set_label(&self.sync.create_hint);
         }
 
+        widgets.dashboard_summary.set_label(&self.dashboard_summary);
+        for (view, button) in &self.dashboard_buttons {
+            if *view == self.dashboard_view {
+                button.add_css_class("suggested-action");
+            } else {
+                button.remove_css_class("suggested-action");
+            }
+        }
         self.sync_task_list(widgets);
 
         let detail = self.sync.detail.as_deref();
@@ -719,6 +829,16 @@ impl TasksPanelModel {
         widgets.actions_box.set_visible(detail.is_some());
         widgets.detail_title.set_visible(detail.is_some());
         widgets.detail_status.set_visible(detail.is_some());
+        widgets.page_stack.set_visible(detail.is_some());
+        widgets.stream_page_button.set_visible(detail.is_some());
+        widgets.diff_page_button.set_visible(detail.is_some());
+        widgets
+            .follow_up_row
+            .set_visible(detail.is_some_and(|d| d.can_follow_up));
+        if detail.is_none() {
+            widgets.follow_up_hint.set_visible(false);
+            widgets.follow_up_send.set_sensitive(false);
+        }
 
         if let Some(detail) = detail {
             widgets.detail_title.set_label(&detail.title);
@@ -803,6 +923,8 @@ fn set_view_text(view: &gtk::TextView, text: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     use super::{task_page_presentation, task_page_toggle_request, DIFF_PAGE, STREAM_PAGE};
 
     #[test]
@@ -852,5 +974,135 @@ mod tests {
             task_page_toggle_request(true, false, DIFF_PAGE),
             Some(DIFF_PAGE)
         );
+    }
+    fn dashboard_test_sync() -> TasksPanelSync {
+        use crate::agent_task::{AgentProvider, NewTask, TaskManager, TaskStatus};
+        let mut manager = TaskManager::new();
+        for title in ["First task", "Needs review"] {
+            manager
+                .create(NewTask {
+                    title: title.into(),
+                    provider: AgentProvider::Codex,
+                    repo_root: "/fixture".into(),
+                    worktree_path: "/fixture/worktree".into(),
+                    branch: "test/dashboard".into(),
+                    base_commit: "a".repeat(40),
+                    source_context: None,
+                })
+                .unwrap();
+        }
+        let mut tasks = manager.tasks().to_vec();
+        tasks[1].status = TaskStatus::Failed;
+        let selected = tasks[0].id;
+        let dashboard = crate::agent_task::DashboardSnapshot::project(
+            &tasks,
+            |_| Default::default(),
+            Default::default(),
+        );
+        let rows = tasks
+            .iter()
+            .map(|task| TaskRowSnapshot {
+                id: task.id,
+                title: task.title.clone(),
+                provider: task.provider,
+                status: task.status,
+                runtime_kind: task.runtime_kind,
+                branch: task.branch.clone(),
+                has_agent_terminal: false,
+                has_validation_terminal: false,
+                has_active_agent_stream: false,
+                native_preparing: false,
+                validation_status: task.validation.status,
+                validation_attempt: 0,
+                needs_attention: task.needs_attention(),
+                status_detail: None,
+            })
+            .collect();
+        let detail = TaskDetailSync {
+            id: selected,
+            title: "First task".into(),
+            status_line: "Created".into(),
+            branch: "test/dashboard".into(),
+            stream: None,
+            approvals: Vec::new(),
+            completed_turns: 0,
+            can_start_codex: false,
+            can_start_terminal: false,
+            can_stop: false,
+            can_finish: false,
+            can_run_validation: false,
+            can_complete: false,
+            can_follow_up: false,
+            follow_up_hint: String::new(),
+            diff: None,
+        };
+        TasksPanelSync {
+            rows,
+            dashboard,
+            selected: Some(selected),
+            detail: Some(Box::new(detail)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn dashboard_filters_preserve_selection_without_retargeting() {
+        gtk::init().expect("GTK display");
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let sink = actions.clone();
+        let controller =
+            TasksPanelModel::builder()
+                .launch(())
+                .connect_receiver(move |_, output| {
+                    let TasksPanelOutput::Action(action) = output;
+                    sink.borrow_mut().push(action);
+                });
+        let window = gtk::Window::new();
+        window.set_child(Some(controller.widget()));
+        let drain = || {
+            let main = gtk::glib::MainContext::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while main.pending() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "bounded component drain"
+                );
+                main.iteration(false);
+            }
+        };
+        let sync = dashboard_test_sync();
+        let selected = sync.selected;
+        controller.emit(TasksPanelMsg::Sync(Box::new(sync.clone())));
+        drain();
+        assert_eq!(controller.model().sync.rows.len(), 2);
+        controller.emit(TasksPanelMsg::DashboardView(
+            crate::agent_task::DashboardView::NeedsAttention,
+        ));
+        drain();
+        assert_eq!(controller.model().sync.selected, selected);
+        assert_eq!(controller.model().sync.rows.len(), 1);
+        assert!(controller.model().sync.detail.is_none());
+        // The old row gesture carries its original task ID, not the new row 0.
+        controller.emit(TasksPanelMsg::SelectRow(selected.unwrap()));
+        controller.emit(TasksPanelMsg::DashboardQuery("missing".into()));
+        drain();
+        assert!(controller.model().sync.rows.is_empty());
+        controller.emit(TasksPanelMsg::DashboardQuery(String::new()));
+        controller.emit(TasksPanelMsg::DashboardView(
+            crate::agent_task::DashboardView::All,
+        ));
+        drain();
+        assert_eq!(controller.model().sync.rows.len(), 2);
+        assert_eq!(controller.model().sync.selected, selected);
+        assert_eq!(
+            controller.model().sync.detail.as_ref().map(|d| d.id),
+            selected
+        );
+        assert!(
+            actions.borrow().is_empty(),
+            "filtering or a hidden stale gesture must not stage an action"
+        );
+        window.close();
     }
 }
