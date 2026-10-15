@@ -46,6 +46,7 @@ mod history;
 mod onboarding;
 #[allow(dead_code)]
 mod palette;
+mod paste_feedback;
 mod review;
 mod scroll;
 mod selection_hold;
@@ -1360,6 +1361,7 @@ fn build_clipboard_paste(text: &str, bracketed_paste: bool) -> pty_input::Paste 
 /// What a paste needs once its text is in hand. The clipboard read is
 /// asynchronous, so this owns its handles instead of borrowing the view.
 struct PasteSink {
+    notify: Rc<dyn Fn(&str)>,
     pty: Rc<OwnedPty>,
     bracketed_paste: Rc<Cell<bool>>,
     bstate: Rc<Cell<BlockState>>,
@@ -1381,6 +1383,7 @@ impl PasteSink {
         preflight_clipboard_paste(text, self.bracketed_paste.get())?;
         let paste = build_clipboard_paste(text, self.bracketed_paste.get());
         if paste.is_empty() {
+            paste_feedback::report(&*self.notify, paste.risk.truncated_to_first_line, false);
             return Ok(());
         }
         if paste.risk.had_embedded_paste_marker {
@@ -1405,6 +1408,7 @@ impl PasteSink {
             &self.pty_synced,
             &self.idle_input_dirty,
         );
+        paste_feedback::report(&*self.notify, paste.risk.truncated_to_first_line, true);
         Ok(())
     }
 }
@@ -15282,6 +15286,7 @@ impl TermView {
 
     fn paste_sink(&self) -> PasteSink {
         PasteSink {
+            notify: paste_feedback::notifier(&self.active_vte),
             pty: self.pty.clone(),
             bracketed_paste: self.bracketed_paste.clone(),
             bstate: self.bstate.clone(),
@@ -26645,6 +26650,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             })]));
         (
             super::PasteSink {
+                notify: Rc::new(|_| {}),
                 pty: Rc::new(crate::pty::OwnedPty::from_openpty(Some(true)).unwrap()),
                 bracketed_paste: Rc::new(Cell::new(false)),
                 bstate: Rc::new(Cell::new(BlockState::AwaitingCommand)),
@@ -26657,6 +26663,50 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             },
             observed,
         )
+    }
+
+    #[test]
+    fn truncated_clipboard_feedback_tracks_actual_delivery() {
+        let (mut sink, _) = paste_test_sink();
+        let notices = Rc::new(RefCell::new(Vec::<String>::new()));
+        let output = notices.clone();
+        sink.notify = Rc::new(move |message| output.borrow_mut().push(message.to_string()));
+        for (text, bracketed, expected, notice) in [
+            (
+                "界\r\nprivate second line",
+                false,
+                "界",
+                Some(super::paste_feedback::PARTIAL),
+            ),
+            (
+                "\nprivate second line",
+                false,
+                "",
+                Some(super::paste_feedback::EMPTY),
+            ),
+            ("界\r\nsecond", true, "\x1b[200~界\nsecond\x1b[201~", None),
+            ("plain", false, "plain", None),
+        ] {
+            notices.borrow_mut().clear();
+            sink.bracketed_paste.set(bracketed);
+            assert!(sink.deliver(text).is_ok());
+            assert_eq!(
+                sink.pty.drain_test_slave(Duration::from_millis(50)),
+                expected.as_bytes()
+            );
+            assert_eq!(
+                notices.borrow().as_slice(),
+                &notice.map(str::to_string).into_iter().collect::<Vec<_>>()
+            );
+        }
+        sink.bracketed_paste.set(false);
+        notices.borrow_mut().clear();
+        sink.pty.kill();
+        assert!(sink.deliver("first\nsecond").is_err());
+        assert!(
+            notices.borrow().is_empty(),
+            "refusal cannot report successful truncation"
+        );
     }
 
     fn direct_human_input_cases() -> [(super::HumanInputKind, &'static [u8]); 7] {
