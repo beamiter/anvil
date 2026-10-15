@@ -4404,9 +4404,8 @@ impl FinishedBlock {
         more.set_focus_on_click(false);
         more.add_css_class("flat");
         more.add_css_class("block-action-btn");
-        // Bind only after the backend has installed the card action group.
-        // Creating an action helper while this button is still unparented can
-        // leave its muxer disconnected across the intermediate plain Boxes.
+        // The backend binds the same guarded action on the card and button.
+        // An unbound card must not offer an inert menu control.
         more.set_sensitive(false);
         let details_btn = gtk::Button::with_label("Review block details");
         details_btn.set_tooltip_text(Some("Review block details"));

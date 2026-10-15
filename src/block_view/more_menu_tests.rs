@@ -197,6 +197,7 @@ fn more_opens_complete_menu_preserves_selection_and_retires_stale_cards() {
             );
             assert_eq!(view.clear_blocks(), 2);
             settle();
+            more.emit_clicked();
             card.widget()
                 .activate_action("block.show-menu", None)
                 .unwrap();

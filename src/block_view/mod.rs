@@ -8589,9 +8589,10 @@ impl RenderBackend for BlockBackend {
         });
         actions.add_action(&show_menu);
         finished_widget.insert_action_group("block", Some(&actions));
-        // First create the action helper with the entire ancestor chain and
-        // its owning group already present. Do not force sensitivity: GTK
-        // derives it from the installed action's availability.
+        // Give the Actionable its own lookup owner. Ancestor-only lookup can
+        // leave dynamically inserted buttons disabled even with a live card
+        // action. Both entry points use the same guarded action instance.
+        more_button.insert_action_group("block", Some(&actions));
         more_button.set_action_name(Some("block.show-menu"));
     }
 
@@ -25819,6 +25820,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         let actions = gtk::gio::SimpleActionGroup::new();
         actions.add_action(&gtk::gio::SimpleAction::new("show-menu", None));
         block.widget().insert_action_group("block", Some(&actions));
+        block.more_btn.insert_action_group("block", Some(&actions));
         block.more_btn.set_action_name(Some("block.show-menu"));
         super::blocks::reveal_block_actions(&block.action_box, true);
         let window = gtk::Window::new();
@@ -25881,11 +25883,21 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             spot.0,
             spot.1
         ));
+        let action = actions
+            .lookup_action("show-menu")
+            .unwrap()
+            .downcast::<gtk::gio::SimpleAction>()
+            .unwrap();
+        action.set_enabled(false);
+        assert!(!more.is_sensitive(), "disabled action disables More");
+        action.set_enabled(true);
+        assert!(more.is_sensitive(), "enabled action re-enables More");
         block
             .widget()
             .insert_action_group("block", None::<&gtk::gio::SimpleActionGroup>);
+        more.insert_action_group("block", None::<&gtk::gio::SimpleActionGroup>);
         assert!(!more.is_sensitive(), "removing the owner disables More");
-        block.widget().insert_action_group("block", Some(&actions));
+        more.insert_action_group("block", Some(&actions));
         assert!(more.is_sensitive(), "restoring the owner re-enables More");
         window.close();
         while context.iteration(false) {}
