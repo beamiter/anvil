@@ -107,7 +107,26 @@ fn more_opens_complete_menu_preserves_selection_and_retires_stale_cards() {
                 .unwrap();
             assert_eq!(more.action_name().as_deref(), Some("block.show-menu"));
             assert!(more.is_mapped(), "the target header must be on screen");
-            assert!(more.is_sensitive(), "the active edge owns enabled actions");
+            assert!(
+                more.is_sensitive(),
+                "the active edge owns enabled actions: mode={mode:?} restored={restored} \
+                 card={} selected={:?} active={:?} active_css={} \
+                 actions_own_sensitive={} actions_effective_sensitive={} \
+                 more_own_sensitive={} copy_effective_sensitive={} action={:?} \
+                 target={:?} parent_is_actions={} card_mapped={}",
+                card.id,
+                selected,
+                view.selected_block_id.get(),
+                card.widget().has_css_class("block-selection-active"),
+                card.action_box.get_sensitive(),
+                card.action_box.is_sensitive(),
+                more.get_sensitive(),
+                card.copy_cmd_btn.is_sensitive(),
+                more.action_name(),
+                more.action_target_value(),
+                more.parent().as_ref() == Some(card.action_box.upcast_ref()),
+                card.widget().is_mapped(),
+            );
             assert!(more.grab_focus(), "visible More must accept keyboard focus");
             assert_eq!(
                 gtk::prelude::GtkWindowExt::focus(&window),
