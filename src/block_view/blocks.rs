@@ -4366,7 +4366,7 @@ impl FinishedBlock {
         let copy_output_btn = icon_button("text-x-generic-symbolic", "Copy output");
         let rerun_btn = icon_button(
             "insert-text-symbolic",
-            "Insert command at prompt for review (does not run)",
+            "Recall command · fill prompt without running",
         );
         // Commandless background blocks retain output actions, find/filter,
         // bookmarks and selection, but cannot copy or recall a command.
@@ -6442,3 +6442,32 @@ mod chat_geometry_tests {
 #[cfg(test)]
 #[path = "fold_preview_tests.rs"]
 mod fold_preview_tests;
+
+#[cfg(test)]
+mod command_reuse_labels_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
+    fn recall_header_describes_insert_only_action() {
+        gtk::init().expect("GTK display");
+        let config = Config::safe_defaults();
+        let card = FinishedBlock::new(
+            1,
+            "$ ",
+            "printf hello",
+            None,
+            "hello",
+            Some(0),
+            &config,
+            None,
+            None,
+            None,
+            80,
+        );
+        assert_eq!(
+            card.rerun_btn.tooltip_text().as_deref(),
+            Some("Recall command · fill prompt without running")
+        );
+    }
+}

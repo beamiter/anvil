@@ -5259,6 +5259,15 @@ fn schedule_prompt_anchor_settle(args: AnchorSettleArgs) {
     });
 }
 
+/// Review opens a separate confirmation step; recall only fills the prompt.
+fn command_reuse_menu_label(selected_count: usize) -> &'static str {
+    if selected_count > 1 {
+        "Review commands…"
+    } else {
+        "Recall command"
+    }
+}
+
 /// The GTK/VTE implementation of [`RenderBackend`] for Block mode: owns the
 /// widget-owning handles the reader lifecycle drives. Shared-`Rc` fields keep
 /// the `_rc`/`_for_cb` names of the former [`ReaderCtx`] fields they moved
@@ -8220,7 +8229,7 @@ impl RenderBackend for BlockBackend {
                     let bracketed_paste_for_action = bracketed_paste_for_rerun_menu.clone();
                     let verified_submission_for_action = verified_submission_for_rerun_menu.clone();
                     let active_for_action = active_for_rerun_menu.clone();
-                    // Same gate as "Insert Command at Prompt": this writes to
+                    // Same gate as "Recall command": this writes to
                     // the prompt, so it needs a clean, idle one.
                     item.set_sensitive(verified_submission_for_action.can_recall_command());
                     // Inserted, never run — the same rule every recall here
@@ -8360,11 +8369,7 @@ impl RenderBackend for BlockBackend {
             }
 
             if has_selected_commands {
-                let item = make_item(if selected_count > 1 {
-                    "Review Commands Before Inserting"
-                } else {
-                    "Insert Command at Prompt"
-                });
+                let item = make_item(command_reuse_menu_label(selected_count));
                 let popover_c = popover.clone();
                 let finished_for_rerun = finished_blocks_for_menu.clone();
                 let selected_ids_for_rerun = selected_ids_for_menu.clone();
@@ -8389,6 +8394,11 @@ impl RenderBackend for BlockBackend {
                         || (selected_recall_is_lossless
                             && verified_submission_for_action.can_recall_command()),
                 );
+                item.set_tooltip_text(Some(if selected_count > 1 {
+                    "Review commands before choosing Insert; does not run"
+                } else {
+                    "Fill prompt without running; requires an editable, verified shell prompt"
+                }));
                 if selected_count == 1 && !selected_recall_is_lossless {
                     const REASON: &str =
                         "Bracketed paste is required to preserve every command line";
@@ -28159,5 +28169,15 @@ impl TermView {
     /// Share the same mutable map as key dispatch; menu rebuilds see reloads.
     pub(crate) fn set_menu_keybindings(&self, map: Rc<RefCell<crate::keybindings::KeybindingMap>>) {
         *self.menu_keybindings.borrow_mut() = Some(map);
+    }
+}
+
+#[cfg(test)]
+mod command_reuse_menu_label_tests {
+    #[test]
+    fn labels_distinguish_the_actual_single_and_multiple_paths() {
+        assert_eq!(super::command_reuse_menu_label(1), "Recall command");
+        assert_eq!(super::command_reuse_menu_label(2), "Review commands…");
+        assert_eq!(super::command_reuse_menu_label(128), "Review commands…");
     }
 }
