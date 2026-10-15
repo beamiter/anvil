@@ -25,6 +25,20 @@ fn search_entry(widget: &gtk::Widget) -> Option<gtk::SearchEntry> {
     None
 }
 
+fn preview_label(widget: &gtk::Widget) -> Option<gtk::Label> {
+    if widget.has_css_class("block-output-preview") {
+        return widget.clone().downcast::<gtk::Label>().ok();
+    }
+    let mut child = widget.first_child();
+    while let Some(widget) = child {
+        if let Some(label) = preview_label(&widget) {
+            return Some(label);
+        }
+        child = widget.next_sibling();
+    }
+    None
+}
+
 #[test]
 #[ignore = "requires DISPLAY; run explicitly under Xvfb"]
 fn folded_preview_tracks_filters_and_preserves_output() {
@@ -53,13 +67,7 @@ fn folded_preview_tracks_filters_and_preserves_output() {
     settle();
     block.set_collapsed(true);
     settle();
-    let preview = block
-        .collapsed_summary
-        .child()
-        .unwrap()
-        .last_child()
-        .and_downcast::<gtk::Label>()
-        .expect("preview label");
+    let preview = preview_label(block.widget().upcast_ref()).expect("preview label");
     assert_eq!(preview.text(), "Preview: private final�");
     assert!(preview.get_visible());
     assert_eq!(preview.ellipsize(), gtk::pango::EllipsizeMode::End);
@@ -102,13 +110,7 @@ fn folded_preview_tracks_filters_and_preserves_output() {
         None,
         80,
     );
-    let empty_preview = empty
-        .collapsed_summary
-        .child()
-        .unwrap()
-        .last_child()
-        .and_downcast::<gtk::Label>()
-        .expect("empty preview label");
+    let empty_preview = preview_label(empty.widget().upcast_ref()).expect("empty preview label");
     assert!(!empty_preview.get_visible());
     window.close();
     settle();
