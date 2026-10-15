@@ -6,7 +6,7 @@
 //! pruned tabs, and pushes composed snapshots back to the panel. The flow
 //! mirrors ember's `app/tasks.rs` action executor and poll loop.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
@@ -242,6 +242,66 @@ impl AppModel {
         agent_task_ui::prompt_policy(&self.config.borrow())
     }
 
+    fn existing_task_terminal(
+        &self,
+        binding: Option<&str>,
+        role: TaskTerminalRole,
+    ) -> Option<(usize, usize)> {
+        agent_task_ui::resolve_task_terminal(
+            binding,
+            self.tabs.iter().enumerate().flat_map(|(ti, tab)| {
+                tab.panes
+                    .iter()
+                    .enumerate()
+                    .filter(move |(_, pane)| pane.task_role == Some(role))
+                    .filter_map(move |(pi, pane)| {
+                        pane.task_session_id
+                            .clone()
+                            .map(|identity| (identity, (ti, pi)))
+                    })
+            }),
+        )
+    }
+
+    fn focus_task_terminal(
+        &mut self,
+        task_id: TaskId,
+        role: TaskTerminalRole,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        if !agent_task_ui::task_focus_allowed(
+            self.tasks_panel_visible.get(),
+            self.selected_task,
+            task_id,
+        ) {
+            return;
+        }
+        let binding = self
+            .task_manager
+            .get(task_id)
+            .and_then(|task| agent_task_ui::task_terminal_binding(task, role))
+            .map(str::to_owned);
+        let Some((ti, pi)) = self.existing_task_terminal(binding.as_deref(), role) else {
+            self.show_toast("Task terminal is no longer available");
+            return;
+        };
+        if self.tabs[ti].zoom.is_some() && self.tabs[ti].active_pane != pi {
+            self.toggle_pane_zoom_for(ti);
+            if self.tabs[ti].zoom.is_some() {
+                self.show_toast("Task terminal cannot be shown while its split is changing");
+                return;
+            }
+        }
+        crate::enter_ownership::claim_held();
+        let tab_id = self.tabs[ti].id;
+        self.select_tab(tab_id, sender);
+        // Reuse ordinary pane navigation so focus, headers and ownership agree.
+        let delta = pi as i32 - self.tabs[ti].active_pane as i32;
+        if delta != 0 {
+            self.cycle_pane_focus(delta);
+        }
+    }
+
     /// Stage a panel action against the live domain. Every branch resolves
     /// the task again; a stale panel snapshot can never retarget an action.
     pub(crate) fn execute_task_panel_action(
@@ -277,6 +337,12 @@ impl AppModel {
             }
             TaskPanelAction::StartTerminal(task_id) => {
                 self.start_task_agent_terminal(task_id, sender)
+            }
+            TaskPanelAction::FocusTerminal(task_id) => {
+                self.focus_task_terminal(task_id, TaskTerminalRole::Agent, sender)
+            }
+            TaskPanelAction::FocusValidation(task_id) => {
+                self.focus_task_terminal(task_id, TaskTerminalRole::Validation, sender)
             }
             TaskPanelAction::StopCodex(task_id) => match self.agent_runtime.cancel(task_id) {
                 Ok(()) => {
@@ -808,6 +874,22 @@ impl AppModel {
     pub(crate) fn sync_tasks_panel(&self) {
         let policy = self.task_prompt_policy();
         let native_ai_enabled = policy.share_command_context;
+        let mut agent_terminals = HashSet::new();
+        let mut validation_terminals = HashSet::new();
+        for pane in self.tabs.iter().flat_map(|tab| tab.panes.iter()) {
+            if let Some(identity) = &pane.task_session_id {
+                match pane.task_role {
+                    Some(TaskTerminalRole::Agent) => {
+                        agent_terminals.insert(identity.clone());
+                    }
+                    Some(TaskTerminalRole::Validation) => {
+                        validation_terminals.insert(identity.clone());
+                    }
+                    None => {}
+                }
+            }
+        }
+
         let mut rows: Vec<TaskRowSnapshot> = self
             .task_manager
             .tasks()
@@ -819,14 +901,26 @@ impl AppModel {
                 status: task.status,
                 runtime_kind: task.runtime_kind,
                 branch: task.branch.clone(),
-                has_agent_terminal: task.terminal_session_id.is_some(),
-                has_validation_terminal: task.validation.terminal_session_id.is_some(),
+                has_agent_terminal: task
+                    .terminal_session_id
+                    .as_ref()
+                    .is_some_and(|id| agent_terminals.contains(id)),
+                has_validation_terminal: task
+                    .validation
+                    .terminal_session_id
+                    .as_ref()
+                    .is_some_and(|id| validation_terminals.contains(id)),
                 has_active_agent_stream: self.task_manager.has_active_agent_event_stream(task.id),
                 native_preparing: self.agent_runtime.has_preparing(task.id),
                 validation_status: task.validation.status,
                 validation_attempt: task.validation.attempt,
                 needs_attention: task.needs_attention(),
                 status_detail: task.status_detail.clone(),
+                validation_detail: task
+                    .validation
+                    .status_detail
+                    .as_deref()
+                    .map(|detail| jterm_core::review_input::safe_inline_display(detail, 1024)),
             })
             .collect();
         let updated: HashMap<TaskId, u64> = self
@@ -840,7 +934,19 @@ impl AppModel {
         let selected = self
             .selected_task
             .filter(|id| self.task_manager.get(*id).is_some());
-        let detail = selected.and_then(|id| self.task_detail_sync(id, native_ai_enabled));
+        let detail = selected.and_then(|id| {
+            let task = self.task_manager.get(id)?;
+            let agent = task
+                .terminal_session_id
+                .as_ref()
+                .is_some_and(|id| agent_terminals.contains(id));
+            let validation = task
+                .validation
+                .terminal_session_id
+                .as_ref()
+                .is_some_and(|id| validation_terminals.contains(id));
+            self.task_detail_sync(id, native_ai_enabled, agent, validation)
+        });
 
         let create_hint = if self.pending_task_creation.is_some() {
             "Creating the isolated task worktree…".to_string()
@@ -874,7 +980,13 @@ impl AppModel {
         self.tasks_panel.emit(TasksPanelMsg::Sync(Box::new(sync)));
     }
 
-    fn task_detail_sync(&self, task_id: TaskId, native_ai_enabled: bool) -> Option<TaskDetailSync> {
+    fn task_detail_sync(
+        &self,
+        task_id: TaskId,
+        native_ai_enabled: bool,
+        can_focus_terminal: bool,
+        can_focus_validation: bool,
+    ) -> Option<TaskDetailSync> {
         let task = self.task_manager.get(task_id)?;
         let view = self.agent_runtime.snapshot(task_id);
         let has_stream = self.task_manager.has_active_agent_event_stream(task_id);
@@ -906,6 +1018,11 @@ impl AppModel {
             validation_attempt: task.validation.attempt,
             needs_attention: task.needs_attention(),
             status_detail: task.status_detail.clone(),
+            validation_detail: task
+                .validation
+                .status_detail
+                .as_deref()
+                .map(|detail| jterm_core::review_input::safe_inline_display(detail, 1024)),
         });
         if let Some(detail) = &task.status_detail {
             status_line = format!("{status_line} · {detail}");
@@ -984,6 +1101,8 @@ impl AppModel {
                 && !native_preparing
                 && native_ai_enabled,
             can_start_terminal,
+            can_focus_terminal,
+            can_focus_validation,
             can_stop: (native_preparing || has_stream) && !native_idle,
             can_finish: native_idle,
             can_run_validation: task.status == TaskStatus::ReadyForReview

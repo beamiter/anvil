@@ -1165,6 +1165,16 @@ and never triggers a scan.
 
 ### AI
 
+The Tasks panel shows visible tasks separately from search matches. **Clear
+filters** resets search and status filters. If the selected task is hidden,
+**Show selected task** restores its details while preserving the selection.
+Press **Enter** in the search field to open the first matching task.
+Status filters show how many tasks match the current search in each view.
+**Agent terminal** and **Validation output** return to the task's existing
+terminal or validation pane, including panes in another tab.
+Failed and waiting tasks show a reason preview in the list, with bounded full
+details available on hover.
+
 AI surfaces are optional and can be hidden with `ai_enabled = false`. Provider
 selection is `ANVIL_AI_PROVIDER`, then the `ai_provider` setting, then the
 Anthropic default. Accepted values are `anthropic`, `openai-compatible` (or
@@ -1276,6 +1286,8 @@ Settings exposes the same four choices as Forge: Automatic, Full, Calm, and
 Static. Settings and configuration reloads apply immediately to existing local
 Block/Unified and traditional VTE panes. Turning it off hides the companion and
 stops that pane's animation timer; re-enabling reuses its existing widgets.
+While disabled, Agent phases do not change the companion's life state or queue
+reactions to replay when it is enabled again.
 
 Traditional VTE has partial, display-only support: a neutral five-character
 companion sits outside the terminal grid, alongside a short capability label.

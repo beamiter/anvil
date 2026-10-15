@@ -9,6 +9,66 @@
 //! are headless-testable. Ported from ember's `app/tasks.rs` and frost's
 //! `agent_task_ui.rs`.
 
+/// Resolve the current binding without interpreting its opaque session identity.
+pub(crate) fn task_terminal_binding(
+    task: &crate::agent_task::AgentTask,
+    role: crate::agent_task::TaskTerminalRole,
+) -> Option<&str> {
+    match role {
+        crate::agent_task::TaskTerminalRole::Agent => task.terminal_session_id.as_deref(),
+        crate::agent_task::TaskTerminalRole::Validation => {
+            task.validation.terminal_session_id.as_deref()
+        }
+    }
+}
+
+/// Resolve against live identities, never against an old tab or pane index.
+pub(crate) fn resolve_task_terminal<T>(
+    binding: Option<&str>,
+    terminals: impl IntoIterator<Item = (String, T)>,
+) -> Option<T> {
+    let binding = binding?;
+    terminals
+        .into_iter()
+        .find_map(|(identity, target)| (identity == binding).then_some(target))
+}
+
+pub(crate) fn task_focus_allowed(
+    visible: bool,
+    selected: Option<TaskId>,
+    requested: TaskId,
+) -> bool {
+    visible && selected == Some(requested)
+}
+
+/// A display-only reason, selected from authoritative task/validation details.
+pub(crate) fn task_reason(
+    status: crate::agent_task::TaskStatus,
+    validation: crate::agent_task::TaskValidationStatus,
+    status_detail: Option<&str>,
+    validation_detail: Option<&str>,
+) -> Option<String> {
+    use crate::agent_task::{TaskStatus, TaskValidationStatus};
+    let nonempty = |text: &&str| !text.trim().is_empty();
+    let validation_reason = matches!(
+        validation,
+        TaskValidationStatus::Failed | TaskValidationStatus::Inconclusive
+    )
+    .then_some(validation_detail)
+    .flatten()
+    .filter(nonempty);
+    let task_reason = matches!(
+        status,
+        TaskStatus::Failed | TaskStatus::WaitingForHuman | TaskStatus::WaitingForApproval
+    )
+    .then_some(status_detail)
+    .flatten()
+    .filter(nonempty);
+    validation_reason
+        .or(task_reason)
+        .map(|text| jterm_core::review_input::safe_inline_display(text.trim(), 1024))
+}
+
 use crate::agent_task::{
     AgentProvider, ManagedWorktree, NativePromptPolicy, SemanticCommandContext, TaskId,
     WorktreeService, CODEX_APP_SERVER_LIVE_TURN_MAX, NATIVE_AGENT_FOLLOW_UP_MAX_BYTES,
@@ -65,6 +125,8 @@ pub(crate) enum TaskPanelAction {
     CreateFromBlock,
     StartCodex(TaskId),
     StartTerminal(TaskId),
+    FocusTerminal(TaskId),
+    FocusValidation(TaskId),
     StopCodex(TaskId),
     FollowUp(TaskId, String),
     FinishCodex(TaskId),
@@ -265,6 +327,7 @@ pub(crate) struct TaskRowSnapshot {
     pub(crate) validation_attempt: u64,
     pub(crate) needs_attention: bool,
     pub(crate) status_detail: Option<String>,
+    pub(crate) validation_detail: Option<String>,
 }
 
 impl TaskRowSnapshot {
@@ -584,6 +647,142 @@ pub(crate) fn approval_summary(approval: &crate::agent_task::CodexAppServerAppro
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn task_reason_prefers_validation_and_drops_stale_or_empty_detail() {
+        use crate::agent_task::{TaskStatus as S, TaskValidationStatus as V};
+        assert_eq!(
+            super::task_reason(
+                S::Failed,
+                V::Failed,
+                Some("task failed"),
+                Some("tests failed")
+            )
+            .as_deref(),
+            Some("tests failed")
+        );
+        assert_eq!(
+            super::task_reason(
+                S::Failed,
+                V::Inconclusive,
+                Some("task failed"),
+                Some("no exit status")
+            )
+            .as_deref(),
+            Some("no exit status")
+        );
+        assert_eq!(
+            super::task_reason(S::Failed, V::Failed, Some("task failed"), Some("  ")).as_deref(),
+            Some("task failed")
+        );
+        for status in [S::WaitingForHuman, S::WaitingForApproval] {
+            assert_eq!(
+                super::task_reason(status, V::NotRun, Some("needs a decision"), None).as_deref(),
+                Some("needs a decision")
+            );
+        }
+        assert_eq!(
+            super::task_reason(
+                S::Completed,
+                V::Passed,
+                Some("old failure"),
+                Some("old tests")
+            ),
+            None
+        );
+        assert_eq!(
+            super::task_reason(S::Failed, V::NotRun, Some(" \n\t "), None),
+            None
+        );
+        assert_eq!(super::task_reason(S::Failed, V::NotRun, None, None), None);
+        let unsafe_detail = format!("bad\u{1b}\n\u{202e}{}", "界".repeat(800));
+        let reason = super::task_reason(S::Failed, V::NotRun, Some(&unsafe_detail), None).unwrap();
+        assert!(reason.len() <= 1024);
+        assert!(!reason.chars().any(char::is_control));
+        assert!(!reason.contains('\u{202e}'));
+        assert_eq!(
+            super::task_reason(S::Failed, V::NotRun, Some("updated"), None).as_deref(),
+            Some("updated")
+        );
+    }
+
+    #[test]
+    fn task_terminal_resolution_survives_reorder_and_rejects_replacement() {
+        use crate::agent_task::{AgentProvider, NewTask, TaskManager, TaskTerminalRole};
+        let mut manager = TaskManager::new();
+        let mut ids = Vec::new();
+        for title in ["first", "second"] {
+            ids.push(
+                manager
+                    .create(NewTask {
+                        title: title.into(),
+                        provider: AgentProvider::Codex,
+                        repo_root: "/fixture".into(),
+                        worktree_path: "/fixture/worktree".into(),
+                        branch: "test/focus".into(),
+                        base_commit: "a".repeat(40),
+                        source_context: None,
+                    })
+                    .unwrap(),
+            );
+        }
+        manager
+            .bind_terminal_session(ids[0], "terminal-first".into())
+            .unwrap();
+        manager
+            .bind_terminal_session(ids[1], "terminal-second".into())
+            .unwrap();
+        manager
+            .update_status(ids[1], crate::agent_task::TaskStatus::ReadyForReview, None)
+            .unwrap();
+        manager
+            .bind_validation_session(ids[1], "validation-second".into())
+            .unwrap();
+        manager.handle_terminal_session_exit("validation-second", Some(0));
+        let before = manager.tasks().to_vec();
+        let binding =
+            super::task_terminal_binding(manager.get(ids[1]).unwrap(), TaskTerminalRole::Agent);
+        assert_eq!(
+            super::resolve_task_terminal(
+                binding,
+                [
+                    ("terminal-first".into(), 11),
+                    ("terminal-second".into(), 22)
+                ]
+            ),
+            Some(22)
+        );
+        assert_eq!(
+            super::resolve_task_terminal(
+                binding,
+                [
+                    ("terminal-second".into(), 22),
+                    ("terminal-first".into(), 11)
+                ]
+            ),
+            Some(22)
+        );
+        assert_eq!(
+            super::resolve_task_terminal(
+                binding,
+                [("replacement".into(), 22), ("terminal-first".into(), 11)]
+            ),
+            None
+        );
+        let validation = super::task_terminal_binding(
+            manager.get(ids[1]).unwrap(),
+            TaskTerminalRole::Validation,
+        );
+        assert_eq!(
+            super::resolve_task_terminal(validation, [("validation-second".into(), 33)]),
+            Some(33),
+            "finished validation output stays focusable"
+        );
+        assert!(super::task_focus_allowed(true, Some(ids[1]), ids[1]));
+        assert!(!super::task_focus_allowed(false, Some(ids[1]), ids[1]));
+        assert!(!super::task_focus_allowed(true, Some(ids[0]), ids[1]));
+        assert_eq!(format!("{:?}", manager.tasks()), format!("{before:?}"));
+    }
+
     use super::*;
     use crate::agent_task::{TaskStatus, TaskValidationStatus};
 
@@ -663,6 +862,7 @@ mod tests {
             validation_attempt: 0,
             needs_attention,
             status_detail: None,
+            validation_detail: None,
         }
     }
 

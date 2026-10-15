@@ -7,6 +7,17 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- Failed and waiting task rows show a bounded reason preview without requiring
+  selection; validation failure details take priority when available.
+
+- Task cards can return to an existing Agent terminal or validation output,
+  including a pane in another tab, without creating another session.
+
+- Task filter summaries distinguish visible tasks from search matches. Clear
+  filters or reveal the hidden selected task without changing its identity.
+  Enter in task search opens the first matching task through ordinary selection.
+  Each status filter shows its count for the current search.
+
 - Finished Block cards separate wrapping folder/branch/time metadata from their
   status and primary copy/insert controls. A named **More output actions** menu
   keeps filtering, output-edge navigation and expansion available in narrow panes.
@@ -851,6 +862,15 @@ versioning for tagged releases while it remains experimental.
   open with that error rather than starting unmanaged.
 
 ### Fixed
+
+- Disabling the ASCII companion stops Agent phases from changing its life state;
+  re-enabling it does not replay phases observed while disabled.
+
+- Block/Chat live search re-anchors on forward and backward wrapping instead of
+  entering earlier commands in preserved scrollback. A failed native anchor
+  invalidates navigation rather than selecting an unrelated match.
+  Output changes and terminal resizing invalidate old live matches before
+  navigation, including the single-match shortcut, so the query can be rebuilt.
 
 - Dropped file paths keep their review-first behavior when Enter is already held,
   including a press inherited after focus returns. Paste framing and path quoting

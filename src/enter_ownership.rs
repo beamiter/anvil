@@ -202,9 +202,9 @@ pub(crate) fn install_controller_with_hint(
     controller.connect_key_released(|controller, key, code, _| {
         // Controller reset/focus cleanup may emit key-released without a real
         // key event. Such a release is not evidence that the finger came up.
-        if !controller
+        if controller
             .current_event()
-            .is_some_and(|event| event.event_type() == gtk::gdk::EventType::KeyRelease)
+            .is_none_or(|event| event.event_type() != gtk::gdk::EventType::KeyRelease)
         {
             return;
         }

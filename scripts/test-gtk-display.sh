@@ -54,9 +54,17 @@ fi
 
 tests=(
     dialogs::tasks_panel::tests::dashboard_filters_preserve_selection_without_retargeting
+    dialogs::tasks_panel::tests::dashboard_search_activate_selects_current_visible_result_only
+    dialogs::tasks_panel::tests::dashboard_filter_counts_follow_search_not_selected_view
+    dialogs::tasks_panel::tests::task_terminal_buttons_only_emit_focus_for_existing_bindings
+    dialogs::tasks_panel::tests::task_reason_updates_and_disappears_without_retargeting
     block_view::fold_geometry_tests::fold_actions_update_visible_and_parked_geometry
     block_view::search_navigation_tests::block_output_search_unfolds_only_target
     block_view::search_navigation_tests::chat_output_search_unfolds_only_target
+    block_view::search_navigation_tests::block_live_find_excludes_retained_scrollback
+    block_view::search_navigation_tests::chat_live_find_excludes_retained_scrollback
+    block_view::search_navigation_tests::block_live_find_rebuilds_after_native_changes
+    block_view::search_navigation_tests::chat_live_find_rebuilds_after_native_changes
     block_view::incremental_find_tests::block_incremental_find_reveals_exact_occurrence
     block_view::incremental_find_tests::chat_incremental_find_reveals_exact_occurrence
     block_view::incremental_find_tests::block_filtered_single_hit_reopens_without_taking_focus
@@ -88,6 +96,7 @@ tests=(
     dialogs::settings::organism_preview::tests::preview_lifecycle_keeps_motion_local_and_stops_hidden_sources
     organism_ui::tests::deferred_agent_loss_retires_closed_panes_but_keeps_hidden_outcomes
     organism_ui::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers
+    organism_ui::tests::agent_signal_uses_window_setting_when_one_native_pane_is_disabled
     block_view::history::tests::block_history_retry_handles_failed_and_repaired_files_without_panicking
     sidebar::tests::long_breadcrumbs_do_not_expand_the_sidebar_minimum_width
     block_view::history::tests::unified_relative_path_authority_does_not_follow_a_cwd_change

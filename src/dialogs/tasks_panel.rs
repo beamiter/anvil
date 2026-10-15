@@ -17,8 +17,25 @@ use relm4::prelude::*;
 use crate::agent_task::{ApprovalId, CodexAppServerApproval, TaskId};
 use crate::agent_task_ui::{
     approval_summary, native_follow_up_can_send, plan_list_refresh, render_stream_text,
-    row_status_line, TaskPanelAction, TaskRowSnapshot,
+    row_status_line, task_reason, TaskPanelAction, TaskRowSnapshot,
 };
+
+/// Counts describe current search matches before the selected quick view.
+fn dashboard_filter_label(
+    view: crate::agent_task::DashboardView,
+    counts: &crate::agent_task::DashboardCounts,
+) -> String {
+    use crate::agent_task::DashboardView;
+    let (label, count) = match view {
+        DashboardView::All => ("All", counts.total),
+        DashboardView::NeedsAttention => ("Needs you", counts.attention),
+        DashboardView::Running => ("Running", counts.running),
+        DashboardView::NotStarted => ("Not started", counts.created),
+        DashboardView::Review => ("Review", counts.review),
+        DashboardView::Finished => ("Finished", counts.done + counts.failed + counts.cancelled),
+    };
+    format!("{label} {count}")
+}
 
 const STREAM_PAGE: &str = "stream";
 const DIFF_PAGE: &str = "diff";
@@ -67,6 +84,8 @@ pub(crate) struct TaskDetailSync {
     pub(crate) completed_turns: usize,
     pub(crate) can_start_codex: bool,
     pub(crate) can_start_terminal: bool,
+    pub(crate) can_focus_terminal: bool,
+    pub(crate) can_focus_validation: bool,
     pub(crate) can_stop: bool,
     pub(crate) can_finish: bool,
     pub(crate) can_run_validation: bool,
@@ -92,6 +111,8 @@ pub(crate) struct DiffSync {
 pub(crate) enum ActionKind {
     StartCodex,
     StartTerminal,
+    FocusTerminal,
+    FocusValidation,
     StopCodex,
     FinishCodex,
     RunValidation,
@@ -100,9 +121,11 @@ pub(crate) enum ActionKind {
     Archive,
 }
 
-const ACTION_KINDS: [(ActionKind, &str); 8] = [
+const ACTION_KINDS: [(ActionKind, &str); 10] = [
     (ActionKind::StartCodex, "Start Codex"),
-    (ActionKind::StartTerminal, "Terminal"),
+    (ActionKind::StartTerminal, "Start terminal"),
+    (ActionKind::FocusTerminal, "Agent terminal"),
+    (ActionKind::FocusValidation, "Validation output"),
     (ActionKind::StopCodex, "Stop"),
     (ActionKind::FinishCodex, "Finish"),
     (ActionKind::RunValidation, "Validate"),
@@ -115,6 +138,8 @@ const ACTION_KINDS: [(ActionKind, &str); 8] = [
 pub(crate) enum TasksPanelMsg {
     Sync(Box<TasksPanelSync>),
     DashboardQuery(String),
+    OpenDashboardResult,
+    ClearDashboardFilters,
     DashboardView(crate::agent_task::DashboardView),
     /// Stable identity captured when the row gesture occurs. A later filter
     /// change may hide it, but must never retarget a queued gesture.
@@ -139,6 +164,7 @@ pub(crate) struct TasksPanelModel {
     dashboard_query: String,
     dashboard_view: crate::agent_task::DashboardView,
     dashboard_summary: String,
+    dashboard_counts: crate::agent_task::DashboardCounts,
     dashboard_buttons: Vec<(crate::agent_task::DashboardView, gtk::Button)>,
     /// Per-task follow-up drafts; the app never sees keystrokes, only the
     /// final text carried by `TaskPanelAction::FollowUp`.
@@ -186,16 +212,13 @@ impl TasksPanelModel {
             sync.detail = None;
         }
         self.dashboard_summary = format!(
-            "{} tasks · {} need you · {} awaiting approval{}",
+            "{} shown · {} search matches · {} need you · {} awaiting approval",
+            dashboard.rows.len(),
             dashboard.counts.total,
             dashboard.counts.attention,
             dashboard.counts.pending_approval,
-            if sync.rows.is_empty() {
-                " · No matching tasks"
-            } else {
-                ""
-            }
         );
+        self.dashboard_counts = dashboard.counts;
         self.sync = sync;
     }
 
@@ -244,6 +267,23 @@ impl TasksPanelModel {
                 lines.set_margin_start(4);
                 lines.append(&title);
                 lines.append(&status);
+                if let Some(reason) = task_reason(
+                    row.status,
+                    row.validation_status,
+                    row.status_detail.as_deref(),
+                    row.validation_detail.as_deref(),
+                ) {
+                    let preview = gtk::Label::new(Some(&reason));
+                    preview.set_halign(gtk::Align::Start);
+                    preview.set_single_line_mode(true);
+                    preview.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                    preview.set_max_width_chars(28);
+                    preview.set_tooltip_text(Some(&reason));
+                    preview.add_css_class("caption");
+                    preview.add_css_class("dim-label");
+                    preview.add_css_class("task-reason");
+                    lines.append(&preview);
+                }
                 let list_row = gtk::ListBoxRow::new();
                 list_row.set_child(Some(&lines));
                 widgets.task_list.append(&list_row);
@@ -386,13 +426,15 @@ impl Component for TasksPanelModel {
                 set_visible: false,
             },
 
+            #[name(dashboard_query_entry)]
             gtk::Entry {
-                set_placeholder_text: Some("Search tasks, providers or repositories"),
+                set_placeholder_text: Some("Search tasks, providers or repositories · Enter to open"),
                 set_max_length: 256,
                 update_property: &[gtk::accessible::Property::Label("Search agent tasks")],
                 connect_changed[sender] => move |entry| {
                     sender.input(TasksPanelMsg::DashboardQuery(entry.text().to_string()));
                 },
+                connect_activate => TasksPanelMsg::OpenDashboardResult,
             },
             #[name(dashboard_filters)]
             gtk::FlowBox {
@@ -403,6 +445,22 @@ impl Component for TasksPanelModel {
             gtk::Label {
                 set_wrap: true,
                 add_css_class: "caption",
+            },
+
+            #[name(dashboard_clear)]
+            gtk::Button {
+                set_label: "Clear filters",
+                set_visible: false,
+                connect_clicked => TasksPanelMsg::ClearDashboardFilters,
+            },
+            #[name(dashboard_reveal)]
+            gtk::Button {
+                set_visible: false,
+                connect_clicked => TasksPanelMsg::ClearDashboardFilters,
+                gtk::Label {
+                    set_label: "Selected task hidden · Show selected task",
+                    set_wrap: true,
+                },
             },
 
             gtk::Paned {
@@ -587,6 +645,7 @@ impl Component for TasksPanelModel {
             dashboard_query: String::new(),
             dashboard_view: crate::agent_task::DashboardView::All,
             dashboard_summary: String::new(),
+            dashboard_counts: Default::default(),
             dashboard_buttons: Vec::new(),
             follow_up_drafts: HashMap::new(),
             action_buttons: Vec::new(),
@@ -673,15 +732,16 @@ impl Component for TasksPanelModel {
 
         let mut dashboard_buttons = Vec::new();
         use crate::agent_task::DashboardView;
-        for (view, label) in [
-            (DashboardView::All, "All"),
-            (DashboardView::NeedsAttention, "Needs you"),
-            (DashboardView::Running, "Running"),
-            (DashboardView::NotStarted, "Not started"),
-            (DashboardView::Review, "Review"),
-            (DashboardView::Finished, "Finished"),
+        for view in [
+            DashboardView::All,
+            DashboardView::NeedsAttention,
+            DashboardView::Running,
+            DashboardView::NotStarted,
+            DashboardView::Review,
+            DashboardView::Finished,
         ] {
-            let button = gtk::Button::with_label(label);
+            let button =
+                gtk::Button::with_label(&dashboard_filter_label(view, &Default::default()));
             button.add_css_class("caption");
             let sender = sender.clone();
             button.connect_clicked(move |_| sender.input(TasksPanelMsg::DashboardView(view)));
@@ -710,6 +770,20 @@ impl Component for TasksPanelModel {
             TasksPanelMsg::Sync(sync) => {
                 self.unfiltered_sync = *sync;
                 self.apply_dashboard_filters();
+            }
+            TasksPanelMsg::ClearDashboardFilters => {
+                self.dashboard_query.clear();
+                self.dashboard_view = crate::agent_task::DashboardView::All;
+                widgets.dashboard_query_entry.set_text("");
+                self.apply_dashboard_filters();
+            }
+            TasksPanelMsg::OpenDashboardResult => {
+                self.apply_dashboard_filters();
+                if let Some(row) = self.sync.rows.first() {
+                    if self.sync.selected != Some(row.id) {
+                        self.emit_action(TaskPanelAction::Select(row.id), &sender);
+                    }
+                }
             }
             TasksPanelMsg::DashboardQuery(query) => {
                 self.dashboard_query = query.chars().take(256).collect();
@@ -752,6 +826,8 @@ impl Component for TasksPanelModel {
                     let action = match kind {
                         ActionKind::StartCodex => TaskPanelAction::StartCodex(id),
                         ActionKind::StartTerminal => TaskPanelAction::StartTerminal(id),
+                        ActionKind::FocusTerminal => TaskPanelAction::FocusTerminal(id),
+                        ActionKind::FocusValidation => TaskPanelAction::FocusValidation(id),
                         ActionKind::StopCodex => TaskPanelAction::StopCodex(id),
                         ActionKind::FinishCodex => TaskPanelAction::FinishCodex(id),
                         ActionKind::RunValidation => TaskPanelAction::RunValidation(id),
@@ -800,7 +876,24 @@ impl TasksPanelModel {
         }
 
         widgets.dashboard_summary.set_label(&self.dashboard_summary);
+        widgets.dashboard_clear.set_visible(
+            !self.dashboard_query.is_empty()
+                || self.dashboard_view != crate::agent_task::DashboardView::All,
+        );
+        let hidden = self.sync.selected.is_some_and(|id| {
+            self.unfiltered_sync
+                .dashboard
+                .rows
+                .iter()
+                .any(|row| row.id == id)
+                && !self.sync.rows.iter().any(|row| row.id == id)
+        });
+        widgets.dashboard_reveal.set_visible(hidden);
         for (view, button) in &self.dashboard_buttons {
+            let label = dashboard_filter_label(*view, &self.dashboard_counts);
+            if button.label().as_deref() != Some(label.as_str()) {
+                button.set_label(&label);
+            }
             if *view == self.dashboard_view {
                 button.add_css_class("suggested-action");
             } else {
@@ -815,6 +908,8 @@ impl TasksPanelModel {
                 match kind {
                     ActionKind::StartCodex => detail.can_start_codex,
                     ActionKind::StartTerminal => detail.can_start_terminal,
+                    ActionKind::FocusTerminal => detail.can_focus_terminal,
+                    ActionKind::FocusValidation => detail.can_focus_validation,
                     ActionKind::StopCodex => detail.can_stop,
                     ActionKind::FinishCodex => detail.can_finish,
                     ActionKind::RunValidation => detail.can_run_validation,
@@ -923,6 +1018,37 @@ fn set_view_text(view: &gtk::TextView, text: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dashboard_filter_labels_map_activity_and_finished_counts() {
+        use crate::agent_task::{DashboardCounts, DashboardView};
+        let counts = DashboardCounts {
+            total: 20,
+            attention: 7,
+            running: 9,
+            created: 3,
+            review: 4,
+            done: 2,
+            failed: 5,
+            cancelled: 1,
+            archived: 99,
+            ..Default::default()
+        };
+        for (view, expected) in [
+            (DashboardView::All, "All 20"),
+            (DashboardView::NeedsAttention, "Needs you 7"),
+            (DashboardView::Running, "Running 9"),
+            (DashboardView::NotStarted, "Not started 3"),
+            (DashboardView::Review, "Review 4"),
+            (DashboardView::Finished, "Finished 8"),
+        ] {
+            assert_eq!(super::dashboard_filter_label(view, &counts), expected);
+        }
+        assert_eq!(
+            super::dashboard_filter_label(DashboardView::Running, &DashboardCounts::default()),
+            "Running 0"
+        );
+    }
+
     use super::*;
 
     use super::{task_page_presentation, task_page_toggle_request, DIFF_PAGE, STREAM_PAGE};
@@ -1016,6 +1142,7 @@ mod tests {
                 validation_attempt: 0,
                 needs_attention: task.needs_attention(),
                 status_detail: None,
+                validation_detail: None,
             })
             .collect();
         let detail = TaskDetailSync {
@@ -1028,6 +1155,8 @@ mod tests {
             completed_turns: 0,
             can_start_codex: false,
             can_start_terminal: false,
+            can_focus_terminal: false,
+            can_focus_validation: false,
             can_stop: false,
             can_finish: false,
             can_run_validation: false,
@@ -1043,6 +1172,337 @@ mod tests {
             detail: Some(Box::new(detail)),
             ..Default::default()
         }
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn task_reason_updates_and_disappears_without_retargeting() {
+        gtk::init().expect("GTK display");
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let sink = actions.clone();
+        let controller =
+            TasksPanelModel::builder()
+                .launch(())
+                .connect_receiver(move |_, output| {
+                    let TasksPanelOutput::Action(action) = output;
+                    sink.borrow_mut().push(action);
+                });
+        let window = gtk::Window::new();
+        window.set_child(Some(controller.widget()));
+        let drain = || {
+            let main = gtk::glib::MainContext::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while main.pending() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "bounded component drain"
+                );
+                main.iteration(false);
+            }
+        };
+        let find_reason = || {
+            let mut pending = vec![controller
+                .widgets()
+                .task_list
+                .clone()
+                .upcast::<gtk::Widget>()];
+            while let Some(widget) = pending.pop() {
+                if widget.has_css_class("task-reason") {
+                    return Some(widget.downcast::<gtk::Label>().unwrap());
+                }
+                let mut child = widget.first_child();
+                while let Some(widget) = child {
+                    child = widget.next_sibling();
+                    pending.push(widget);
+                }
+            }
+            None
+        };
+        let mut sync = dashboard_test_sync();
+        let selected = sync.selected.unwrap();
+        let row = sync.rows.iter_mut().find(|row| row.id == selected).unwrap();
+        row.status = crate::agent_task::TaskStatus::Failed;
+        row.status_detail = Some("task reason".into());
+        row.validation_status = crate::agent_task::TaskValidationStatus::Failed;
+        row.validation_detail = Some("validation old".into());
+        let row = sync
+            .dashboard
+            .rows
+            .iter_mut()
+            .find(|row| row.id == selected)
+            .unwrap();
+        row.status = crate::agent_task::TaskStatus::Failed;
+        row.status_detail = Some("task reason".into());
+        row.validation_status = crate::agent_task::TaskValidationStatus::Failed;
+        controller.emit(TasksPanelMsg::Sync(Box::new(sync.clone())));
+        drain();
+        let reason = find_reason().unwrap();
+        assert_eq!(reason.label(), "validation old");
+        assert_eq!(reason.tooltip_text().as_deref(), Some("validation old"));
+        assert_eq!(reason.ellipsize(), gtk::pango::EllipsizeMode::End);
+        assert!(reason.is_single_line_mode());
+        sync.rows
+            .iter_mut()
+            .find(|row| row.id == selected)
+            .unwrap()
+            .validation_detail = Some("updated".into());
+        controller.emit(TasksPanelMsg::Sync(Box::new(sync.clone())));
+        drain();
+        assert_eq!(find_reason().unwrap().label(), "updated");
+        sync.rows
+            .iter_mut()
+            .find(|row| row.id == selected)
+            .unwrap()
+            .validation_detail = None;
+        sync.rows
+            .iter_mut()
+            .find(|row| row.id == selected)
+            .unwrap()
+            .status_detail = None;
+        sync.dashboard
+            .rows
+            .iter_mut()
+            .find(|row| row.id == selected)
+            .unwrap()
+            .status_detail = None;
+        controller.emit(TasksPanelMsg::Sync(Box::new(sync)));
+        drain();
+        assert!(
+            find_reason().is_none(),
+            "old preview and tooltip must disappear"
+        );
+        assert_eq!(controller.model().sync.selected, Some(selected));
+        assert!(actions.borrow().is_empty());
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn task_terminal_buttons_only_emit_focus_for_existing_bindings() {
+        gtk::init().expect("GTK display");
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let sink = actions.clone();
+        let controller =
+            TasksPanelModel::builder()
+                .launch(())
+                .connect_receiver(move |_, output| {
+                    let TasksPanelOutput::Action(action) = output;
+                    sink.borrow_mut().push(action);
+                });
+        let window = gtk::Window::new();
+        window.set_child(Some(controller.widget()));
+        let drain = || {
+            let main = gtk::glib::MainContext::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while main.pending() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "bounded component drain"
+                );
+                main.iteration(false);
+            }
+        };
+        let mut sync = dashboard_test_sync();
+        let id = sync.selected.unwrap();
+        sync.detail.as_mut().unwrap().can_focus_terminal = true;
+        sync.detail.as_mut().unwrap().can_focus_validation = true;
+        controller.emit(TasksPanelMsg::Sync(Box::new(sync.clone())));
+        drain();
+        for kind in [ActionKind::FocusTerminal, ActionKind::FocusValidation] {
+            let button = controller
+                .model()
+                .action_buttons
+                .iter()
+                .find(|(candidate, _)| *candidate == kind)
+                .unwrap()
+                .1
+                .clone();
+            assert!(button.is_sensitive());
+            button.emit_clicked();
+            drain();
+        }
+        assert_eq!(
+            *actions.borrow(),
+            [
+                TaskPanelAction::FocusTerminal(id),
+                TaskPanelAction::FocusValidation(id)
+            ]
+        );
+        assert_eq!(controller.model().sync.selected, Some(id));
+        assert_eq!(controller.model().unfiltered_sync.rows, sync.rows);
+        sync.detail.as_mut().unwrap().can_focus_terminal = false;
+        sync.detail.as_mut().unwrap().can_focus_validation = false;
+        controller.emit(TasksPanelMsg::Sync(Box::new(sync)));
+        drain();
+        assert!(controller
+            .model()
+            .action_buttons
+            .iter()
+            .filter(|(kind, _)| matches!(
+                kind,
+                ActionKind::FocusTerminal | ActionKind::FocusValidation
+            ))
+            .all(|(_, button)| !button.is_sensitive()));
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn dashboard_filter_counts_follow_search_not_selected_view() {
+        gtk::init().expect("GTK display");
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let sink = actions.clone();
+        let controller =
+            TasksPanelModel::builder()
+                .launch(())
+                .connect_receiver(move |_, output| {
+                    let TasksPanelOutput::Action(action) = output;
+                    sink.borrow_mut().push(action);
+                });
+        let window = gtk::Window::new();
+        window.set_child(Some(controller.widget()));
+        let drain = || {
+            let main = gtk::glib::MainContext::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while main.pending() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "bounded component drain"
+                );
+                main.iteration(false);
+            }
+        };
+        let sync = dashboard_test_sync();
+        let selected = sync.selected;
+        controller.emit(TasksPanelMsg::Sync(Box::new(sync.clone())));
+        drain();
+        let labels = || {
+            controller
+                .model()
+                .dashboard_buttons
+                .iter()
+                .map(|(_, button)| button.label().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            labels(),
+            [
+                "All 2",
+                "Needs you 1",
+                "Running 0",
+                "Not started 1",
+                "Review 0",
+                "Finished 1"
+            ]
+        );
+        controller.emit(TasksPanelMsg::DashboardView(
+            crate::agent_task::DashboardView::Running,
+        ));
+        drain();
+        assert!(controller.model().sync.rows.is_empty());
+        assert_eq!(
+            labels()[0],
+            "All 2",
+            "choosing a view must not shrink badges"
+        );
+        controller.widgets().dashboard_query_entry.set_text("First");
+        drain();
+        assert_eq!(
+            labels(),
+            [
+                "All 1",
+                "Needs you 0",
+                "Running 0",
+                "Not started 1",
+                "Review 0",
+                "Finished 0"
+            ]
+        );
+        controller
+            .widgets()
+            .dashboard_query_entry
+            .set_text("missing");
+        drain();
+        assert!(labels().iter().all(|label| label.ends_with(" 0")));
+        assert!(controller
+            .model()
+            .dashboard_buttons
+            .iter()
+            .all(|(_, button)| button.is_sensitive()));
+        assert_eq!(controller.model().sync.selected, selected);
+        assert_eq!(controller.model().unfiltered_sync.rows, sync.rows);
+        assert!(actions.borrow().is_empty());
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn dashboard_search_activate_selects_current_visible_result_only() {
+        gtk::init().expect("GTK display");
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let sink = actions.clone();
+        let controller =
+            TasksPanelModel::builder()
+                .launch(())
+                .connect_receiver(move |_, output| {
+                    let TasksPanelOutput::Action(action) = output;
+                    sink.borrow_mut().push(action);
+                });
+        let window = gtk::Window::new();
+        window.set_child(Some(controller.widget()));
+        let drain = || {
+            let main = gtk::glib::MainContext::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while main.pending() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "bounded component drain"
+                );
+                main.iteration(false);
+            }
+        };
+        let sync = dashboard_test_sync();
+        let expected = sync
+            .dashboard
+            .rows
+            .iter()
+            .find(|row| row.title == "Needs review")
+            .unwrap()
+            .id;
+        controller.emit(TasksPanelMsg::Sync(Box::new(sync.clone())));
+        drain();
+        controller
+            .widgets()
+            .dashboard_query_entry
+            .set_text("review");
+        drain();
+        assert!(actions.borrow().is_empty(), "typing must not select");
+        controller.emit(TasksPanelMsg::DashboardView(
+            crate::agent_task::DashboardView::Running,
+        ));
+        controller.widgets().dashboard_query_entry.emit_activate();
+        drain();
+        assert!(
+            actions.borrow().is_empty(),
+            "the current view can hide all matches"
+        );
+        controller.emit(TasksPanelMsg::DashboardView(
+            crate::agent_task::DashboardView::All,
+        ));
+        controller.widgets().dashboard_query_entry.emit_activate();
+        drain();
+        assert!(
+            matches!(actions.borrow().as_slice(), [TaskPanelAction::Select(id)] if *id == expected)
+        );
+        assert_eq!(controller.model().unfiltered_sync.rows, sync.rows);
+        controller
+            .widgets()
+            .dashboard_query_entry
+            .set_text("no matches");
+        controller.widgets().dashboard_query_entry.emit_activate();
+        drain();
+        assert_eq!(actions.borrow().len(), 1, "empty results are inert");
+        window.close();
     }
 
     #[test]
@@ -1088,10 +1548,7 @@ mod tests {
         controller.emit(TasksPanelMsg::DashboardQuery("missing".into()));
         drain();
         assert!(controller.model().sync.rows.is_empty());
-        controller.emit(TasksPanelMsg::DashboardQuery(String::new()));
-        controller.emit(TasksPanelMsg::DashboardView(
-            crate::agent_task::DashboardView::All,
-        ));
+        controller.widgets().dashboard_reveal.emit_clicked();
         drain();
         assert_eq!(controller.model().sync.rows.len(), 2);
         assert_eq!(controller.model().sync.selected, selected);
@@ -1099,6 +1556,16 @@ mod tests {
             controller.model().sync.detail.as_ref().map(|d| d.id),
             selected
         );
+        let mut removed = sync;
+        removed.rows.retain(|row| Some(row.id) != selected);
+        removed
+            .dashboard
+            .rows
+            .retain(|row| Some(row.id) != selected);
+        removed.detail = None;
+        controller.emit(TasksPanelMsg::Sync(Box::new(removed)));
+        drain();
+        assert!(!controller.widgets().dashboard_reveal.is_visible());
         assert!(
             actions.borrow().is_empty(),
             "filtering or a hidden stale gesture must not stage an action"

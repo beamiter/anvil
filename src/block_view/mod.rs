@@ -4207,6 +4207,9 @@ pub struct TermView {
     /// The single persistent live VTE (anvil model): prompt + typing + output all
     /// render here natively; finished commands snapshot into styled blocks above.
     active_vte: Terminal,
+    /// Existing native contents clock, shared with prompt/layout observation.
+    /// Search reads it; selection and scrolling never advance it.
+    contents_generation: Rc<Cell<u64>>,
     active: Rc<RefCell<ActiveBlock>>,
     bstate: Rc<Cell<BlockState>>,
     /// Keystroke shadow used only to size the idle input cell (line count). The
@@ -14099,6 +14102,7 @@ impl TermView {
             block_onboarding,
             notice_dock,
             active_vte,
+            contents_generation,
             active,
             bstate,
             typed_cmd,

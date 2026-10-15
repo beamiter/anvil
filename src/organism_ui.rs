@@ -1819,19 +1819,35 @@ impl OrganismPresence {
 /// are deduplicated so status refreshes cannot pump the state.
 pub(crate) struct OrganismAgentSignal {
     life: Rc<Cell<LifeState>>,
+    config: Rc<RefCell<crate::config::Config>>,
     last: Cell<Option<AgentPulse>>,
 }
 
 impl OrganismAgentSignal {
-    pub(crate) fn new(life: Rc<Cell<LifeState>>) -> Rc<Self> {
+    pub(crate) fn new(
+        life: Rc<Cell<LifeState>>,
+        config: Rc<RefCell<crate::config::Config>>,
+    ) -> Rc<Self> {
         Rc::new(Self {
             life,
+            config,
             last: Cell::new(None),
         })
     }
 
     pub(crate) fn note_phase(&self, pulse: AgentPulse) {
         if self.last.replace(Some(pulse)) == Some(pulse) {
+            return;
+        }
+        // Consume phases even while off, so re-enabling cannot replay them.
+        // Window configuration is authoritative; a hidden/background pane
+        // must not disable another pane's shared mind. A config update that
+        // still owns its mutable borrow also admits no reward.
+        if !self
+            .config
+            .try_borrow()
+            .is_ok_and(|config| config.ascii_organism_enabled)
+        {
             return;
         }
         self.life
@@ -3957,13 +3973,13 @@ impl OrganismHub {
             .unwrap_or_default();
 
         let hub = Rc::new(Self {
-            config,
+            config: config.clone(),
             desktop_motion_observer: RefCell::new(None),
             organism_memory: Rc::new(RefCell::new(organism_memory)),
             organism_correction: OrganismCorrectionSignal::new(organism_life.clone()),
             organism_activity: OrganismActivity::new(circadian, growth),
             organism_presence: OrganismPresence::new(),
-            organism_agent: OrganismAgentSignal::new(organism_life.clone()),
+            organism_agent: OrganismAgentSignal::new(organism_life.clone(), config),
             organism_life,
         });
         if let Some(desktop) = gtk::Settings::default() {
@@ -9125,9 +9141,90 @@ mod tests {
     }
 
     #[test]
+    fn agent_signal_disabled_phases_are_consumed_without_life_rewards() {
+        let life = Rc::new(Cell::new(LifeState::default()));
+        let config = Rc::new(RefCell::new(crate::config::Config::safe_defaults()));
+        config.borrow_mut().ascii_organism_enabled = false;
+        let signal = OrganismAgentSignal::new(life.clone(), config.clone());
+        let before = format!("{:?}", life.get());
+        for pulse in [
+            AgentPulse::Working,
+            AgentPulse::AskingReview,
+            AgentPulse::Finished,
+            AgentPulse::Gone,
+        ] {
+            signal.note_phase(pulse);
+        }
+        assert_eq!(format!("{:?}", life.get()), before);
+        config.borrow_mut().ascii_organism_enabled = true;
+        signal.note_phase(AgentPulse::Gone);
+        assert_eq!(format!("{:?}", life.get()), before);
+        signal.note_phase(AgentPulse::Working);
+        assert!(life.get().social_need > LifeState::default().social_need);
+        let after = format!("{:?}", life.get());
+        signal.note_phase(AgentPulse::Working);
+        assert_eq!(format!("{:?}", life.get()), after);
+    }
+
+    #[test]
+    fn agent_signal_busy_config_borrow_consumes_phase_without_panicking_or_replaying() {
+        let life = Rc::new(Cell::new(LifeState::default()));
+        let config = Rc::new(RefCell::new(crate::config::Config::safe_defaults()));
+        config.borrow_mut().ascii_organism_enabled = true;
+        let signal = OrganismAgentSignal::new(life.clone(), config.clone());
+        let before = format!("{:?}", life.get());
+        let updating = config.borrow_mut();
+        signal.note_phase(AgentPulse::Finished);
+        assert_eq!(format!("{:?}", life.get()), before);
+        drop(updating);
+        signal.note_phase(AgentPulse::Finished);
+        assert_eq!(format!("{:?}", life.get()), before);
+        signal.note_phase(AgentPulse::Working);
+        assert!(life.get().social_need > LifeState::default().social_need);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn agent_signal_uses_window_setting_when_one_native_pane_is_disabled() {
+        gtk::init().expect("GTK display");
+        relm4::adw::init().expect("libadwaita display");
+        let view = crate::block_view::organism_settings_test_view();
+        let presence = OrganismPresence::new();
+        presence.remember_view(&view);
+        let token = presence.reserve();
+        let life = Rc::new(Cell::new(LifeState::default()));
+        let runtime = OrganismRuntime::new(
+            life.clone(),
+            OrganismActivity::new(None, GrowthProgress::default()),
+            presence.clone(),
+            token,
+            OrganismMotion::Static,
+            false,
+        );
+        presence.bind(token, &view, &runtime);
+        let config = Rc::new(RefCell::new(crate::config::Config::safe_defaults()));
+        config.borrow_mut().ascii_organism_enabled = true;
+        let signal = OrganismAgentSignal::new(life.clone(), config.clone());
+        OrganismRuntime::apply_settings(&runtime, &view, false, OrganismMotion::Static);
+        assert!(!runtime.enabled.get());
+        assert!(runtime.surface_timer.borrow().is_none());
+        signal.note_phase(AgentPulse::Finished);
+        assert!(life.get().social_need > LifeState::default().social_need);
+        let before_disabled = format!("{:?}", life.get());
+        config.borrow_mut().ascii_organism_enabled = false;
+        signal.note_phase(AgentPulse::Gone);
+        assert_eq!(format!("{:?}", life.get()), before_disabled);
+        config.borrow_mut().ascii_organism_enabled = true;
+        signal.note_phase(AgentPulse::Gone);
+        assert_eq!(format!("{:?}", life.get()), before_disabled);
+    }
+
+    #[test]
     fn agent_signal_deduplicates_repeated_phase_renders() {
         let life = Rc::new(Cell::new(LifeState::default()));
-        let signal = OrganismAgentSignal::new(life.clone());
+        let mut config = crate::config::Config::safe_defaults();
+        config.ascii_organism_enabled = true;
+        let signal = OrganismAgentSignal::new(life.clone(), Rc::new(RefCell::new(config)));
         let before = life.get().social_need;
         signal.note_phase(AgentPulse::Working);
         let after_first = life.get().social_need;

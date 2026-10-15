@@ -153,7 +153,18 @@ pub(super) fn assert_native_paint_contract(card: &gtk::Widget) {
     assert!(bounds.x() + bounds.width() >= native.x() + native.width());
     assert!(bounds.y() + bounds.height() >= native.y() + native.height());
 
-    let pixels = |node: &gtk::gsk::RenderNode, scale: f64| {
+    // A direct draw to an image is not a complete-ink oracle: GSK's
+    // per-node image clipping can discard hinted glyph overhang. Record the
+    // native subtree without extents first, independently of our bounded
+    // production node, then compare both recordings at each device scale.
+    let reference = gtk::cairo::RecordingSurface::create(gtk::cairo::Content::ColorAlpha, None)
+        .expect("unbounded native ink reference");
+    let reference_cr = gtk::cairo::Context::new(&reference).unwrap();
+    original.draw(&reference_cr);
+    reference_cr.status().expect("native reference recording");
+    drop(reference_cr);
+
+    let pixels = |paint: &dyn Fn(&gtk::cairo::Context), scale: f64| {
         // An additional three-pixel surrounding canvas detects clipping by
         // our declared envelope rather than hiding it in the comparison ROI.
         let width = ((f64::from(bounds.width()) + 6.0) * scale).ceil() as i32;
@@ -165,7 +176,7 @@ pub(super) fn assert_native_paint_contract(card: &gtk::Widget) {
         let cr = gtk::cairo::Context::new(&surface).unwrap();
         cr.scale(scale, scale);
         cr.translate(3.0 - f64::from(bounds.x()), 3.0 - f64::from(bounds.y()));
-        node.draw(&cr);
+        paint(&cr);
         cr.status().expect("native subtree draw");
         drop(cr);
         surface.flush();
@@ -173,14 +184,16 @@ pub(super) fn assert_native_paint_contract(card: &gtk::Widget) {
         bytes
     };
     for scale in [1.0, 1.25, 1.5, 2.0] {
-        let reference = pixels(&original, scale);
-        let recorded = pixels(&painted, scale);
-        let changed = reference
-            .iter()
-            .zip(&recorded)
-            .filter(|(a, b)| a != b)
-            .count();
-        assert_eq!(reference.len(), recorded.len());
+        let native = pixels(
+            &|cr| {
+                cr.set_source_surface(&reference, 0.0, 0.0).unwrap();
+                cr.paint().unwrap();
+            },
+            scale,
+        );
+        let recorded = pixels(&|cr| painted.draw(cr), scale);
+        let changed = native.iter().zip(&recorded).filter(|(a, b)| a != b).count();
+        assert_eq!(native.len(), recorded.len());
         assert_eq!(
             changed, 0,
             "recording must preserve complete native ink at scale {scale}"

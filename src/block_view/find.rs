@@ -224,6 +224,16 @@ impl Drop for FindReplayRepair {
     }
 }
 
+/// Native changes that can invalidate live match counts and coordinates.
+/// Viewport scroll and selection are deliberately absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LiveFindStamp {
+    contents_generation: u64,
+    rows: i64,
+    columns: i64,
+    origin: Option<i64>,
+}
+
 #[derive(Default)]
 pub(crate) struct FindState {
     /// An asynchronous exact step failed; the next action must rebuild rather
@@ -248,6 +258,7 @@ pub(crate) struct FindState {
     /// The live surface's counted range (see [`LiveAnchor`]), kept from the
     /// count so the steps start exactly where it did.
     live_anchor: Option<LiveAnchor>,
+    live_stamp: Option<LiveFindStamp>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -446,12 +457,16 @@ fn live_search_rows(lower: f64, upper: f64, page_size: f64, origin: Option<i64>)
 /// Point the live VTE's native search at the ends of the counted range before
 /// the first step into the live surface: a forward step starts at the view's
 /// top row (`anchor`), a backward one at the view's bottom (the buffer's end).
-fn anchor_live_native_search(vte: &vte4::Terminal, direction: FindDirection, anchor: LiveAnchor) {
+fn anchor_live_native_search(
+    vte: &vte4::Terminal,
+    direction: FindDirection,
+    anchor: LiveAnchor,
+) -> bool {
     use gtk::prelude::*;
 
     vte.unselect_all();
     let Some(adjustment) = vte.vadjustment() else {
-        return;
+        return false;
     };
     match direction {
         FindDirection::Next => {
@@ -459,13 +474,14 @@ fn anchor_live_native_search(vte: &vte4::Terminal, direction: FindDirection, anc
             vte.search_set_wrap_around(false);
             for _ in 0..anchor.skip {
                 if !vte.search_find_next() {
-                    break;
+                    return false;
                 }
             }
         }
         FindDirection::Previous => adjustment
             .set_value((adjustment.upper() - adjustment.page_size()).max(adjustment.lower())),
     }
+    true
 }
 
 /// Matches in the live rows `view_row..from_row`: on the view's last page,
@@ -1386,6 +1402,20 @@ fn add_snapshot_jump_fallbacks<'a>(
 
 #[allow(dead_code)]
 impl TermView {
+    fn live_find_stamp(&self) -> LiveFindStamp {
+        LiveFindStamp {
+            contents_generation: self.contents_generation.get(),
+            rows: self.active_vte.row_count(),
+            columns: self.active_vte.column_count(),
+            origin: self.active.borrow().live_cursor_origin().get(),
+        }
+    }
+
+    fn live_find_is_current(&self) -> bool {
+        let expected = self.find_state.borrow().live_stamp;
+        expected.is_none_or(|stamp| stamp == self.live_find_stamp())
+    }
+
     /// Cheap version probe for an open picker. No command/output text is
     /// cloned; callers can poll this and rebuild only when finalized record
     /// identity or bookmark membership actually changes.
@@ -1492,6 +1522,7 @@ impl TermView {
             Err(_) => return FindSearchResult::InvalidRegex,
         };
 
+        let live_stamp_at_start = self.live_find_stamp();
         let mut surfaces = Vec::new();
         let mut highlighted_terminals = Vec::new();
         let mut total = 0usize;
@@ -1512,6 +1543,7 @@ impl TermView {
                 .native_fallback
                 .as_ref()
                 .is_some_and(|fallback| fallback.is_live);
+        let mut live_observed = completed_owns_live_surface;
         let completed_incomplete = completed_batch.incomplete;
         let native_fallback = completed_batch.native_fallback;
         for backend_surface in completed_batch.surfaces {
@@ -1621,6 +1653,7 @@ impl TermView {
                 super::BlockState::CollectingOutput | super::BlockState::PostCommand
             )
         {
+            live_observed = true;
             let live_rows = self.active_vte.vadjustment().map(|adjustment| {
                 live_search_rows(
                     adjustment.lower(),
@@ -1698,6 +1731,7 @@ impl TermView {
             };
         }
         let capped = match_limited || scan_limited;
+        let live_stamp = live_observed.then_some(live_stamp_at_start);
         {
             let mut st = self.find_state.borrow_mut();
             st.surfaces = surfaces;
@@ -1712,6 +1746,7 @@ impl TermView {
             st.scan_limited = scan_limited;
             st.highlighted_terminals = highlighted_terminals;
             st.live_anchor = live_anchor;
+            st.live_stamp = live_stamp;
         }
         if let Some(resume) = resume {
             let cursor = resumed_find_cursor(&self.find_state.borrow().surfaces, resume);
@@ -2026,6 +2061,12 @@ impl TermView {
     }
 
     fn step_find(&self, direction: FindDirection) -> FindNavigationResult {
+        // Invalidate before the one-hit/at-boundary shortcut: native output
+        // can erase its selection or add hits without moving our old cursor.
+        if !self.live_find_is_current() {
+            self.clear_find();
+            return FindNavigationResult::Invalidated;
+        }
         if std::mem::take(&mut self.find_state.borrow_mut().invalidated) {
             return FindNavigationResult::Invalidated;
         }
@@ -2118,6 +2159,9 @@ impl TermView {
         direction: FindDirection,
         restart: bool,
     ) -> FindFocusResult {
+        if !self.live_find_is_current() {
+            return FindFocusResult::Invalidated;
+        }
         let (surface, query_at_start, cursor_at_start) = {
             let state = self.find_state.borrow();
             let Some(surface) = state.surfaces.get(surface_index) else {
@@ -2183,7 +2227,7 @@ impl TermView {
         let restart = restart
             || lost_selection
             || (surface.pending_replay.is_some() && pending_replay.is_none());
-        let wrap_once = if restart {
+        let mut wrap_once = if restart {
             if surface.is_live
                 || occurrence >= surface.count
                 || current_render_stamp != Some(surface.render_stamp)
@@ -2203,20 +2247,26 @@ impl TermView {
                 None => return FindFocusResult::Invalidated,
             }
         };
-        if surface.is_live && surface.block_id == 0 && surface.vte_cursor.is_none() {
+        if surface.is_live && surface.block_id == 0 && (surface.vte_cursor.is_none() || wrap_once) {
             let anchor = self.find_state.borrow().live_anchor;
-            if let Some(anchor) = anchor {
-                anchor_live_native_search(&vte, direction, anchor);
+            let Some(anchor) = anchor else {
+                return FindFocusResult::Invalidated;
+            };
+            if !anchor_live_native_search(&vte, direction, anchor) {
+                return FindFocusResult::Invalidated;
             }
+            // Native wrapping spans the whole ring, including prior commands.
+            wrap_once = false;
         }
         #[cfg(test)]
         super::alt_screen::trace_find_render(&format!("find-before-select block={} output={} occurrence={occurrence} stamp={current_render_stamp:?}", surface.block_id, surface.is_output), &vte);
         let still_current = || {
-            self.find_state.try_borrow().is_ok_and(|state| {
-                state.query == query_at_start
-                    && state.cursor == cursor_at_start
-                    && state.surfaces.get(surface_index) == Some(&surface)
-            })
+            self.live_find_is_current()
+                && self.find_state.try_borrow().is_ok_and(|state| {
+                    state.query == query_at_start
+                        && state.cursor == cursor_at_start
+                        && state.surfaces.get(surface_index) == Some(&surface)
+                })
         };
         vte.search_set_wrap_around(wrap_once);
         let found = if restart {
