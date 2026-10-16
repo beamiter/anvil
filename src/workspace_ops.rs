@@ -1827,12 +1827,18 @@ impl AppModel {
     }
 
     pub(crate) fn select_tab(&mut self, id: u64, sender: &ComponentSender<AppModel>) {
+        self.select_tab_from_pane(id, sender, self.active_pane_id());
+    }
+
+    /// A removed tab's numeric index can already name the destination. Carry
+    /// the former pane identity across removal so search still gets rebound.
+    fn select_tab_from_pane(
+        &mut self,
+        id: u64,
+        sender: &ComponentSender<AppModel>,
+        previous_pane_id: Option<u64>,
+    ) {
         let Some(idx) = self.index_of(id) else { return };
-        let previous_pane_id = self
-            .tabs
-            .get(self.active)
-            .and_then(|tab| tab.panes.get(tab.active_pane))
-            .map(|pane| pane.id);
         let next_pane_id = self.tabs[idx]
             .panes
             .get(self.tabs[idx].active_pane)
@@ -1845,8 +1851,10 @@ impl AppModel {
             // Clear the old owner before changing `self.active`; its delayed
             // Idle response is pane-tagged and therefore cannot reset the new
             // pane's replayed status.
-            if let Some(terminal) = self.active_terminal() {
-                terminal.emit(VteInput::SearchClear);
+            // Close paths clear before destruction; ordinary selection still
+            // has the previous controller and clears that exact pane here.
+            if let Some((ti, pi)) = previous_pane_id.and_then(|pane_id| self.find_pane(pane_id)) {
+                self.tabs[ti].panes[pi].terminal.emit(VteInput::SearchClear);
             }
         }
         self.active = idx;
@@ -1882,7 +1890,9 @@ impl AppModel {
     pub(crate) fn close_tab(&mut self, id: u64, sender: &ComponentSender<AppModel>) {
         let Some(idx) = self.index_of(id) else { return };
         let active_id = self.tabs.get(self.active).map(|tab| tab.id);
+        let previous_pane_id = self.active_pane_id();
         if active_id == Some(id) {
+            self.begin_search_pane_transition(None);
             self.begin_organism_focus_transfer(None, true);
         }
         let pane_ids = self.tabs[idx]
@@ -1929,7 +1939,7 @@ impl AppModel {
             return;
         }
         let new_id = self.tabs[new_idx].id;
-        self.select_tab(new_id, sender);
+        self.select_tab_from_pane(new_id, sender, previous_pane_id);
     }
 
     /// Re-label a tab from the pane it currently has selected.
@@ -2360,11 +2370,13 @@ impl AppModel {
             return;
         }
         let selected: std::collections::HashSet<u64> = ids.into_iter().collect();
+        let previous_pane_id = self.active_pane_id();
         if self
             .tabs
             .get(self.active)
             .is_some_and(|tab| selected.contains(&tab.id))
         {
+            self.begin_search_pane_transition(None);
             self.begin_organism_focus_transfer(None, true);
         }
         let pane_ids = self
@@ -2417,7 +2429,7 @@ impl AppModel {
             self.refresh_bottom_bar();
             return;
         }
-        self.select_tab(self.tabs[new_idx].id, sender);
+        self.select_tab_from_pane(self.tabs[new_idx].id, sender, previous_pane_id);
     }
 
     pub(crate) fn find_pane(&self, pane_id: u64) -> Option<(usize, usize)> {
@@ -2513,6 +2525,7 @@ impl AppModel {
                 } else {
                     pane_header::PaneDropEdge::Bottom
                 };
+                let search_transition = self.begin_search_pane_transition(Some(pane_id));
                 let focus_transfer = self.begin_organism_focus_transfer(Some(pane_id), true);
                 slot.replace_with_split(&cur_widget, &new_widget, edge);
 
@@ -2530,6 +2543,7 @@ impl AppModel {
                         schedule_pane_rebalance(root);
                     }
                 }
+                self.finish_search_pane_transition(search_transition);
                 self.finish_organism_focus_transfer(focus_transfer);
                 self.tabs[ti].panes[self.tabs[ti].active_pane]
                     .terminal
@@ -2571,7 +2585,11 @@ impl AppModel {
         } else {
             false
         };
+        let search_transition = was_active_tab
+            && failed_was_active
+            && self.begin_search_pane_transition(Some(source_pane_id));
         let Some(removed) = self.detach_pane_from_tab(tab_index, pane_index) else {
+            self.finish_search_pane_transition(search_transition);
             self.finish_organism_focus_transfer(focus_transfer);
             return false;
         };
@@ -2586,6 +2604,7 @@ impl AppModel {
                 "Split rollback removed pane {pane_id}, but source pane {source_pane_id} disappeared"
             );
             self.refresh_pane_headers(tab_index);
+            self.finish_search_pane_transition(search_transition);
             self.finish_organism_focus_transfer(focus_transfer);
             return true;
         };
@@ -2593,6 +2612,7 @@ impl AppModel {
             self.tabs[tab_index].active_pane = source_index;
         }
         self.refresh_pane_headers(tab_index);
+        self.finish_search_pane_transition(search_transition);
         self.finish_organism_focus_transfer(focus_transfer);
         if was_active_tab && failed_was_active {
             self.tabs[tab_index].panes[source_index]
@@ -2664,7 +2684,18 @@ impl AppModel {
             .remote
             .as_ref()
             .is_some_and(|conn| conn.pane_id == pane_id);
+        let tab = &self.tabs[ti];
+        let next_index = active_index_after_remove(tab.active_pane, pi, tab.panes.len() - 1);
+        let next_pane_id = tab
+            .panes
+            .iter()
+            .filter(|pane| pane.id != pane_id)
+            .nth(next_index)
+            .map(|pane| pane.id);
+        let search_transition =
+            ti == self.active && self.begin_search_pane_transition(next_pane_id);
         let Some(removed) = self.detach_pane_from_tab(ti, pi) else {
+            self.finish_search_pane_transition(search_transition);
             log::error!("Failed to detach pane {pane_id} from tab widget tree");
             self.finish_organism_focus_transfer(focus_transfer);
             return;
@@ -2676,12 +2707,32 @@ impl AppModel {
             }
         }
         drop(removed);
+        self.finish_search_pane_transition(search_transition);
         // Numbering shifted, and dropping back to one pane hides the headers.
         self.refresh_pane_headers(ti);
         self.finish_organism_focus_transfer(focus_transfer);
         if ti == self.active {
             let ap = self.tabs[ti].active_pane;
             self.tabs[ti].panes[ap].terminal.emit(VteInput::GrabFocus);
+        }
+    }
+
+    /// Retire the old backend search before changing the selected pane. A
+    /// later PaneFocused event sees the new model index already committed and
+    /// cannot infer this transition on our behalf.
+    fn begin_search_pane_transition(&self, next_pane_id: Option<u64>) -> bool {
+        let changed = search::active_pane_changed(self.active_pane_id(), next_pane_id);
+        if changed {
+            if let Some(terminal) = self.active_terminal() {
+                terminal.emit(VteInput::SearchClear);
+            }
+        }
+        changed
+    }
+
+    fn finish_search_pane_transition(&self, changed: bool) {
+        if changed {
+            self.search.emit(search::SearchMsg::ActivePaneChanged);
         }
     }
 
@@ -2697,8 +2748,10 @@ impl AppModel {
         let next = ((cur + delta) % n + n) % n;
         let next = next as usize;
         let next_pane_id = tab.panes[next].id;
+        let search_transition = self.begin_search_pane_transition(Some(next_pane_id));
         let focus_transfer = self.begin_organism_focus_transfer(Some(next_pane_id), false);
         self.tabs[self.active].active_pane = next;
+        self.finish_search_pane_transition(search_transition);
         self.finish_organism_focus_transfer(focus_transfer);
         self.tabs[self.active].panes[next]
             .terminal
@@ -2755,8 +2808,10 @@ impl AppModel {
 
         if let Some((_, i)) = best {
             let next_pane_id = self.tabs[self.active].panes[i].id;
+            let search_transition = self.begin_search_pane_transition(Some(next_pane_id));
             let focus_transfer = self.begin_organism_focus_transfer(Some(next_pane_id), false);
             self.tabs[self.active].active_pane = i;
+            self.finish_search_pane_transition(search_transition);
             self.finish_organism_focus_transfer(focus_transfer);
             self.tabs[self.active].panes[i]
                 .terminal
@@ -3929,7 +3984,7 @@ mod pane_tree_tests {
         assert!(preserved.contains("self.active = new_idx"));
         assert!(preserved.contains("self.rebuild_tab_strip(sender)"));
         assert!(preserved.contains("return;"));
-        assert!(!preserved.contains("self.select_tab("));
+        assert!(!preserved.contains("self.select_tab"));
         assert!(!preserved.contains("begin_organism_focus_transfer("));
         assert!(!preserved.contains("GrabFocus"));
         assert!(close.contains("self.force_quit()"));
@@ -3987,7 +4042,7 @@ mod pane_tree_tests {
             .split("if preserves_active {")
             .nth(1)
             .unwrap()
-            .split("self.select_tab(")
+            .split("self.select_tab_from_pane(")
             .next()
             .unwrap();
         assert!(preserved.contains("self.active = new_idx"));

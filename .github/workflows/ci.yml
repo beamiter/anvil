@@ -77,6 +77,9 @@ jobs:
       - name: Check search callback lifecycle
         run: python3 scripts/test-search-lifecycle.py
 
+      - name: Check workspace search ownership transitions
+        run: python3 scripts/test-workspace-search-transition.py
+
       - name: Verify generated Flatpak Cargo sources
         run: scripts/update-flatpak-cargo-sources.sh --check
 
