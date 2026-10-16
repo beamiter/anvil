@@ -158,6 +158,105 @@ pub(crate) enum TasksPanelOutput {
     Action(TaskPanelAction),
 }
 
+/// Cached by stable task identity, including currently filtered-out live rows.
+#[derive(Clone)]
+struct TaskRowWidgets {
+    row: gtk::ListBoxRow,
+    title: gtk::Label,
+    status: gtk::Label,
+    reason: gtk::Label,
+    snapshot: TaskRowSnapshot,
+    #[cfg(test)]
+    updates: usize,
+}
+
+impl TaskRowWidgets {
+    fn new(snapshot: &TaskRowSnapshot) -> Self {
+        let title = gtk::Label::new(None);
+        title.set_max_width_chars(28);
+        let status = gtk::Label::new(None);
+        status.add_css_class("dim-label");
+        status.add_css_class("caption");
+        let reason = gtk::Label::new(None);
+        reason.set_single_line_mode(true);
+        reason.set_max_width_chars(28);
+        reason.add_css_class("caption");
+        reason.add_css_class("dim-label");
+        reason.add_css_class("task-reason");
+        let lines = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        lines.set_margin_top(4);
+        lines.set_margin_bottom(4);
+        lines.set_margin_start(4);
+        for label in [&title, &status, &reason] {
+            label.set_halign(gtk::Align::Start);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            lines.append(label);
+        }
+        let row = gtk::ListBoxRow::new();
+        row.set_child(Some(&lines));
+        let mut widgets = Self {
+            row,
+            title,
+            status,
+            reason,
+            snapshot: snapshot.clone(),
+            #[cfg(test)]
+            updates: 0,
+        };
+        widgets.update(snapshot);
+        widgets
+    }
+
+    fn update(&mut self, snapshot: &TaskRowSnapshot) {
+        #[cfg(test)]
+        {
+            self.updates += 1;
+        }
+        self.title.set_label(&snapshot.title);
+        self.status.set_label(&row_status_line(snapshot));
+        if snapshot.needs_attention {
+            self.status.add_css_class("warning");
+        } else {
+            self.status.remove_css_class("warning");
+        }
+        let reason = task_reason(
+            snapshot.status,
+            snapshot.validation_status,
+            snapshot.status_detail.as_deref(),
+            snapshot.validation_detail.as_deref(),
+        );
+        self.reason.set_visible(reason.is_some());
+        // Existing diagnostics identify present previews by this class.
+        if reason.is_some() {
+            self.reason.add_css_class("task-reason");
+        } else {
+            self.reason.remove_css_class("task-reason");
+        }
+        self.reason.set_label(reason.as_deref().unwrap_or_default());
+        self.reason.set_tooltip_text(reason.as_deref());
+        self.snapshot.clone_from(snapshot);
+    }
+}
+
+/// Restores the previous guard even if GTK synchronously calls user handlers.
+struct SelectionGuard {
+    flag: Rc<Cell<bool>>,
+    previous: bool,
+}
+impl SelectionGuard {
+    fn enter(flag: &Rc<Cell<bool>>) -> Self {
+        Self {
+            previous: flag.replace(true),
+            flag: flag.clone(),
+        }
+    }
+}
+impl Drop for SelectionGuard {
+    fn drop(&mut self) {
+        self.flag.set(self.previous);
+    }
+}
+
 pub(crate) struct TasksPanelModel {
     sync: TasksPanelSync,
     unfiltered_sync: TasksPanelSync,
@@ -177,6 +276,7 @@ pub(crate) struct TasksPanelModel {
     /// real change, so an unchanged Sync is a pure no-op — no widget churn,
     /// and no signals feeding back into the component's input queue.
     rendered_rows: Vec<TaskRowSnapshot>,
+    row_widgets: HashMap<TaskId, TaskRowWidgets>,
     rendered_selected: Option<TaskId>,
     rendered_approvals: Vec<CodexAppServerApproval>,
     /// Set while refresh applies a programmatic selection, so the resulting
@@ -230,13 +330,7 @@ impl TasksPanelModel {
         }
     }
 
-    /// Reconcile the task list widget with the pushed row table. Rows are
-    /// rebuilt only when their snapshots change, and selection is applied
-    /// only when it (or the table) changed, behind `selection_guard` so the
-    /// emitted `row-selected` cannot echo back as a `SelectRow` input.
-    /// Together these make refreshing unchanged state idempotent; an
-    /// unguarded re-select on every refresh previously re-queued `SelectRow`
-    /// per refresh and livelocked the component's message loop.
+    /// Reconcile by stable TaskId. The domain and hidden tasks are untouched.
     fn sync_task_list(&mut self, widgets: &TasksPanelModelWidgets) {
         let plan = plan_list_refresh(
             &self.rendered_rows,
@@ -244,69 +338,76 @@ impl TasksPanelModel {
             &self.sync.rows,
             self.sync.selected,
         );
-        if plan.rebuild_rows {
-            self.selection_guard.set(true);
-            *self.selection_ids.borrow_mut() = self.sync.rows.iter().map(|row| row.id).collect();
-            while let Some(child) = widgets.task_list.first_child() {
-                widgets.task_list.remove(&child);
-            }
+        // Raw task rows may contain archived records. The unfiltered dashboard
+        // is the authoritative set of live visible-capable task identities.
+        let live: std::collections::HashSet<_> = self
+            .unfiltered_sync
+            .dashboard
+            .rows
+            .iter()
+            .map(|row| row.id)
+            .collect();
+        let _guard = SelectionGuard::enter(&self.selection_guard);
+        let focused = self
+            .row_widgets
+            .iter()
+            .find_map(|(id, widgets)| widgets.row.has_focus().then_some(*id));
+        if plan.update_rows {
             for row in &self.sync.rows {
-                let title = gtk::Label::new(Some(&row.title));
-                title.set_halign(gtk::Align::Start);
-                title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                title.set_max_width_chars(28);
-                let status = gtk::Label::new(Some(&row_status_line(row)));
-                status.set_halign(gtk::Align::Start);
-                status.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                status.add_css_class("dim-label");
-                status.add_css_class("caption");
-                if row.needs_attention {
-                    status.add_css_class("warning");
+                match self.row_widgets.get_mut(&row.id) {
+                    Some(widgets) if widgets.snapshot != *row => widgets.update(row),
+                    Some(_) => {}
+                    None => {
+                        self.row_widgets.insert(row.id, TaskRowWidgets::new(row));
+                    }
                 }
-                let lines = gtk::Box::new(gtk::Orientation::Vertical, 2);
-                lines.set_margin_top(4);
-                lines.set_margin_bottom(4);
-                lines.set_margin_start(4);
-                lines.append(&title);
-                lines.append(&status);
-                if let Some(reason) = task_reason(
-                    row.status,
-                    row.validation_status,
-                    row.status_detail.as_deref(),
-                    row.validation_detail.as_deref(),
-                ) {
-                    let preview = gtk::Label::new(Some(&reason));
-                    preview.set_halign(gtk::Align::Start);
-                    preview.set_single_line_mode(true);
-                    preview.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                    preview.set_max_width_chars(28);
-                    preview.set_tooltip_text(Some(&reason));
-                    preview.add_css_class("caption");
-                    preview.add_css_class("dim-label");
-                    preview.add_css_class("task-reason");
-                    lines.append(&preview);
-                }
-                let list_row = gtk::ListBoxRow::new();
-                list_row.set_child(Some(&lines));
-                widgets.task_list.append(&list_row);
             }
+        }
+        if plan.reconcile_order {
+            let ids: Vec<_> = self.sync.rows.iter().map(|row| row.id).collect();
+            let visible: std::collections::HashSet<_> = ids.iter().copied().collect();
+            // Release the RefCell before GTK calls: row-selected is synchronous.
+            *self.selection_ids.borrow_mut() = ids.clone();
+            for old in &self.rendered_rows {
+                if !visible.contains(&old.id) {
+                    if let Some(row) = self.row_widgets.get(&old.id) {
+                        widgets.task_list.remove(&row.row);
+                    }
+                }
+            }
+            for (index, id) in ids.iter().enumerate() {
+                let row = &self.row_widgets[id].row;
+                if widgets.task_list.row_at_index(index as i32).as_ref() != Some(row) {
+                    if row.parent().is_some() {
+                        widgets.task_list.remove(row);
+                    }
+                    widgets.task_list.insert(row, index as i32);
+                }
+            }
+        }
+        // Prune even when only a hidden/archived task changed.
+        self.row_widgets.retain(|id, _| live.contains(id));
+        if plan.apply_selection {
+            let row = plan
+                .select_index
+                .and_then(|i| widgets.task_list.row_at_index(i as i32));
+            if widgets.task_list.selected_row() != row {
+                widgets.task_list.select_row(row.as_ref());
+            }
+        }
+        if plan.reconcile_order {
+            // Preserve focus only if it was on a surviving visible task; never
+            // steal it from search, detail controls, or a now-hidden task.
+            if let Some(row) = focused.and_then(|id| self.row_widgets.get(&id)) {
+                if row.row.parent().is_some() && !row.row.has_focus() {
+                    row.row.grab_focus();
+                }
+            }
+        }
+        if plan.update_rows {
             self.rendered_rows.clone_from(&self.sync.rows);
         }
-        if plan.apply_selection {
-            self.selection_guard.set(true);
-            match plan.select_index {
-                Some(index) => {
-                    let row = widgets.task_list.row_at_index(index as i32);
-                    widgets.task_list.select_row(row.as_ref());
-                }
-                None => widgets.task_list.unselect_all(),
-            }
-            self.selection_guard.set(false);
-        }
-        if plan.rebuild_rows || plan.apply_selection {
-            self.selection_guard.set(false);
-            self.rendered_selected = self.sync.selected;
-        }
+        self.rendered_selected = self.sync.selected;
     }
 
     /// Rebuild the approval cards only when the pushed approval set changed;
@@ -654,6 +755,7 @@ impl Component for TasksPanelModel {
             action_buttons: Vec::new(),
             action_target: action_target.clone(),
             rendered_rows: Vec::new(),
+            row_widgets: HashMap::new(),
             rendered_selected: None,
             rendered_approvals: Vec::new(),
             selection_guard: selection_guard.clone(),
@@ -681,6 +783,46 @@ impl Component for TasksPanelModel {
             widgets.actions_box.insert(&button, -1);
             action_buttons.push((kind, button));
         }
+
+        let keys = gtk::EventControllerKey::new();
+        keys.set_name(Some("task-list-navigation"));
+        keys.connect_key_pressed({
+            let list = widgets.task_list.downgrade();
+            let selection_ids = selection_ids.clone();
+            let selection_guard = selection_guard.clone();
+            move |_, key, _, modifiers| {
+                use gtk::gdk::Key;
+                if selection_guard.get()
+                    || modifiers.intersects(
+                        gtk::gdk::ModifierType::CONTROL_MASK
+                            | gtk::gdk::ModifierType::ALT_MASK
+                            | gtk::gdk::ModifierType::SUPER_MASK,
+                    )
+                    || !matches!(key, Key::Up | Key::Down | Key::Home | Key::End)
+                {
+                    return gtk::glib::Propagation::Proceed;
+                }
+                let Some(list) = list.upgrade() else {
+                    return gtk::glib::Propagation::Proceed;
+                };
+                let len = selection_ids.borrow().len();
+                if len != 0 {
+                    let current = list.selected_row().map(|row| row.index() as usize);
+                    let index = match key {
+                        Key::Home => 0,
+                        Key::End => len - 1,
+                        Key::Up => current.map_or(len - 1, |i| i.saturating_sub(1)),
+                        _ => current.map_or(0, |i| (i + 1).min(len - 1)),
+                    };
+                    if let Some(row) = list.row_at_index(index as i32) {
+                        list.select_row(Some(&row));
+                        row.grab_focus();
+                    }
+                }
+                gtk::glib::Propagation::Stop
+            }
+        });
+        widgets.task_list.add_controller(keys);
 
         widgets.task_list.connect_row_selected({
             let sender = sender.clone();
@@ -1111,7 +1253,7 @@ mod tests {
             Some(DIFF_PAGE)
         );
     }
-    fn dashboard_test_sync() -> TasksPanelSync {
+    pub(super) fn dashboard_test_sync() -> TasksPanelSync {
         use crate::agent_task::{AgentProvider, NewTask, TaskManager, TaskStatus};
         let mut manager = TaskManager::new();
         for title in ["First task", "Needs review"] {
@@ -1640,3 +1782,7 @@ mod tests {
         window.close();
     }
 }
+
+#[cfg(test)]
+#[path = "tasks_panel_keyed_tests.rs"]
+mod keyed_tests;

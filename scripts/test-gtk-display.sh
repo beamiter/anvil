@@ -74,6 +74,10 @@ tests=(
     dialogs::tasks_panel::tests::dashboard_filter_counts_follow_search_not_selected_view
     dialogs::tasks_panel::tests::task_terminal_buttons_only_emit_focus_for_existing_bindings
     dialogs::tasks_panel::tests::task_reason_updates_and_disappears_without_retargeting
+    dialogs::tasks_panel::keyed_tests::keyed_rows_update_only_changed_widgets_and_prune_archives
+    dialogs::tasks_panel::keyed_tests::keyed_selection_guard_survives_synchronous_callbacks
+    dialogs::tasks_panel::keyed_tests::keyed_task_list_mixed_update_benchmark
+    dialogs::tasks_panel::keyed_tests::keyed_tasks_keep_focus_and_route_real_keyboard
     terminal::vte::tests::explicit_focus_return_respects_reopened_search
     block_view::fold_geometry_tests::fold_actions_update_visible_and_parked_geometry
     block_view::search_navigation_tests::block_output_search_unfolds_only_target
