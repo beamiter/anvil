@@ -75,7 +75,6 @@ use crate::agent_task::{
 };
 use crate::config::Config;
 use crate::review_text::visible_bounded;
-use relm4::adw;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -1377,7 +1376,7 @@ mod tests {
 }
 
 /// A bounded, redacted title and a stable ID prefix; never use prompt/output text.
-fn feedback_identity(manager: &crate::agent_task::TaskManager, id: TaskId) -> String {
+pub(crate) fn feedback_identity(manager: &crate::agent_task::TaskManager, id: TaskId) -> String {
     let full = id.to_string();
     let peers: Vec<_> = manager
         .tasks()
@@ -1410,6 +1409,7 @@ fn feedback_title(title: &str) -> String {
     )
 }
 
+#[cfg(test)]
 pub(crate) fn task_completion_feedback(
     manager: &crate::agent_task::TaskManager,
     completions: impl IntoIterator<Item = (TaskId, crate::agent_task::AgentSessionOutcome)>,
@@ -1438,6 +1438,7 @@ pub(crate) fn task_completion_feedback(
     Some(format!("{}: {outcome}", feedback_identity(manager, id)))
 }
 
+#[cfg(test)]
 pub(crate) fn task_validation_feedback(
     manager: &crate::agent_task::TaskManager,
     id: TaskId,
@@ -1468,11 +1469,90 @@ pub(crate) fn task_validation_feedback(
     ))
 }
 
-/// Passive delivery: does not select a task, activate a pane, or move input focus.
-pub(crate) fn show_task_feedback(overlay: &adw::ToastOverlay, message: &str) {
-    let toast = adw::Toast::new(message);
-    toast.set_use_markup(false);
-    overlay.add_toast(toast);
+/// Report-only runtime errors are not necessarily retained in TaskManager.
+/// Keep their redacted explanation in visible, accessible feedback. The sole
+/// explicit announcement uses only a fixed safe summary. Merge per task with a result from the same poll, avoiding an
+/// Alert toast plus an explicit announcement for the same event.
+pub(crate) fn merge_task_issue_feedback(
+    messages: &mut Vec<(TaskId, String)>,
+    issues: &[crate::agent_task::AgentRuntimeIssue],
+) -> std::collections::HashMap<TaskId, String> {
+    let mut details: std::collections::HashMap<TaskId, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut order = Vec::new();
+    for issue in issues {
+        let redacted = jterm_core::redact::redact_secrets(&issue.detail);
+        let detail = visible_bounded(
+            &redacted.split_whitespace().collect::<Vec<_>>().join(" "),
+            256,
+        );
+        if !details.contains_key(&issue.task_id) {
+            order.push(issue.task_id);
+        }
+        let task_details = details.entry(issue.task_id).or_default();
+        if !task_details.contains(&detail) {
+            task_details.push(detail);
+        }
+    }
+    let mut accessible_details = std::collections::HashMap::new();
+    for id in order {
+        let detail = visible_bounded(&details.remove(&id).unwrap().join("; "), 512);
+        accessible_details.insert(id, detail);
+        let issue = "Native Agent runtime issue; details in Tasks";
+        if let Some((_, message)) = messages.iter_mut().find(|(task_id, _)| *task_id == id) {
+            message.push_str("; ");
+            message.push_str(&issue);
+        } else {
+            messages.push((id, issue.into()));
+        }
+    }
+    accessible_details
+}
+
+/// Single production delivery path, also exercised by the isolated AT-SPI
+/// fixture. Detail is visible/accessibility-readable but never announced.
+pub(crate) fn deliver_task_feedback(
+    window: &relm4::gtk::Widget,
+    label: &relm4::gtk::Label,
+    message: &str,
+    detail: Option<&str>,
+) {
+    use relm4::gtk::prelude::AccessibleExt;
+    let visible = detail.map_or_else(
+        || message.to_string(),
+        |detail| format!("{message}. {detail}"),
+    );
+    show_task_feedback(label, &visible);
+    window.announce(message, relm4::gtk::AccessibleAnnouncementPriority::Medium);
+}
+
+/// Passive visible feedback with the natural static-text accessible role.
+/// AdwToastWidget has Alert semantics, so task result delivery must not use it
+/// alongside explicit polite window announcements (two speech owners).
+pub(crate) fn build_task_feedback() -> relm4::gtk::Label {
+    use relm4::gtk::{self, prelude::*};
+    let label = gtk::Label::new(None);
+    label.set_use_markup(false);
+    label.set_focusable(false);
+    label.set_xalign(0.0);
+    label.set_wrap(true);
+    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    label.set_lines(2);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    label.set_margin_start(12);
+    label.set_margin_end(12);
+    label.set_margin_top(4);
+    label.set_margin_bottom(4);
+    label.set_visible(false);
+    label
+}
+
+/// Only visible text changes here; the application owns semantic announcements.
+/// No task selection, pane activation, focus, or accessible role is modified.
+pub(crate) fn show_task_feedback(label: &relm4::gtk::Label, message: &str) {
+    use relm4::gtk::prelude::*;
+    label.set_text(message);
+    label.set_visible(true);
 }
 
 #[cfg(test)]
@@ -1600,6 +1680,7 @@ mod feedback_tests {
     #[ignore = "requires an isolated GTK process and display"]
     fn task_feedback_keeps_input_draft_and_focus() {
         use adw::prelude::*;
+        use relm4::adw;
         use relm4::gtk;
         use relm4::gtk::glib;
 
@@ -1607,7 +1688,11 @@ mod feedback_tests {
         let overlay = adw::ToastOverlay::new();
         let input = gtk::Entry::new();
         input.set_text("unfinished input");
-        overlay.set_child(Some(&input));
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let feedback = build_task_feedback();
+        content.append(&input);
+        content.append(&feedback);
+        overlay.set_child(Some(&content));
         let window = gtk::Window::new();
         window.set_default_size(640, 240);
         window.set_child(Some(&overlay));
@@ -1643,7 +1728,7 @@ mod feedback_tests {
         for id in [a, b] {
             let message =
                 task_completion_feedback(&manager, [(id, AgentSessionOutcome::Failed)]).unwrap();
-            show_task_feedback(&overlay, &message);
+            show_task_feedback(&feedback, &message);
             settle();
             assert_eq!(
                 gtk::prelude::GtkWindowExt::focus(&window),
@@ -1653,11 +1738,65 @@ mod feedback_tests {
             if id == a {
                 assert!(
                     displays(overlay.upcast_ref(), &message),
-                    "the actual toast is rendered"
+                    "the passive task feedback is rendered"
                 );
             }
         }
         assert!(overlay.is_mapped());
         window.close();
+    }
+}
+
+#[cfg(test)]
+mod issue_feedback_tests {
+    use super::*;
+    use crate::agent_task::AgentRuntimeIssue;
+
+    #[test]
+    fn report_only_issue_has_fixed_announcement_and_accessible_safe_detail() {
+        let id = TaskId::new();
+        let secret = format!("sk-{}", "a".repeat(32));
+        let issue = AgentRuntimeIssue {
+            task_id: id,
+            detail: format!("Preparation failed for {secret}\ncheck configuration"),
+        };
+        let mut messages = Vec::new();
+        let details = merge_task_issue_feedback(&mut messages, &[issue.clone(), issue]);
+        assert_eq!(
+            messages,
+            vec![(id, "Native Agent runtime issue; details in Tasks".into())]
+        );
+        assert!(details[&id].contains("Preparation failed"));
+        assert!(!details[&id].contains(&secret));
+        assert!(!details[&id].contains('\n'));
+        assert!(!messages[0].1.contains("Preparation failed"));
+    }
+
+    #[test]
+    fn issue_and_terminal_transition_share_one_owner_without_erasing_other_tasks() {
+        let a = TaskId::new();
+        let b = TaskId::new();
+        let mut messages = vec![(a, "Task failed".into())];
+        let details = merge_task_issue_feedback(
+            &mut messages,
+            &[
+                AgentRuntimeIssue {
+                    task_id: a,
+                    detail: "transport stopped".into(),
+                },
+                AgentRuntimeIssue {
+                    task_id: b,
+                    detail: "preparation policy changed".into(),
+                },
+            ],
+        );
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].1,
+            "Task failed; Native Agent runtime issue; details in Tasks"
+        );
+        assert_eq!(details[&a], "transport stopped");
+        assert_eq!(details[&b], "preparation policy changed");
+        assert!(merge_task_issue_feedback(&mut Vec::new(), &[]).is_empty());
     }
 }

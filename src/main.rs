@@ -27,6 +27,7 @@ mod file_tree_ops;
 mod font;
 mod git_meta_ui;
 mod history_notice;
+mod task_announcements;
 use jterm_core::{child_env, command_history, notify, parser, pty_input, review_input};
 
 mod host {
@@ -341,6 +342,7 @@ struct AppModel {
     sidebar_tab_rows: FactoryVecDeque<tab_strip::TabRow>,
     window: adw::ApplicationWindow,
     toast_overlay: adw::ToastOverlay,
+    task_feedback: gtk::Label,
     /// The live opacity-hotkey toast, if one is currently shown. Held so rapid
     /// Ctrl+Alt+=/- presses update one toast in place instead of queueing a
     /// separate toast per step.
@@ -452,6 +454,7 @@ struct AppModel {
     /// Native Codex agent task domain: the reducer, the app-server runtime,
     /// and the single-flight diff worker.
     task_manager: crate::agent_task::TaskManager,
+    task_announcements: crate::task_announcements::TaskAnnouncements,
     agent_runtime: crate::agent_task::AgentRuntimeManager,
     agent_diff: crate::agent_task::AgentDiffPanel,
     selected_task: Option<crate::agent_task::TaskId>,
@@ -774,6 +777,9 @@ impl SimpleComponent for AppModel {
                     content_paned -> gtk::Paned {
                         set_vexpand: true,
                     },
+
+                    #[local_ref]
+                    task_feedback -> gtk::Label {},
 
                     #[local_ref]
                     bottom_bar -> gtk::Box {},
@@ -1270,6 +1276,7 @@ impl SimpleComponent for AppModel {
         }
 
         let toast_overlay = adw::ToastOverlay::new();
+        let task_feedback = agent_task_ui::build_task_feedback();
         let quit_allowed = Rc::new(std::cell::Cell::new(false));
         let tab_drag_coordinator = Rc::new(tab_strip::TabDragCoordinator::default());
         // Block-history failures stay wrong until answered; the sticky bar
@@ -1315,6 +1322,7 @@ impl SimpleComponent for AppModel {
             sidebar_tab_rows,
             window: root.clone(),
             toast_overlay: toast_overlay.clone(),
+            task_feedback,
             opacity_toast: Rc::new(RefCell::new(None)),
             font_toast: Rc::new(RefCell::new(None)),
             quit_allowed: quit_allowed.clone(),
@@ -1384,6 +1392,7 @@ impl SimpleComponent for AppModel {
             tasks_panel,
             tasks_panel_visible: std::cell::Cell::new(false),
             task_manager: crate::agent_task::TaskManager::new(),
+            task_announcements: crate::task_announcements::TaskAnnouncements::default(),
             agent_runtime: crate::agent_task::AgentRuntimeManager::new(),
             agent_diff: crate::agent_task::AgentDiffPanel::new(),
             selected_task: None,
@@ -1445,6 +1454,7 @@ impl SimpleComponent for AppModel {
         let top_bar_handle = gtk::WindowHandle::new();
         top_bar_handle.set_child(Some(top_bar));
         let toast_overlay = &model.toast_overlay;
+        let task_feedback = &model.task_feedback;
         let block_history_notice = &model.block_history_notice;
         let widgets = view_output!();
         let cross_block_search_key_latch =

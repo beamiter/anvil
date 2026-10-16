@@ -125,6 +125,49 @@ fn task_action_allowed(enabled: bool, action: &TaskPanelAction) -> bool {
 }
 
 impl AppModel {
+    /// Observe authoritative task state, independent of panel visibility/selection.
+    /// Keep the announcer on the persistent window, never a transient toast.
+    fn announce_task_transitions(&mut self) {
+        self.announce_task_transitions_with_report(&[], &[]);
+    }
+
+    fn announce_task_transitions_with_report(
+        &mut self,
+        issues: &[crate::agent_task::AgentRuntimeIssue],
+        completions: &[crate::agent_task::AgentRuntimeCompletion],
+    ) {
+        use crate::task_announcements::TaskAnnouncementSnapshot;
+        use relm4::gtk::prelude::Cast;
+        let snapshots = self
+            .task_manager
+            .tasks()
+            .iter()
+            .map(|task| TaskAnnouncementSnapshot {
+                id: task.id,
+                status: task.status,
+                terminal: task.terminal_session_id.clone(),
+                validation_attempt: task.validation.attempt,
+                validation_status: task.validation.status,
+            });
+        let mut messages = self.task_announcements.observe(snapshots);
+        self.task_announcements
+            .sessions_finished(completions, &mut messages);
+        let details = agent_task_ui::merge_task_issue_feedback(&mut messages, issues);
+        for (id, status) in messages {
+            let message = format!(
+                "{}: {status}",
+                agent_task_ui::feedback_identity(&self.task_manager, id)
+            );
+            agent_task_ui::deliver_task_feedback(
+                self.window.upcast_ref::<relm4::gtk::Widget>(),
+                &self.task_feedback,
+                &message,
+                details.get(&id).map(String::as_str),
+            );
+        }
+        self.task_announcements.retain_issue_details(details);
+    }
+
     pub(crate) fn toggle_tasks_panel(&mut self, sender: &ComponentSender<AppModel>) {
         if self.safe_mode {
             self.show_toast("Agent tasks are unavailable in safe mode.");
@@ -161,6 +204,7 @@ impl AppModel {
     /// events, pending worktree creation, and the diff worker. Rearms the
     /// timer at the cadence current activity justifies.
     pub(crate) fn agent_tasks_tick(&mut self, sender: &ComponentSender<AppModel>) {
+        self.announce_task_transitions();
         self.agent_tasks_timer_armed.set(false);
         let mut keep_fast = false;
 
@@ -169,20 +213,11 @@ impl AppModel {
         {
             let policy = self.task_prompt_policy();
             let report = self.agent_runtime.poll(&mut self.task_manager, policy);
-            if let Some(issue) = report.issues.last() {
-                self.show_toast(format!("Native Agent issue: {}", issue.detail));
-            } else {
-                let message = agent_task_ui::task_completion_feedback(
-                    &self.task_manager,
-                    report
-                        .completions
-                        .iter()
-                        .map(|completion| (completion.task_id, completion.outcome)),
-                );
-                if let Some(message) = message {
-                    agent_task_ui::show_task_feedback(&self.toast_overlay, &message);
-                }
-            }
+            self.task_announcements.applied_turns(&report.applied_turns);
+            // Report issues are consumed once, even when preparation failure
+            // leaves the task status unchanged. Merge with terminal transitions
+            // before delivery so one event has only one semantic speech owner.
+            self.announce_task_transitions_with_report(&report.issues, &report.completions);
             keep_fast |= report.made_progress() || self.agent_runtime.needs_fast_poll();
 
             if let Some(pending) = &self.pending_task_creation {
@@ -221,6 +256,7 @@ impl AppModel {
             }
         }
 
+        self.announce_task_transitions();
         let has_tasks = self.task_manager.tasks().iter().next().is_some();
         if keep_fast
             || has_tasks
@@ -331,6 +367,7 @@ impl AppModel {
             self.show_toast("Agent tasks are disabled in the configuration");
             return;
         }
+        self.announce_task_transitions();
         match action {
             TaskPanelAction::CreateFromBlock => self.create_task_from_block(sender),
             TaskPanelAction::Select(task_id) => {
@@ -403,7 +440,9 @@ impl AppModel {
             TaskPanelAction::RunValidation(task_id) => self.start_task_validation(task_id, sender),
             TaskPanelAction::Complete(task_id) => {
                 match self.task_manager.complete_after_validation(task_id) {
-                    Ok(()) => self.show_toast("Task marked complete after passing validation"),
+                    // The transition observer supplies both visible feedback and
+                    // the sole polite announcement for successful completion.
+                    Ok(()) => {}
                     Err(error) => self.show_toast(error.to_string()),
                 }
             }
@@ -432,6 +471,7 @@ impl AppModel {
                 Err(error) => self.show_toast(error.to_string()),
             },
         }
+        self.announce_task_transitions();
         self.ensure_agent_tasks_timer(sender);
         if self.tasks_panel_visible.get() {
             self.sync_tasks_panel();
@@ -803,8 +843,9 @@ impl AppModel {
     /// authoritative exit to the task model before the pane closes; returns
     /// true when the pane was task-owned.
     pub(crate) fn note_task_terminal_exited(&mut self, pane_id: u64, exit_code: i32) -> bool {
+        self.announce_task_transitions();
         self.pending_validation_pins.remove(&pane_id);
-        let Some((session_id, role)) = self
+        let Some((session_id, _role)) = self
             .pane(pane_id)
             .and_then(|pane| pane.task_session_id.clone().zip(pane.task_role))
         else {
@@ -812,23 +853,12 @@ impl AppModel {
         };
         self.task_manager
             .handle_terminal_session_exit(&session_id, Some(exit_code));
-        if let Some(task_id) = self
-            .task_manager
-            .handle_terminal_session_closed(&session_id)
-        {
-            if role == TaskTerminalRole::Validation {
-                if let Some(message) = agent_task_ui::task_validation_feedback(
-                    &self.task_manager,
-                    task_id,
-                    &session_id,
-                ) {
-                    agent_task_ui::show_task_feedback(&self.toast_overlay, &message);
-                }
-            }
-        }
+        self.task_manager
+            .handle_terminal_session_closed(&session_id);
         if self.tasks_panel_visible.get() {
             self.sync_tasks_panel();
         }
+        self.announce_task_transitions();
         true
     }
 
@@ -836,6 +866,7 @@ impl AppModel {
     /// Retire its task session now, so validation can be retried and its cwd
     /// descriptor is not held until the user closes the diagnostic pane.
     pub(crate) fn note_task_terminal_launch_failed(&mut self, pane_id: u64) {
+        self.announce_task_transitions();
         self.pending_validation_pins.remove(&pane_id);
         let Some((session_id, role)) = self
             .pane(pane_id)
@@ -847,6 +878,7 @@ impl AppModel {
         if self.tasks_panel_visible.get() {
             self.sync_tasks_panel();
         }
+        self.announce_task_transitions();
     }
 
     /// PaneLaunched releases the validation cwd pin retained for that pane.
@@ -861,6 +893,7 @@ impl AppModel {
     /// cwd pin is released. Safe to call after `note_task_terminal_exited`:
     /// the reducer ignores closes for terminals already in a terminal state.
     pub(crate) fn note_task_terminal_closed(&mut self, pane_id: u64) {
+        self.announce_task_transitions();
         self.pending_validation_pins.remove(&pane_id);
         let Some(session_id) = self
             .pane(pane_id)
@@ -876,6 +909,7 @@ impl AppModel {
         {
             self.sync_tasks_panel();
         }
+        self.announce_task_transitions();
     }
 
     /// Push the composed panel state. Rows are rebuilt from the domain every
@@ -1035,6 +1069,9 @@ impl AppModel {
         });
         if let Some(detail) = &task.status_detail {
             status_line = format!("{status_line} · {detail}");
+        }
+        if let Some(detail) = self.task_announcements.issue_detail(task_id) {
+            status_line = format!("{status_line} · Latest runtime issue: {detail}");
         }
         if task.validation.attempt > 0 {
             status_line = format!(
