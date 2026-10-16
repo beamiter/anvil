@@ -18,7 +18,10 @@ RUNNER = Path(__file__).with_name("test-gtk-display.sh")
 ENTER = "enter_ownership::tests::queued_review_write_claims_enter_at_both_backend_boundaries"
 HELD = "block_view::tests::held_enter_history_recall_does_not_submit_the_recalled_command"
 A11Y = "organism_ui::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers"
-IME = "block_view::chat::tests::native_ime_commit_cancel_and_independent_ptys"
+IME_TESTS = {
+    "block_view::chat::tests::native_ime_commit_cancel_and_independent_ptys",
+    "block_view::chat::tests::native_ime_send_button_diagnostic",
+}
 VARIANT_KEYS = (
     "ANVIL_ENTER_MODE", "ANVIL_QA_PREWARM_ENTER", "ANVIL_QA_INHERITED_ENTER",
     "ANVIL_QA_FILE_DROP", "ANVIL_QA_DUAL_ENTER", "ANVIL_QA_FRESH_ENTER",
@@ -94,7 +97,7 @@ def expected_cases(tests):
 def main():
     source = RUNNER.read_text()
     tests = re.search(r"^tests=\(\n(.*?)\n\)", source, re.M | re.S).group(1).split()
-    assert len(tests) == len(set(tests)) and {ENTER, HELD, A11Y, IME}.issubset(tests)
+    assert len(tests) == len(set(tests)) and {ENTER, HELD, A11Y, *IME_TESTS}.issubset(tests)
     expected = expected_cases(tests)
     assert len(expected) == len(tests) + 11
     bash = shutil.which("bash")
@@ -143,7 +146,7 @@ def main():
                     actual = {key: call["env"][key] for key in VARIANT_KEYS if key in call["env"]}
                     assert actual == variant, (test, actual, variant)
                     for key, value in {"GTK_A11Y": "test" if test == A11Y else "none",
-                                       "GTK_IM_MODULE": "simple" if test == IME else "contract-inherited",
+                                       "GTK_IM_MODULE": "simple" if test in IME_TESTS else "contract-inherited",
                                        "RUST_TEST_THREADS": "1", "GDK_BACKEND": "x11",
                                        "GSK_RENDERER": "cairo", "LIBGL_ALWAYS_SOFTWARE": "1",
                                        "NO_AT_BRIDGE": "1"}.items():
