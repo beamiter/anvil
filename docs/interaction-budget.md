@@ -372,14 +372,14 @@ it does not claim a hermetic toolchain or operating-system image.
 ## Short independent virtual-pixel and drag gate (source checkpoint)
 
 The next workflow uses the same historical baseline and exact event-SHA candidate,
-with reviewed parent 892a0869abc4a29b95e70052cb7496b2b61cfb7c. The separately
+with reviewed source parent da722752dc170ea2fcbd15a21d90f750e44632fc. The separately
 reviewed Bash locale production fix, its regression test and ordinary CI step
 are preserved byte-for-byte. The fixed historical baseline remains intentional:
 these short gates do not attribute performance changes to A04. A changed master
 requires a new pin review. Identical temporary instrumentation is applied to
 both fresh independent builds; production sources and normal release binaries
 still contain no benchmark control surface. The current combined overlay digest
-is 6f05b023b36a19f834ac42afe2eee84876eb44ca749a6ba8f9e7f43b508701a5. The historical digest above describes the already-passed raw
+is eac561f4c56d15c6038ceee148c0bb2bba24280b95c7d8144f9d288c8dffd26b. The historical digest above describes the already-passed raw
 smoke, not this successor. No hosted result is implied by this source checkpoint.
 
 Twelve short runs pair observe/control for each baseline/candidate and 1/8/32-total
@@ -475,3 +475,48 @@ paths, traversal, separators, symlink files, nonregular files and mismatched has
 are rejected. The same unchanged JSON and PNG hashes replay after moving the
 artifact to another private directory. Timestamp values are never rewritten to
 make a relocated artifact pass.
+
+
+### Native coordinate and GTK narrow-handle model correction
+
+The first hosted pixel run (38977524020) passed all four completed one-pane
+observe/control cases, independently replayed from retained images. Baseline
+8-pane then failed the old pointer-delta/allocation-delta oracle: requested +12,
+actual allocation +6, with verified empty owned-process cleanup. This was motion,
+not an unmoved divider. Full performance acceptance remains open.
+
+Two separate issues are corrected in this source successor:
+
+1. Widget bounds are not X11 surface coordinates. Each fresh GTK snapshot records
+   actual GtkNative surface offsets, surface/widget sizes, scale, units and XID.
+   GTK 4.14.5 subtracts its API offsets from incoming surface event coordinates;
+   therefore the explicitly recorded surface-to-widget vector is their negative.
+   Input and ROI both invert that vector and add the same owned X11 surface root
+   origin. No 5px constant or missing-value zero fallback is used. A bounded input
+   helper independently verifies XID/native dimensions and acknowledges each frame
+   before input. Unsupported scales, nonfinite values and changed identities fail.
+2. GTK 4.14.5 gtkpaned.c expands a narrow handle's measured bounds by 6px for hit
+   testing, then stores int(start-local minus expanded-origin) as drag_pos.
+   update_drag truncates the end-local coordinate, subtracts drag_pos and clamps
+   to min/max. The pre-injection model records actual separator and paned bounds,
+   stable paned identity, GTK runtime version, direction, wide-handle state and
+   min/max. Only version 4.14.5, narrow, LTR, unclamped movement is supported.
+   It predicts +12 pointer -> +6 allocation and -12 pointer -> -18 allocation;
+   unsupported versions/wide/RTL/clamped or incompatible geometry fail closed.
+   Same-connection XQueryPointer observes start/end positions in the bounded
+   helper. No expectation is derived from the post-drag allocation.
+
+The pointer schedule remains ±12. The allocation tolerance remains ±4; independent
+pixels still agree with actual allocation within ±2, with one unique edge over a
+shared union plus old-edge disappearance/new-edge appearance. The pixel search
+union follows the precomputed allocation displacement rather than pointer delta.
+This explicitly repairs the old oracle model, without a larger input or retries.
+XQueryPointer and XSync remain confined to the deadline-supervised owned helper;
+the collector's unconditional cleanup path is unchanged. Normal production code
+is untouched, and both disposable builds receive the identical updated overlay.
+
+Primary implementation references: GNOME GTK tag 4.14.5, gtk/gtkpaned.c
+(get_handle_area, gesture_drag_begin_cb, update_drag), gtk/gtkwindow.c
+(gtk_window_native_get_surface_transform), and gtk/gtkmain.c event translation.
+This source checkpoint has no new native/display result. A later master rebase
+requires separate parent-pin review before publication.

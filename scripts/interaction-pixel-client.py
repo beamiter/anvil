@@ -29,6 +29,34 @@ def active_tab(snapshot):
     return tabs[index]
 
 
+def native_coordinate_frame(snapshot, identity):
+    """Widget→surface is inverse of the EXPLICIT signed surface→widget vector."""
+    if type(identity) is not dict or type(identity.get('window_xid')) is not int or not 0 < identity['window_xid'] <= 0xffffffff:
+        raise ValueError('invalid owned native window identity')
+    frame = snapshot['native_frame']
+    if type(frame) is not dict or frame.get('units') != 'logical_pixels_at_scale_1' or type(frame.get('scale_factor')) is not int or frame['scale_factor'] != 1:
+        raise ValueError('missing or unsupported native coordinate frame')
+    xid = frame['window_xid']
+    if type(xid) is not int or xid <= 0 or xid != identity['window_xid']:
+        raise ValueError('native frame belongs to a different owned X11 window')
+    for field in ('surface_size', 'widget_size'):
+        values = frame[field]
+        if type(values) is not list or len(values) != 2 or any(type(v) is not int or not 0 < v <= 4096 for v in values):
+            raise ValueError('invalid native/widget dimensions')
+    if frame['surface_size'] != identity['surface_size'] or frame['surface_size'] != [1600, 1000] or frame['widget_size'] != snapshot['window_size']:
+        raise ValueError('native/widget size identity mismatch')
+    api = coordinates(frame['native_api_offset'], 2)
+    translation = coordinates(frame['surface_to_widget_translation'], 2)
+    if any(abs(v) > 64 for v in api + translation) or translation != [-v for v in api]:
+        raise ValueError('invalid signed native translation')
+    root = coordinates(identity['surface_root_origin'], 2)
+    if any(type(v) is not int or v < 0 for v in identity['surface_root_origin']):
+        raise ValueError('invalid X11 surface root origin')
+    if any(frame['widget_size'][i] > frame['surface_size'][i] + 2 * abs(api[i]) for i in (0,1)):
+        raise ValueError('widget dimensions incompatible with native frame')
+    return [root[i] - translation[i] for i in (0,1)]
+
+
 def marker_rect(pane, origin):
     geometry = pane['pixel_geometry']; cell_width = geometry['cell_width']; cell_height = geometry['cell_height']
     if type(cell_width) is not int or type(cell_height) is not int or not (1 <= cell_width <= 20 and 1 <= cell_height <= 64):
@@ -60,6 +88,48 @@ def divider_rect(divider, origin):
     if rect[0] < 0 or rect[1] < 0 or rect[0] + width > 1600 or rect[1] + height > 1000:
         raise ValueError('divider ROI outside isolated screen')
     return rect, 32
+
+
+def expected_drag(snapshot, delta, origin):
+    """GTK 4.14.5 gtkpaned.c: expanded handle origin, int update_drag, unclamped LTR.
+
+    This predicts geometry BEFORE injecting; never derives expectation from the
+    observed result. Narrow handle hit-area expansion is version-bound to 6px.
+    """
+    if snapshot.get('gtk_runtime_version') != [4, 14, 5] or any(type(v) is not int for v in snapshot['gtk_runtime_version']):
+        raise ValueError('unsupported GtkPaned runtime version')
+    if type(delta) is not int or abs(delta) != 12: raise ValueError('unsupported pointer delta')
+    divider = snapshot['dividers'][0]
+    if divider.get('wide_handle') is not False or divider.get('direction') != 'ltr':
+        raise ValueError('unsupported wide/RTL GtkPaned mapping')
+    if type(divider.get('paned_identity')) is not int or divider['paned_identity'] <= 0:
+        raise ValueError('missing stable paned identity')
+    if type(divider['horizontal']) is not bool: raise ValueError('invalid orientation')
+    handles = divider['handle_bounds_local']
+    if type(handles) is not list or len(handles) != 1: raise ValueError('ambiguous GtkPaned handle')
+    handle = coordinates(handles[0], 4); bounds = coordinates(divider['paned_bounds'], 4)
+    if min(handle[2:] + bounds[2:]) <= 0: raise ValueError('invalid paned/handle bounds')
+    origin = coordinates(origin, 2)
+    axis = 0 if divider['horizontal'] else 1
+    pointer = [round(origin[i] + divider[['x','y'][i]]) for i in (0,1)]
+    local_start = [pointer[i] - origin[i] - bounds[i] for i in (0,1)]
+    hit_area = [handle[0]-6, handle[1]-6, handle[2]+12, handle[3]+12]
+    if any(not hit_area[i] <= local_start[i] < hit_area[i]+hit_area[i+2] for i in (0,1)):
+        raise ValueError('pointer misses measured narrow-handle hit area')
+    for name in ('position','min_position','max_position'):
+        if type(divider[name]) is not int: raise ValueError('invalid allocation limit')
+    # drag_pos is int in GTK. update_drag also takes int coordinates.
+    grab_offset = int(local_start[axis] - hit_area[axis])
+    predicted_position = int(local_start[axis] + delta) - grab_offset
+    if not divider['min_position'] < predicted_position < divider['max_position']:
+        raise ValueError('clamped GtkPaned movement is unsupported')
+    shift = predicted_position - divider['position']
+    if shift != delta - 6 or shift * delta <= 0:
+        raise ValueError('measured handle does not satisfy pinned narrow-handle mapping')
+    return dict(model='gtk-4.14.5-narrow-ltr-unclamped', pointer_delta=delta,
+                pointer_start_root=pointer, pointer_end_root=[pointer[i]+(delta if i==axis else 0) for i in (0,1)],
+                pointer_start_local=local_start, handle_hit_area_local=hit_area,
+                grab_offset=grab_offset, predicted_position=predicted_position, expected_allocation_shift=shift)
 
 
 def allocation_shift(before, after, delta):

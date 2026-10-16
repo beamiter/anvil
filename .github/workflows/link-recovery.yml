@@ -1,0 +1,95 @@
+name: Native link recovery boundary
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/link-recovery.yml'
+      - 'scripts/link-recovery/**'
+      - 'src/terminal/url.rs'
+      - 'src/terminal/url_recovery.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-link-recovery-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  owned-boundary:
+    name: Isolated owned portal and handler only
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '1'
+      CARGO_TERM_COLOR: never
+      RUST_BACKTRACE: '0'
+    steps:
+      - name: Check out immutable candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Initialize failure evidence
+        run: |
+          mkdir -m 0700 evidence
+          git rev-parse HEAD > evidence/commit.txt
+          test "$(cat evidence/commit.txt)" = "$GITHUB_SHA"
+          printf '%s\n' 'Native boundary not yet executed; missing success evidence is not a pass.' > evidence/status.txt
+      - name: Install official native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            pkg-config libglib2.0-dev python3 python3-gi gir1.2-glib-2.0 dbus-daemon util-linux
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Verify source extraction and record provenance
+        run: |
+          python3 scripts/link-recovery/extract.py --check
+          python3 scripts/link-recovery/provenance.py evidence/source.json
+          python3 scripts/link-recovery/test_bus_startup.py 2>&1 | tee evidence/startup-tests.log
+          python3 scripts/link-recovery/test_integration.py 2>&1 | tee evidence/integration-tests.log
+          rustc -vV > evidence/rustc.txt
+          cargo -vV > evidence/cargo.txt
+          dpkg-query -W libglib2.0-0t64 libglib2.0-dev python3-gi dbus-daemon util-linux > evidence/packages.txt
+          /usr/bin/python3 -c 'from gi.repository import GLib; print(GLib.MAJOR_VERSION, GLib.MINOR_VERSION, GLib.MICRO_VERSION)' > evidence/glib-runtime.txt
+          uname -a > evidence/kernel.txt
+          cp scripts/link-recovery/Cargo.lock evidence/fixture-Cargo.lock
+      - name: Fetch pinned dependencies and build probe
+        run: |
+          cargo fetch --locked --manifest-path scripts/link-recovery/Cargo.toml
+          cargo build --offline --locked --manifest-path scripts/link-recovery/Cargo.toml 2>&1 | tee evidence/build.log
+          python3 scripts/link-recovery/extract.py --check
+          sha256sum scripts/link-recovery/target/debug/anvil-owned-launch-boundary > evidence/binary.sha256
+          git diff --exit-code
+      - name: Run isolated owned backend cases
+        run: |
+          sh scripts/link-recovery/run-hosted.sh --hosted-native-approved \
+            "$PWD/scripts/link-recovery/target/debug/anvil-owned-launch-boundary" \
+            "$PWD/evidence/native" 2>&1 | tee evidence/native-run.log
+          python3 - <<'PYCODE'
+          import json
+          from pathlib import Path
+          result = json.loads(Path('evidence/native/result.json').read_text())
+          if result.get('passed') is not True or len(result.get('completed_cases', [])) != 9:
+              raise SystemExit('Native boundary evidence incomplete')
+          Path('evidence/status.txt').write_text('Nine owned backend lanes passed; GTK UI acceptance remains separate.\n')
+          PYCODE
+          python3 scripts/link-recovery/extract.py --check
+          git diff --exit-code
+      - name: Upload source identities and failure evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: native-link-recovery-${{ github.sha }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 7

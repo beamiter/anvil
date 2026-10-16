@@ -400,6 +400,22 @@ class XInput:
         self.root = self.x.XDefaultRootWindow(self.display)
         self.refresh_origin()
 
+    def surface_identity(self):
+        # Called only inside the bounded owned input helper for pixel mode.
+        self.x.XGetGeometry.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_uint),
+            ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint)]
+        self.x.XGetGeometry.restype = ctypes.c_int
+        root = ctypes.c_ulong(); x = ctypes.c_int(); y = ctypes.c_int()
+        width = ctypes.c_uint(); height = ctypes.c_uint(); border = ctypes.c_uint(); depth = ctypes.c_uint()
+        if not self.x.XGetGeometry(self.display, self.window, ctypes.byref(root), ctypes.byref(x), ctypes.byref(y),
+                ctypes.byref(width), ctypes.byref(height), ctypes.byref(border), ctypes.byref(depth)):
+            raise RuntimeError("cannot verify owned X11 surface geometry")
+        if root.value != self.root or depth.value != 24:
+            raise RuntimeError("owned X11 surface identity changed")
+        self.refresh_origin()
+        return dict(window_xid=self.window, surface_size=[width.value, height.value], surface_root_origin=list(self.origin))
+
     def refresh_origin(self):
         x, y, child = ctypes.c_int(), ctypes.c_int(), ctypes.c_ulong()
         if not self.x.XTranslateCoordinates(self.display, self.window, self.root, 0, 0,
@@ -427,13 +443,31 @@ class XInput:
         self.x.XFlush(self.display)
         return stamp
 
-    def drag(self, divider, delta):
-        self.move(divider["x"], divider["y"]); self.button(True)
+    def pointer_root(self):
+        # Only called by the deadline-supervised helper, on its injection connection.
+        self.x.XQueryPointer.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_uint)]
+        self.x.XQueryPointer.restype = ctypes.c_int
+        root, child = ctypes.c_ulong(), ctypes.c_ulong()
+        rx, ry, wx, wy = (ctypes.c_int() for _ in range(4)); mask = ctypes.c_uint()
+        if not self.x.XQueryPointer(self.display, self.window, ctypes.byref(root), ctypes.byref(child),
+                ctypes.byref(rx), ctypes.byref(ry), ctypes.byref(wx), ctypes.byref(wy), ctypes.byref(mask)) or root.value != self.root:
+            raise RuntimeError("cannot observe pointer on owned X11 root")
+        return [rx.value, ry.value]
+
+    def drag(self, divider, delta, observe=False):
+        self.move(divider["x"], divider["y"])
+        start = self.pointer_root() if observe else None
+        self.button(True)
         self.x.XFlush(self.display)
         stamp = time.monotonic_ns()
         self.move(divider["x"] + (delta if divider["horizontal"] else 0),
                   divider["y"] + (0 if divider["horizontal"] else delta))
+        end = self.pointer_root() if observe else None
         self.button(False); self.x.XFlush(self.display)
+        if observe: self.last_drag_pointer = dict(start_root=start, end_root=end)
         return stamp
 
     def close(self):
@@ -498,8 +532,13 @@ def main():
                 temporary.replace(root / "command.json")
                 ownership.send(process.pid, signal.SIGUSR1)
                 response = wait_for(lambda: (r if (r := read_json(root / "response.json")) and r["request"] == request else None), process)
-                ownership.refresh()
                 evidence["snapshots"].append(response)
+                if args.pixel_gate and xinput is not None:
+                    frame = xinput.configure(response)
+                    evidence.setdefault("input_coordinate_frames", []).append(frame)
+                    evidence["window_origin"] = list(xinput.origin)
+                    evidence["surface_identity"] = xinput.identity
+                ownership.refresh()
                 evidence["owned_identities"] = ownership.identities()
                 harvest(evidence, root, reports, ownership)
                 return response
@@ -637,6 +676,8 @@ def main():
                         divider = dict(snapshot["dividers"][0])
                         drag_before_snapshot = snapshot
                     delta = 12 if index % 2 == 0 else -12
+                    drag_model = pixel_module.expected_drag(drag_before_snapshot, delta, xinput.origin) if args.pixel_gate else None
+                    predicted_shift = drag_model["expected_allocation_shift"] if drag_model else delta
                     pixel_drag = None
                     if pixel:
                         rect, expected = pixel_module.divider_rect(divider, xinput.origin)
@@ -644,14 +685,14 @@ def main():
                                           delta=delta, before_snapshot=drag_before_snapshot)
                         evidence["pixel_drags"].append(pixel_drag)
                         pixel_drag["before"] = pixel.request(kind="divider", name=f"drag-{index}-before", rect=rect,
-                            horizontal=divider["horizontal"], expected=expected + delta // 2, radius=abs(delta) // 2 + 5)
+                            horizontal=divider["horizontal"], expected=expected + predicted_shift // 2, radius=abs(predicted_shift) // 2 + 5)
                     stamp = xinput.drag(divider, delta)
                     if args.pixel_gate:
                         sleep_cancellable(.1)
                         after_drag = control("snapshot")
                         moved = after_drag["dividers"][0]
-                        shift = pixel_module.allocation_shift(drag_before_snapshot, after_drag, delta)
-                        evidence["allocation_drags"].append(dict(id=index, delta=delta, shift=shift,
+                        shift = pixel_module.allocation_shift(drag_before_snapshot, after_drag, predicted_shift)
+                        evidence["allocation_drags"].append(dict(id=index, delta=delta, shift=shift, model=drag_model, pointer_observation=xinput.last_drag_pointer,
                             before=drag_before_snapshot, after=after_drag))
                         for visible_tab in after_drag["tabs"]:
                             for visible_pane in visible_tab["panes"]:
@@ -659,7 +700,7 @@ def main():
                         if pixel:
                             pixel_drag.update(injected_ns=stamp, after_snapshot=after_drag, allocation_shift=shift)
                             after = pixel.request(kind="divider", name=f"drag-{index}-after", rect=rect,
-                                horizontal=divider["horizontal"], expected=expected + delta // 2, radius=abs(delta) // 2 + 5)
+                                horizontal=divider["horizontal"], expected=expected + predicted_shift // 2, radius=abs(predicted_shift) // 2 + 5)
                             pixel_drag["after"] = after
                             pixel_shift = after["position"] - pixel_drag["before"]["position"]
                             pixel_drag["pixel_shift"] = pixel_shift

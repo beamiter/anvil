@@ -15,6 +15,8 @@ def load(name, filename):
     return module
 
 
+geometry = load('input_frame_geometry', 'interaction-pixel-client.py')
+
 def valid_numbers(values, count):
     if not isinstance(values, list) or len(values) != count or any(type(v) not in (int, float) or not math.isfinite(v) for v in values):
         raise ValueError('invalid bounded numeric input geometry')
@@ -24,6 +26,14 @@ def valid_numbers(values, count):
 def execute(command, xinput):
     """Injection and completion fence must use this exact same X connection."""
     kind = command['kind']
+    if kind == 'configure':
+        if set(command) != {'kind','name','native_frame','window_size'}: raise ValueError('unexpected coordinate frame field')
+        identity = xinput.surface_identity()
+        origin = geometry.native_coordinate_frame(command, identity)
+        xinput.origin = tuple(origin)
+        stamp = time.monotonic_ns()
+        return dict(kind=kind, name=command['name'], injected_ns=stamp, completed_ns=stamp,
+                    origin=origin, identity=identity)
     if kind == 'focus':
         if set(command) != {'kind', 'name', 'bounds'}: raise ValueError('unexpected focus field')
         bounds = valid_numbers(command['bounds'], 4)
@@ -41,10 +51,12 @@ def execute(command, xinput):
         x, y = valid_numbers([divider['x'], divider['y']], 2)
         if type(delta) is not int or abs(delta) != 12 or not (12 <= x < 1588 and 12 <= y < 988):
             raise ValueError('drag outside isolated screen')
-        stamp = xinput.drag(divider, delta)
+        stamp = xinput.drag(divider, delta, observe=True)
     else: raise ValueError('unknown input command')
     xinput.x.XSync(xinput.display, False)
-    return dict(kind=kind, name=command['name'], injected_ns=stamp, completed_ns=time.monotonic_ns())
+    result = dict(kind=kind, name=command['name'], injected_ns=stamp, completed_ns=time.monotonic_ns())
+    if kind == 'drag': result['pointer_observation'] = xinput.last_drag_pointer
+    return result
 
 
 def serve(source, sink, factory):
@@ -64,7 +76,7 @@ def serve(source, sink, factory):
                 fields = Path(f"/proc/{command['pid']}/stat").read_text().rsplit(')',1)[1].split()
                 if int(fields[1]) != os.getppid(): raise ValueError('app is not owned by this collector')
                 xinput = factory(command['pid'])
-                result = dict(kind='initialize', name=command['name'], origin=list(xinput.origin))
+                result = dict(kind='initialize', name=command['name'], identity=xinput.surface_identity())
             else: result = execute(command, xinput)
             sink.write(json.dumps(result, allow_nan=False)+'\n'); sink.flush()
     finally:

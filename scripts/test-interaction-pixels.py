@@ -96,26 +96,47 @@ def valid(directory, panes=8, mode="observe", horizontal=True):
         if panes == 1:
             continue
         delta = 12 if index % 2 == 0 else -12
+        shift = delta - 6
         before = copy.deepcopy(snapshot); before.update(request=index * 3 + 2, monotonic_ns=base + 50)
         after = copy.deepcopy(before); after.update(request=index * 3 + 3, monotonic_ns=base + 80)
-        after["dividers"][0]["position"] += delta
-        after["dividers"][0]["x" if horizontal else "y"] += delta
+        after["dividers"][0]["position"] += shift
+        after["dividers"][0]["x" if horizontal else "y"] += shift
         for field in (after["tabs"][active]["panes"][0]["bounds"], after["tabs"][active]["panes"][0]["pixel_geometry"]["bounds"]):
-            field[2 if horizontal else 3] += delta
+            field[2 if horizontal else 3] += shift
         raw["snapshots"] += [before, after]
         raw["drags"].append(dict(id=index, injected_ns=base + 70, delta=delta))
-        raw["allocation_drags"].append(dict(id=index, delta=delta, shift=delta, before=before, after=after))
+        raw["allocation_drags"].append(dict(id=index, delta=delta, shift=shift, before=before, after=after))
         if mode == "observe":
             rect, expected = gate.client.divider_rect(before["dividers"][0], raw["window_origin"])
             event = dict(id=index, tab_id=tabs[active]["tab_id"], rect=rect, horizontal=horizontal, delta=delta,
-                         before_snapshot=before, after_snapshot=after, injected_ns=base + 70, allocation_shift=delta, pixel_shift=delta)
+                         before_snapshot=before, after_snapshot=after, injected_ns=base + 70, allocation_shift=shift, pixel_shift=shift)
             event["before"] = response(directory, "divider", f"drag-{index}-before", rect, base + 60, base + 65,
                                         divider_rgb(*rect[2:], expected, horizontal), position=expected, horizontal=horizontal)
             event["after"] = response(directory, "divider", f"drag-{index}-after", rect, base + 90, base + 95,
-                                       divider_rgb(*rect[2:], expected + delta, horizontal), position=expected + delta, horizontal=horizontal)
+                                       divider_rgb(*rect[2:], expected + shift, horizontal), position=expected + shift, horizontal=horizontal)
             raw["pixel_drags"].append(event)
     raw["setup_snapshot"] = copy.deepcopy(raw["snapshots"][-1])
     raw["raw_probe"]["painted_markers"] = [[k["pid"], k["sequence"], k["injected_ns"] + 2] for k in raw["keys"]]
+    raw['surface_identity']=dict(window_xid=17,surface_size=[1600,1000],surface_root_origin=[0,0])
+    raw['input_coordinate_frames']=[]
+    for snapshot in raw['snapshots']:
+        snapshot['gtk_runtime_version']=[4,14,5]
+        for divider in snapshot['dividers']:
+            position=divider['position']; axis=0 if divider['horizontal'] else 1
+            # Local paned origin locates its measured handle at the injected point.
+            pb=[divider['x']-position-.5,divider['y']-100,1500,800] if axis==0 else [divider['x']-100,divider['y']-position-.5,1500,990]
+            hb=[position,0,1,800] if axis==0 else [0,position,1500,1]
+            divider.update(paned_identity=77,wide_handle=False,direction='ltr',min_position=1,max_position=1500,
+                           handle_bounds_local=[hb],paned_bounds=pb)
+        snapshot['window_size']=[1600,1000]
+        snapshot['native_frame']=dict(units='logical_pixels_at_scale_1',scale_factor=1,window_xid=17,
+            surface_size=[1600,1000],widget_size=[1600,1000],native_api_offset=[0.0,0.0],surface_to_widget_translation=[0.0,0.0])
+        raw['input_coordinate_frames'].append(dict(snapshot_request=snapshot['request'],native_frame=copy.deepcopy(snapshot['native_frame']),
+            surface_identity=copy.deepcopy(raw['surface_identity']),widget_root_origin=[0.0,0.0],configured_ns=snapshot['monotonic_ns']+1))
+
+    for allocation in raw['allocation_drags']:
+        allocation['model']=gate.client.expected_drag(allocation['before'],allocation['delta'],raw['window_origin'])
+        allocation['pointer_observation']=dict(start_root=allocation['model']['pointer_start_root'],end_root=allocation['model']['pointer_end_root'])
     return raw
 
 
@@ -205,7 +226,7 @@ class PixelGate(unittest.TestCase):
         for field, value in (("name", "key-1"), ("kind", "divider"), ("rect", [0, 0, 66, 16])):
             self.reject(lambda r: r["pixel_events"][0]["after"].update({field: value}))
         self.reject(lambda r: r["pixel_events"][0].update(rect=[0, 0, 66, 16]))
-        for origin in ([True, 0], [-1, 0], [1600, 0], [0], [0.0, 0]):
+        for origin in ([True, 0], [-1, 0], [1600, 0], [0], [float("nan"), 0]):
             self.reject(lambda r: r.update(window_origin=origin))
 
     def test_negative_scrolled_terminal_origin_uses_valid_clipped_intersection(self):
@@ -325,7 +346,7 @@ class PixelGate(unittest.TestCase):
         for unrelated in (False, True):
             raw = valid(self.directory)
             for event in raw["pixel_drags"]:
-                width, height = event['rect'][2:]; old, new = 32, 32 + event['delta']
+                width, height = event['rect'][2:]; old, new = 32, 32 + event['allocation_shift']
                 rgb = bytes(v for y in range(height) for x in range(width)
                             for v in ([220]*3 if min(old,new) <= x < max(old,new) else [20]*3))
                 for phase, position in [('before',old),('after',new)]:
@@ -344,6 +365,24 @@ class PixelGate(unittest.TestCase):
             result=gate.validate(self.raw,8,DIGEST,relocated)
             self.assertEqual(result['status'],'short_gate_only')
             self.assertEqual(self.raw,original)
+
+    def test_native_frame_is_mandatory_and_fresh_for_both_input_and_roi(self):
+        self.reject(lambda r:r.pop('surface_identity'))
+        self.reject(lambda r:r.pop('input_coordinate_frames'))
+        self.reject(lambda r:r['snapshots'][0].pop('native_frame'))
+        self.reject(lambda r:r['input_coordinate_frames'][0].update(configured_ns=r['keys'][0]['injected_ns']+1))
+        self.reject(lambda r:r['input_coordinate_frames'][0]['native_frame'].update(window_xid=99))
+        self.reject(lambda r:r['surface_identity'].update(window_xid=99))
+        self.reject(lambda r:r['input_coordinate_frames'][0].update(widget_root_origin=[5,5]))
+
+    def test_narrow_handle_prediction_and_observed_pointer_fail_closed(self):
+        for field,value in [('wide_handle',True),('direction','rtl'),('min_position',900),
+                            ('max_position',760),('paned_identity',None),('handle_bounds_local',[])]:
+            self.reject(lambda r,f=field,v=value:r['allocation_drags'][0]['before']['dividers'][0].__setitem__(f,v))
+        self.reject(lambda r:r['allocation_drags'][0]['before'].__setitem__('gtk_runtime_version',[4,16,0]))
+        self.reject(lambda r:r['allocation_drags'][0]['pointer_observation']['start_root'].__setitem__(0,0))
+        self.reject(lambda r:r['allocation_drags'][0]['model'].__setitem__('expected_allocation_shift',12))
+        self.reject(lambda r:r['allocation_drags'][0]['after']['dividers'][0].__setitem__('paned_identity',78))
 
     def test_input_helper_must_have_distinct_cleaned_identity(self):
         for value in (None,True,999,100,123456):

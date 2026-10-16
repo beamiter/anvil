@@ -5,11 +5,18 @@ use std::collections::BTreeMap;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
 
-use relm4::gtk::{self, glib, prelude::*};
+use glib::translate::ToGlibPtr;
 use relm4::ComponentSender;
+use relm4::gtk::{self, glib, prelude::*};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use vte4::prelude::*;
+
+// Benchmark overlay is Linux/X11-only. No production module links this control.
+#[link(name = "gtk-4")]
+unsafe extern "C" {
+    fn gdk_x11_surface_get_xid(surface: *mut gtk::gdk::ffi::GdkSurface) -> std::ffi::c_ulong;
+}
 
 const LIMIT: usize = 100_000;
 const MARKER_LIMIT: usize = 10_000;
@@ -473,6 +480,19 @@ pub(crate) fn handle(model: &mut crate::AppModel, sender: &ComponentSender<crate
             STATE.with(|s| s.borrow_mut().phase = Phase::Finished);
         }
     }
+    let native_frame = model.window.surface().and_then(|surface| {
+        if !surface.type_().name().contains("X11") {
+            return None;
+        }
+        let (x, y) = model.window.surface_transform();
+        // GTK4.14 gtkmain.c subtracts these API offsets from surface events.
+        // Therefore the explicit surface-to-widget translation is (-x, -y).
+        let xid = unsafe { gdk_x11_surface_get_xid(surface.to_glib_none().0) };
+        Some(json!({"units": "logical_pixels_at_scale_1", "scale_factor": model.window.scale_factor(),
+            "window_xid": xid, "surface_size": [surface.width(), surface.height()],
+            "widget_size": [model.window.width(), model.window.height()],
+            "native_api_offset": [x, y], "surface_to_widget_translation": [-x, -y]}))
+    });
     let panes: Vec<_> = model
         .tabs
         .iter()
@@ -504,9 +524,10 @@ pub(crate) fn handle(model: &mut crate::AppModel, sender: &ComponentSender<crate
         });
     let report = STATE.with(|cell| {
         let s = cell.borrow();
-        json!({"request": request, "monotonic_ns": now_ns(), "tabs": panes,
+        json!({"request": request, "monotonic_ns": now_ns(), "tabs": panes, "native_frame": native_frame,
             "fixture_program_matches": fixture_program_matches,
             "window_size": [model.window.width(), model.window.height()], "active_tab_index": model.active, "session_persistence": model.session_persistence,
+            "gtk_runtime_version": [gtk::major_version(), gtk::minor_version(), gtk::micro_version()],
             "dividers": model.tabs.get(model.active).map(|tab| dividers(&tab.holder.clone().upcast(), &model.window.clone().upcast())),
             "dispatch_ids": s.dispatch.iter().take(if include_samples { LIMIT } else { 0 }).map(|v| v.0).collect::<Vec<_>>(),
             "dispatch_ms": s.dispatch.iter().take(if include_samples { LIMIT } else { 0 }).map(|v| v.1 as f64 / 1_000_000.0).collect::<Vec<_>>(),
@@ -570,7 +591,29 @@ fn dividers(root: &gtk::Widget, window: &gtk::Widget) -> Vec<Value> {
                     } else {
                         (a.x() + a.width() / 2.0, (a.y() + a.height() + b.y()) / 2.0)
                     };
-                    output.push(json!({"x": x, "y": y, "horizontal": horizontal, "position": paned.position()}));
+                    let mut handles = Vec::new();
+                    let mut child = paned.first_child();
+                    while let Some(current) = child {
+                        if current.css_name() == "separator" {
+                            if let Some(bounds) = current.compute_bounds(paned) {
+                                handles.push(json!([
+                                    bounds.x(),
+                                    bounds.y(),
+                                    bounds.width(),
+                                    bounds.height()
+                                ]));
+                            }
+                        }
+                        child = current.next_sibling();
+                    }
+                    let paned_bounds = paned.compute_bounds(window).map(|bounds| {
+                        json!([bounds.x(), bounds.y(), bounds.width(), bounds.height()])
+                    });
+                    output.push(json!({"x": x, "y": y, "horizontal": horizontal, "position": paned.position(),
+                        "paned_identity": paned.as_ptr() as usize, "handle_bounds_local": handles,
+                        "paned_bounds": paned_bounds, "wide_handle": paned.is_wide_handle(),
+                        "direction": if paned.direction() == gtk::TextDirection::Ltr { "ltr" } else { "unsupported" },
+                        "min_position": paned.min_position(), "max_position": paned.max_position()}));
                 }
             }
         }

@@ -3,6 +3,7 @@
 No UI injection, account access, provider invocation, or existing-session takeover.
 """
 import argparse
+import datetime
 import json
 import os
 from pathlib import Path
@@ -91,6 +92,51 @@ def verify_phase(expected, events, speech, window, marker):
     check(not any(e['type'].startswith('object:state-changed:focused') and e['priority'] and e['name'] != 'A11 draft owner' for e in events), 'focus moved')
     check(not any(e['type'].startswith('window:activate') for e in events), 'window activated during feedback')
 
+class ClockGuard:
+    def __init__(self):
+        self.wall = time.time()
+        self.monotonic = time.monotonic()
+    def checkpoint(self):
+        wall = time.time()
+        elapsed = time.monotonic() - self.monotonic
+        check(abs((wall - self.wall) - elapsed) < 0.25,
+              'wall clock drifted from continuous monotonic reference')
+        return wall
+
+def verify_flushed_speech(log, phases, marker):
+    # Orca 46 buffers its debug file. Read only after graceful owned shutdown,
+    # but attribute each utterance using Orca's recorded wall-clock timestamp.
+    check(bool(phases), 'missing measured phases')
+    previous_end = None
+    for phase in phases:
+        check(phase['wall_start'] < phase['wall_end'], 'invalid phase interval')
+        if previous_end is not None:
+            check(previous_end < phase['wall_start'], 'overlapping or unordered phase intervals')
+        previous_end = phase['wall_end']
+    records = []
+    for line in log.splitlines():
+        messages = presented_messages(line, marker)
+        if not messages:
+            continue
+        match = re.match(r'(\d{2}:\d{2}:\d{2}\.\d+) - SPEECH OUTPUT:', line)
+        check(match is not None, 'speech presentation lacks timestamp')
+        clock = datetime.datetime.strptime(match.group(1), '%H:%M:%S.%f').time()
+        anchor = datetime.datetime.fromtimestamp(phases[0]['wall_start'])
+        candidates = [datetime.datetime.combine(anchor.date() + datetime.timedelta(days=day), clock).timestamp()
+                      for day in (-1, 0, 1)]
+        stamp = min(candidates, key=lambda value: abs(value - phases[0]['wall_start']))
+        records.extend((stamp, message) for message in messages)
+    assigned = [[] for _ in phases]
+    for stamp, message in records:
+        matches = [index for index, phase in enumerate(phases)
+                   if phase['wall_start'] <= stamp <= phase['wall_end']]
+        check(len(matches) == 1, 'speech record must belong to exactly one phase')
+        assigned[matches[0]].append(message)
+    for phase, speech in zip(phases, assigned):
+        check(speech == phase['expected'], ('Orca phase presentation', phase['name'], speech, phase['expected']))
+        phase['orca_presented'] = speech
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--test-binary', required=True)
@@ -110,12 +156,15 @@ def main():
     marker = f'A11 {token} same task ['
     env = child_environment(os.environ)
     env.update(ANVIL_A11_TOKEN=token, ANVIL_A11_EVIDENCE=str(evidence))
+    clock_guard = ClockGuard()
     children = []
     files = []
     events = []
     fixture = None
     result = {'passed': False, 'native_executed': True, 'token': token,
               'orca_presentation_verified': False, 'audible_output_verified': False,
+              'speech_clock': 'same-host local wall clock, Orca HH:MM:SS.microseconds',
+              'timezone': list(time.tzname),
               'scope': 'production delivery helper and reducer; synthetic lifecycle, not full AppModel/runtime'}
     def start(argv, log):
         out = open(evidence / log, 'w')
@@ -124,6 +173,7 @@ def main():
         children.append(child)
         return child
     def pump():
+        clock_guard.checkpoint()
         context = GLib.MainContext.default()
         while context.pending():
             context.iteration(False)
@@ -198,20 +248,24 @@ def main():
             while time.monotonic() < end:
                 pump()
             event_start = len(events)
-            speech_start = len(orca_log.read_text(errors='replace'))
+            wall_start = clock_guard.checkpoint()
             (evidence / f'{index:02}.go').touch()
             wait(lambda: (evidence / f'{index:02}.done.json').exists())
             expected = phase['expected']
-            if expected:
-                wait(lambda: len(presented_messages(orca_log.read_text(errors='replace')[speech_start:], marker)) >= len(expected))
             # Include trailing events/speech so duplicates cannot be hidden by
             # advancing as soon as the first matching utterance appears.
             end = time.monotonic() + 1.0
             while time.monotonic() < end:
                 pump()
             captured = events[event_start:]
-            speech = orca_log.read_text(errors='replace')[speech_start:]
-            verify_phase(expected, captured, speech, phase['window'], marker)
+            wall_end = clock_guard.checkpoint()
+            # Event/focus checks are immediate; speech is checked from the
+            # flushed genuine Orca log after shutdown, never synthetic text.
+            announcements = [e for e in captured if e['type'].startswith('object:announcement')]
+            check([e['text'] for e in announcements] == expected, 'AT-SPI announcement mismatch')
+            check(all(e['priority'] == 1 and e['name'] == phase['window'] for e in announcements), 'wrong source/politeness')
+            check(not any(e['type'].startswith('object:state-changed:focused') and e['priority'] and e['name'] != 'A11 draft owner' for e in captured), 'focus moved')
+            check(not any(e['type'].startswith('window:activate') for e in captured), 'window activated during feedback')
             nodes = tree()
             check(not any(n['alert'] for n in nodes), 'task-result Alert remains in the exported tree')
             check(any(n['focused'] and n['name'] == 'A11 draft owner' for n in nodes), 'native oracle failed')
@@ -220,7 +274,7 @@ def main():
             done = json.loads((evidence / f'{index:02}.done.json').read_text())
             check(done['focus_preserved'] and done['draft_preserved'], 'native oracle failed')
             phases.append({'name': phase['name'], 'expected': expected, 'events': captured,
-                           'orca_presented': presented_messages(speech, marker), 'tree': nodes})
+                           'wall_start': wall_start, 'wall_end': wall_end, 'tree': nodes})
             (evidence / f'{index:02}.ack').touch()
             index += 1
         check(json.loads(finished.read_text())['phases'] == index == 21, 'incomplete scenario suite')
@@ -230,6 +284,14 @@ def main():
         exit_code = fixture.wait(timeout=10)
         check(exit_code == 0, 'GTK fixture failed after final phase')
         check(orca.poll() is None, 'Orca exited before completion')
+        # Graceful TERM flushes Orca's owned debug file. A hang or forced kill
+        # cannot yield a passing speech result. Final cleanup still owns it.
+        clock_guard.checkpoint()
+        orca.terminate()
+        orca_exit = orca.wait(timeout=5)
+        clock_guard.checkpoint()
+        check(orca_exit == 0, f'Orca did not shut down gracefully: {orca_exit}')
+        verify_flushed_speech(orca_log.read_text(errors='strict'), phases, marker)
         result.update(passed=True, orca_presentation_verified=True)
     except Exception as error:
         result['error'] = repr(error)

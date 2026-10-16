@@ -150,5 +150,49 @@ class FinalizationTests(unittest.TestCase):
             self.assertEqual(child.calls, ['terminate','wait'])
             self.assertFalse(json.loads((Path(directory)/'result.json').read_text())['passed'])
 
+class FlushedSpeechTests(unittest.TestCase):
+    marker = 'A11 token same task ['
+    message = marker + '12345678]: Ready for review'
+    def fixtures(self):
+        import datetime
+        start = datetime.datetime(2026,10,16,23,59,59).timestamp()
+        return [dict(name='complete',wall_start=start,wall_end=start+0.8,expected=[self.message]),
+                dict(name='quiet',wall_start=start+1,wall_end=start+1.8,expected=[])]
+    def log(self, stamp='23:59:59.200000'):
+        return f"{stamp} - SPEECH OUTPUT: '{self.message}' {{}}\n"
+    def test_flushed_presentation_retains_phase_assignment_across_midnight(self):
+        observer.verify_flushed_speech(self.log(), self.fixtures(), self.marker)
+    def test_missing_duplicate_quiet_and_gap_speech_fail(self):
+        for log in ['',self.log()*2,self.log()+self.log('00:00:00.200000'),
+                    self.log()+self.log('23:59:59.900000')]:
+            with self.assertRaises(AssertionError):
+                observer.verify_flushed_speech(log,self.fixtures(),self.marker)
+    def test_raw_event_and_untimestamped_speech_cannot_pass(self):
+        for log in ['EVENT: '+self.message, f"SPEECH OUTPUT: '{self.message}'"]:
+            with self.assertRaises(AssertionError):
+                observer.verify_flushed_speech(log,self.fixtures(),self.marker)
+
+class AttributionRegressionTests(unittest.TestCase):
+    fixtures = FlushedSpeechTests.fixtures
+    log = FlushedSpeechTests.log
+    marker = FlushedSpeechTests.marker
+    message = FlushedSpeechTests.message
+    def test_overlap_with_outside_record_cannot_cancel_assignment_count(self):
+        phases = self.fixtures()
+        phases[1].update(wall_start=phases[0]['wall_start'],wall_end=phases[0]['wall_end'],expected=[self.message])
+        with self.assertRaises(AssertionError):
+            observer.verify_flushed_speech(self.log()+self.log('00:00:05.000000'),phases,self.marker)
+    def test_backwards_phase_interval_is_rejected(self):
+        phases = self.fixtures()[::-1]
+        with self.assertRaises(AssertionError):
+            observer.verify_flushed_speech(self.log(),phases,self.marker)
+    def test_continuous_reference_rejects_interphase_rollback(self):
+        with mock.patch.object(observer.time,'time',side_effect=[1000,1001,999]), \
+             mock.patch.object(observer.time,'monotonic',side_effect=[10,11,12]):
+            guard = observer.ClockGuard()
+            self.assertEqual(guard.checkpoint(),1001)
+            with self.assertRaises(AssertionError):
+                guard.checkpoint()
+
 if __name__ == '__main__':
     unittest.main()

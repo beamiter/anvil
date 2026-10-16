@@ -1,0 +1,10 @@
+[package]
+name = "anvil-owned-launch-boundary"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+gio = "=0.22.8"
+glib = "=0.22.8"
+jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "89d58df8ed1ed2304e7773adf7105c0bbb99974d" }

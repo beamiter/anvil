@@ -1426,3 +1426,11 @@ mod tests {
             .any(|failure| failure.error == "session failed"));
     }
 }
+
+#[cfg(test)]
+#[path = "persistence_durability_tests.rs"]
+mod durability_tests;
+
+#[cfg(test)]
+#[path = "persistence_restart_tests.rs"]
+mod restart_tests;

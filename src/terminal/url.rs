@@ -42,16 +42,169 @@ fn clip_plain_url(raw: &str) -> Option<(usize, usize, &str)> {
     is_openable_url(candidate).then_some((start, end, candidate))
 }
 
-pub fn open_uri(uri: &str) {
-    if !is_openable_url(uri) {
-        log::warn!("Refusing to open a malformed or unsupported URI");
-        return;
+/// Map only typed error codes; backend messages may contain the complete target.
+fn launch_failure(error: &gtk::glib::Error) -> super::url_recovery::OpenFailure {
+    use super::url_recovery::OpenFailure;
+    if error.matches(gio::DBusError::AccessDenied) {
+        return OpenFailure::PermissionDenied;
     }
-    if let Err(err) = gio::AppInfo::launch_default_for_uri(uri, None::<&gio::AppLaunchContext>) {
-        log::warn!(
-            "Failed to open a validated URI: {}",
-            crate::review_input::safe_inline_display(&err.to_string(), 1024)
+    match error.kind::<gio::IOErrorEnum>() {
+        Some(gio::IOErrorEnum::NotFound | gio::IOErrorEnum::NotSupported) => {
+            OpenFailure::MissingHandler
+        }
+        Some(gio::IOErrorEnum::PermissionDenied) => OpenFailure::PermissionDenied,
+        Some(gio::IOErrorEnum::InvalidArgument) => OpenFailure::InvalidUri,
+        _ => OpenFailure::Failed,
+    }
+}
+
+/// GIO's async completion includes portal/activation failures that a successful
+/// synchronous dispatch may miss. Cancellation is a silent terminal outcome.
+fn launch_outcome(result: Result<(), gtk::glib::Error>) -> super::url_recovery::LaunchOutcome {
+    use super::url_recovery::LaunchOutcome;
+    match result {
+        Ok(()) => LaunchOutcome::Opened,
+        Err(error) if error.matches(gio::IOErrorEnum::Cancelled) => LaunchOutcome::Cancelled,
+        Err(error) => LaunchOutcome::Failed(launch_failure(&error)),
+    }
+}
+
+/// The single production dispatch boundary, also exercised by the isolated
+/// native handler/portal fixture. Never call this with a display-only summary.
+fn dispatch_uri(
+    uri: &str,
+    cancellable: &gio::Cancellable,
+    completion: impl FnOnce(super::url_recovery::LaunchOutcome) + 'static,
+) -> Result<(), super::url_recovery::OpenFailure> {
+    super::url_recovery::dispatch_with(uri, |target| {
+        gio::AppInfo::launch_default_for_uri_async(
+            target,
+            None::<&gio::AppLaunchContext>,
+            Some(cancellable),
+            move |result| completion(launch_outcome(result)),
         );
+    })
+}
+
+/// One recovery prompt per source widget. No URI is stored in widget labels,
+/// object names, accessibility text, or diagnostic messages.
+#[derive(Clone)]
+pub(crate) struct LinkOpener {
+    owner: gtk::glib::WeakRef<gtk::Widget>,
+    pending: std::rc::Rc<std::cell::RefCell<super::url_recovery::RecoveryOwner>>,
+    cancel: std::rc::Rc<std::cell::RefCell<Option<gio::Cancellable>>>,
+}
+
+impl LinkOpener {
+    pub(crate) fn new(widget: &impl IsA<gtk::Widget>) -> Self {
+        let opener = Self {
+            owner: widget.as_ref().downgrade(),
+            pending: Default::default(),
+            cancel: Default::default(),
+        };
+        let on_unmap = opener.clone();
+        widget.connect_unmap(move |_| on_unmap.invalidate());
+        opener
+    }
+
+    pub(crate) fn invalidate(&self) {
+        self.pending.borrow_mut().clear();
+        let previous = self.cancel.borrow_mut().take();
+        if let Some(previous) = previous {
+            previous.cancel();
+        }
+    }
+
+    pub(crate) fn open(&self, uri: &str) {
+        self.invalidate();
+        if self.owner.upgrade().is_none_or(|owner| !owner.is_mapped()) {
+            return;
+        }
+        // Establish ownership before dispatch, including a backend that invokes
+        // completion immediately. Invalidate before cancelling on replacement.
+        let ticket = self.pending.borrow_mut().begin();
+        let cancel = gio::Cancellable::new();
+        *self.cancel.borrow_mut() = Some(cancel.clone());
+        let opener = self.clone();
+        let callback_ticket = ticket.clone();
+        let original = uri.to_owned();
+        let result = dispatch_uri(uri, &cancel, move |outcome| {
+            opener.finish_launch(callback_ticket, original, outcome);
+        });
+        if let Err(failure) = result {
+            self.finish_launch(
+                ticket,
+                uri.to_owned(),
+                super::url_recovery::LaunchOutcome::Failed(failure),
+            );
+        }
+    }
+
+    fn finish_launch(
+        &self,
+        ticket: std::rc::Rc<()>,
+        target: String,
+        outcome: super::url_recovery::LaunchOutcome,
+    ) {
+        let mapped = self.owner.upgrade().is_some_and(|owner| owner.is_mapped());
+        let (owned, failure) = self
+            .pending
+            .borrow_mut()
+            .complete_launch(&ticket, mapped, outcome);
+        // Only the current request may clear its cancellable. complete_launch
+        // consumes the current ticket even on success/cancel/owner loss.
+        if !owned {
+            return;
+        }
+        self.cancel.borrow_mut().take();
+        let Some(failure) = failure else {
+            return;
+        };
+        self.show_failure(target, failure);
+    }
+
+    fn show_failure(&self, target: String, failure: super::url_recovery::OpenFailure) {
+        let Some(owner) = self.owner.upgrade().filter(|owner| owner.is_mapped()) else {
+            return;
+        };
+        let Some(window) = owner.root().and_downcast::<gtk::Window>() else {
+            return;
+        };
+        let uri = target.as_str();
+        let recoverable =
+            is_openable_url(uri) && failure != super::url_recovery::OpenFailure::InvalidUri;
+        let dialog = gtk::AlertDialog::builder()
+            .message("Could not open link")
+            .detail(failure.message())
+            .modal(true)
+            .cancel_button(0)
+            .default_button(0)
+            .build();
+        dialog.set_buttons(if recoverable {
+            &["Close", "Retry", "Copy link"]
+        } else {
+            &["Close"]
+        });
+        let ticket = self.pending.borrow_mut().begin();
+        let cancel = gio::Cancellable::new();
+        *self.cancel.borrow_mut() = Some(cancel.clone());
+        let opener = self.clone();
+        // This original, validated target is the only value used for recovery.
+        dialog.choose(Some(&window), Some(&cancel), move |response| {
+            if !opener.pending.borrow_mut().consume(&ticket) {
+                return;
+            }
+            opener.cancel.borrow_mut().take();
+            let Some(owner) = opener.owner.upgrade().filter(|owner| owner.is_mapped()) else {
+                return;
+            };
+            use super::url_recovery::{recovery_action, RecoveryAction};
+            match recovery_action(response.ok(), recoverable, &target) {
+                RecoveryAction::Retry(target) => opener.open(target),
+                RecoveryAction::Copy(target) => owner.clipboard().set_text(target),
+                RecoveryAction::None => {}
+            }
+        });
     }
 }
 
@@ -90,10 +243,13 @@ fn link_to_open(hyperlink: Option<String>, regex_match: Option<String>) -> Optio
     first_openable_link([hyperlink, regex_match])
 }
 
-/// Tooltip naming an OSC 8 link's target. The label is chosen by the program
+/// Tooltip naming an OSC 8 link's safe origin, excluding path/query/fragment. The label is chosen by the program
 /// and can read as anything, so hover shows where a click would really go.
 fn hyperlink_tooltip(uri: &str) -> String {
-    format!("{uri}\nCtrl+click to open")
+    match super::url_recovery::safe_origin(uri) {
+        Some(origin) => format!("{origin}\nCtrl+click to open"),
+        None => "Web link\nCtrl+click to open".to_owned(),
+    }
 }
 
 /// Show the target of the OSC 8 link under the pointer as the VTE's tooltip.
@@ -218,6 +374,15 @@ pub fn get_osc8_bounds_at_position(
 /// output/command `TextView`.
 pub fn attach_url_handlers(view: &gtk::TextView) {
     let buffer = view.buffer();
+    let opener = LinkOpener::new(view);
+    let on_changed = opener.clone();
+    let hover_owner = view.downgrade();
+    buffer.connect_changed(move |_| {
+        on_changed.invalidate();
+        if let Some(view) = hover_owner.upgrade() {
+            view.set_tooltip_text(None);
+        }
+    });
 
     let click = gtk::GestureClick::new();
     click.set_button(1);
@@ -234,7 +399,7 @@ pub fn attach_url_handlers(view: &gtk::TextView) {
                 if state.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
                     if let Some(iter) = iter {
                         if let Some(url) = get_url_at_position(&buffer, &iter) {
-                            open_uri(&url);
+                            opener.open(&url);
                             controller.set_state(gtk::EventSequenceState::Claimed);
                             return;
                         }
@@ -273,17 +438,16 @@ pub fn attach_url_handlers(view: &gtk::TextView) {
             buffer.remove_tag(&tag, &start, &end);
 
             if let Some(iter) = view.iter_at_location(bx, by) {
-                if let Some((us, ue, _)) = get_url_bounds_at_position(&buffer, &iter) {
+                if let Some((us, ue, target)) = get_osc8_bounds_at_position(&buffer, &iter)
+                    .or_else(|| get_url_bounds_at_position(&buffer, &iter))
+                {
                     buffer.apply_tag(&tag, &us, &ue);
-                    view.set_cursor(gtk::gdk::Cursor::from_name("pointer", None).as_ref());
-                    return;
-                }
-                if let Some((us, ue, _)) = get_osc8_bounds_at_position(&buffer, &iter) {
-                    buffer.apply_tag(&tag, &us, &ue);
+                    view.set_tooltip_text(Some(&hyperlink_tooltip(&target)));
                     view.set_cursor(gtk::gdk::Cursor::from_name("pointer", None).as_ref());
                     return;
                 }
             }
+            view.set_tooltip_text(None);
             view.set_cursor(gtk::gdk::Cursor::from_name("text", None).as_ref());
         });
     }
@@ -295,6 +459,7 @@ pub fn attach_url_handlers(view: &gtk::TextView) {
             let start = buffer.start_iter();
             let end = buffer.end_iter();
             buffer.remove_tag(&tag, &start, &end);
+            view.set_tooltip_text(None);
             view.set_cursor(gtk::gdk::Cursor::from_name("text", None).as_ref());
         });
     }
@@ -304,6 +469,60 @@ pub fn attach_url_handlers(view: &gtk::TextView) {
 #[cfg(test)]
 mod tests {
     use super::{clip_plain_url, first_openable_link, is_openable_url, link_to_open};
+
+    #[test]
+    fn backend_error_messages_never_enter_failure_feedback() {
+        use super::super::url_recovery::OpenFailure;
+        use super::{hyperlink_tooltip, launch_failure};
+        use relm4::gtk;
+        let secret = "https://example.com/private?token=secret#secret";
+        for (code, expected) in [
+            (gtk::gio::IOErrorEnum::NotFound, OpenFailure::MissingHandler),
+            (
+                gtk::gio::IOErrorEnum::PermissionDenied,
+                OpenFailure::PermissionDenied,
+            ),
+            (
+                gtk::gio::IOErrorEnum::InvalidArgument,
+                OpenFailure::InvalidUri,
+            ),
+            (gtk::gio::IOErrorEnum::Failed, OpenFailure::Failed),
+        ] {
+            let error = gtk::glib::Error::new(code, secret);
+            let failure = launch_failure(&error);
+            assert_eq!(failure, expected);
+            assert!(!failure.message().contains(secret));
+        }
+        assert_eq!(
+            launch_failure(&gtk::glib::Error::new(
+                gtk::gio::DBusError::AccessDenied,
+                secret
+            )),
+            OpenFailure::PermissionDenied
+        );
+        assert_eq!(
+            launch_failure(&gtk::glib::Error::new(
+                gtk::gio::IOErrorEnum::NotSupported,
+                secret
+            )),
+            OpenFailure::MissingHandler
+        );
+        assert_eq!(
+            launch_failure(&gtk::glib::Error::new(gtk::glib::FileError::Failed, secret)),
+            OpenFailure::Failed
+        );
+        assert_eq!(
+            super::launch_outcome(Err(gtk::glib::Error::new(
+                gtk::gio::IOErrorEnum::Cancelled,
+                secret
+            ))),
+            super::super::url_recovery::LaunchOutcome::Cancelled
+        );
+        assert_eq!(
+            hyperlink_tooltip(secret),
+            "https://example.com\nCtrl+click to open"
+        );
+    }
 
     #[test]
     fn wrapping_punctuation_does_not_hide_an_openable_url() {

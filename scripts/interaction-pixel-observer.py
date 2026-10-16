@@ -298,8 +298,8 @@ def detect_divider(rgb, width, height, *, horizontal, expected, radius):
 
 def divider_motion(before, after, width, height, *, horizontal, expected, delta):
     """Match one moving edge over the SAME union, then prove disappearance/appearance."""
-    integer(delta, "delta", -12, 12)
-    if abs(delta) != 12: raise ProtocolError("unsupported drag delta")
+    integer(delta, "delta", -18, 12)
+    if delta not in (-18, -12, 6, 12): raise ProtocolError("unsupported drag delta")
     center, radius = expected + delta // 2, abs(delta) // 2 + 5
     first = detect_divider(before, width, height, horizontal=horizontal, expected=center, radius=radius)
     second = detect_divider(after, width, height, horizontal=horizontal, expected=center, radius=radius)

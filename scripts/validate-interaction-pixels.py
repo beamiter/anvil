@@ -290,7 +290,7 @@ def validate(raw, panes, binary_sha256, evidence_directory=None):
     require(mode in ("observe", "control") and raw.get("pixel_metric") == METRIC, "not a short pixel-gate record")
     origin = raw.get("window_origin")
     require(type(origin) is list and len(origin) == 2, "missing window origin")
-    integer(origin[0], "window origin x", 0, 1599); integer(origin[1], "window origin y", 0, 999)
+    for value in origin: require(-64 <= number(value, "widget root origin") <= 1664, "widget root origin outside bound")
     for field in ("pixel_events", "pixel_drags", "allocation_drags", "drags"):
         require(type(raw.get(field)) is list, f"missing {field} array")
     observed = mode == "observe"
@@ -313,6 +313,23 @@ def validate(raw, panes, binary_sha256, evidence_directory=None):
     require(not observed or observer_pid not in fixture_pids, "observer aliases fixture PID")
     snapshots = {s["request"]: s for s in raw["snapshots"]}
     evidence = Evidence(evidence_directory) if observed else None
+    identity = raw.get("surface_identity")
+    require(type(identity) is dict, "missing owned surface identity")
+    frames = raw.get("input_coordinate_frames")
+    require(type(frames) is list and frames, "missing bounded input frame acknowledgements")
+    frame_times = {}; previous_frame = -1; previous_time = -1
+    for frame in frames:
+        request = integer(frame.get("snapshot_request"), "frame snapshot request")
+        configured = integer(frame.get("configured_ns"), "configured frame timestamp", 1)
+        require(request > previous_frame and configured > previous_time and request in snapshots, "invalid frame acknowledgement order")
+        snapshot = snapshots[request]
+        require(exact(frame.get("native_frame"), snapshot.get("native_frame")) and
+                exact(frame.get("surface_identity"), identity), "frame does not match observed native window")
+        calculated = client.native_coordinate_frame(snapshot, identity)
+        client.coordinates(frame.get("widget_root_origin"), 2)
+        require(frame.get("widget_root_origin") == calculated == origin and configured >= snapshot["monotonic_ns"],
+                "incorrect composed widget/surface/root frame")
+        frame_times[request] = configured; previous_frame = request; previous_time = configured
     summaries = []
     drag_tabs = set()
     previous_end = 0
@@ -320,6 +337,8 @@ def validate(raw, panes, binary_sha256, evidence_directory=None):
         for index, key in enumerate(raw["keys"]):
             target = snapshots[key["target_snapshot_request"]]
             target_time = linked_snapshot(target, snapshots)
+            require(target["request"] in frame_times and frame_times[target["request"]] <= key["injected_ns"], "key has no fresh configured native frame")
+            target_time = frame_times[target["request"]]
             active = geometry(target, topology, panes, origin)
             pane = next(p for p in active["panes"] if p["pid"] == key["pid"])
             require(key["injected_ns"] > previous_end, "next key precedes prior completed observation/drag")
@@ -360,14 +379,22 @@ def validate(raw, panes, binary_sha256, evidence_directory=None):
             stamp = integer(drag.get("injected_ns"), "drag injection", 1)
             before_snapshot, after_snapshot = allocation["before"], allocation["after"]
             before_time = linked_snapshot(before_snapshot, snapshots); after_time = linked_snapshot(after_snapshot, snapshots)
+            require(before_snapshot["request"] in frame_times and after_snapshot["request"] in frame_times, "drag missing configured native frame")
+            before_time = frame_times[before_snapshot["request"]]; after_time = frame_times[after_snapshot["request"]]
             before_tab = geometry(before_snapshot, topology, panes, origin)
             after_tab = geometry(after_snapshot, topology, panes, origin)
             require(before_tab["tab_id"] == after_tab["tab_id"] == key["active_tab_id"], "drag not on the key's active tab")
             require(key_end <= before_time <= stamp < after_time and before_snapshot["request"] < after_snapshot["request"],
                     "allocation observations do not bracket drag injection")
-            shift = client.allocation_shift(before_snapshot, after_snapshot, drag["delta"])
+            model = client.expected_drag(before_snapshot, drag["delta"], origin)
+            require(exact(allocation.get("model"), model), "recorded drag prediction differs from measured pre-injection model")
+            require(exact(allocation.get('pointer_observation'), dict(start_root=model['pointer_start_root'],
+                        end_root=model['pointer_end_root'])), "actual pointer observations differ from predicted drag")
+            predicted_shift = model['expected_allocation_shift']
+            shift = client.allocation_shift(before_snapshot, after_snapshot, predicted_shift)
             require(exact(allocation.get("shift"), shift), "recorded allocation shift differs from geometry")
             first, last = before_snapshot["dividers"][0], after_snapshot["dividers"][0]
+            require(first.get("paned_identity") == last.get("paned_identity"), "drag changed measured paned identity")
             axis, cross = ("x", "y") if first["horizontal"] else ("y", "x")
             require(abs((last[axis] - first[axis]) - shift) <= 1 and abs(last[cross] - first[cross]) <= 1,
                     "divider screen coordinates disagree with allocated motion")
@@ -383,11 +410,11 @@ def validate(raw, panes, binary_sha256, evidence_directory=None):
                 divider = before_snapshot["dividers"][0]
                 rect, expected = client.divider_rect(divider, origin)
                 require(exact(event.get("rect"), rect) and exact(event.get("horizontal"), divider["horizontal"]), "pixel divider ROI mismatch")
-                center, radius = expected + drag["delta"] // 2, abs(drag["delta"]) // 2 + 5
+                center, radius = expected + predicted_shift // 2, abs(predicted_shift) // 2 + 5
                 before_capture, before_position, before_rgb = divider_response(evidence, event, "before", center, radius)
                 after_capture, after_position, after_rgb = divider_response(evidence, event, "after", center, radius)
                 observer.divider_motion(before_rgb, after_rgb, *rect[2:], horizontal=event["horizontal"],
-                                        expected=expected, delta=drag["delta"])
+                                        expected=expected, delta=predicted_shift)
                 require(before_time <= before_capture["started_ns"] < before_capture["finished_ns"] <= stamp and
                         after_time <= after_capture["started_ns"] < after_capture["finished_ns"] and
                         after_capture["finished_ns"] - stamp <= MAX_RESPONSE_NS, "divider captures do not bracket drag/geometry")

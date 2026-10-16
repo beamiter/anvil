@@ -1,7 +1,6 @@
 //! blocks — finished-block widgets (VTE-backed) and the live ActiveBlock.
 use super::*;
 use crate::config::Config;
-use crate::terminal::open_uri;
 use gtk::Orientation;
 use relm4::gtk;
 use serde::{Deserialize, Serialize};
@@ -4874,6 +4873,9 @@ impl FinishedBlock {
             let click = gtk::GestureClick::new();
             click.set_button(1);
             let vte_for_click = output_vte.downgrade();
+            let opener = crate::terminal::url::LinkOpener::new(&output_vte);
+            let on_changed = opener.clone();
+            output_vte.connect_contents_changed(move |_| on_changed.invalidate());
             click.connect_pressed(move |controller, n_press, x, y| {
                 if n_press != 1 {
                     return;
@@ -4886,7 +4888,7 @@ impl FinishedBlock {
                     return;
                 };
                 if let Some(uri) = crate::terminal::url::openable_link_at(&vte_for_click, x, y) {
-                    open_uri(&uri);
+                    opener.open(&uri);
                     controller.set_state(gtk::EventSequenceState::Claimed);
                 }
             });

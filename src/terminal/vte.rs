@@ -225,12 +225,15 @@ pub(crate) fn setup_terminal_click_handler(terminal: &Terminal) {
     click_controller.set_button(GDK_BUTTON_PRIMARY as u32);
     click_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     let terminal_clone = terminal.clone();
+    let opener = super::url::LinkOpener::new(terminal);
+    let on_changed = opener.clone();
+    terminal.connect_contents_changed(move |_| on_changed.invalidate());
     click_controller.connect_pressed(move |controller, n_press, x, y| {
         if n_press == 1 {
             let state = controller.current_event_state();
             if state.contains(ModifierType::CONTROL_MASK) {
                 if let Some(uri) = super::url::openable_link_at(&terminal_clone, x, y) {
-                    super::url::open_uri(&uri);
+                    opener.open(&uri);
                     controller.set_state(gtk::EventSequenceState::Claimed);
                     return;
                 }
