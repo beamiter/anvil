@@ -106,13 +106,31 @@ fn semantic_context_from_evidence(
     })
 }
 
+/// Disabling task creation must not revoke controls for already-owned work.
+fn task_action_allowed(enabled: bool, action: &TaskPanelAction) -> bool {
+    enabled
+        || matches!(
+            action,
+            TaskPanelAction::Select(_)
+                | TaskPanelAction::Close
+                | TaskPanelAction::StopCodex(_)
+                | TaskPanelAction::FinishCodex(_)
+                | TaskPanelAction::Deny(_, _)
+                | TaskPanelAction::FocusTerminal(_)
+                | TaskPanelAction::FocusValidation(_)
+                | TaskPanelAction::ReviewDiff(_)
+                | TaskPanelAction::Archive(_)
+                | TaskPanelAction::Complete(_)
+        )
+}
+
 impl AppModel {
     pub(crate) fn toggle_tasks_panel(&mut self, sender: &ComponentSender<AppModel>) {
         if self.safe_mode {
             self.show_toast("Agent tasks are unavailable in safe mode.");
             return;
         }
-        if !self.config.borrow().agent_tasks_enabled {
+        if !self.config.borrow().agent_tasks_enabled && self.task_manager.tasks().is_empty() {
             self.show_toast(
                 "Agent tasks are opt-in: set agent_tasks_enabled = true in the config file first",
             );
@@ -146,7 +164,9 @@ impl AppModel {
         self.agent_tasks_timer_armed.set(false);
         let mut keep_fast = false;
 
-        if self.config.borrow().agent_tasks_enabled {
+        // Poll already-owned workers even after opt-out. The policy below
+        // cancels pending provider preparation before it can launch.
+        {
             let policy = self.task_prompt_policy();
             let report = self.agent_runtime.poll(&mut self.task_manager, policy);
             if let Some(issue) = report.issues.last() {
@@ -169,7 +189,11 @@ impl AppModel {
                 match pending.receiver.try_recv() {
                     Ok(Ok(prepared)) => {
                         self.pending_task_creation = None;
-                        self.register_prepared_task(prepared, sender);
+                        if self.config.borrow().agent_tasks_enabled {
+                            self.register_prepared_task(prepared, sender);
+                        } else {
+                            self.show_toast("Task creation finished after tasks were disabled; its worktree was preserved without starting an agent");
+                        }
                     }
                     Ok(Err(error)) => {
                         self.pending_task_creation = None;
@@ -198,7 +222,11 @@ impl AppModel {
         }
 
         let has_tasks = self.task_manager.tasks().iter().next().is_some();
-        if keep_fast || has_tasks || self.tasks_panel_visible.get() {
+        if keep_fast
+            || has_tasks
+            || self.tasks_panel_visible.get()
+            || self.agent_runtime.has_any_activity()
+        {
             self.ensure_agent_tasks_timer_with(
                 if keep_fast {
                     TASKS_POLL_FAST
@@ -225,7 +253,11 @@ impl AppModel {
     }
 
     fn task_prompt_policy(&self) -> NativePromptPolicy {
-        agent_task_ui::prompt_policy(&self.config.borrow())
+        let config = self.config.borrow();
+        let mut policy = agent_task_ui::prompt_policy(&config);
+        // Preparation compares this policy before consuming any ready result.
+        policy.share_command_context &= config.agent_tasks_enabled;
+        policy
     }
 
     fn existing_task_terminal(
@@ -295,7 +327,7 @@ impl AppModel {
         action: TaskPanelAction,
         sender: &ComponentSender<AppModel>,
     ) {
-        if !self.config.borrow().agent_tasks_enabled {
+        if !task_action_allowed(self.config.borrow().agent_tasks_enabled, &action) {
             self.show_toast("Agent tasks are disabled in the configuration");
             return;
         }
@@ -1302,6 +1334,87 @@ mod tests {
             manager.terminal_retry_session_id(task_id).ok(),
             None,
             "validation launch failure must not mark the agent terminal for retry"
+        );
+    }
+}
+
+#[cfg(test)]
+mod disabled_task_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn opt_out_preserves_stop_and_review_but_never_starts_work() {
+        let task = TaskId::new();
+        let approval = crate::agent_task::ApprovalId::new();
+        for action in [
+            TaskPanelAction::CreateFromBlock,
+            TaskPanelAction::StartCodex(task),
+            TaskPanelAction::StartTerminal(task),
+            TaskPanelAction::FollowUp(task, "next turn".into()),
+            TaskPanelAction::Approve(task, approval),
+            TaskPanelAction::RunValidation(task),
+        ] {
+            assert!(task_action_allowed(true, &action));
+            assert!(!task_action_allowed(false, &action));
+            assert!(
+                task_action_allowed(true, &action),
+                "re-enable restores access"
+            );
+        }
+        for action in [
+            TaskPanelAction::Select(task),
+            TaskPanelAction::Close,
+            TaskPanelAction::StopCodex(task),
+            TaskPanelAction::FinishCodex(task),
+            TaskPanelAction::Deny(task, approval),
+            TaskPanelAction::FocusTerminal(task),
+            TaskPanelAction::FocusValidation(task),
+            TaskPanelAction::ReviewDiff(task),
+            TaskPanelAction::Archive(task),
+            TaskPanelAction::Complete(task),
+        ] {
+            assert!(task_action_allowed(false, &action));
+        }
+    }
+
+    #[test]
+    fn drain_survives_opt_out_without_registering_or_starting_new_work() {
+        let source = include_str!("task_ops.rs");
+        let tick = source
+            .split("pub(crate) fn agent_tasks_tick(")
+            .nth(1)
+            .unwrap()
+            .split("fn existing_task_terminal(")
+            .next()
+            .unwrap();
+        let before_poll = tick.split(".poll(").next().unwrap();
+        assert!(!before_poll.contains("if self.config.borrow().agent_tasks_enabled"));
+        assert!(
+            tick.contains(".has_any_activity()"),
+            "cleanup remains scheduled even with no task rows"
+        );
+        assert!(tick.contains("if self.config.borrow().agent_tasks_enabled {"));
+        assert!(tick.contains("its worktree was preserved without starting an agent"));
+        let policy = source
+            .split("fn task_prompt_policy(")
+            .nth(1)
+            .unwrap()
+            .split("\n    }")
+            .next()
+            .unwrap();
+        assert!(policy.contains("policy.share_command_context &= config.agent_tasks_enabled"));
+        let dispatch = source
+            .split("pub(crate) fn execute_task_panel_action(")
+            .nth(1)
+            .unwrap()
+            .split("fn decide_native_approval(")
+            .next()
+            .unwrap();
+        assert!(dispatch
+            .contains("task_action_allowed(self.config.borrow().agent_tasks_enabled, &action)"));
+        assert!(
+            dispatch.contains(".cancel(task_id)"),
+            "Stop keeps the requested stable identity"
         );
     }
 }
