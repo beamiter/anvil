@@ -1,0 +1,105 @@
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,5 +1,7 @@
+ #![allow(dead_code)]
+ 
++#[path = "../scripts/interaction_budget_probe.rs"]
++mod interaction_budget;
+ mod action_ops;
+ mod agent;
+ mod agent_capability;
+@@ -1804,11 +1806,14 @@
+             });
+         }
+ 
++        interaction_budget::install(&sender);
+         ComponentParts { model, widgets }
+     }
+ 
+     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
++        if !matches!(&msg, AppMsg::InteractionBudgetSignal) { interaction_budget::app_update(); }
+         match msg {
++            AppMsg::InteractionBudgetSignal => interaction_budget::handle(self, &sender),
+             AppMsg::NewTab => {
+                 let startup = self.config.borrow().startup_commands.clone();
+                 self.add_tab(startup, &sender);
+--- a/src/app_msg.rs
++++ b/src/app_msg.rs
+@@ -7,6 +7,7 @@
+ 
+ #[derive(Debug, Clone)]
+ pub(crate) enum AppMsg {
++    InteractionBudgetSignal,
+     NewTab,
+     CloseTab(u64),
+     ForceCloseTab(u64),
+--- a/src/pty.rs
++++ b/src/pty.rs
+@@ -1501,6 +1501,7 @@
+             let on_exit = std::cell::Cell::new(Some(on_exit));
+ 
+             unix_fd_add_local(eventfd.as_raw_fd(), move || {
++                let mut budget_dispatch = crate::interaction_budget::dispatch();
+                 let _ = drain_eventfd(eventfd.as_raw_fd());
+ 
+                 // A producer may enqueue between the first empty read and
+@@ -1525,6 +1526,7 @@
+ 
+                 match message {
+                     PtyMsg::Data(data) => {
++                        budget_dispatch.data();
+                         callback(data);
+                         // Re-arm at idle priority rather than after a fixed
+                         // sleep. This watch is itself a DEFAULT_IDLE source, so
+@@ -1559,6 +1561,7 @@
+             return Ok(());
+         }
+ 
++        crate::interaction_budget::fallback();
+         // eventfd is Linux-specific and can also fail under descriptor
+         // pressure. Retain the original timer transport as a safe fallback.
+         let on_exit = std::cell::Cell::new(Some(on_exit));
+@@ -1568,10 +1571,12 @@
+             PTY_DISPATCH_INTERVAL,
+             glib::Priority::DEFAULT_IDLE,
+             move || {
++                let mut budget_dispatch = crate::interaction_budget::dispatch();
+                 let mut processed = 0usize;
+                 loop {
+                     match rx.borrow().try_recv() {
+                         Ok(PtyMsg::Data(data)) => {
++                            budget_dispatch.data();
+                             callback(data);
+                             processed += 1;
+                             if processed >= MAX_MESSAGES_PER_DISPATCH {
+--- a/src/block_view/mod.rs
++++ b/src/block_view/mod.rs
+@@ -10020,8 +10020,10 @@
+             }
+         });
+         let exit_ctx = ctx.clone();
++        let budget_pid = pty.pid_i32();
+         pty.start_reader(
+             move |data: Vec<u8>| {
++                let _budget_consumer = crate::interaction_budget::consumer(budget_pid, &data);
+                 if data.is_empty() {
+                     return;
+                 }
+@@ -14511,6 +14513,7 @@
+ 
+         // ── Resize handler: sync PTY cols/rows when widget allocation changes ──
+         term_view.install_resize_watchers();
++        crate::interaction_budget::register_surface(&term_view.active_vte, &term_view.widget(), term_view.pty.pid_i32());
+ 
+         Ok(term_view)
+     }
+--- a/src/terminal/vte.rs
++++ b/src/terminal/vte.rs
+@@ -258,6 +258,7 @@
+     sender: ComponentSender<VteTerminal>,
+     on_launch_failed: impl Fn() + 'static,
+ ) {
++    crate::interaction_budget::vte_spawn();
+     let (argv_vec, _) = crate::config::shell_argv_with_session(argv_owned, session_id);
+     let home = std::env::var("HOME").ok();
+     let requested_working_directory = working_directory.or(home.as_deref());

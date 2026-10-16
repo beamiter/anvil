@@ -1,0 +1,103 @@
+name: Native Block interaction smoke
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/interaction-smoke.yml'
+      - 'scripts/*interaction*'
+      - 'docs/interaction-budget.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-block-interaction-smoke-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  paired-smoke:
+    name: Paired raw Block correctness and cleanup only
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '1'
+      RUST_BACKTRACE: '1'
+      BASELINE_SHA: 88c3f4c565cb5b9f8d47d22eb3ad07f47a822ae4
+      CANDIDATE_PARENT_SHA: 1f89fcfa362c07326a42415d60682e7fa13a3914
+    steps:
+      - name: Check out immutable candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: candidate
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Check out immutable baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.BASELINE_SHA }}
+          path: baseline
+          persist-credentials: false
+      - name: Install native smoke dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes pkg-config libgtk-4-dev \
+            libadwaita-1-dev libvte-2.91-gtk4-dev libxtst6 python3 dbus-x11 \
+            xauth xdotool xvfb fonts-dejavu-core
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Prepare identical disposable instrumentation
+        run: |
+          mkdir -p evidence binaries
+          test "$(git -C baseline rev-parse HEAD)" = "$BASELINE_SHA"
+          test "$(git -C candidate rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C candidate rev-parse HEAD^)" = "$CANDIDATE_PARENT_SHA"
+          python3 - <<'PYCODE'
+          import json, os
+          from pathlib import Path
+          Path('evidence/source-identities.json').write_text(json.dumps({
+              'baseline_sha': os.environ['BASELINE_SHA'],
+              'candidate_sha': os.environ['GITHUB_SHA'],
+              'candidate_parent_sha': os.environ['CANDIDATE_PARENT_SHA'],
+              'purpose': 'short raw echo proxy and owned cleanup only',
+              'budget_acceptance': False}, indent=2) + '\n')
+          PYCODE
+          python3 candidate/scripts/prepare-interaction-budget.py baseline observed-baseline > evidence/baseline-overlay.json
+          python3 candidate/scripts/prepare-interaction-budget.py candidate observed-candidate > evidence/candidate-overlay.json
+          cmp evidence/baseline-overlay.json evidence/candidate-overlay.json
+          python3 candidate/scripts/test-interaction-budget.py
+          python3 candidate/scripts/test-interaction-pty-fixture.py
+          python3 candidate/scripts/test-interaction-budget-collector.py
+          python3 candidate/scripts/test-interaction-smoke.py
+          rustc -vV > evidence/rustc.txt
+          cargo -vV > evidence/cargo.txt
+          uname -a > evidence/kernel.txt
+          dpkg-query -W libgtk-4-1 libvte-2.91-gtk4-0 libadwaita-1-0 fonts-dejavu-core > evidence/packages.txt
+      - name: Build disposable baseline and candidate binaries
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/smoke-target
+        run: |
+          cargo build --manifest-path observed-baseline/Cargo.toml --release --locked
+          cp smoke-target/release/anvil binaries/baseline
+          cargo build --manifest-path observed-candidate/Cargo.toml --release --locked
+          cp smoke-target/release/anvil binaries/candidate
+          sha256sum binaries/* > evidence/binaries.sha256
+          git -C baseline diff --exit-code
+          git -C candidate diff --exit-code
+      - name: Run short paired 1, 8 and 32-total pane smoke
+        run: |
+          python3 candidate/scripts/run-interaction-smoke.py \
+            --baseline-binary "$PWD/binaries/baseline" --candidate-binary "$PWD/binaries/candidate" \
+            --baseline-sha "$BASELINE_SHA" --candidate-sha "$GITHUB_SHA" \
+            --output "$PWD/evidence"
+      - name: Upload raw smoke evidence even on failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: native-block-smoke-${{ github.sha }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 7
