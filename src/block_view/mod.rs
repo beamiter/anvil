@@ -142,6 +142,7 @@ pub(crate) enum CommandPromptStatus {
     Fullscreen,
     Initializing,
     ShellIntegrationUnavailable,
+    AgentExecutionUnavailable(crate::agent_capability::AgentExecutionLimitation),
 }
 
 impl CommandPromptStatus {
@@ -157,12 +158,14 @@ impl CommandPromptStatus {
             Self::Fullscreen => "Full-screen app active",
             Self::Initializing => "Prompt initializing",
             Self::ShellIntegrationUnavailable => "Shell integration required",
+            Self::AgentExecutionUnavailable(reason) => reason.short_label(),
         }
     }
 
     pub(crate) fn blocked_message(self) -> &'static str {
         match self {
             Self::Ready => "The pinned Block prompt is ready.",
+            Self::AgentExecutionUnavailable(reason) => reason.blocked_message(),
             Self::HasInput => {
                 "The pinned shell prompt already contains input. Clear it and press Enter to reach a fresh prompt, then try again."
             }
@@ -14784,10 +14787,13 @@ impl TermView {
     }
 
     pub(crate) fn agent_command_prompt_status(&self) -> CommandPromptStatus {
-        if self.agent_execution_supported.get() {
-            self.command_prompt_status()
+        if let Some(reason) = self
+            .pty
+            .agent_execution_limitation(self.agent_execution_supported.get())
+        {
+            CommandPromptStatus::AgentExecutionUnavailable(reason)
         } else {
-            CommandPromptStatus::ShellIntegrationUnavailable
+            self.command_prompt_status()
         }
     }
 

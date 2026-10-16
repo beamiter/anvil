@@ -53,6 +53,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    agent::capability_display_tests::capability_reason_label_tooltip_and_repeated_transitions
     vte_pty::tests::native_bridge_pairs_remain_raw_and_do_not_leak_across_exec
     terminal::block::tests::session_export_slow_fsync_keeps_native_input_and_tabs_responsive
     dialogs::tasks_panel::tests::queued_task_controls_keep_the_rendered_task_across_sync

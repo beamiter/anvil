@@ -1136,19 +1136,70 @@ fn render_prompt_status(
     widgets: &AgentPanelModelWidgets,
     status: crate::block_view::CommandPromptStatus,
 ) {
-    widgets.prompt_status.set_label(status.short_label());
-    widgets
-        .prompt_status
-        .set_tooltip_text(Some(status.blocked_message()));
-    widgets.prompt_status.remove_css_class("agent-prompt-ready");
-    widgets
-        .prompt_status
-        .remove_css_class("agent-prompt-blocked");
-    widgets.prompt_status.add_css_class(if status.is_ready() {
+    render_prompt_status_label(&widgets.prompt_status, status);
+}
+
+fn render_prompt_status_label(label: &gtk::Label, status: crate::block_view::CommandPromptStatus) {
+    label.set_label(status.short_label());
+    label.set_tooltip_text(Some(status.blocked_message()));
+    label.remove_css_class("agent-prompt-ready");
+    label.remove_css_class("agent-prompt-blocked");
+    label.add_css_class(if status.is_ready() {
         "agent-prompt-ready"
     } else {
         "agent-prompt-blocked"
     });
+}
+
+#[cfg(test)]
+mod capability_display_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn capability_reason_label_tooltip_and_repeated_transitions() {
+        use crate::agent_capability::{
+            execution_limitation, launch_limitation, AgentExecutionLimitation,
+        };
+        use crate::block_view::CommandPromptStatus;
+        gtk::init().expect("GTK display");
+        let label = gtk::Label::new(None);
+        let missing_entropy = launch_limitation(false, true, true, false);
+        let host_bridge = launch_limitation(true, true, true, false);
+        for _ in 0..2 {
+            for launch in [missing_entropy, host_bridge] {
+                let reason =
+                    execution_limitation(launch, true, true).expect("launch remains blocked");
+                render_prompt_status_label(
+                    &label,
+                    CommandPromptStatus::AgentExecutionUnavailable(reason),
+                );
+                assert_eq!(label.label(), reason.short_label());
+                assert_eq!(
+                    label.tooltip_text().as_deref(),
+                    Some(reason.blocked_message())
+                );
+                assert!(label.has_css_class("agent-prompt-blocked"));
+                assert!(!label.has_css_class("agent-prompt-ready"));
+            }
+            let reason = execution_limitation(None, false, true).unwrap();
+            assert_eq!(reason, AgentExecutionLimitation::ForegroundUnknown);
+            render_prompt_status_label(
+                &label,
+                CommandPromptStatus::AgentExecutionUnavailable(reason),
+            );
+            assert_eq!(label.label(), "Foreground identity unknown");
+            assert_eq!(
+                label.tooltip_text().as_deref(),
+                Some(reason.blocked_message())
+            );
+            assert_eq!(execution_limitation(None, true, true), None);
+            render_prompt_status_label(&label, CommandPromptStatus::Ready);
+            assert_eq!(label.label(), "Prompt ready");
+            assert!(label.has_css_class("agent-prompt-ready"));
+            assert!(!label.has_css_class("agent-prompt-blocked"));
+        }
+    }
 }
 
 fn agent_context_label(context: &crate::ai::BlockContext) -> String {

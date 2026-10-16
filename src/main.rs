@@ -2,6 +2,7 @@
 
 mod action_ops;
 mod agent;
+mod agent_capability;
 mod agent_ops;
 mod agent_task;
 mod agent_task_ui;

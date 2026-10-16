@@ -34,6 +34,8 @@ pub struct OwnedPty {
     /// Host-bridged shells live in another PID namespace, so their foreground
     /// process-group number cannot be compared with this local child PID.
     foreground_identity_available: bool,
+    /// Immutable, non-secret launch diagnostic. Never used as execution authority.
+    agent_launch_limitation: Option<crate::agent_capability::AgentExecutionLimitation>,
     reader_cancelled: Arc<AtomicBool>,
     /// Linux wakeup for a reader blocked on an idle PTY. `None` means eventfd
     /// creation failed (or this is not Linux), so the reader retains its 50 ms
@@ -936,6 +938,12 @@ impl OwnedPty {
         } else {
             shell_token_channel()?
         };
+        let agent_launch_limitation = crate::agent_capability::launch_limitation(
+            host_bridge,
+            enable_shell_token,
+            cfg!(target_os = "linux"),
+            token_channel.is_some(),
+        );
         // Neither caller-supplied spelling is authoritative. The public token
         // spelling is never used at all; the fd spelling is reconstructed from
         // the owned descriptor immediately below.
@@ -1112,6 +1120,7 @@ impl OwnedPty {
                     input_tx,
                     child_lifecycle,
                     foreground_identity_available: !host_bridge,
+                    agent_launch_limitation,
                     reader_cancelled: Arc::new(AtomicBool::new(false)),
                     reader_cancel_eventfd: create_reader_cancel_eventfd(),
                     input_guard: std::sync::Mutex::new(pty_input::InputGuard::new()),
@@ -1145,6 +1154,18 @@ impl OwnedPty {
             .ok()
             .and_then(|guard| guard.as_ref().map(|fd| fd.as_raw_fd()))
             .unwrap_or(-1)
+    }
+
+    /// Presentation only. The caller must still enforce every execution guard.
+    pub(crate) fn agent_execution_limitation(
+        &self,
+        integration_verified: bool,
+    ) -> Option<crate::agent_capability::AgentExecutionLimitation> {
+        crate::agent_capability::execution_limitation(
+            self.agent_launch_limitation,
+            self.shell_is_foreground().is_some(),
+            integration_verified,
+        )
     }
 
     /// Whether the PTY child/shell owns the foreground process group. `None`
@@ -1770,6 +1791,7 @@ impl OwnedPty {
             input_tx,
             child_lifecycle,
             foreground_identity_available: true,
+            agent_launch_limitation: None,
             reader_cancelled: Arc::new(AtomicBool::new(false)),
             reader_cancel_eventfd: create_reader_cancel_eventfd(),
             input_guard: Mutex::new(pty_input::InputGuard::new()),
