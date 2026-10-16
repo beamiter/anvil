@@ -1501,7 +1501,7 @@ pub(crate) fn merge_task_issue_feedback(
         let issue = "Native Agent runtime issue; details in Tasks";
         if let Some((_, message)) = messages.iter_mut().find(|(task_id, _)| *task_id == id) {
             message.push_str("; ");
-            message.push_str(&issue);
+            message.push_str(issue);
         } else {
             messages.push((id, issue.into()));
         }

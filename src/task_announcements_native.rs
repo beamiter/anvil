@@ -340,12 +340,11 @@ fn semantic_task_results_reach_atspi_and_orca() {
         &[issue],
         &[(ids[3], "Native Agent runtime issue; details in Tasks")],
     );
-    assert!(
-        f.state
-            .issue_detail(ids[3])
-            .unwrap()
-            .contains("Synthetic preparation unavailable")
-    );
+    assert!(f
+        .state
+        .issue_detail(ids[3])
+        .unwrap()
+        .contains("Synthetic preparation unavailable"));
     assert!(!f.label.text().contains(&format!("sk-{}", "a".repeat(32))));
     f.phase("final-no-replay", &[], &[], &[]);
     atomic_json(

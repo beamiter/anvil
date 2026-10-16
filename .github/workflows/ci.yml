@@ -45,6 +45,11 @@ jobs:
             libxtst6 \
             python3 \
             python3-venv \
+            python3-gi \
+            gir1.2-atspi-2.0 \
+            at-spi2-core \
+            orca \
+            openbox \
             appstream \
             desktop-file-utils \
             file \
@@ -96,6 +101,50 @@ jobs:
         id: tests
         shell: bash
         run: xvfb-run --auto-servernum cargo test --all-targets --locked --no-fail-fast 2>&1 | tee test.log
+
+      - name: Check task accessibility observer failure controls
+        run: |
+          python3 scripts/test-task-accessibility-observer.py
+          PYTHONOPTIMIZE=1 python3 scripts/test-task-accessibility-observer.py
+
+      - name: Run owned AT-SPI and Orca task feedback fixture
+        timeout-minutes: 10
+        run: |
+          mkdir -p task-accessibility-diagnostics
+          git rev-parse HEAD > task-accessibility-diagnostics/source-commit.txt
+          sha256sum Cargo.lock > task-accessibility-diagnostics/cargo-lock.sha256
+          dpkg-query -W libgtk-4-1 libadwaita-1-0 at-spi2-core orca python3-gi openbox \
+            > task-accessibility-diagnostics/native-package-versions.txt
+          cargo test --locked --no-run --bin anvil --message-format=json \
+            > task-accessibility-diagnostics/test-build.jsonl
+          python3 - <<'PYCODE'
+          import json
+          from pathlib import Path
+          root = Path('task-accessibility-diagnostics')
+          binaries = []
+          for line in (root / 'test-build.jsonl').read_text().splitlines():
+              message = json.loads(line)
+              if (message.get('reason') == 'compiler-artifact'
+                      and message.get('target', {}).get('name') == 'anvil'
+                      and message.get('profile', {}).get('test')
+                      and message.get('executable')):
+                  binaries.append(message['executable'])
+          if len(binaries) != 1:
+              raise RuntimeError(f'Expected one Anvil test executable, got {binaries}')
+          (root / 'test-binary.txt').write_text(str(Path(binaries[0]).resolve()) + '\n')
+          PYCODE
+          binary="$(cat task-accessibility-diagnostics/test-binary.txt)"
+          sha256sum "$binary" > task-accessibility-diagnostics/test-binary.sha256
+          bash scripts/test-task-accessibility.sh "$binary" "$PWD/task-accessibility-diagnostics/native"
+
+      - name: Upload task accessibility evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: task-accessibility-diagnostics
+          path: task-accessibility-diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Check GTK runner failure aggregation
         run: python3 scripts/test-gtk-display-contract.py

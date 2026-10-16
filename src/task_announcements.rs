@@ -408,7 +408,7 @@ mod tests {
             cause: crate::agent_task::CodexAppServerExitCause::IoFailed,
             detail: Some("not spoken".into()),
         };
-        state.sessions_finished(&[completion.clone()], &mut messages);
+        state.sessions_finished(std::slice::from_ref(&completion), &mut messages);
         assert_eq!(messages, vec![(id, "Agent session failed".into())]);
         let mut repeated = Vec::new();
         state.sessions_finished(&[completion], &mut repeated);
@@ -463,7 +463,7 @@ mod tests {
             cause: crate::agent_task::CodexAppServerExitCause::IoFailed,
             detail: Some("not spoken".into()),
         };
-        state.sessions_finished(&[completion.clone()], &mut messages);
+        state.sessions_finished(std::slice::from_ref(&completion), &mut messages);
         assert_eq!(messages, vec![(id, "Agent session cancelled".into())]);
         let mut repeated = Vec::new();
         state.sessions_finished(&[completion], &mut repeated);
