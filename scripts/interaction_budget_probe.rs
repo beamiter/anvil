@@ -489,9 +489,15 @@ pub(crate) fn handle(model: &mut crate::AppModel, sender: &ComponentSender<crate
         }).collect::<Vec<_>>()})
         })
         .collect();
+    let fixture_program_matches = std::env::var_os("ANVIL_INTERACTION_FIXTURE_PROGRAM")
+        .is_some_and(|expected| {
+            model.shell_argv.len() == 1
+                && std::path::Path::new(&model.shell_argv[0]) == std::path::Path::new(&expected)
+        });
     let report = STATE.with(|cell| {
         let s = cell.borrow();
         json!({"request": request, "monotonic_ns": now_ns(), "tabs": panes,
+            "fixture_program_matches": fixture_program_matches,
             "window_size": [model.window.width(), model.window.height()], "active_tab_index": model.active, "session_persistence": model.session_persistence,
             "dividers": model.tabs.get(model.active).map(|tab| dividers(&tab.holder.clone().upcast(), &model.window.clone().upcast())),
             "dispatch_ids": s.dispatch.iter().take(if include_samples { LIMIT } else { 0 }).map(|v| v.0).collect::<Vec<_>>(),

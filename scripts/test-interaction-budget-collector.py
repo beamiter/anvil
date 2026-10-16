@@ -314,4 +314,21 @@ while True: time.sleep(1)
                     if process is not None: process.wait(timeout=5)
                     sentinel.terminate(); sentinel.wait(timeout=5)
 
+class FixtureLauncher(unittest.TestCase):
+    def test_single_executable_config_path_execs_fixture_without_changing_pid(self):
+        import os, tomllib
+        with tempfile.TemporaryDirectory(prefix="a04 quoted '") as directory:
+            root = Path(directory); fixture = root / "fixture with space.py"
+            fixture.write_text("import os,sys,json; print(json.dumps(dict(pid=os.getpid(),args=sys.argv[1:])))")
+            reports = root / 'reports'; reports.mkdir(mode=0o700)
+            launcher = collector.create_fixture_launcher(root, fixture, reports)
+            config = tomllib.loads('shell = ' + json.dumps(str(launcher)))
+            self.assertEqual(config['shell'], str(launcher))
+            self.assertTrue(Path(config['shell']).is_file() and os.access(config['shell'], os.X_OK))
+            self.assertEqual(launcher.stat().st_mode & 0o777, 0o700)
+            process = subprocess.Popen([config['shell']], stdout=subprocess.PIPE, text=True)
+            output, _ = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 0)
+            self.assertEqual(json.loads(output), dict(pid=process.pid, args=['--reports', str(reports)]))
+
 if __name__ == "__main__": unittest.main()

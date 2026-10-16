@@ -36,6 +36,7 @@ def validate(raw, panes, binary_sha256):
     require(ids and parents and len(set(ids)) == len(ids), "missing actual OwnedPty dispatch/Block consumption")
     require(len(ids) == len(probe["dispatch_ms"]) and len(parents) == len(probe["consumer_ms"]), "sample relation invalid")
     require(set(parents) <= set(ids) and probe["consumed_bytes"] > 0, "unattributed Block consumption")
+    require(raw["setup_snapshot"].get("fixture_program_matches") is True, "production fixture program not verified")
     tabs = raw["setup_snapshot"]["tabs"]
     require(len(tabs) == (2 if panes == 32 else 1), "unsupported tab topology")
     require([len(t["panes"]) for t in tabs] == ([16, 16] if panes == 32 else [panes]), "unsupported pane topology")
@@ -113,6 +114,8 @@ def main():
     for role in ("baseline", "candidate"):
         require(re.fullmatch(r"[0-9a-f]{40}", getattr(args, role + "_sha")), "source must be an immutable commit")
     output = args.output.resolve(); output.mkdir(parents=True, exist_ok=True)
+    require(hashlib.sha256(args.baseline_binary.read_bytes()).digest() !=
+            hashlib.sha256(args.candidate_binary.read_bytes()).digest(), "refusing identical paired binaries")
     result = dict(schema="a04-short-smoke-v1", budget_acceptance=False, missing_gates=MISSING_GATES, runs=[])
     summary = output / "smoke-summary.json"
     wrapper = Path(__file__).with_name("run-interaction-budget.sh")

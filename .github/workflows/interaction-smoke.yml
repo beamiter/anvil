@@ -26,7 +26,7 @@ jobs:
       CARGO_BUILD_JOBS: '1'
       RUST_BACKTRACE: '1'
       BASELINE_SHA: 88c3f4c565cb5b9f8d47d22eb3ad07f47a822ae4
-      CANDIDATE_PARENT_SHA: 1f89fcfa362c07326a42415d60682e7fa13a3914
+      CANDIDATE_PARENT_SHA: 5ccfdffc4e37ed2cb45912660152a17daeb2eceb
     steps:
       - name: Check out immutable candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -68,6 +68,8 @@ jobs:
           python3 candidate/scripts/prepare-interaction-budget.py baseline observed-baseline > evidence/baseline-overlay.json
           python3 candidate/scripts/prepare-interaction-budget.py candidate observed-candidate > evidence/candidate-overlay.json
           cmp evidence/baseline-overlay.json evidence/candidate-overlay.json
+          python3 -I candidate/scripts/build-interaction-smoke.py --record-source baseline observed-baseline
+          python3 -I candidate/scripts/build-interaction-smoke.py --record-source candidate observed-candidate
           python3 candidate/scripts/test-interaction-budget.py
           python3 candidate/scripts/test-interaction-pty-fixture.py
           python3 candidate/scripts/test-interaction-budget-collector.py
@@ -77,13 +79,15 @@ jobs:
           uname -a > evidence/kernel.txt
           dpkg-query -W libgtk-4-1 libvte-2.91-gtk4-0 libadwaita-1-0 fonts-dejavu-core > evidence/packages.txt
       - name: Build disposable baseline and candidate binaries
-        env:
-          CARGO_TARGET_DIR: ${{ github.workspace }}/smoke-target
         run: |
-          cargo build --manifest-path observed-baseline/Cargo.toml --release --locked
-          cp smoke-target/release/anvil binaries/baseline
-          cargo build --manifest-path observed-candidate/Cargo.toml --release --locked
-          cp smoke-target/release/anvil binaries/candidate
+          python3 -I candidate/scripts/build-interaction-smoke.py --source observed-baseline \
+            --target baseline-target --binary binaries/baseline --evidence evidence --role baseline
+          python3 -I candidate/scripts/build-interaction-smoke.py --source observed-candidate \
+            --target candidate-target --binary binaries/candidate --evidence evidence --role candidate
+          if cmp -s binaries/baseline binaries/candidate; then
+            echo 'Refusing identical baseline/candidate binaries for these distinct sources' >&2
+            exit 1
+          fi
           sha256sum binaries/* > evidence/binaries.sha256
           git -C baseline diff --exit-code
           git -C candidate diff --exit-code
@@ -98,6 +102,8 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: native-block-smoke-${{ github.sha }}
-          path: evidence/
+          path: |
+            evidence/
+            binaries/
           if-no-files-found: error
           retention-days: 7

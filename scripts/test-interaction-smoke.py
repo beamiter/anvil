@@ -30,7 +30,7 @@ def valid(panes):
                 binary_sha256='a' * 64, raw_capture_completed=True, evidence_write_succeeded=True,
                 cancellation_count=0, cleanup=dict(verified_empty=True, remaining_pids=[], errors=[],
                 owned_identities=[{'pid': 100 + n} for n in range(panes)]),
-                setup_snapshot=dict(tabs=tabs), fixtures=[{'pid': 100 + n} for n in range(panes)],
+                setup_snapshot=dict(tabs=tabs, fixture_program_matches=True), fixtures=[{'pid': 100 + n} for n in range(panes)],
                 keys=keys, drags=[] if panes == 1 else [{}, {}, {}],
                 raw_probe=dict(vte_spawn_count=0, timer_fallback=False, overflow=False,
                 dispatch_ids=[0, 1], dispatch_ms=[.01, .02], consumer_dispatch_ids=[1, 1],
@@ -133,6 +133,88 @@ class SmokeGate(unittest.TestCase):
             elif kind == 'request_order': row['snapshots'].reverse()
             else: row['snapshots'][1]['monotonic_ns'] = 0
             with self.assertRaises(ValueError): smoke.validate(row, 1, 'a' * 64)
+
+    def test_rejects_production_config_fallback(self):
+        row = valid(1); row['setup_snapshot']['fixture_program_matches'] = False
+        with self.assertRaises(ValueError): smoke.validate(row, 1, 'a' * 64)
+
+    def test_build_provenance_rejects_reused_or_wrong_source_artifact(self):
+        import tempfile
+        spec = importlib.util.spec_from_file_location('build', Path(__file__).with_name('build-interaction-smoke.py'))
+        build = importlib.util.module_from_spec(spec); spec.loader.exec_module(build)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'source'; root.mkdir()
+            target = Path(directory) / 'target'; (target / 'release').mkdir(parents=True)
+            executable = target / 'release/anvil'; executable.write_bytes(b'binary')
+            message = dict(reason='compiler-artifact', target=dict(name='anvil'), executable=str(executable),
+                           manifest_path=str(root / 'Cargo.toml'), fresh=False)
+            self.assertEqual(build.validate_artifact([message], root, target), executable)
+            for changes in (dict(fresh=True), dict(manifest_path=str(root / 'wrong.toml')),
+                            dict(executable=str(root))):
+                bad = dict(message, **changes)
+                with self.assertRaises(ValueError): build.validate_artifact([bad], root, target)
+            with self.assertRaises(ValueError): build.validate_artifact([message, message], root, target)
+            with self.assertRaises(ValueError): build.build(root, target, executable, root, 'candidate')
+
+    def test_wrapper_records_exact_source_and_rejects_wrong_cwd(self):
+        import tempfile, os, sys, subprocess, json
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'source'; (root / 'src').mkdir(parents=True)
+            (root / 'src/main.rs').write_text('fn main() {}')
+            fake = Path(directory) / 'rustc'; fake.write_text('#!' + sys.executable + '\n'); fake.chmod(0o700)
+            record = Path(directory) / 'rustc.jsonl'
+            env = dict(os.environ, A04_EXPECTED_SOURCE=str(root), A04_RUSTC_RECORD=str(record))
+            command = [sys.executable, str(Path(__file__).with_name('build-interaction-smoke.py').resolve()),
+                       '--rustc-wrapper', str(fake), '--crate-name', 'anvil', 'src/main.rs']
+            subprocess.run(command, cwd=root, env=env, check=True)
+            row = json.loads(record.read_text()); self.assertEqual(row['source'], str(root / 'src/main.rs'))
+            self.assertEqual(row['returncode'], 0)
+            failed = subprocess.run(command, cwd=directory, env=env, capture_output=True)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertEqual(len(record.read_text().splitlines()), 1)
+
+    def test_complete_git_inputs_include_assets_and_reject_untracked_delta(self):
+        import tempfile, subprocess, shutil, json
+        spec = importlib.util.spec_from_file_location('build', Path(__file__).with_name('build-interaction-smoke.py'))
+        build = importlib.util.module_from_spec(spec); spec.loader.exec_module(build)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'source'; root.mkdir()
+            subprocess.run(['git', 'init', '-q', str(root)], check=True)
+            for name in ['src/main.rs', 'build.rs', 'Cargo.lock', 'config.toml.example', 'scripts/shell-integration/test']:
+                path = root / name; path.parent.mkdir(parents=True, exist_ok=True); path.write_text('fixture')
+            subprocess.run(['git', '-C', str(root), 'add', '.'], check=True)
+            subprocess.run(['git', '-C', str(root), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                            'commit', '-qm', 'fixture'], check=True)
+            observed = Path(directory) / 'observed'
+            shutil.copytree(root, observed, ignore=shutil.ignore_patterns('.git'))
+            (observed / 'scripts/interaction_budget_probe.rs').write_text('probe')
+            (observed / 'interaction-overlay.json').write_text('{}')
+            build.record_source(root, observed)
+            record = json.loads((observed / 'interaction-source.json').read_text())
+            self.assertIn('config.toml.example', record['prepared_files'])
+            self.assertIn('scripts/shell-integration/test', record['prepared_files'])
+            self.assertEqual(len(record['tracked_entries']), 5)
+            (observed / 'interaction-source.json').unlink()
+            (observed / 'config.toml.example').write_text('changed embedded asset')
+            with self.assertRaises(ValueError): build.record_source(root, observed)
+            (observed / 'config.toml.example').write_text('fixture')
+            (root / 'build.rs').write_text('dirty checkout')
+            with self.assertRaises(ValueError): build.record_source(root, observed)
+
+    def test_rejects_cargo_compiler_and_flags_environment_aliases(self):
+        import os, tempfile
+        from unittest import mock
+        spec = importlib.util.spec_from_file_location('build', Path(__file__).with_name('build-interaction-smoke.py'))
+        build = importlib.util.module_from_spec(spec); spec.loader.exec_module(build)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); target = root / 'target'
+            for key in ('RUSTC', 'RUSTC_WORKSPACE_WRAPPER', 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS',
+                        'CARGO_BUILD_RUSTC', 'CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER',
+                        'CARGO_BUILD_RUSTC_WRAPPER', 'CARGO_BUILD_RUSTFLAGS',
+                        'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS'):
+                with self.subTest(key=key), mock.patch.dict(os.environ, {key: 'override'}):
+                    with self.assertRaisesRegex(ValueError, 'override environment'):
+                        build.build(root, target, root / 'binary', root, 'candidate')
 
 
 if __name__ == '__main__': unittest.main()

@@ -288,9 +288,9 @@ before forcibly killing the collector; hosted smoke remains subject to review.
 The narrowly scoped path-filtered push workflow builds only disposable observed
 binaries. Baseline is pinned to 88c3f4c565cb5b9f8d47d22eb3ad07f47a822ae4;
 candidate is the immutable event SHA, with its parent required to equal reviewed
-A08 head 1f89fcfa362c07326a42415d60682e7fa13a3914. A later changed parent fails
+A04 publication head 5ccfdffc4e37ed2cb45912660152a17daeb2eceb. A later changed parent fails
 closed and requires another reviewed pin. Both trees receive the byte-identical
-observer overlay (digest 7b06d789ec1d7c5ceab5027c4dbeac2841bfd382ba98763ef9b80ffa3197e6b7).
+observer overlay (digest cb8b833a01ba814fd88c8e2abda856d997a71e9abbcc8af6c90e3cdea83ff633).
 All published A06, A07 and A08 production changes are retained. No normal/release build sources, release
 workflow, installed artifact or published binary are replaced by this smoke job.
 
@@ -332,3 +332,38 @@ raw echo/cleanup contract work on both revisions, not that differences are cause
 by A04 or that either revision meets performance budgets. The candidate remains
 the exact push-event commit, with an exact-parent guard. A different master head
 requires another pin review rather than replaying an obsolete tree operation.
+
+
+### First hosted failure and harness repair
+
+Run 38969356891 failed before any keys: production treats config.shell as one
+executable path, so the former command string triggered normal-shell fallback.
+The fixture identity guard refused that child, and the saved report verified an
+empty owned tree after cleanup. No echo/performance success was inferred. The
+build artifact also showed identical baseline/candidate hashes after a 0.09-second
+second build; that pair is invalid and retained as failure evidence.
+
+The corrected launcher is an atomically created private mode-0700 executable,
+with a fixed Python interpreter and literal quoted argv. It execs the fixture,
+preserving child PID. A temporary observer boolean checks actual AppModel
+shell_argv, after the production config parser and program resolver, equals the
+exact fixture executable. A false result aborts before workload signals. Local
+launcher tests validate TOML path round-trip and exec PID identity; actual Rust
+config/parser success remains a mandatory hosted gate, not a local test claim.
+
+Each revision now compiles into its own absent target directory. Cargo JSON must
+prove a non-fresh artifact from the expected manifest; a rustc wrapper records
+and verifies the actual anvil source path/digest, compiler, argument digest and
+times. Build records retain source manifests, overlay identity and output
+hash/size/mtime. Source mutation, reused artifacts and identical paired binaries
+fail closed. Both observed binaries and build records are kept in the smoke
+artifact, separate from ordinary release artifacts. Download caches may be shared;
+compiled target directories may not. All prior acceptance gaps remain open.
+
+The build-input record starts from verified git ls-tree entries of the exact
+checkout commit/tree, covering embedded assets, build scripts and Cargo files.
+Only the explicit temporary overlay delta is permitted; every prepared file is
+hashed before and after compilation. Compiler/flag overrides are rejected,
+PYTHON* inherited variables are cleared for children, and the fixed launcher and
+compiler-wrapper Python processes use isolated mode. This records source inputs;
+it does not claim a hermetic toolchain or operating-system image.

@@ -13,7 +13,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import shlex
 import signal
 import select
 import sys
@@ -75,6 +74,23 @@ def sleep_cancellable(seconds):
         remaining = deadline - time.monotonic()
         if remaining <= 0: return
         time.sleep(min(.05, remaining))
+
+
+def create_fixture_launcher(root, fixture, reports):
+    """Config accepts ONE executable path, never a shell command string."""
+    interpreter = str(Path(sys.executable).resolve(strict=True))
+    if any(c.isspace() for c in interpreter):
+        raise ValueError("fixture interpreter path cannot contain shebang whitespace")
+    launcher = root / "fixture-launcher"
+    program = ("#!" + interpreter + " -I\nimport os\n" +
+               "os.execv(" + repr(interpreter) + ", " +
+               repr([interpreter, "-I", str(fixture.resolve(strict=True)), "--reports", str(reports)]) + ")\n")
+    with tempfile.NamedTemporaryFile(mode="w", dir=root, prefix="launcher-", delete=False) as temporary:
+        temporary.write(program)
+        os.fchmod(temporary.fileno(), 0o700)
+        temporary_path = Path(temporary.name)
+    temporary_path.replace(launcher)
+    return launcher
 
 
 def scheduled_tab_index(elapsed_seconds, interval_seconds, tab_count):
@@ -444,14 +460,15 @@ def main():
     with tempfile.TemporaryDirectory(prefix="anvil-interaction-") as directory:
         root = Path(directory)
         reports = root / "fixtures"; reports.mkdir(mode=0o700)
-        env = os.environ.copy()
+        env = {key: value for key, value in os.environ.items() if not key.startswith("PYTHON")}
         for key in ("CONFIG", "DATA", "STATE", "CACHE", "RUNTIME"):
             path = root / key.lower(); path.mkdir(mode=0o700)
             env["XDG_" + key + ("_DIR" if key == "RUNTIME" else "_HOME")] = str(path)
         env.update(ANVIL_INTERACTION_BUDGET_DIR=str(root), GDK_BACKEND="x11", GSK_RENDERER="cairo", GDK_SCALE="1", GDK_DPI_SCALE="1",
                    LIBGL_ALWAYS_SOFTWARE="1", GTK_A11Y="none", NO_AT_BRIDGE="1")
         # Configured executable preserves normal session-persistence and pane caps.
-        shell = shlex.join(["python3", str(fixture), "--reports", str(reports)])
+        shell = str(create_fixture_launcher(root, fixture, reports))
+        env["ANVIL_INTERACTION_FIXTURE_PROGRAM"] = shell
         config = root / "config.toml"
         config.write_text('terminal_mode = "block"\nfont = "DejaVu Sans Mono 12"\nfont_scale = 1.0\n'
                           'opacity = 1.0\nsidebar_visible = false\ntab_placement = "top"\n'
@@ -481,6 +498,8 @@ def main():
                 harvest(evidence, root, reports, ownership)
                 return response
             snapshot = control("snapshot")
+            if snapshot.get("fixture_program_matches") is not True:
+                raise RuntimeError("production config parser did not select the exact executable fixture program")
             if not snapshot["session_persistence"]:
                 raise RuntimeError("benchmark must preserve production persistence/pane limits")
             tab_ids = []
