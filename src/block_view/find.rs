@@ -998,6 +998,31 @@ fn bookmarked_empty_reason<'a>(
     }
 }
 
+/// Do not inspect retained output when the selected scope already resolves
+/// from the command. Besides avoiding a full leading-blank-line scan, this
+/// keeps Command-only browsing within its command-only scan-byte budget.
+fn metadata_filter_line<'a>(
+    command: &'a str,
+    output: impl FnOnce() -> Option<&'a str>,
+    scope: CrossBlockSearchScope,
+) -> Option<(bool, usize, &'a str)> {
+    let command_line = first_meaningful_line(command);
+    let output_line = || output().and_then(first_meaningful_line);
+    match scope {
+        CrossBlockSearchScope::All => command_line
+            .map(|(index, line)| (false, index + 1, line))
+            .or_else(|| output_line().map(|(index, line)| (true, index + 1, line))),
+        CrossBlockSearchScope::Command => {
+            let (index, line) = command_line?;
+            Some((false, index + 1, line))
+        }
+        CrossBlockSearchScope::Output => {
+            let (index, line) = output_line()?;
+            Some((true, index + 1, line))
+        }
+    }
+}
+
 /// An empty text query with active metadata filters is a block browser rather
 /// than an idle picker. Represent each eligible record once, choosing the
 /// first meaningful line on the requested surface.
@@ -1006,21 +1031,7 @@ fn metadata_filter_hit(
     scope: CrossBlockSearchScope,
 ) -> Option<CrossBlockHit> {
     let command = record.command();
-    let command_line = first_meaningful_line(command);
-    let output_line = record.output().and_then(first_meaningful_line);
-    let (is_output, line_no, line) = match scope {
-        CrossBlockSearchScope::All => command_line
-            .map(|(index, line)| (false, index + 1, line))
-            .or_else(|| output_line.map(|(index, line)| (true, index + 1, line)))?,
-        CrossBlockSearchScope::Command => {
-            let (index, line) = command_line?;
-            (false, index + 1, line)
-        }
-        CrossBlockSearchScope::Output => {
-            let (index, line) = output_line?;
-            (true, index + 1, line)
-        }
-    };
+    let (is_output, line_no, line) = metadata_filter_line(command, || record.output(), scope)?;
     Some(CrossBlockHit {
         block_id: record.id(),
         is_output,
@@ -3997,6 +4008,45 @@ mod tests {
             assert_eq!(hits[0].duration_ms, Some(2_000));
             assert_eq!(hits[0].cwd.as_deref(), Some("/srv/legacy"));
         }
+    }
+
+    #[test]
+    fn metadata_command_hits_never_resolve_unneeded_output() {
+        for scope in [CrossBlockSearchScope::Command, CrossBlockSearchScope::All] {
+            assert_eq!(
+                metadata_filter_line(
+                    "\u{2003}\n命令 🙂",
+                    || panic!("output must stay unobserved"),
+                    scope
+                ),
+                Some((false, 2, "命令 🙂")),
+            );
+        }
+        assert_eq!(
+            metadata_filter_line(
+                " \t\n",
+                || panic!("Command scope never reads output"),
+                CrossBlockSearchScope::Command
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn metadata_output_fallback_retains_lines_unicode_and_missing_text() {
+        for scope in [CrossBlockSearchScope::All, CrossBlockSearchScope::Output] {
+            assert_eq!(
+                metadata_filter_line(" \t\n", || Some("\r\n\u{2003}\n输出 🙂\nnext"), scope),
+                Some((true, 3, "输出 🙂")),
+            );
+            for output in [None, Some(""), Some(" \t\r\n\u{2003}")] {
+                assert_eq!(metadata_filter_line("", || output, scope), None);
+            }
+        }
+        assert_eq!(
+            metadata_filter_line("command", || Some("output"), CrossBlockSearchScope::Output),
+            Some((true, 1, "output")),
+        );
     }
 
     #[test]
