@@ -50,6 +50,7 @@ jobs:
             file \
             dbus-x11 \
             xauth \
+            xdotool \
             xvfb
 
       - name: Install Rust toolchain
