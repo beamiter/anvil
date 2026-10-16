@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   paired-smoke:
-    name: Paired raw Block correctness and cleanup only
+    name: Paired Block virtual-pixel correctness and cleanup only
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -26,7 +26,7 @@ jobs:
       CARGO_BUILD_JOBS: '1'
       RUST_BACKTRACE: '1'
       BASELINE_SHA: 88c3f4c565cb5b9f8d47d22eb3ad07f47a822ae4
-      CANDIDATE_PARENT_SHA: 5ccfdffc4e37ed2cb45912660152a17daeb2eceb
+      CANDIDATE_PARENT_SHA: 892a0869abc4a29b95e70052cb7496b2b61cfb7c
     steps:
       - name: Check out immutable candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -62,7 +62,7 @@ jobs:
               'baseline_sha': os.environ['BASELINE_SHA'],
               'candidate_sha': os.environ['GITHUB_SHA'],
               'candidate_parent_sha': os.environ['CANDIDATE_PARENT_SHA'],
-              'purpose': 'short raw echo proxy and owned cleanup only',
+              'purpose': 'short virtual-display pixel and drag correctness, descriptive observer cost only',
               'budget_acceptance': False}, indent=2) + '\n')
           PYCODE
           python3 candidate/scripts/prepare-interaction-budget.py baseline observed-baseline > evidence/baseline-overlay.json
@@ -74,6 +74,12 @@ jobs:
           python3 candidate/scripts/test-interaction-pty-fixture.py
           python3 candidate/scripts/test-interaction-budget-collector.py
           python3 candidate/scripts/test-interaction-smoke.py
+          python3 candidate/scripts/test-interaction-pixel-codec.py
+          python3 candidate/scripts/test-interaction-pixel-observer.py
+          python3 candidate/scripts/test-interaction-input-helper.py
+          python3 candidate/scripts/test-interaction-pixel-client.py
+          python3 candidate/scripts/test-interaction-pixels.py
+          python3 candidate/scripts/test-interaction-pixel-gate.py
           rustc -vV > evidence/rustc.txt
           cargo -vV > evidence/cargo.txt
           uname -a > evidence/kernel.txt
@@ -91,9 +97,9 @@ jobs:
           sha256sum binaries/* > evidence/binaries.sha256
           git -C baseline diff --exit-code
           git -C candidate diff --exit-code
-      - name: Run short paired 1, 8 and 32-total pane smoke
+      - name: Run short paired 1, 8 and 32-total pane pixel/control gates
         run: |
-          python3 candidate/scripts/run-interaction-smoke.py \
+          python3 candidate/scripts/run-interaction-pixel-gate.py \
             --baseline-binary "$PWD/binaries/baseline" --candidate-binary "$PWD/binaries/candidate" \
             --baseline-sha "$BASELINE_SHA" --candidate-sha "$GITHUB_SHA" \
             --output "$PWD/evidence"

@@ -283,7 +283,7 @@ blocked native call can prevent Python finalization and/or evidence persistence.
 No SIGKILL cleanup claim is made. CI must allow the bounded cleanup grace period
 before forcibly killing the collector; hosted smoke remains subject to review.
 
-## Reviewed hosted smoke checkpoint
+## Historical raw-smoke checkpoint (published and passed)
 
 The narrowly scoped path-filtered push workflow builds only disposable observed
 binaries. Baseline is pinned to 88c3f4c565cb5b9f8d47d22eb3ad07f47a822ae4;
@@ -325,7 +325,7 @@ every topology tab. Two different panes in the same tab cannot prove two-tab
 coverage. Scheduling uses int(elapsed_seconds / interval_seconds) modulo the tab
 count, preserving fractional smoke time while returning an integer index.
 
-The publication parent pin is rebased to the reviewed A08 head above, preserving
+That publication parent pin was rebased to the reviewed head above, preserving
 all published A07/A08 production changes. The baseline remains the historical
 88c3 commit intentionally: this short smoke checks that the same observer and
 raw echo/cleanup contract work on both revisions, not that differences are caused
@@ -367,3 +367,111 @@ hashed before and after compilation. Compiler/flag overrides are rejected,
 PYTHON* inherited variables are cleared for children, and the fixed launcher and
 compiler-wrapper Python processes use isolated mode. This records source inputs;
 it does not claim a hermetic toolchain or operating-system image.
+
+
+## Short independent virtual-pixel and drag gate (source checkpoint)
+
+The next workflow uses the same historical baseline and exact event-SHA candidate,
+with reviewed parent 892a0869abc4a29b95e70052cb7496b2b61cfb7c. The separately
+reviewed Bash locale production fix, its regression test and ordinary CI step
+are preserved byte-for-byte. The fixed historical baseline remains intentional:
+these short gates do not attribute performance changes to A04. A changed master
+requires a new pin review. Identical temporary instrumentation is applied to
+both fresh independent builds; production sources and normal release binaries
+still contain no benchmark control surface. The current combined overlay digest
+is 6f05b023b36a19f834ac42afe2eee84876eb44ca749a6ba8f9e7f43b508701a5. The historical digest above describes the already-passed raw
+smoke, not this successor. No hosted result is implied by this source checkpoint.
+
+Twelve short runs pair observe/control for each baseline/candidate and 1/8/32-total
+scenario on one runner, backend, font and fixed 1600x1000 screen. Observe/control
+order is reversed for eight panes. Both modes emit identical ANSI barcodes and
+perform actual allocation checks. The raw echo, exact fixture program, per-event
+identity, both-tab coverage, source/build provenance and owned-tree cleanup gates
+remain prerequisites. A single pair exposes gross observer cost but is not a
+statistical regression result or an unbiased estimate of population perturbation.
+The full 1200-second matrix is neither invoked nor authorized here.
+
+Each fixture emits a 31-cell single-row background-color barcode carrying its
+22-bit PID, 20-bit key sequence and CRC-8/ATM, using public SGR only. It never
+changes shell authorization, OSC133 trust or input routing. Fixed 4096-byte blocks
+contain whole frames; padding precedes frames so trailing spaces cannot scroll
+the last marker out of the bounded bottom-four-row ROI. Capacity/backpressure
+counters remain in fixture reports. Unsupported PID range, small/clipped panes,
+unknown cell geometry, or unrenderable colors fail closed.
+
+A separate owned process reads X11 root-window RGB pixels using XGetImage. It
+receives only expected numeric identity, cell geometry and bounded ROI, never
+VTE text, paint markers or callback timings. Pane geometry and actual screen
+origin define the ROI; bounds are rounded inward. The decoder checks sync cells,
+all pixels, exact scale, payload/checksum and identity. It records future-marker
+absence before injection, then polls at 16ms intervals for at most one second
+and 64 captures. The before and final captures are exclusive-created PNGs with
+SHA256; the validator decodes retained RGB independently and applies wrong-ID,
+wrong-sequence and blank-image negative controls on the decoded current-marker
+crop with a reported black border. This permits genuinely stale neighboring
+frames in the larger ROI without mistaking them for a decoder failure. Intermediate capture intervals
+are metadata only. Retained-image timing yields the conservative interval from
+zero to final-readback completion minus injection start; it does not reproduce
+a tighter lower bound without retaining every intermediate image.
+
+This observes Xvfb virtual-display readback. It proves neither physical scanout
+nor presentation timing on a real compositor/monitor. Each readback has monotonic
+start/end timestamps; conversion/decoding/storage overhead is recorded separately
+in per-request elapsed and process-CPU counts. The short gate bounds individual
+readback to 250ms, each observer request to 1.5s and the active workload to 8s.
+These are fail-closed observer-usability caps, not the 15-percent interaction
+regression budget. Summaries report enabled/control app CPU ticks, collector CPU,
+active duration and observer capture costs as one-pair descriptive measurements.
+They do not subtract observer cost to manufacture latency or certify unsampled
+p50/p95/p99. Future latency acceptance needs repeated calibrated observer-error
+bounds and a separately reviewed fixed full workload.
+
+Real XTest divider drags are checked against fresh snapshots: unchanged active
+tab/pane identities, appropriate position movement, changed pane allocation on
+the correct axis, preserved readable marker area, and an independently detected
+separator-pixel shift agreeing within two pixels. The observed RGB edge must be
+unambiguous and high contrast near the expected location. One-pane drag is
+explicitly N/A; 32-total keys/drags must cover both actual tabs. No pane-limit
+increase or unsupported 32-visible claim is made.
+
+The observer is a descendant of the dedicated collector and must appear in its
+owned identity/exit evidence. Closing pipes does not replace unconditional
+pidfd-owned cleanup. Catchable cancellation and failure preserve partial JSON,
+PNG and app/collector logs; outer collector SIGKILL or host loss still cannot
+provide guaranteed cleanup. Final summaries always keep budget_acceptance=false.
+Complete idle callback attribution, full-duration matrix, production callback
+budgets, RSS/wakes and physical-display evidence remain separate open gates.
+
+
+### Short-gate source review corrections
+
+The original pixel checkpoint was rejected before native execution: separate
+before/after search windows could select two stationary edges, active-loop XSync
+could block the cleanup owner indefinitely, and absolute PNG paths prevented
+unchanged-record replay after artifact relocation. That checkpoint remains frozen.
+
+The successor uses one shared union region for both divider images. It requires
+one unambiguous edge in each capture, correct displacement, disappearance of the
+old edge, and absence of the new edge in the before image. Equal hashes are not
+the criterion: stationary stripes, unrelated changed pixels and swapped edge
+strengths are negative tests. Actual themes that cannot support this correspondence
+fail closed rather than weakening the proof.
+
+Pixel-mode input initialization, focus, key injection and drag injection now run
+in a separate owned helper. Each injection and XSync completion fence use that
+helper's SAME X connection. The parent performs no active-loop Xlib barrier and
+waits at most five seconds per bounded numeric JSON request, checking cancellation
+while waiting. It records the helper PID before initialization acknowledgement,
+so initialization stalls also remain owned. The helper contains no shell-command,
+text/token or arbitrary-key control. It is reaped by the existing unconditional
+owned-tree cleanup. Real PTY tests cover a deliberately hung fake XSync, timeout,
+SIGTERM/SIGINT cancellation, failed-evidence persistence and an untouched outside
+sentinel. These tests do not open a display. The old raw-only input startup path
+is unchanged; this correction does not claim a broad Xlib lifecycle redesign.
+
+PNG records now contain only the exact restricted relative basename and hash.
+An explicitly supplied private evidence directory is pinned by dirfd; absolute
+paths, traversal, separators, symlink files, nonregular files and mismatched hashes
+are rejected. The same unchanged JSON and PNG hashes replay after moving the
+artifact to another private directory. Timestamp values are never rewritten to
+make a relocated artifact pass.

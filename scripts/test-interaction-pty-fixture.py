@@ -16,4 +16,17 @@ class Fixture(unittest.TestCase):
         self.assertIn(b"A04K000123", block)
         self.assertNotIn(b"\x1b", block)
         self.assertTrue(all(32 <= v <= 126 or v in (10, 13) for v in block))
+    def test_barcode_chunk_ends_with_complete_frame_not_wrapping_padding(self):
+        import sys
+        spec = importlib.util.spec_from_file_location("fixture_codec", Path(__file__).with_name("interaction-pixel-codec.py"))
+        codec = importlib.util.module_from_spec(spec); sys.modules[spec.name] = codec; spec.loader.exec_module(codec)
+        marker = codec.encode_marker(123, 7)
+        data = fixture.block(7, marker)
+        self.assertEqual(len(data), 4096)
+        self.assertTrue(data.endswith(marker.encode("ascii") + b"\r\n"))
+        self.assertNotIn(b"\x1b]", data)
+        self.assertGreater(data.count(marker.encode("ascii")), 1)
+    def test_barcode_frame_cannot_exceed_chunk(self):
+        with self.assertRaises(ValueError): fixture.block(1, 'x' * 4096)
 if __name__ == "__main__": unittest.main()
+

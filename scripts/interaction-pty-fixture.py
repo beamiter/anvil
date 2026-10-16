@@ -6,6 +6,8 @@ OSC133, clipboard, authentication material, or network access is used.
 """
 import argparse
 import json
+import importlib.util
+import sys
 import os
 from pathlib import Path
 import select
@@ -17,7 +19,12 @@ RATE = 256 * 1024
 CHUNK = 4096
 
 
-def block(sequence):
+def block(sequence, pixel_marker=None):
+    if pixel_marker is not None:
+        frame = (f"\r\nA04K{sequence:06d}\r\n" + pixel_marker + "\r\n").encode("ascii")
+        if len(frame) > CHUNK: raise ValueError("barcode frame exceeds chunk")
+        data = frame * (CHUNK // len(frame))
+        return b" " * (CHUNK - len(data)) + data
     line = (f"A04K{sequence:06d} " + "." * 52 + "\r\n").encode("ascii")
     return (line * ((CHUNK + len(line) - 1) // len(line)))[:CHUNK]
 
@@ -60,12 +67,17 @@ def main():
             json.dump(data, output)
         os.replace(temp, args.reports / f"{os.getpid()}.json")
 
+    pixel_codec = None
+    if os.environ.get("ANVIL_INTERACTION_PIXEL_MARKERS") == "1":
+        spec = importlib.util.spec_from_file_location("pixel_codec", Path(__file__).with_name("interaction-pixel-codec.py"))
+        pixel_codec = importlib.util.module_from_spec(spec); sys.modules[spec.name] = pixel_codec; spec.loader.exec_module(pixel_codec)
+        pixel_codec.encode_marker(os.getpid(), 0)  # Validate identity range before readiness.
     report()
     try:
         while True:
             now = time.monotonic_ns()
             if running and not pending and scheduled_bytes(start, now) >= emitted + CHUNK:
-                pending = block(sequence)
+                pending = block(sequence, pixel_codec.encode_marker(os.getpid(), sequence) if pixel_codec else None)
                 blocked_since = time.monotonic_ns()
             deadline = start + (emitted + CHUNK) * 1_000_000_000 // RATE
             timeout = max(0, (deadline - now) / 1e9) if running and not pending else None

@@ -482,9 +482,17 @@ pub(crate) fn handle(model: &mut crate::AppModel, sender: &ComponentSender<crate
             let widget = pane.widget();
             let rect = widget.compute_bounds(&model.window);
             let grid = pane.terminal.grid_size();
+            let pixel_geometry = SURFACES.with(|surfaces| {
+                surfaces.borrow().iter().find(|s| s.pid == pane.probe.shell_pid.get())
+                    .and_then(|s| s.terminal.upgrade()).map(|terminal| {
+                        json!({"cell_width": terminal.char_width(), "cell_height": terminal.char_height(),
+                            "bounds": terminal.compute_bounds(&model.window)
+                                .map(|r| [r.x(), r.y(), r.width(), r.height()])})
+                    })
+            });
             json!({"pane_id": pane.id, "pid": pane.probe.shell_pid.get(),
                 "block": pane.mode == crate::config::TerminalMode::Block, "mapped": widget.is_mapped(),
-                "columns": grid.0, "rows": grid.1,
+                "columns": grid.0, "rows": grid.1, "pixel_geometry": pixel_geometry,
                 "bounds": rect.map(|r| [r.x(), r.y(), r.width(), r.height()])})
         }).collect::<Vec<_>>()})
         })

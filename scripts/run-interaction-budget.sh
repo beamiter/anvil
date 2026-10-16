@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Hosted native only. Never use a preexisting/user display or session bus.
 set -Eeuo pipefail
-if [[ $# -ne 4 ]]; then
-    echo 'usage: run-interaction-budget.sh INSTRUMENTED_BINARY PANES OUTPUT_JSON --smoke|--full-budget' >&2
+if [[ $# -ne 4 && $# -ne 6 ]]; then
+    echo 'usage: run-interaction-budget.sh INSTRUMENTED_BINARY PANES OUTPUT_JSON --smoke|--full-budget [--pixel-gate observe|control]' >&2
     exit 2
 fi
 if [[ "$4" != --smoke && "$4" != --full-budget ]]; then
