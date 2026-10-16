@@ -16,8 +16,9 @@ use relm4::prelude::*;
 
 use crate::agent_task::{ApprovalId, CodexAppServerApproval, TaskId};
 use crate::agent_task_ui::{
-    approval_summary, native_follow_up_can_send, plan_list_refresh, render_stream_text,
-    row_status_line, task_reason, TaskPanelAction, TaskRowSnapshot,
+    approval_summary, native_follow_up_can_send, plan_list_refresh, render_stream_history,
+    render_stream_status, render_stream_text, row_status_line, stream_history_index, task_reason,
+    TaskPanelAction, TaskRowSnapshot,
 };
 
 /// Counts describe current search matches before the selected quick view.
@@ -150,6 +151,7 @@ pub(crate) enum TasksPanelMsg {
     Act(TaskId, ActionKind),
     Decide(TaskId, ApprovalId, bool),
     ShowPage(&'static str),
+    HistoryStep(TaskId, i32),
     Close,
 }
 
@@ -294,6 +296,8 @@ pub(crate) struct TasksPanelModel {
     selection_guard: Rc<Cell<bool>>,
     selection_ids: Rc<RefCell<Vec<TaskId>>>,
     page: &'static str,
+    history_ordinal: Option<usize>,
+    history_task: Option<TaskId>,
     /// Programmatic toggle synchronization must not enqueue stale ShowPage
     /// messages after newer user selections already waiting in the queue.
     page_guard: Rc<Cell<bool>>,
@@ -663,17 +667,65 @@ impl Component for TasksPanelModel {
                         set_hexpand: true,
                         set_vexpand: true,
 
-                        add_named[Some(STREAM_PAGE)] = &gtk::ScrolledWindow {
-                            set_policy: (gtk::PolicyType::Never, gtk::PolicyType::Automatic),
-
-                            #[name(stream_view)]
-                            gtk::TextView {
-                                set_editable: false,
-                                set_cursor_visible: false,
-                                set_wrap_mode: gtk::WrapMode::WordChar,
-                                set_left_margin: 4,
-                                set_right_margin: 4,
-                                add_css_class: "ai-explain-body",
+                        add_named[Some(STREAM_PAGE)] = &gtk::Box {
+                            set_orientation: gtk::Orientation::Vertical,
+                            set_spacing: 4,
+                            #[name(stream_status)]
+                            gtk::Label {
+                                set_halign: gtk::Align::Start,
+                                set_wrap: true,
+                                set_lines: 3,
+                                set_ellipsize: gtk::pango::EllipsizeMode::End,
+                            },
+                            gtk::ScrolledWindow {
+                                set_policy: (gtk::PolicyType::Never, gtk::PolicyType::Automatic),
+                                set_vexpand: true,
+                                set_min_content_height: 100,
+                                #[name(stream_view)]
+                                gtk::TextView {
+                                    set_editable: false,
+                                    set_cursor_visible: false,
+                                    set_wrap_mode: gtk::WrapMode::WordChar,
+                                    set_left_margin: 4,
+                                    set_right_margin: 4,
+                                    add_css_class: "ai-explain-body",
+                                },
+                            },
+                            gtk::Box {
+                                set_spacing: 4,
+                                #[name(history_older)]
+                                gtk::Button {
+                                    set_label: "Older",
+                                },
+                                #[name(history_newer)]
+                                gtk::Button {
+                                    set_label: "Newer",
+                                },
+                                #[name(history_latest)]
+                                gtk::Button {
+                                    set_label: "Latest history",
+                                },
+                            },
+                            gtk::Label {
+                                set_label: "Select and copy visible text in either pane. Select All copies only that pane; updates or paging replace that pane’s selection. Omitted text is not copied.",
+                                set_wrap: true,
+                                add_css_class: "caption",
+                                add_css_class: "dim-label",
+                            },
+                            #[name(history_scroll)]
+                            gtk::ScrolledWindow {
+                                set_policy: (gtk::PolicyType::Never, gtk::PolicyType::Automatic),
+                                set_vexpand: true,
+                                set_min_content_height: 100,
+                                #[name(history_view)]
+                                gtk::TextView {
+                                    set_editable: false,
+                                    set_cursor_visible: false,
+                                    set_wrap_mode: gtk::WrapMode::WordChar,
+                                    set_left_margin: 4,
+                                    set_right_margin: 4,
+                                    add_css_class: "ai-explain-body",
+                                },
                             },
                         },
 
@@ -775,6 +827,8 @@ impl Component for TasksPanelModel {
             selection_guard: selection_guard.clone(),
             selection_ids: selection_ids.clone(),
             page: STREAM_PAGE,
+            history_ordinal: None,
+            history_task: None,
             page_guard: page_guard.clone(),
         };
         let widgets: TasksPanelModelWidgets = view_output!();
@@ -782,6 +836,19 @@ impl Component for TasksPanelModel {
             .diff_page_button
             .set_group(Some(&widgets.stream_page_button));
 
+        for (button, direction) in [
+            (&widgets.history_older, -1),
+            (&widgets.history_newer, 1),
+            (&widgets.history_latest, 0),
+        ] {
+            let target = action_target.clone();
+            let sender = sender.clone();
+            button.connect_clicked(move |_| {
+                if let Some(id) = target.get() {
+                    sender.input(TasksPanelMsg::HistoryStep(id, direction));
+                }
+            });
+        }
         for (kind, label) in ACTION_KINDS {
             let button = gtk::Button::with_label(label);
             button.add_css_class("caption");
@@ -932,6 +999,29 @@ impl Component for TasksPanelModel {
         // visible effect even while the worker is still loading.
         let show_diff = matches!(&message, TasksPanelMsg::Act(_, ActionKind::ReviewDiff));
         match message {
+            TasksPanelMsg::HistoryStep(id, direction) => {
+                if self.sync.detail.as_deref().map(|detail| detail.id) != Some(id) {
+                    return;
+                }
+                if let Some(snapshot) = self
+                    .sync
+                    .detail
+                    .as_deref()
+                    .and_then(|detail| detail.stream.as_deref())
+                {
+                    if direction == 0 {
+                        self.history_ordinal = None;
+                    } else if let Some(index) = stream_history_index(snapshot, self.history_ordinal)
+                    {
+                        let next = if direction < 0 {
+                            index.saturating_sub(1)
+                        } else {
+                            (index + 1).min(snapshot.turn_history.len() - 1)
+                        };
+                        self.history_ordinal = Some(snapshot.turn_history[next].ordinal);
+                    }
+                }
+            }
             TasksPanelMsg::Sync(sync) => {
                 self.unfiltered_sync = *sync;
                 self.apply_dashboard_filters();
@@ -1068,6 +1158,10 @@ impl TasksPanelModel {
         self.sync_task_list(widgets);
 
         let detail = self.sync.detail.as_deref();
+        if self.history_task != detail.map(|detail| detail.id) {
+            self.history_task = detail.map(|detail| detail.id);
+            self.history_ordinal = None;
+        }
         self.action_target.set(detail.map(|detail| detail.id));
         for (kind, button) in &self.action_buttons {
             let sensitive = detail.is_some_and(|detail| {
@@ -1115,6 +1209,28 @@ impl TasksPanelModel {
                     "No native Codex session snapshot for this task yet.".to_string()
                 });
             set_view_text(&widgets.stream_view, &stream_text);
+            let snapshot = detail.stream.as_deref();
+            widgets
+                .stream_status
+                .set_label(&snapshot.map(render_stream_status).unwrap_or_default());
+            let index =
+                snapshot.and_then(|snapshot| stream_history_index(snapshot, self.history_ordinal));
+            widgets
+                .history_older
+                .set_sensitive(index.is_some_and(|index| index > 0));
+            widgets.history_newer.set_sensitive(
+                snapshot
+                    .zip(index)
+                    .is_some_and(|(snapshot, index)| index + 1 < snapshot.turn_history.len()),
+            );
+            widgets
+                .history_latest
+                .set_sensitive(self.history_ordinal.is_some());
+            let history = snapshot
+                .map(|snapshot| render_stream_history(snapshot, self.history_ordinal))
+                .unwrap_or_default();
+            widgets.history_scroll.set_visible(!history.is_empty());
+            set_view_text(&widgets.history_view, &history);
 
             if let Some(diff) = &detail.diff {
                 widgets.diff_header.set_label(&diff.header);
@@ -1800,3 +1916,7 @@ mod tests {
 #[cfg(test)]
 #[path = "tasks_panel_keyed_tests.rs"]
 mod keyed_tests;
+
+#[cfg(test)]
+#[path = "tasks_panel_stream_tests.rs"]
+mod stream_tests;

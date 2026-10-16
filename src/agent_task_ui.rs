@@ -407,6 +407,27 @@ pub(crate) fn plan_list_refresh(
 /// Display bounds for the native stream text projection.
 pub(crate) const MAX_NATIVE_STREAM_DISPLAY_BYTES: usize = 64 * 1024;
 const MAX_NATIVE_ITEM_DISPLAY_BYTES: usize = 8 * 1024;
+const MAX_NATIVE_STREAM_STATUS_BYTES: usize = 1024;
+const MAX_NATIVE_STREAM_PANE_BYTES: usize =
+    (MAX_NATIVE_STREAM_DISPLAY_BYTES - MAX_NATIVE_STREAM_STATUS_BYTES) / 2;
+
+/// A compact, pinned summary remains visible while either text pane scrolls.
+/// Its reserved budget is part of the same total as the two text buffers.
+pub(crate) fn render_stream_status(
+    snapshot: &crate::agent_task::CodexAppServerViewSnapshot,
+) -> String {
+    let turn = snapshot.displayed_turn_ordinal.map_or_else(
+        || "latest turn".to_string(),
+        |ordinal| format!("turn {ordinal}"),
+    );
+    let mut status = format!("phase: {} · {turn}", phase_label(snapshot.phase));
+    if let Some(error) = &snapshot.last_error {
+        status.push_str("\nLatest error (preview): ");
+        status.push_str(&jterm_core::review_input::safe_inline_display(error, 512));
+    }
+    debug_assert!(status.len() <= MAX_NATIVE_STREAM_STATUS_BYTES);
+    status
+}
 
 fn phase_label(phase: crate::agent_task::CodexAppServerPhase) -> &'static str {
     use crate::agent_task::CodexAppServerPhase::*;
@@ -440,7 +461,7 @@ impl StreamDisplay {
         if self.truncated || text.is_empty() {
             return;
         }
-        let remaining = MAX_NATIVE_STREAM_DISPLAY_BYTES.saturating_sub(self.text.len());
+        let remaining = MAX_NATIVE_STREAM_PANE_BYTES.saturating_sub(self.text.len());
         // Four look-ahead bytes cover any UTF-8 scalar. Even if the shared
         // helper adds its ellipsis, overflow still leaves more than `remaining`
         // bytes, including when a scalar cannot fit the final one or two bytes.
@@ -463,7 +484,7 @@ impl StreamDisplay {
             let mut end = self
                 .text
                 .len()
-                .min(MAX_NATIVE_STREAM_DISPLAY_BYTES - NOTICE.len());
+                .min(MAX_NATIVE_STREAM_PANE_BYTES - NOTICE.len());
             while !self.text.is_char_boundary(end) {
                 end -= 1;
             }
@@ -475,40 +496,88 @@ impl StreamDisplay {
 }
 
 fn push_bounded(out: &mut StreamDisplay, text: &str) {
-    out.push_str(text);
+    let shown =
+        jterm_core::review_input::safe_multiline_display(text, MAX_NATIVE_ITEM_DISPLAY_BYTES + 4);
+    let mut end = shown.len().min(MAX_NATIVE_ITEM_DISPLAY_BYTES);
+    while !shown.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.push_str(&shown[..end]);
+    if shown.len() > end {
+        out.push_str("\n(item display truncated)");
+    }
 }
 
 /// Render one native session snapshot as bounded plain text for the panel's
 /// stream view. Provider-controlled strings are already display-safe and
 /// bounded by the worker; this projection re-bounds the composed whole and
 /// never treats any of it as markup.
-pub(crate) fn render_stream_text(
+/// The current pane and one history page share the unchanged 64 KiB total
+/// with the reserved pinned status summary. Paging borrows a single retained turn; it never clones logs.
+pub(crate) fn stream_history_index(
     snapshot: &crate::agent_task::CodexAppServerViewSnapshot,
+    ordinal: Option<usize>,
+) -> Option<usize> {
+    let turns = &snapshot.turn_history;
+    if turns.is_empty() {
+        return None;
+    }
+    Some(ordinal.map_or(turns.len() - 1, |ordinal| {
+        turns
+            .iter()
+            .position(|turn| turn.ordinal >= ordinal)
+            .unwrap_or(turns.len() - 1)
+    }))
+}
+
+pub(crate) fn render_stream_history(
+    snapshot: &crate::agent_task::CodexAppServerViewSnapshot,
+    ordinal: Option<usize>,
 ) -> String {
     let mut out = StreamDisplay::default();
-    out.push_str(&format!("phase: {}", phase_label(snapshot.phase)));
-    if let Some(error) = &snapshot.last_error {
-        push_bounded(&mut out, &format!("\nerror: {error}"));
-    }
+    let index = stream_history_index(snapshot, ordinal);
     if snapshot.dropped_turns > 0 {
         out.push_str(&format!(
             "\n({} oldest turns elided by the retained-history budget)",
             snapshot.dropped_turns
         ));
     }
-    for turn in snapshot.turn_history.iter() {
+    if let Some(index) = index {
+        out.push_str(&format!(
+            "\nRetained history: turn {}. Other retained turns are available with Older/Newer.",
+            snapshot.turn_history[index].ordinal
+        ));
+    } else if snapshot.dropped_turns == 0 {
+        return String::new();
+    }
+    if let Some(turn) = index.and_then(|index| snapshot.turn_history.get(index)) {
         out.push_str(&format!("\n\n— turn {} —", turn.ordinal));
+        if turn.dropped_updates > 0 {
+            out.push_str(&format!(
+                "\n({} updates lost to the live-turn retention budget)",
+                turn.dropped_updates
+            ));
+        }
+        if turn.agent_text_truncated
+            || turn.commands.iter().any(|command| command.output_omitted)
+            || turn
+                .file_changes
+                .iter()
+                .any(|change| change.changes_truncated || change.path_truncated)
+        {
+            out.push_str("\n(text, output or file details omitted by retention budget)");
+        }
         if let Some(feedback) = &turn.follow_up_feedback {
             push_bounded(&mut out, &format!("\n> {feedback}"));
         }
         if !turn.agent_text.is_empty() {
             out.push('\n');
             push_bounded(&mut out, &turn.agent_text);
-            if turn.agent_text_truncated {
-                out.push_str(" …");
-            }
         }
         for command in &turn.commands {
+            if out.truncated {
+                break;
+            }
             push_bounded(
                 &mut out,
                 &format!(
@@ -516,7 +585,7 @@ pub(crate) fn render_stream_text(
                     command.command,
                     command.status,
                     if command.output_omitted {
-                        " (output omitted)"
+                        " (output omitted from retained history)"
                     } else {
                         ""
                     }
@@ -524,6 +593,9 @@ pub(crate) fn render_stream_text(
             );
         }
         for change in &turn.file_changes {
+            if out.truncated {
+                break;
+            }
             push_bounded(
                 &mut out,
                 &format!(
@@ -535,14 +607,40 @@ pub(crate) fn render_stream_text(
                 ),
             );
         }
-        if turn.dropped_updates > 0 {
-            out.push_str(&format!(
-                "\n({} updates dropped by the live-turn budget)",
-                turn.dropped_updates
-            ));
-        }
     }
-    let shows_live_projection = !snapshot.agent_text.is_empty()
+    out.finish()
+}
+
+pub(crate) fn render_stream_text(
+    snapshot: &crate::agent_task::CodexAppServerViewSnapshot,
+) -> String {
+    let mut out = StreamDisplay::default();
+    out.push_str(&format!("phase: {}", phase_label(snapshot.phase)));
+    if snapshot.dropped_updates > 0 {
+        out.push_str(&format!(
+            "\n({} updates lost to the live-turn retention budget)",
+            snapshot.dropped_updates
+        ));
+    }
+    if snapshot.agent_text_truncated
+        || snapshot
+            .commands
+            .iter()
+            .any(|command| command.output_truncated)
+        || snapshot
+            .file_changes
+            .iter()
+            .any(|change| change.changes_truncated)
+    {
+        out.push_str("\n(text, output or file details omitted by retention budget)");
+    }
+    if let Some(error) = &snapshot.last_error {
+        out.push_str("\nerror: ");
+        push_bounded(&mut out, error);
+    }
+
+    let shows_live_projection = snapshot.displayed_turn_ordinal.is_some()
+        || !snapshot.agent_text.is_empty()
         || !snapshot.commands.is_empty()
         || !snapshot.file_changes.is_empty();
     if shows_live_projection {
@@ -557,30 +655,27 @@ pub(crate) fn render_stream_text(
         if !snapshot.agent_text.is_empty() {
             out.push('\n');
             push_bounded(&mut out, &snapshot.agent_text);
-            if snapshot.agent_text_truncated {
-                out.push_str(" …");
-            }
         }
         for command in &snapshot.commands {
+            if out.truncated {
+                break;
+            }
             push_bounded(
                 &mut out,
                 &format!("\n$ {} [{}]", command.command, command.status),
             );
             if !command.output.is_empty() {
                 out.push('\n');
-                push_bounded(
-                    &mut out,
-                    &jterm_core::review_input::safe_multiline_display(
-                        &command.output,
-                        MAX_NATIVE_ITEM_DISPLAY_BYTES,
-                    ),
-                );
+                push_bounded(&mut out, &command.output);
                 if command.output_truncated {
-                    out.push_str(" …");
+                    out.push_str(" (text omitted by retention budget)");
                 }
             }
         }
         for change in &snapshot.file_changes {
+            if out.truncated {
+                break;
+            }
             push_bounded(
                 &mut out,
                 &format!(
@@ -591,6 +686,9 @@ pub(crate) fn render_stream_text(
                 ),
             );
             for file in &change.changes {
+                if out.truncated {
+                    break;
+                }
                 push_bounded(&mut out, &format!("\n  {} {}", file.kind, file.path));
             }
         }
@@ -1011,7 +1109,7 @@ mod tests {
             });
         let rendered = render_stream_text(&snapshot);
         assert!(rendered.contains("\nerror: first\nsecond"), "{rendered:?}");
-        assert!(rendered.contains("\n> please\ncontinue"));
+        assert!(render_stream_history(&snapshot, None).contains("\n> please\ncontinue"));
         assert!(rendered.contains("\n> adjust\nthis"));
         assert!(rendered.contains("hello\n\tworld"));
         assert!(rendered.contains("\n$ echo hello [completed]\none\ntwo\tthree"));
@@ -1053,7 +1151,7 @@ mod tests {
             "{} bytes",
             rendered.len()
         );
-        assert!(rendered.ends_with("\n(stream display truncated)"));
+        assert!(rendered.contains("display truncated"));
     }
 
     #[test]
@@ -1072,10 +1170,189 @@ mod tests {
                     "{scalar:?}/{edge}: {} bytes",
                     rendered.len()
                 );
-                assert!(rendered.ends_with("\n(stream display truncated)"));
+                assert!(rendered.contains("display truncated"));
                 assert!(rendered.is_char_boundary(rendered.len()));
             }
         }
+    }
+
+    #[test]
+    fn stream_pages_reserve_current_and_error_budgets() {
+        let mut snapshot = stream_snapshot();
+        snapshot.displayed_turn_ordinal = Some(101);
+        snapshot.last_error = Some(format!("latest error {}", "x".repeat(100_000)));
+        snapshot.agent_text = "CURRENT PROGRESS".into();
+        snapshot.turn_history = (1..=100)
+            .map(|ordinal| {
+                let mut turn = stream_history(ordinal);
+                turn.agent_text = format!("history-{ordinal} {}", "界".repeat(30_000));
+                turn
+            })
+            .collect::<Vec<_>>()
+            .into();
+        let current = render_stream_text(&snapshot);
+        assert!(current.contains("phase: created"));
+        assert!(current.contains("latest error"));
+        assert!(current.contains("turn 101 (latest)"));
+        assert!(current.contains("CURRENT PROGRESS"));
+        for ordinal in 1..=100 {
+            let history = render_stream_history(&snapshot, Some(ordinal));
+            assert!(history.contains(&format!("history-{ordinal} ")));
+            assert!(history.contains("item display truncated"));
+            assert!(
+                render_stream_status(&snapshot).len() + current.len() + history.len()
+                    <= MAX_NATIVE_STREAM_DISPLAY_BYTES
+            );
+        }
+    }
+
+    #[test]
+    fn stream_combined_budget_includes_error_metadata_and_notices() {
+        let mut snapshot = stream_snapshot();
+        snapshot.dropped_updates = 19;
+        let huge = "界\u{1b}\u{202e}".repeat(40_000);
+        snapshot.last_error = Some(huge.clone());
+        snapshot.displayed_follow_up_feedback = Some(huge.clone());
+        snapshot.displayed_turn_ordinal = Some(2);
+        snapshot.agent_text = huge.clone();
+        let mut turn = stream_history(1);
+        turn.dropped_updates = 23;
+        turn.agent_text = huge.clone();
+        for _ in 0..20 {
+            snapshot
+                .commands
+                .push(crate::agent_task::CodexAppServerCommandView {
+                    item_id: String::new(),
+                    command: huge.clone(),
+                    cwd: String::new(),
+                    status: huge.clone(),
+                    output: huge.clone(),
+                    output_truncated: true,
+                });
+            turn.commands
+                .push(crate::agent_task::CodexAppServerTurnCommandSummary {
+                    command: huge.clone(),
+                    status: huge.clone(),
+                    output_omitted: true,
+                });
+        }
+        snapshot.turn_history = vec![turn].into();
+        snapshot.dropped_turns = usize::MAX;
+        let current = render_stream_text(&snapshot);
+        let history = render_stream_history(&snapshot, None);
+        assert!(current.contains("turn 2 (latest)"));
+        assert!(current.starts_with("phase: created"));
+        assert!(current.contains("\nerror: "));
+        assert!(current.ends_with("(stream display truncated)"));
+        assert!(history.ends_with("(stream display truncated)"));
+        assert!(
+            render_stream_status(&snapshot).len() + current.len() + history.len()
+                <= MAX_NATIVE_STREAM_DISPLAY_BYTES
+        );
+        assert!(history.contains("retained-history budget"));
+        assert!(current.contains("19 updates lost"));
+        assert!(history.contains("23 updates lost"));
+        for unsafe_char in ['\u{1b}', '\u{202e}'] {
+            assert!(!current.contains(unsafe_char) && !history.contains(unsafe_char));
+        }
+    }
+
+    #[test]
+    fn stream_live_dropped_updates_always_have_a_retention_notice() {
+        let mut snapshot = stream_snapshot();
+        snapshot.dropped_updates = 19;
+        assert!(render_stream_text(&snapshot)
+            .contains("19 updates lost to the live-turn retention budget"));
+    }
+
+    #[test]
+    fn stream_saturated_history_cannot_hide_dropped_updates() {
+        let mut snapshot = stream_snapshot();
+        let mut turn = stream_history(1);
+        turn.dropped_updates = 19;
+        turn.commands = (0..20)
+            .map(|_| crate::agent_task::CodexAppServerTurnCommandSummary {
+                command: "x".repeat(MAX_NATIVE_ITEM_DISPLAY_BYTES),
+                status: "done".into(),
+                output_omitted: true,
+            })
+            .collect();
+        snapshot.turn_history = vec![turn].into();
+        let page = render_stream_history(&snapshot, None);
+        assert!(page.ends_with("(stream display truncated)"));
+        assert!(page.contains("19 updates lost to the live-turn retention budget"));
+    }
+
+    #[test]
+    fn stream_retention_loss_survives_saturated_panes_and_status_is_bounded() {
+        let mut snapshot = stream_snapshot();
+        snapshot.phase = crate::agent_task::CodexAppServerPhase::Running;
+        snapshot.displayed_turn_ordinal = Some(99);
+        snapshot.last_error = Some("LATEST\n\u{1b}\u{202e}界".repeat(10000));
+        snapshot.agent_text = "x".repeat(100000);
+        snapshot.agent_text_truncated = true;
+        snapshot.dropped_updates = 123;
+        let mut turn = stream_history(98);
+        turn.agent_text = snapshot.agent_text.clone();
+        turn.dropped_updates = 456;
+        turn.agent_text_truncated = true;
+        snapshot.turn_history = vec![turn].into();
+        let current = render_stream_text(&snapshot);
+        let history = render_stream_history(&snapshot, None);
+        assert!(current.contains("123 updates lost to the live-turn retention budget"));
+        assert!(history.contains("456 updates lost to the live-turn retention budget"));
+        assert!(current.contains("omitted by retention budget"));
+        assert!(history.contains("omitted by retention budget"));
+        assert!(
+            current.contains("item display truncated")
+                && history.contains("item display truncated")
+        );
+        let status = render_stream_status(&snapshot);
+        assert!(status.starts_with("phase: running · turn 99"));
+        assert!(status.contains("Latest error (preview): LATEST"));
+        assert!(status.len() <= MAX_NATIVE_STREAM_STATUS_BYTES);
+        assert_eq!(status.matches('\n').count(), 1);
+        assert!(!status.contains('\u{1b}') && !status.contains('\u{202e}'));
+        assert!(status.len() + current.len() + history.len() <= MAX_NATIVE_STREAM_DISPLAY_BYTES);
+    }
+
+    #[test]
+    fn stream_history_cursor_survives_append_and_eviction() {
+        let mut snapshot = stream_snapshot();
+        assert_eq!(stream_history_index(&snapshot, None), None);
+        snapshot.turn_history = (3..=6).map(stream_history).collect::<Vec<_>>().into();
+        assert_eq!(stream_history_index(&snapshot, None), Some(3));
+        assert_eq!(stream_history_index(&snapshot, Some(4)), Some(1));
+        snapshot.turn_history = (4..=7).map(stream_history).collect::<Vec<_>>().into();
+        assert_eq!(stream_history_index(&snapshot, Some(4)), Some(0));
+        assert_eq!(stream_history_index(&snapshot, Some(3)), Some(0));
+        snapshot.dropped_turns = 3;
+        let history = render_stream_history(&snapshot, Some(3));
+        assert!(history.contains("3 oldest turns elided by the retained-history budget"));
+        assert!(history.contains("turn 4"));
+        assert!(!history.contains("display truncated"));
+    }
+
+    #[test]
+    fn stream_history_page_neutralizes_controls_and_bounds_expansion() {
+        let mut snapshot = stream_snapshot();
+        let mut turn = stream_history(1);
+        turn.agent_text = "left\u{1b}\u{202e}\u{200b}\u{00a0}\rright".repeat(9000);
+        snapshot.turn_history = vec![turn].into();
+        let history = render_stream_history(&snapshot, None);
+        assert!(history.contains("left"));
+        for unsafe_char in ['\u{1b}', '\u{202e}', '\u{200b}', '\u{00a0}', '\r'] {
+            assert!(!history.contains(unsafe_char));
+        }
+        assert!(history.contains("item display truncated"));
+        assert!(history.len() <= MAX_NATIVE_STREAM_DISPLAY_BYTES / 2);
+    }
+
+    #[test]
+    fn stream_empty_current_turn_keeps_its_heading() {
+        let mut snapshot = stream_snapshot();
+        snapshot.displayed_turn_ordinal = Some(7);
+        assert!(render_stream_text(&snapshot).contains("turn 7 (latest)"));
     }
 
     #[test]
@@ -1094,7 +1371,8 @@ mod tests {
         let rendered = render_stream_text(&snapshot);
         assert!(rendered.contains("\nfirst\n"));
         assert!(rendered.len() < MAX_NATIVE_ITEM_DISPLAY_BYTES + 256);
-        assert!(rendered.ends_with(" …"));
+        assert!(rendered.contains("item display truncated"));
+        assert!(rendered.contains("retention budget"));
     }
 }
 
