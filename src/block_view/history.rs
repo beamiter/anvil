@@ -557,17 +557,34 @@ pub(super) fn atomic_write(
     target: &Path,
     write_contents: impl FnOnce(&mut File) -> io::Result<()>,
 ) -> io::Result<()> {
+    atomic_write_checkpoints(target, write_contents, |_| Ok(()))
+}
+
+// The production path and crash tests share the actual filesystem operations.
+// The no-op observer is optimized away in ordinary builds. Returning an error
+// models a syscall failure at that boundary, without global/environment hooks.
+fn atomic_write_checkpoints(
+    target: &Path,
+    write_contents: impl FnOnce(&mut File) -> io::Result<()>,
+    mut checkpoint: impl FnMut(&'static str) -> io::Result<()>,
+) -> io::Result<()> {
     let parent_directory = open_parent_directory(target)?;
 
     let (mut temp, temp_path) = create_unique_temp(target)?;
     let result = (|| {
         temp.set_permissions(fs::Permissions::from_mode(0o600))?;
+        checkpoint("created")?;
         write_contents(&mut temp)?;
+        checkpoint("written")?;
         temp.flush()?;
+        checkpoint("flushed")?;
         temp.sync_all()?;
+        checkpoint("synced")?;
         drop(temp);
         fs::rename(&temp_path, target)?;
+        checkpoint("renamed")?;
         parent_directory.sync_all()?;
+        checkpoint("durable")?;
         Ok(())
     })();
 
@@ -2253,6 +2270,7 @@ mod tests {
     #[test]
     #[ignore = "requires an isolated GTK process; real pane over inert PTY"]
     fn block_history_retry_handles_failed_and_repaired_files_without_panicking() {
+        use gtk::prelude::*;
         gtk::init().expect("GTK display");
         for repaired in [false, true] {
             let directory = TestDir::new("native-block-retry");
@@ -2277,6 +2295,66 @@ mod tests {
                 .expect("real Block pane over inert PTY"),
             );
             let window = mount_native_history_view(&view);
+            window.set_child(None::<&gtk::Widget>);
+            let chrome = crate::history_notice::build_block_history_notice();
+            let query = gtk::SearchEntry::new();
+            query.set_text("keep this draft");
+            let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            root.append(&query);
+            root.append(&chrome.bar);
+            root.append(&view.widget());
+            window.set_child(Some(&root));
+            let context = gtk::glib::MainContext::default();
+            for _ in 0..100 {
+                if !context.pending() {
+                    break;
+                }
+                context.iteration(false);
+            }
+            let map_started = Instant::now();
+            while !(query.is_mapped() && query.width() > 0 && view.widget().is_mapped()) {
+                assert!(
+                    map_started.elapsed() < Duration::from_secs(5),
+                    "history fixture did not map"
+                );
+                for _ in 0..100 {
+                    if !context.pending() {
+                        break;
+                    }
+                    context.iteration(false);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(query.grab_focus());
+            let focus_before = gtk::prelude::RootExt::focus(&window).unwrap();
+            let result_cell = Rc::new(RefCell::new(None));
+            let result_out = result_cell.clone();
+            let weak = Rc::downgrade(&view);
+            let bar = chrome.bar.clone();
+            let label = chrome.label.clone();
+            chrome.retry.connect_clicked(move |_| {
+                bar.set_visible(false);
+                let result = weak.upgrade().unwrap().retry_history_persistence();
+                if let Err(error) = &result {
+                    crate::history_notice::reveal_block_history_failure(
+                        &bar,
+                        &label,
+                        &error.to_string(),
+                    );
+                }
+                *result_out.borrow_mut() = Some(result);
+            });
+            crate::history_notice::reveal_block_history_failure(
+                &chrome.bar,
+                &chrome.label,
+                "history restore failed; original file preserved",
+            );
+            assert_eq!(
+                gtk::prelude::RootExt::focus(&window).as_ref(),
+                Some(&focus_before)
+            );
+            assert!(chrome.bar.is_visible());
+            assert!(chrome.label.text().contains("history restore failed"));
             assert!(matches!(
                 *view.history_load_outcome.borrow(),
                 HistoryLoadOutcome::Failed { .. }
@@ -2284,7 +2362,33 @@ mod tests {
             if repaired {
                 write_native_zone_fixture(&path, &[]);
             }
-            let result = view.retry_history_persistence();
+            let retry_started = Instant::now();
+            chrome.retry.emit_clicked();
+            let result = result_cell.borrow_mut().take().expect("Retry callback ran");
+            for _ in 0..100 {
+                if !context.pending() {
+                    break;
+                }
+                context.iteration(false);
+            }
+            assert_eq!(
+                gtk::prelude::RootExt::focus(&window).as_ref(),
+                Some(&focus_before)
+            );
+            assert_eq!(query.text(), "keep this draft");
+            assert!(query.is_mapped() && query.width() > 0 && view.widget().is_mapped());
+            assert_eq!(chrome.bar.is_visible(), !repaired);
+            if !repaired {
+                assert!(chrome
+                    .label
+                    .text()
+                    .starts_with("Block history was not saved:"));
+                assert!(chrome
+                    .label
+                    .text()
+                    .contains("partial block-history frame header"));
+            }
+            eprintln!("native history Retry repaired={repaired}: {:?}; mapped pane, draft and focus preserved", retry_started.elapsed());
             if repaired {
                 assert!(
                     result.is_ok(),
@@ -3792,3 +3896,7 @@ mod tests {
         assert_eq!(loaded.blocks.front().map(|block| block.id), Some(3));
     }
 }
+
+#[cfg(test)]
+#[path = "history_fault_tests.rs"]
+mod history_fault_tests;
