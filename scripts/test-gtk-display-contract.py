@@ -114,7 +114,7 @@ def main():
         # A closed PATH prevents any real Cargo, D-Bus, or Xvfb fallback.
         for command in ("dirname", "mktemp", "mkdir", "chmod", "rm", "grep"):
             (bindir / command).symlink_to(shutil.which(command))
-        for command in ("cargo", "dbus-run-session", "dbus-daemon", "xvfb-run"):
+        for command in ("cargo", "dbus-run-session", "dbus-daemon", "xvfb-run", "xdotool"):
             child = bindir / command
             child.write_text(f"#!{sys.executable}\n" + FAKE_CHILD)
             child.chmod(0o755)

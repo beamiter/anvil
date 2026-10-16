@@ -1216,10 +1216,11 @@ fn native_find_controls_preserve_query(mode: crate::config::TerminalMode) {
         find::FindSearchResult::Matches(_)
     ));
     settle();
-    fixture.query.select_region(2, 5);
+    fixture.query.set_position(4);
     let selection = fixture.query.selection_bounds();
     let caret = fixture.query.position();
-    assert_eq!(selection, Some((2, 5)));
+    assert_eq!(selection, None);
+    assert_eq!(caret, 4);
     let unchanged = || {
         assert_eq!(fixture.query.text().as_str(), "needle");
         assert_eq!(
@@ -1354,17 +1355,89 @@ fn native_find_controls_preserve_query(mode: crate::config::TerminalMode) {
     assert!(owns(&fixture.window, &outside));
     activated(7, 2);
     unchanged();
+    // A selected query and a VTE match cannot both own PRIMARY. GTK's
+    // GtkText content-detach collapses to the range's anchor (2), not its
+    // directed caret (5). Measure this native distinction separately rather
+    // than asserting impossible simultaneous selections.
+    assert!(fixture.query.grab_focus());
+    fixture.query.select_region(2, 5);
+    assert_eq!(fixture.query.position(), 5);
+    assert_eq!(fixture.query.selection_bounds(), Some((2, 5)));
+    let point = next
+        .compute_point(
+            &fixture.window,
+            &gtk::graphene::Point::new(next.width() as f32 / 2.0, next.height() as f32 / 2.0),
+        )
+        .unwrap();
+    input(&[
+        "mousemove",
+        "--window",
+        &id,
+        &point.x().round().to_string(),
+        &point.y().round().to_string(),
+    ]);
+    input(&["mousedown", "1"]);
+    settle();
+    fixture.assert_ownership();
+    assert_eq!(
+        fixture.query.position(),
+        5,
+        "pointer press must not move the query caret"
+    );
+    assert_eq!(
+        fixture.query.selection_bounds(),
+        Some((2, 5)),
+        "pointer press must retain the selection until native navigation"
+    );
+    assert_eq!(activations.get(), 7, "press alone must not navigate");
+    input(&["mouseup", "1"]);
+    activated(8, 3);
+    fixture.assert_match(2, true, "needle");
+    assert_eq!(
+        fixture.query.selection_bounds(),
+        None,
+        "native match must receive PRIMARY"
+    );
+    assert_eq!(
+        fixture.query.position(),
+        2,
+        "GTK PRIMARY loss collapses to the original selection anchor"
+    );
+    input(&["type", "X"]);
+    wait_until(
+        || fixture.query.text().as_str() == "neXedle",
+        "typing must continue at GTK's collapse endpoint",
+    );
+    assert_eq!(fixture.query.position(), 3);
+    fixture.assert_ownership();
+
+    // Start an independent collapsed-caret editing scenario. No focus request
+    // or caret repair occurs between navigation and the ensuing native typing.
+    fixture.query.set_text("needle");
+    fixture.query.set_position(4);
+    click(&fixture.window, &id, &next);
+    activated(9, 4);
+    fixture.assert_match(2, true, "needle");
+    assert_eq!(fixture.query.selection_bounds(), None);
+    assert_eq!(fixture.query.position(), 4);
+    input(&["type", "X"]);
+    wait_until(
+        || fixture.query.text().as_str() == "needXle",
+        "navigation must preserve the insertion caret",
+    );
+    assert_eq!(fixture.query.position(), 5);
+    fixture.assert_ownership();
     fixture.window.close();
 }
 
 #[test]
 #[ignore = "requires isolated X11 DISPLAY and xdotool"]
-fn block_native_find_controls_keep_query_selection_and_tab_focus() {
+fn block_native_find_controls_keep_query_caret_and_tab_focus() {
     native_find_controls_preserve_query(crate::config::TerminalMode::Block);
 }
 
 #[test]
 #[ignore = "requires isolated X11 DISPLAY and xdotool"]
-fn chat_native_find_controls_keep_query_selection_and_tab_focus() {
+fn chat_native_find_controls_keep_query_caret_and_tab_focus() {
     native_find_controls_preserve_query(crate::config::TerminalMode::Chat);
 }
