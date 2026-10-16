@@ -49,6 +49,7 @@ mod pane_header;
 mod persistence;
 mod process;
 mod pty;
+mod pty_pair;
 mod remote_fs;
 mod review_input_ops;
 mod review_text;

@@ -6,9 +6,10 @@
 use crate::child_env;
 use crate::process::{ChildLifecycle, EscalationPolicy, ReapOwner};
 use crate::pty_input;
+use crate::pty_pair::openpty_cloexec;
 use gtk::glib;
 use nix::libc;
-use nix::pty::{openpty, OpenptyResult};
+use nix::pty::OpenptyResult;
 use nix::unistd::{self, ForkResult, Pid};
 use relm4::gtk;
 use std::collections::VecDeque;
@@ -64,24 +65,6 @@ pub struct OwnedPty {
     /// Recorded foreground process group for a bare test PTY (0 = unknown).
     #[cfg(test)]
     test_foreground_group: std::sync::atomic::AtomicI32,
-}
-
-/// Do not let later commands inherit another pane's master or spare slave.
-/// `openpty` has no CLOEXEC option, so this closes the persistent inheritance
-/// leak but is not atomic against another thread forking before fcntl runs.
-fn openpty_cloexec(size: Option<&nix::pty::Winsize>) -> io::Result<OpenptyResult> {
-    let pair = openpty(size, None).map_err(io::Error::other)?;
-    for fd in [&pair.master, &pair.slave] {
-        // SAFETY: each descriptor is live and owned by `pair`. Preserve any
-        // existing descriptor flags; an error drops both ends before return.
-        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
-        if flags < 0
-            || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(pair)
 }
 
 #[cfg(target_os = "linux")]

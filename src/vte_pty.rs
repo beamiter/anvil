@@ -29,9 +29,10 @@
 //!   shell → parser → vte_pty.write_bytes()       (anvil → VTE)
 //!   vte_pty reader → shell_pty.write_bytes()     (VTE → shell)
 
+use crate::pty_pair::openpty_cloexec;
 use gtk::glib;
 use nix::libc;
-use nix::pty::{openpty, OpenptyResult};
+use nix::pty::OpenptyResult;
 use relm4::gtk;
 use std::io::{self, Read as _};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -126,8 +127,7 @@ impl VtePty {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        let OpenptyResult { master, slave } =
-            openpty(Some(&initial_size), None).map_err(io::Error::other)?;
+        let OpenptyResult { master, slave } = openpty_cloexec(Some(&initial_size))?;
         // Put the slave in raw mode. openpty(3) leaves it in the kernel default
         // canonical/cooked discipline (ICANON + ECHO + ICRNL + OPOST). That
         // discipline mangles the MITM splice in two ways: ICANON line-buffers
@@ -366,6 +366,47 @@ impl Drop for VtePty {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires GTK display; registered in test-gtk-display.sh"]
+    fn native_bridge_pairs_remain_raw_and_do_not_leak_across_exec() {
+        gtk::init().unwrap();
+        let mut bridges = Vec::new();
+        let mut fds = Vec::new();
+        for _ in 0..32 {
+            let bridge = VtePty::new().unwrap();
+            let local = bridge.local.lock().unwrap();
+            let slave = local.as_ref().unwrap();
+            let attrs = nix::sys::termios::tcgetattr(slave).unwrap();
+            assert!(!attrs.local_flags.intersects(
+                nix::sys::termios::LocalFlags::ICANON | nix::sys::termios::LocalFlags::ECHO
+            ));
+            let master = bridge.vte_pty.fd().as_raw_fd();
+            for fd in [master, slave.as_raw_fd()] {
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                assert!(flags >= 0);
+                assert_ne!(flags & libc::FD_CLOEXEC, 0);
+                fds.push(fd.to_string());
+            }
+            drop(local);
+            bridges.push(bridge);
+        }
+        let status = std::thread::spawn(move || {
+            std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "for fd do test ! -e /proc/self/fd/$fd || exit 1; done",
+                    "anvil-bridge-inheritance-test",
+                ])
+                .args(fds)
+                .status()
+                .unwrap()
+        })
+        .join()
+        .unwrap();
+        assert!(status.success());
+        drop(bridges);
+    }
 
     fn eventfd() -> OwnedFd {
         let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
