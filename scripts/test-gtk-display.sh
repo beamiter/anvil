@@ -53,6 +53,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::ime_gate::tests::preedit_lifecycle_tracks_each_live_context_without_text
     block_view::more_menu_tests::more_opens_complete_menu_preserves_selection_and_retires_stale_cards
     block_view::blocks::command_reuse_labels_tests::recall_header_describes_insert_only_action
     block_view::shortcut_hints::tests::menu_hints_follow_current_mapping_without_dispatch
@@ -88,7 +89,7 @@ tests=(
     block_view::paste_feedback::tests::notice_preserves_focus
     block_view::tests::ssh_remote_prompt_cursor_stays_inside_live_clip_without_clear
     block_view::chat::tests::native_ime_commit_cancel_and_independent_ptys
-    block_view::chat::tests::native_ime_send_button_diagnostic
+    block_view::chat::tests::native_ime_send_button_preserves_composition
     block_view::focus_restore::tests::deferred_pty_focus_respects_newer_owners
     block_view::focus_restore::tests::deferred_focus_preserves_remaps_and_retires_hidden_targets
     block_view::focus_restore::tests::popover_focus_return_retires_on_newer_owner
@@ -206,7 +207,7 @@ for test_name in "${tests[@]}"; do
         fixture_a11y="test"
     fi
     fixture_im_module="${GTK_IM_MODULE-}"
-    if [[ "${test_name}" == block_view::chat::tests::native_ime_commit_cancel_and_independent_ptys || "${test_name}" == block_view::chat::tests::native_ime_send_button_diagnostic ]]; then
+    if [[ "${test_name}" == block_view::chat::tests::native_ime_commit_cancel_and_independent_ptys || "${test_name}" == block_view::chat::tests::native_ime_send_button_preserves_composition ]]; then
         fixture_im_module=simple
     fi
     GTK_IM_MODULE="${fixture_im_module}" GTK_A11Y="${fixture_a11y}" run_case "${test_name}" \

@@ -495,7 +495,8 @@ pub(super) fn connect_submit(
         let (state, generation, pty) = (state.clone(), generation.clone(), Rc::downgrade(pty));
         capture_activation(button, move || {
             let pty = pty.upgrade()?;
-            if !submit_allowed(state.get(), pty.shell_is_foreground()) {
+            if super::ime_gate::blocked() || !submit_allowed(state.get(), pty.shell_is_foreground())
+            {
                 return None;
             }
             Some(SendIntent {
@@ -504,6 +505,10 @@ pub(super) fn connect_submit(
             })
         })
     };
+    let notify = super::paste_feedback::notifier(terminal);
+    button.set_tooltip_text(Some(
+        "Send Enter to the live shell. Finish or cancel text composition before using Send.",
+    ));
     let (state, terminal, pty, hold, generation, pending) = (
         state.clone(),
         terminal.downgrade(),
@@ -513,7 +518,12 @@ pub(super) fn connect_submit(
         pending.clone(),
     );
     button.connect_clicked(move |button| {
-        let Some(intent) = activation.native.take(&activation.pointer) else {
+        let intent = activation.native.take(&activation.pointer);
+        if super::ime_gate::blocked() {
+            notify(super::ime_gate::notice());
+            return;
+        }
+        let Some(intent) = intent else {
             return;
         };
         if !button.is_mapped() || !button.is_sensitive() {
@@ -523,7 +533,8 @@ pub(super) fn connect_submit(
             return;
         };
         hold.flush_now();
-        if !submit_allowed(state.get(), pty.shell_is_foreground())
+        if super::ime_gate::blocked()
+            || !submit_allowed(state.get(), pty.shell_is_foreground())
             || generation.get() != intent.generation
             || pty.foreground_group() != Some(intent.foreground)
         {

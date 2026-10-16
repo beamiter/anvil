@@ -43,6 +43,7 @@ mod fold_preview;
 mod shortcut_hints;
 pub(crate) use focus_restore::restore_live_focus_deferred;
 mod history;
+mod ime_gate;
 mod onboarding;
 #[allow(dead_code)]
 mod palette;
@@ -11637,6 +11638,7 @@ impl TermView {
         let config = &pane_config;
         let chat_mode = *mode == crate::config::TerminalMode::Chat;
 
+        ime_gate::install();
         // ── Build widget tree ──────────────────────────────────────────────
         let root = gtk::Box::new(Orientation::Vertical, 0);
         root.set_hexpand(true);

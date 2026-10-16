@@ -1,6 +1,6 @@
 // Included only inside chat::tests. Real XTest events exercise VTE's private
 // GtkIMContext. The established keyboard regression covers commit/cancel.
-// The separate Send diagnostic records the button path; it is not a safety proof.
+// The Send regression uses the actual pointer path and checks native IM safety.
 
 fn native_ime_keys(action: &str) {
     let output = std::process::Command::new("python3")
@@ -114,11 +114,10 @@ fn native_ime_commit_cancel_and_independent_ptys() {
     second.pty.kill();
 }
 
-// Diagnostic only: record native Send behavior during preedit before choosing
-// a production fix. Normal input and isolation checks remain strict.
+// A real pointer click must never bypass native preedit with a raw shell CR.
 #[test]
 #[ignore = "requires isolated X11 DISPLAY, GTK_IM_MODULE=simple and xdotool"]
-fn native_ime_send_button_diagnostic() {
+fn native_ime_send_button_preserves_composition() {
     assert_eq!(std::env::var("GTK_IM_MODULE").as_deref(), Ok("simple"));
     let (first, window, _) = fixture();
     let (second, second_window, _) = fixture();
@@ -193,27 +192,32 @@ fn native_ime_send_button_diagnostic() {
             .drain_test_slave(Duration::from_millis(50))
             .is_empty());
         click();
-        let during = owner.pty.drain_test_slave(Duration::from_millis(100));
-        let retained_focus = owner.active_vte.has_focus();
-        // These observations are intentionally not a safety pass/fail oracle:
-        // the fixture must measure the unknown production path on CI first.
-        native_ime_keys("commit");
-        let after = owner.pty.drain_test_slave(Duration::from_millis(100));
-        let sibling = other.pty.drain_test_slave(Duration::from_millis(100));
         assert!(
-            sibling.is_empty(),
-            "Send/composition cannot reach another pane"
+            owner
+                .pty
+                .drain_test_slave(Duration::from_millis(100))
+                .is_empty(),
+            "Send cannot submit or alter an active composition"
         );
-        eprintln!(
-            "IME_SEND_DIAGNOSTIC click={during:?} subsequent_return={after:?} retained_focus={retained_focus}"
+        assert!(
+            owner.active_vte.has_focus(),
+            "blocked Send keeps native candidate ownership"
         );
-        // Reset the native simple context, then require ordinary input and
-        // Send to recover. Escape may cancel preedit or pass through after a
-        // commit; account for those diagnostic bytes before the strict control.
-        assert!(owner.active_vte.grab_focus());
+        native_ime_keys("commit");
+        native_ime_expect(&owner.pty, "中".as_bytes());
+        // Only the next deliberate Send after native commit may submit.
+        click();
+        native_ime_expect(&owner.pty, b"\r");
+        native_ime_keys("compose");
+        assert!(owner
+            .pty
+            .drain_test_slave(Duration::from_millis(100))
+            .is_empty());
         native_ime_keys("cancel");
-        let reset = owner.pty.drain_test_slave(Duration::from_millis(100));
-        eprintln!("IME_SEND_DIAGNOSTIC reset={reset:?}");
+        assert!(owner
+            .pty
+            .drain_test_slave(Duration::from_millis(100))
+            .is_empty());
         native_ime_keys("ascii-a");
         native_ime_expect(&owner.pty, b"a");
         click();
@@ -223,7 +227,33 @@ fn native_ime_send_button_diagnostic() {
             .drain_test_slave(Duration::from_millis(100))
             .is_empty());
     }
+    // Hidden-but-live contexts must not be forgotten prematurely. Remapping
+    // and native cancellation must recover without any application IM reset.
+    assert!(first.active_vte.grab_focus());
+    native_ime_keys("compose");
+    assert!(super::super::ime_gate::blocked());
+    first.root.set_visible(false);
+    pump_for(Duration::from_millis(180));
+    first.root.set_visible(true);
+    pump_for(Duration::from_millis(180));
+    assert!(first.active_vte.grab_focus());
+    native_ime_keys("cancel");
+    assert!(!first
+        .pty
+        .drain_test_slave(Duration::from_millis(100))
+        .contains(&b'\r'));
+    assert!(
+        !super::super::ime_gate::blocked(),
+        "native cancel after remap clears the gate"
+    );
+    native_ime_keys("compose");
+    assert!(super::super::ime_gate::blocked());
     window.close();
+    pump_for(Duration::from_millis(180));
+    assert!(
+        !super::super::ime_gate::blocked(),
+        "unrealized contexts cannot strand Send"
+    );
     first.pty.kill();
     second.pty.kill();
 }

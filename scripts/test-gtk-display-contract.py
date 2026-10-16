@@ -20,7 +20,7 @@ HELD = "block_view::tests::held_enter_history_recall_does_not_submit_the_recalle
 A11Y = "organism_ui::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers"
 IME_TESTS = {
     "block_view::chat::tests::native_ime_commit_cancel_and_independent_ptys",
-    "block_view::chat::tests::native_ime_send_button_diagnostic",
+    "block_view::chat::tests::native_ime_send_button_preserves_composition",
 }
 VARIANT_KEYS = (
     "ANVIL_ENTER_MODE", "ANVIL_QA_PREWARM_ENTER", "ANVIL_QA_INHERITED_ENTER",
