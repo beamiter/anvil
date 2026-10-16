@@ -53,6 +53,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::readline_preservation_tests::search_and_native_split_preserve_readline_draft_cursor_and_undo
     agent_task_ui::feedback_tests::task_feedback_keeps_input_draft_and_focus
     block_view::ime_gate::tests::preedit_lifecycle_tracks_each_live_context_without_text
     block_view::more_menu_tests::more_opens_complete_menu_preserves_selection_and_retires_stale_cards
