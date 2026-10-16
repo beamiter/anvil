@@ -147,7 +147,7 @@ pub(crate) enum TasksPanelMsg {
     FollowUpChanged(String),
     SendFollowUp,
     Create,
-    Act(ActionKind),
+    Act(TaskId, ActionKind),
     Decide(TaskId, ApprovalId, bool),
     ShowPage(&'static str),
     Close,
@@ -170,6 +170,8 @@ pub(crate) struct TasksPanelModel {
     /// final text carried by `TaskPanelAction::FollowUp`.
     follow_up_drafts: HashMap<TaskId, String>,
     action_buttons: Vec<(ActionKind, gtk::Button)>,
+    /// Task shown by the action buttons, captured before queuing a click.
+    action_target: Rc<Cell<Option<TaskId>>>,
     /// Render cache: what the list and approval widgets currently show.
     /// Refresh diffs each pushed Sync against it and touches GTK only on
     /// real change, so an unchanged Sync is a pure no-op — no widget churn,
@@ -636,6 +638,7 @@ impl Component for TasksPanelModel {
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         let mut action_buttons = Vec::new();
+        let action_target = Rc::new(Cell::new(None));
         let selection_guard = Rc::new(Cell::new(false));
         let selection_ids = Rc::new(RefCell::new(Vec::<TaskId>::new()));
         let page_guard = Rc::new(Cell::new(false));
@@ -649,6 +652,7 @@ impl Component for TasksPanelModel {
             dashboard_buttons: Vec::new(),
             follow_up_drafts: HashMap::new(),
             action_buttons: Vec::new(),
+            action_target: action_target.clone(),
             rendered_rows: Vec::new(),
             rendered_selected: None,
             rendered_approvals: Vec::new(),
@@ -667,7 +671,12 @@ impl Component for TasksPanelModel {
             button.add_css_class("caption");
             button.connect_clicked({
                 let sender = sender.clone();
-                move |_| sender.input(TasksPanelMsg::Act(kind))
+                let action_target = action_target.clone();
+                move |_| {
+                    if let Some(id) = action_target.get() {
+                        sender.input(TasksPanelMsg::Act(id, kind));
+                    }
+                }
             });
             widgets.actions_box.insert(&button, -1);
             action_buttons.push((kind, button));
@@ -765,7 +774,7 @@ impl Component for TasksPanelModel {
     ) {
         // Requesting a diff also opens the diff page so the action has a
         // visible effect even while the worker is still loading.
-        let show_diff = matches!(&message, TasksPanelMsg::Act(ActionKind::ReviewDiff));
+        let show_diff = matches!(&message, TasksPanelMsg::Act(_, ActionKind::ReviewDiff));
         match message {
             TasksPanelMsg::Sync(sync) => {
                 self.unfiltered_sync = *sync;
@@ -821,22 +830,22 @@ impl Component for TasksPanelModel {
             TasksPanelMsg::Create => {
                 self.emit_action(TaskPanelAction::CreateFromBlock, &sender);
             }
-            TasksPanelMsg::Act(kind) => {
-                if let Some(id) = self.sync.selected {
-                    let action = match kind {
-                        ActionKind::StartCodex => TaskPanelAction::StartCodex(id),
-                        ActionKind::StartTerminal => TaskPanelAction::StartTerminal(id),
-                        ActionKind::FocusTerminal => TaskPanelAction::FocusTerminal(id),
-                        ActionKind::FocusValidation => TaskPanelAction::FocusValidation(id),
-                        ActionKind::StopCodex => TaskPanelAction::StopCodex(id),
-                        ActionKind::FinishCodex => TaskPanelAction::FinishCodex(id),
-                        ActionKind::RunValidation => TaskPanelAction::RunValidation(id),
-                        ActionKind::Complete => TaskPanelAction::Complete(id),
-                        ActionKind::ReviewDiff => TaskPanelAction::ReviewDiff(id),
-                        ActionKind::Archive => TaskPanelAction::Archive(id),
-                    };
-                    self.emit_action(action, &sender);
-                }
+            TasksPanelMsg::Act(id, kind) => {
+                // Keep the clicked task even if a queued Sync changes selection.
+                // The application/runtime rechecks this task and its live gates.
+                let action = match kind {
+                    ActionKind::StartCodex => TaskPanelAction::StartCodex(id),
+                    ActionKind::StartTerminal => TaskPanelAction::StartTerminal(id),
+                    ActionKind::FocusTerminal => TaskPanelAction::FocusTerminal(id),
+                    ActionKind::FocusValidation => TaskPanelAction::FocusValidation(id),
+                    ActionKind::StopCodex => TaskPanelAction::StopCodex(id),
+                    ActionKind::FinishCodex => TaskPanelAction::FinishCodex(id),
+                    ActionKind::RunValidation => TaskPanelAction::RunValidation(id),
+                    ActionKind::Complete => TaskPanelAction::Complete(id),
+                    ActionKind::ReviewDiff => TaskPanelAction::ReviewDiff(id),
+                    ActionKind::Archive => TaskPanelAction::Archive(id),
+                };
+                self.emit_action(action, &sender);
             }
             TasksPanelMsg::Decide(task_id, approval_id, approved) => {
                 let action = if approved {
@@ -903,6 +912,7 @@ impl TasksPanelModel {
         self.sync_task_list(widgets);
 
         let detail = self.sync.detail.as_deref();
+        self.action_target.set(detail.map(|detail| detail.id));
         for (kind, button) in &self.action_buttons {
             let sensitive = detail.is_some_and(|detail| {
                 match kind {
@@ -1171,6 +1181,63 @@ mod tests {
             selected: Some(selected),
             detail: Some(Box::new(detail)),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn queued_task_controls_keep_the_rendered_task_across_sync() {
+        gtk::init().expect("GTK display");
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let sink = actions.clone();
+        let controller =
+            TasksPanelModel::builder()
+                .launch(())
+                .connect_receiver(move |_, output| {
+                    let TasksPanelOutput::Action(action) = output;
+                    sink.borrow_mut().push(action);
+                });
+        let drain = || {
+            let main = gtk::glib::MainContext::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while main.pending() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "bounded component drain"
+                );
+                main.iteration(false);
+            }
+        };
+        for kind in [ActionKind::StopCodex, ActionKind::FinishCodex] {
+            let mut first = dashboard_test_sync();
+            let clicked = first.selected.unwrap();
+            first.detail.as_mut().unwrap().can_stop = true;
+            first.detail.as_mut().unwrap().can_finish = true;
+            controller.emit(TasksPanelMsg::Sync(Box::new(first)));
+            drain();
+            actions.borrow_mut().clear();
+            let button = controller
+                .model()
+                .action_buttons
+                .iter()
+                .find(|(candidate, _)| *candidate == kind)
+                .unwrap()
+                .1
+                .clone();
+            // Queue a replacement snapshot without rendering it yet. The
+            // visible button still belongs to the first task when clicked.
+            controller.emit(TasksPanelMsg::Sync(Box::new(dashboard_test_sync())));
+            button.emit_clicked();
+            drain();
+            assert_ne!(controller.model().sync.selected, Some(clicked));
+            assert_eq!(actions.borrow().len(), 1);
+            match (&actions.borrow()[0], kind) {
+                (TaskPanelAction::StopCodex(id), ActionKind::StopCodex)
+                | (TaskPanelAction::FinishCodex(id), ActionKind::FinishCodex) => {
+                    assert_eq!(*id, clicked);
+                }
+                _ => panic!("wrong task control"),
+            }
         }
     }
 
