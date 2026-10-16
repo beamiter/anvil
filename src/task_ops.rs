@@ -14,8 +14,8 @@ use relm4::gtk::glib;
 use relm4::{ComponentController, ComponentSender};
 
 use crate::agent_task::{
-    AgentProvider, AgentSessionOutcome, ApprovalDecision, CodexAppServerPhase, NativePromptPolicy,
-    NewTask, TaskId, TaskRuntimeKind, TaskStatus, TaskTerminalRole, TaskValidationStatus,
+    AgentProvider, ApprovalDecision, CodexAppServerPhase, NativePromptPolicy, NewTask, TaskId,
+    TaskRuntimeKind, TaskStatus, TaskTerminalRole, TaskValidationStatus,
 };
 use crate::agent_task_ui::{
     self, order_task_rows, row_status_line, TaskPanelAction, TaskRowSnapshot,
@@ -151,31 +151,17 @@ impl AppModel {
             let report = self.agent_runtime.poll(&mut self.task_manager, policy);
             if let Some(issue) = report.issues.last() {
                 self.show_toast(format!("Native Agent issue: {}", issue.detail));
-            } else if let Some(completion) = report.completions.last() {
-                let message = if report.completions.len() > 1 {
-                    format!(
-                        "{} native Codex sessions stopped; open Tasks for individual results",
-                        report.completions.len()
-                    )
-                } else {
-                    match completion.outcome {
-                        AgentSessionOutcome::Clean => {
-                            "Native Codex stopped cleanly; review its diff, then run validation"
-                                .to_string()
-                        }
-                        AgentSessionOutcome::Cancelled => {
-                            "Native Codex was cancelled and fully stopped".to_string()
-                        }
-                        AgentSessionOutcome::Failed => format!(
-                            "Native Codex failed: {}",
-                            completion
-                                .detail
-                                .as_deref()
-                                .unwrap_or("provider session did not complete")
-                        ),
-                    }
-                };
-                self.show_toast(message);
+            } else {
+                let message = agent_task_ui::task_completion_feedback(
+                    &self.task_manager,
+                    report
+                        .completions
+                        .iter()
+                        .map(|completion| (completion.task_id, completion.outcome)),
+                );
+                if let Some(message) = message {
+                    agent_task_ui::show_task_feedback(&self.toast_overlay, &message);
+                }
             }
             keep_fast |= report.made_progress() || self.agent_runtime.needs_fast_poll();
 
@@ -799,21 +785,12 @@ impl AppModel {
             .handle_terminal_session_closed(&session_id)
         {
             if role == TaskTerminalRole::Validation {
-                let outcome = self.task_manager.get(task_id).map(|task| {
-                    (
-                        task.validation.status,
-                        task.validation.status_detail.clone(),
-                    )
-                });
-                if let Some((status, detail)) = outcome {
-                    let message = match status {
-                        TaskValidationStatus::Passed => "Validation passed".to_string(),
-                        TaskValidationStatus::Failed => {
-                            format!("Validation failed (exit {exit_code})")
-                        }
-                        _ => detail.unwrap_or_else(|| "Validation ended".to_string()),
-                    };
-                    self.show_toast(message);
+                if let Some(message) = agent_task_ui::task_validation_feedback(
+                    &self.task_manager,
+                    task_id,
+                    &session_id,
+                ) {
+                    agent_task_ui::show_task_feedback(&self.toast_overlay, &message);
                 }
             }
         }

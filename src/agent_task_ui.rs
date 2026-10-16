@@ -75,6 +75,7 @@ use crate::agent_task::{
 };
 use crate::config::Config;
 use crate::review_text::visible_bounded;
+use relm4::adw;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -1079,5 +1080,291 @@ mod tests {
         assert!(rendered.contains("\nfirst\n"));
         assert!(rendered.len() < MAX_NATIVE_ITEM_DISPLAY_BYTES + 256);
         assert!(rendered.ends_with(" …"));
+    }
+}
+
+/// A bounded, redacted title and a stable ID prefix; never use prompt/output text.
+fn feedback_identity(manager: &crate::agent_task::TaskManager, id: TaskId) -> String {
+    let full = id.to_string();
+    let peers: Vec<_> = manager
+        .tasks()
+        .iter()
+        .filter(|task| task.id != id)
+        .map(|task| task.id.to_string())
+        .collect();
+    let length = feedback_id_prefix_length(&full, &peers);
+    let title = manager
+        .get(id)
+        .map(|task| feedback_title(&task.title))
+        .unwrap_or_else(|| "Task no longer available".into());
+    format!("{title} [{}]", &full[..length])
+}
+
+fn feedback_id_prefix_length(full: &str, peers: &[String]) -> usize {
+    let mut length = 8;
+    while length < full.len() && peers.iter().any(|peer| peer.starts_with(&full[..length])) {
+        length = (length + 4).min(full.len());
+    }
+    length
+}
+
+fn feedback_title(title: &str) -> String {
+    // Redact before bounding so a secret cannot evade detection at the cut point.
+    let redacted = jterm_core::redact::redact_secrets(title);
+    visible_bounded(
+        &redacted.split_whitespace().collect::<Vec<_>>().join(" "),
+        64,
+    )
+}
+
+pub(crate) fn task_completion_feedback(
+    manager: &crate::agent_task::TaskManager,
+    completions: impl IntoIterator<Item = (TaskId, crate::agent_task::AgentSessionOutcome)>,
+) -> Option<String> {
+    use crate::agent_task::AgentSessionOutcome;
+    let completions: Vec<_> = completions.into_iter().collect();
+    let (id, outcome) = *completions.first()?;
+    if completions.len() > 1 {
+        let failed = completions
+            .iter()
+            .filter(|(_, outcome)| *outcome == AgentSessionOutcome::Failed)
+            .count();
+        let cancelled = completions
+            .iter()
+            .filter(|(_, outcome)| *outcome == AgentSessionOutcome::Cancelled)
+            .count();
+        return Some(format!("{} agent sessions stopped: {} clean, {cancelled} cancelled, {failed} failed; open Tasks for details", completions.len(), completions.len() - failed - cancelled));
+    }
+    let outcome = match outcome {
+        AgentSessionOutcome::Clean => {
+            "Agent session stopped cleanly; review changes, then validate"
+        }
+        AgentSessionOutcome::Cancelled => "Agent session cancelled and stopped",
+        AgentSessionOutcome::Failed => "Agent session failed; open Tasks for details",
+    };
+    Some(format!("{}: {outcome}", feedback_identity(manager, id)))
+}
+
+pub(crate) fn task_validation_feedback(
+    manager: &crate::agent_task::TaskManager,
+    id: TaskId,
+    session: &str,
+) -> Option<String> {
+    use crate::agent_task::TaskValidationStatus;
+    let task = manager.get(id)?;
+    let validation = &task.validation;
+    if validation.terminal_session_id.as_deref() != Some(session) {
+        return None;
+    }
+    let outcome = match validation.status {
+        TaskValidationStatus::NotRun | TaskValidationStatus::Running => return None,
+        TaskValidationStatus::Passed => "passed".into(),
+        TaskValidationStatus::Failed => validation
+            .exit_code
+            .map(|code| format!("failed (exit {code})"))
+            .unwrap_or_else(|| "failed; open Tasks for details".into()),
+        TaskValidationStatus::Cancelled => "cancelled".into(),
+        TaskValidationStatus::Inconclusive => {
+            "ended without a confirmed result; open Tasks for details".into()
+        }
+    };
+    Some(format!(
+        "{}: Validation #{} {outcome}",
+        feedback_identity(manager, id),
+        validation.attempt
+    ))
+}
+
+/// Passive delivery: does not select a task, activate a pane, or move input focus.
+pub(crate) fn show_task_feedback(overlay: &adw::ToastOverlay, message: &str) {
+    let toast = adw::Toast::new(message);
+    toast.set_use_markup(false);
+    overlay.add_toast(toast);
+}
+
+#[cfg(test)]
+mod feedback_tests {
+    use super::*;
+    use crate::agent_task::{AgentSessionOutcome, NewTask, TaskManager, TaskStatus};
+
+    fn add_task(manager: &mut TaskManager, title: &str) -> TaskId {
+        manager
+            .create(NewTask {
+                title: title.into(),
+                provider: AgentProvider::Codex,
+                repo_root: "/fixture".into(),
+                worktree_path: "/fixture/worktree".into(),
+                branch: "test/feedback".into(),
+                base_commit: "a".repeat(40),
+                source_context: None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn completion_feedback_identifies_same_title_tasks_and_missing_task() {
+        let mut manager = TaskManager::new();
+        let a = add_task(&mut manager, "Same title");
+        let b = add_task(&mut manager, "Same title");
+        let message =
+            |id| task_completion_feedback(&manager, [(id, AgentSessionOutcome::Failed)]).unwrap();
+        assert_ne!(message(a), message(b));
+        assert!(message(a).contains(&a.to_string()[..8]));
+        assert!(message(b).contains(&b.to_string()[..8]));
+        let missing = TaskId::new();
+        assert!(message(missing).contains("Task no longer available"));
+        assert!(message(missing).contains(&missing.to_string()[..8]));
+        assert!(task_completion_feedback(&manager, []).is_none());
+        let batch = task_completion_feedback(
+            &manager,
+            [
+                (a, AgentSessionOutcome::Clean),
+                (b, AgentSessionOutcome::Cancelled),
+                (a, AgentSessionOutcome::Failed),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            batch,
+            "3 agent sessions stopped: 1 clean, 1 cancelled, 1 failed; open Tasks for details"
+        );
+        assert!(!batch.contains("3 tasks"));
+    }
+
+    #[test]
+    fn feedback_id_prefix_extends_for_live_collisions() {
+        let a = "12345678-1111-4111-8111-111111111111";
+        let b = "12345678-2222-4222-8222-222222222222";
+        assert_eq!(feedback_id_prefix_length(a, &[]), 8);
+        let length = feedback_id_prefix_length(a, &[b.into()]);
+        assert_eq!(length, 12);
+        assert_ne!(&a[..length], &b[..length]);
+    }
+
+    #[test]
+    fn feedback_title_is_redacted_single_line_and_utf8_bounded() {
+        let secret = format!("sk-{}", "a".repeat(32));
+        assert!(!feedback_title(&format!("Fix {secret}")).contains(&secret));
+        let hostile = feedback_title("one\n\t\u{202e}two\u{2066}\u{1b}[31m");
+        assert!(!hostile.chars().any(char::is_control));
+        assert!(!hostile.contains('\u{202e}'));
+        assert!(!hostile.contains('\u{2066}'));
+        assert!(hostile.contains("one "));
+        let long = feedback_title(&"界🙂".repeat(80));
+        assert!(long.len() <= 64);
+        assert!(long.is_char_boundary(long.len()));
+        assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn validation_feedback_uses_bound_attempt_and_stored_result() {
+        let mut manager = TaskManager::new();
+        let a = add_task(&mut manager, "Same title");
+        let b = add_task(&mut manager, "Same title");
+        for (id, session) in [(a, "agent-a"), (b, "agent-b")] {
+            manager.bind_terminal_session(id, session.into()).unwrap();
+            manager
+                .update_status(id, TaskStatus::ReadyForReview, None)
+                .unwrap();
+        }
+        manager
+            .bind_validation_session(a, "validation-a".into())
+            .unwrap();
+        manager
+            .bind_validation_session(b, "validation-b".into())
+            .unwrap();
+        assert!(task_validation_feedback(&manager, a, "validation-a").is_none());
+        manager.handle_terminal_session_exit("validation-a", Some(7));
+        assert_eq!(
+            manager.handle_terminal_session_closed("validation-a"),
+            Some(a)
+        );
+        let failed = task_validation_feedback(&manager, a, "validation-a").unwrap();
+        assert!(failed.contains(&a.to_string()[..8]));
+        assert!(failed.ends_with("Validation #1 failed (exit 7)"));
+        assert!(task_validation_feedback(&manager, b, "validation-a").is_none());
+        manager
+            .bind_validation_session(a, "validation-a-retry".into())
+            .unwrap();
+        assert!(manager
+            .handle_terminal_session_exit("validation-a", Some(0))
+            .is_none());
+        assert!(task_validation_feedback(&manager, a, "validation-a").is_none());
+        assert!(task_validation_feedback(&manager, a, "validation-a-retry").is_none());
+        manager.handle_terminal_session_exit("validation-a-retry", Some(0));
+        assert_eq!(
+            manager.handle_terminal_session_closed("validation-a-retry"),
+            Some(a)
+        );
+        assert!(task_validation_feedback(&manager, b, "validation-b").is_none());
+        assert!(task_validation_feedback(&manager, a, "validation-a-retry")
+            .unwrap()
+            .ends_with("Validation #2 passed"));
+        assert!(task_validation_feedback(&TaskManager::new(), a, "validation-a-retry").is_none());
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK process and display"]
+    fn task_feedback_keeps_input_draft_and_focus() {
+        use adw::prelude::*;
+        use relm4::gtk;
+        use relm4::gtk::glib;
+
+        adw::init().expect("GTK display");
+        let overlay = adw::ToastOverlay::new();
+        let input = gtk::Entry::new();
+        input.set_text("unfinished input");
+        overlay.set_child(Some(&input));
+        let window = gtk::Window::new();
+        window.set_default_size(640, 240);
+        window.set_child(Some(&overlay));
+        window.present();
+        let settle = || {
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(150);
+            while std::time::Instant::now() < until {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        settle();
+        assert!(input.grab_focus());
+        let owner = gtk::prelude::GtkWindowExt::focus(&window).expect("input focus owner");
+        let mut manager = TaskManager::new();
+        let a = add_task(&mut manager, "<b>Same title</b>");
+        let b = add_task(&mut manager, "<b>Same title</b>");
+        fn displays(widget: &gtk::Widget, text: &str) -> bool {
+            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                if label.is_mapped() && label.text() == text {
+                    return true;
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                if displays(&current, text) {
+                    return true;
+                }
+                child = current.next_sibling();
+            }
+            false
+        }
+        for id in [a, b] {
+            let message =
+                task_completion_feedback(&manager, [(id, AgentSessionOutcome::Failed)]).unwrap();
+            show_task_feedback(&overlay, &message);
+            settle();
+            assert_eq!(
+                gtk::prelude::GtkWindowExt::focus(&window),
+                Some(owner.clone())
+            );
+            assert_eq!(input.text(), "unfinished input");
+            if id == a {
+                assert!(
+                    displays(overlay.upcast_ref(), &message),
+                    "the actual toast is rendered"
+                );
+            }
+        }
+        assert!(overlay.is_mapped());
+        window.close();
     }
 }
