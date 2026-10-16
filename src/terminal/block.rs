@@ -64,6 +64,119 @@ fn export_notice(result: std::io::Result<std::path::PathBuf>) -> String {
     }
 }
 
+/// A separate nonmodal window leaves terminal input and tab switching available.
+/// Only this main-context callback touches GTK; the worker owns plain data.
+fn start_session_export(
+    view: &Rc<TermView>,
+    slot: &Rc<RefCell<Option<crate::block_view::export::SessionExportJob>>>,
+    sender: &relm4::Sender<VteOutput>,
+    format: crate::block_view::SessionExportFormat,
+) {
+    if slot.borrow().is_some() {
+        let _ = sender.send(VteOutput::Notice(
+            "A session export is already running.".into(),
+        ));
+        return;
+    }
+    let job = match view
+        .session_export_snapshot()
+        .and_then(|snapshot| snapshot.start(format))
+    {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = sender.send(VteOutput::Notice(export_notice(Err(error))));
+            return;
+        }
+    };
+    let window = gtk::Window::builder()
+        .title("Exporting session")
+        .default_width(340)
+        .modal(false)
+        .build();
+    if let Some(parent) = view.widget().root().and_downcast::<gtk::Window>() {
+        window.set_transient_for(Some(&parent));
+        window.set_destroy_with_parent(true);
+    }
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_top(16);
+    content.set_margin_bottom(16);
+    content.set_margin_start(16);
+    content.set_margin_end(16);
+    let label = gtk::Label::new(Some("Preparing export…"));
+    let progress = gtk::ProgressBar::new();
+    let cancel = gtk::Button::with_label("Cancel");
+    content.append(&label);
+    content.append(&progress);
+    content.append(&cancel);
+    window.set_child(Some(&content));
+    let token = job.cancellation.clone();
+    cancel.connect_clicked(move |button| {
+        let accepted = token.cancel();
+        button.set_sensitive(false);
+        button.set_label(if accepted {
+            "Cancelling…"
+        } else {
+            "Finishing…"
+        });
+    });
+    let token = job.cancellation.clone();
+    window.connect_close_request(move |_| {
+        token.cancel();
+        gtk::glib::Propagation::Proceed
+    });
+    *slot.borrow_mut() = Some(job);
+    window.present();
+    let weak_slot = Rc::downgrade(slot);
+    let output = sender.clone();
+    // Strong window reference lasts only until the worker result or pane close.
+    gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
+        let Some(slot) = weak_slot.upgrade() else {
+            window.destroy();
+            return gtk::glib::ControlFlow::Break;
+        };
+        let outcome = {
+            let borrowed = slot.borrow();
+            let Some(job) = borrowed.as_ref() else {
+                window.destroy();
+                return gtk::glib::ControlFlow::Break;
+            };
+            let completed = job.completed.load(std::sync::atomic::Ordering::Relaxed);
+            progress.set_fraction(if job.total == 0 {
+                1.0
+            } else {
+                completed as f64 / job.total as f64
+            });
+            label.set_text(&if completed == job.total {
+                "Saving export…".to_string()
+            } else {
+                format!("Exporting {completed} / {} records…", job.total)
+            });
+            match job.result.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err(std::io::Error::other("export worker stopped")))
+                }
+            }
+        };
+        if let Some(result) = outcome {
+            slot.borrow_mut().take();
+            window.destroy();
+            let message = match result {
+                Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    "Session export cancelled.".to_string()
+                }
+                result => export_notice(result),
+            };
+            let _ = output.send(VteOutput::Notice(message));
+            gtk::glib::ControlFlow::Break
+        } else {
+            gtk::glib::ControlFlow::Continue
+        }
+    });
+    // The callback owns a clone, not this handle.
+}
+
 fn record_navigation_notice(result: RecordNavigationResult) -> Option<&'static str> {
     match result {
         RecordNavigationResult::LocationUnavailable => {
@@ -108,6 +221,7 @@ pub struct BlockTerminal {
     /// The read-only snapshot view opened by record navigation. One slot per
     /// pane, so a second navigation replaces the open view instead of stacking.
     record_snapshot_dialog: Rc<RefCell<Option<relm4::adw::Dialog>>>,
+    session_export: Rc<RefCell<Option<crate::block_view::export::SessionExportJob>>>,
     /// Last result belongs to the regex currently installed in this pane.
     /// Keeping it backend-side prevents navigation after a compile error from
     /// turning that diagnostic into a misleading `(0, 0)` result.
@@ -580,6 +694,7 @@ impl Component for BlockTerminal {
             cross_block_search_dialog: Rc::new(RefCell::new(None)),
             cross_block_search_memory: Rc::new(RefCell::new(Default::default())),
             record_snapshot_dialog: Rc::new(RefCell::new(None)),
+            session_export: Rc::new(RefCell::new(None)),
             search_status: SearchStatus::Idle,
             search_query: None,
             search_live: false,
@@ -742,17 +857,13 @@ impl Component for BlockTerminal {
             VteInput::JumpToNextFailed => {
                 report_record_navigation(&sender, view, &snapshot_dialog, view.jump_to_failed(1))
             }
-            VteInput::ExportSessionMarkdown => {
-                let message = export_notice(
-                    view.export_session_to_file(crate::block_view::SessionExportFormat::Markdown),
-                );
-                let _ = sender.output(VteOutput::Notice(message));
-            }
-            VteInput::ExportSessionJson => {
-                let message = export_notice(
-                    view.export_session_to_file(crate::block_view::SessionExportFormat::Json),
-                );
-                let _ = sender.output(VteOutput::Notice(message));
+            VteInput::ExportSessionMarkdown | VteInput::ExportSessionJson => {
+                let format = if matches!(msg, VteInput::ExportSessionJson) {
+                    crate::block_view::SessionExportFormat::Json
+                } else {
+                    crate::block_view::SessionExportFormat::Markdown
+                };
+                start_session_export(view, &self.session_export, sender.output_sender(), format);
             }
             VteInput::SearchSet(query, use_regex, case_sensitive) => {
                 self.search_status = if let Some(status) =
@@ -873,6 +984,7 @@ impl Component for BlockTerminal {
     }
 
     fn shutdown(&mut self, _widgets: &mut Self::Widgets, _output: relm4::Sender<Self::Output>) {
+        self.session_export.borrow_mut().take();
         self.terminate_once();
     }
 }
@@ -886,6 +998,172 @@ mod tests {
         FindStep, RecordNavigationResult, VteOutput,
     };
     use crate::search::SearchStatus;
+
+    #[test]
+    #[ignore = "requires GTK display, session bus and xdotool; registered in test-gtk-display.sh"]
+    fn session_export_slow_fsync_keeps_native_input_and_tabs_responsive() {
+        use gtk::prelude::*;
+        use relm4::gtk;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::{Duration, Instant};
+        fn pump(duration: Duration) {
+            let end = Instant::now() + duration;
+            let context = gtk::glib::MainContext::default();
+            while Instant::now() < end {
+                while context.pending() {
+                    context.iteration(false);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        fn wait(condition: impl Fn() -> bool) {
+            let end = Instant::now() + Duration::from_secs(5);
+            while !condition() {
+                assert!(Instant::now() < end, "GUI export test timed out");
+                pump(Duration::from_millis(10));
+            }
+        }
+        crate::child_env::capture_inherited_environment().unwrap();
+        gtk::init().unwrap();
+        let view = crate::block_view::organism_settings_test_view();
+        let entry = gtk::Entry::new();
+        let second = gtk::Entry::new();
+        let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        page.append(&entry);
+        page.append(&view.widget());
+        let tabs = gtk::Notebook::new();
+        tabs.append_page(&page, Some(&gtk::Label::new(Some("Terminal"))));
+        tabs.append_page(&second, Some(&gtk::Label::new(Some("Second pane"))));
+        let window = gtk::Window::builder()
+            .title("A01 export responsiveness")
+            .default_width(640)
+            .default_height(480)
+            .child(&tabs)
+            .build();
+        window.present();
+        wait(|| entry.is_mapped());
+        let slot = Rc::new(RefCell::new(None));
+        let (output, received) = relm4::channel();
+        let notices = Rc::new(RefCell::new(Vec::new()));
+        let observed = notices.clone();
+        gtk::glib::spawn_future_local(async move {
+            while let Some(message) = received.recv().await {
+                if let super::VteOutput::Notice(message) = message {
+                    observed.borrow_mut().push(message);
+                }
+            }
+        });
+        let directory = gtk::glib::user_data_dir().join("anvil/exports");
+        let before = std::fs::read_dir(&directory)
+            .map(|d| d.count())
+            .unwrap_or(0);
+        for close_pane in [false, true] {
+            let (entered, entered_rx) = std::sync::mpsc::channel();
+            crate::block_view::export::set_test_sync(move |file| {
+                entered.send(()).unwrap();
+                std::thread::sleep(Duration::from_secs(2));
+                file.sync_all()
+            });
+            super::start_session_export(
+                &view,
+                &slot,
+                &output,
+                crate::block_view::SessionExportFormat::Json,
+            );
+            wait(|| entered_rx.try_recv().is_ok());
+            assert!(slot.borrow().is_some());
+            let now = Instant::now();
+            window.present();
+            tabs.set_current_page(Some(0));
+            entry.grab_focus();
+            pump(Duration::from_millis(80));
+            let result = std::process::Command::new("xdotool")
+                .args(["search", "--name", "^A01 export responsiveness$"])
+                .output()
+                .unwrap();
+            assert!(result.status.success());
+            let id = String::from_utf8(result.stdout).unwrap();
+            let id = id.lines().last().unwrap();
+            assert!(std::process::Command::new("xdotool")
+                .args([
+                    "windowfocus",
+                    "--sync",
+                    id,
+                    "key",
+                    "ctrl+a",
+                    "type",
+                    "responsive"
+                ])
+                .status()
+                .unwrap()
+                .success());
+            wait(|| entry.text() == "responsive");
+            // Deliver real X11 key events through TermView/VTE into the kernel
+            // PTY while fsync is sleeping. An auxiliary entry alone would only
+            // establish GTK-loop responsiveness, not terminal input delivery.
+            view.grab_focus();
+            pump(Duration::from_millis(50));
+            crate::block_view::organism_settings_test_pty_bytes(&view);
+            assert!(std::process::Command::new("xdotool")
+                .args(["type", "terminal-responsive"])
+                .status()
+                .unwrap()
+                .success());
+            let delivered = RefCell::new(Vec::new());
+            wait(|| {
+                delivered
+                    .borrow_mut()
+                    .extend(crate::block_view::organism_settings_test_pty_bytes(&view));
+                delivered
+                    .borrow()
+                    .windows(b"terminal-responsive".len())
+                    .any(|bytes| bytes == b"terminal-responsive")
+            });
+            entry.grab_focus();
+            pump(Duration::from_millis(30));
+
+            assert!(std::process::Command::new("xdotool")
+                .args(["key", "ctrl+Page_Down"])
+                .status()
+                .unwrap()
+                .success());
+            wait(|| tabs.current_page() == Some(1));
+            assert!(
+                now.elapsed() < Duration::from_millis(1500),
+                "input/tab interaction waited for 2-second fsync"
+            );
+            let notices_before = notices.borrow().len();
+            if close_pane {
+                // Exact shutdown path: dropping the job cancels; the next main
+                // tick retires the UI callback without posting stale results.
+                slot.borrow_mut().take();
+            } else {
+                // Closing the real progress window requests cancellation.
+                let export_window = gtk::Window::list_toplevels()
+                    .into_iter()
+                    .filter_map(|w| w.downcast::<gtk::Window>().ok())
+                    .find(|w| w.title().as_deref() == Some("Exporting session"))
+                    .unwrap();
+                export_window.close();
+            }
+            wait(|| slot.borrow().is_none());
+            pump(Duration::from_millis(2200));
+            if close_pane {
+                assert_eq!(notices.borrow().len(), notices_before);
+            } else {
+                assert!(notices.borrow().last().unwrap().contains("cancelled"));
+            }
+            assert_eq!(
+                std::fs::read_dir(&directory)
+                    .map(|d| d.count())
+                    .unwrap_or(0),
+                before
+            );
+        }
+        window.destroy();
+        view.kill();
+    }
 
     #[test]
     fn block_exit_status_maps_to_command_finished_success() {

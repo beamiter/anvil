@@ -53,6 +53,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    terminal::block::tests::session_export_slow_fsync_keeps_native_input_and_tabs_responsive
     dialogs::tasks_panel::tests::queued_task_controls_keep_the_rendered_task_across_sync
     block_view::incremental_find_tests::block_native_find_controls_keep_query_caret_and_tab_focus
     block_view::incremental_find_tests::chat_native_find_controls_keep_query_caret_and_tab_focus

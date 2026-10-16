@@ -6,11 +6,15 @@
 //! bounded snapshot retained beside it, and `output_available: false` with no
 //! `output` key when none is retained.
 
+use super::session_export_io::{self, Cancellation};
 use gtk::prelude::*;
 use relm4::gtk;
-use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 use super::{
     markdown_fence, strip_ansi, BackendRecordRef, BackendRecords, CompletedCommandRecord, TermView,
@@ -187,6 +191,7 @@ impl SessionExportFormat {
 }
 
 /// `session-<stamp>.<ext>` with a numeric suffix for same-second collisions.
+#[cfg(test)]
 fn export_file_name(stamp: &str, extension: &str, attempt: u32) -> String {
     if attempt == 0 {
         format!("session-{stamp}.{extension}")
@@ -195,30 +200,204 @@ fn export_file_name(stamp: &str, extension: &str, attempt: u32) -> String {
     }
 }
 
-#[allow(dead_code)]
-impl TermView {
-    fn write_session_export(
+#[cfg(test)]
+type TestSync = Box<dyn FnOnce(&std::fs::File) -> io::Result<()> + Send>;
+#[cfg(test)]
+thread_local! {
+    static TEST_SYNC: std::cell::RefCell<Option<TestSync>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn set_test_sync(hook: impl FnOnce(&std::fs::File) -> io::Result<()> + Send + 'static) {
+    TEST_SYNC.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+const MAX_EXPORT_RECORDS: usize = 4096;
+const MAX_EXPORT_BYTES: usize = 16 * 1024 * 1024;
+
+enum OwnedRecord {
+    Block(super::BlockData),
+    Metadata(CompletedCommandRecord, Option<ZoneOutputSnapshot>),
+}
+impl OwnedRecord {
+    fn borrowed(&self) -> BackendRecordRef<'_> {
+        match self {
+            Self::Block(record) => BackendRecordRef::Block(record),
+            Self::Metadata(record, snapshot) => BackendRecordRef::Metadata {
+                record,
+                snapshot: snapshot.as_ref(),
+            },
+        }
+    }
+}
+impl serde::Serialize for OwnedRecord {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Block(record) => record.serialize(serializer),
+            Self::Metadata(record, snapshot) => {
+                metadata_record_export(record, snapshot.as_ref()).serialize(serializer)
+            }
+        }
+    }
+}
+
+/// Future range/preview selection can consume this boundary without GTK in the worker.
+pub(crate) struct SessionExportSnapshot(Vec<OwnedRecord>);
+impl SessionExportSnapshot {
+    fn capture(records: &BackendRecords<'_>) -> io::Result<Self> {
+        let too_large = || {
+            io::Error::other("session exceeds export snapshot budget (4096 records / 16 MiB); export individual blocks instead")
+        };
+        if records.len() > MAX_EXPORT_RECORDS {
+            return Err(too_large());
+        }
+        let mut bytes = records
+            .len()
+            .saturating_mul(std::mem::size_of::<OwnedRecord>());
+        // Size every string before cloning any record. This is O(record count),
+        // not O(output bytes), and bounds both GTK copy work and worker memory.
+        for record in records.iter() {
+            let sizes = match record {
+                BackendRecordRef::Block(r) => [
+                    r.prompt.len(),
+                    r.cmd.len(),
+                    r.output.len(),
+                    r.cmd_markup.as_ref().map_or(0, String::len),
+                    r.cwd.as_ref().map_or(0, String::len),
+                ],
+                BackendRecordRef::Metadata {
+                    record: r,
+                    snapshot,
+                } => [
+                    r.cmd.len(),
+                    r.cwd.as_ref().map_or(0, String::len),
+                    snapshot.map_or(0, |s| s.plain.len()),
+                    0,
+                    0,
+                ],
+            };
+            for size in sizes {
+                bytes = bytes.checked_add(size).ok_or_else(too_large)?;
+            }
+            if bytes > MAX_EXPORT_BYTES {
+                return Err(too_large());
+            }
+        }
+        Ok(Self(
+            records
+                .iter()
+                .map(|record| match record {
+                    BackendRecordRef::Block(r) => OwnedRecord::Block(r.clone()),
+                    BackendRecordRef::Metadata { record, snapshot } => {
+                        OwnedRecord::Metadata(record.clone(), snapshot.cloned())
+                    }
+                })
+                .collect(),
+        ))
+    }
+
+    fn write(
         &self,
-        writer: &mut impl Write,
+        writer: &mut dyn Write,
         format: SessionExportFormat,
+        completed: &AtomicUsize,
     ) -> io::Result<()> {
-        let records = self.render_backend.records();
         match format {
-            SessionExportFormat::Json => writer.write_all(records_json(&records).as_bytes()),
+            SessionExportFormat::Json => {
+                // SerializeSeq retains serde_json's exact pretty-array format.
+                use serde::ser::{SerializeSeq, Serializer};
+                let mut serializer = serde_json::Serializer::pretty(writer);
+                let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+                for record in &self.0 {
+                    sequence.serialize_element(record)?;
+                    completed.fetch_add(1, Ordering::Relaxed);
+                }
+                sequence.end().map_err(io::Error::other)
+            }
             SessionExportFormat::Markdown => {
                 writeln!(writer, "# Terminal Session Export\n")?;
-                writeln!(writer, "Total blocks: {}\n", records.len())?;
+                writeln!(writer, "Total blocks: {}\n", self.0.len())?;
                 writeln!(writer, "---\n")?;
-                for (index, record) in records.iter().enumerate() {
+                for (index, record) in self.0.iter().enumerate() {
                     writeln!(writer, "## Block #{}\n", index + 1)?;
-                    writer.write_all(record_markdown(record).as_bytes())?;
+                    writer.write_all(record_markdown(record.borrowed()).as_bytes())?;
                     writeln!(writer, "\n---\n")?;
+                    completed.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(())
             }
         }
     }
 
+    pub(crate) fn start(self, format: SessionExportFormat) -> io::Result<SessionExportJob> {
+        let directory = gtk::glib::user_data_dir().join("anvil").join("exports");
+        let stamp = gtk::glib::DateTime::now_local()
+            .ok()
+            .and_then(|now| now.format("%Y%m%d-%H%M%S").ok())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("pid{}", std::process::id()));
+        let cancellation = Cancellation::default();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let total = self.0.len();
+        let (tx, result) = std::sync::mpsc::sync_channel(1);
+        let cancel = cancellation.clone();
+        let progress = completed.clone();
+        #[cfg(test)]
+        let sync_hook = TEST_SYNC.with(|slot| slot.borrow_mut().take());
+        std::thread::Builder::new()
+            .name("session-export".into())
+            .spawn(move || {
+                let write = |writer: &mut dyn Write| self.write(writer, format, &progress);
+                #[cfg(test)]
+                let outcome = if let Some(sync) = sync_hook {
+                    session_export_io::publish_with_sync(
+                        &directory,
+                        &stamp,
+                        format.extension(),
+                        &cancel,
+                        write,
+                        sync,
+                    )
+                } else {
+                    session_export_io::publish(
+                        &directory,
+                        &stamp,
+                        format.extension(),
+                        &cancel,
+                        write,
+                    )
+                };
+                #[cfg(not(test))]
+                let outcome = session_export_io::publish(
+                    &directory,
+                    &stamp,
+                    format.extension(),
+                    &cancel,
+                    write,
+                );
+                let _ = tx.send(outcome);
+            })?;
+        Ok(SessionExportJob {
+            cancellation,
+            completed,
+            total,
+            result,
+        })
+    }
+}
+pub(crate) struct SessionExportJob {
+    pub(crate) cancellation: Cancellation,
+    pub(crate) completed: Arc<AtomicUsize>,
+    pub(crate) total: usize,
+    pub(crate) result: std::sync::mpsc::Receiver<io::Result<PathBuf>>,
+}
+impl Drop for SessionExportJob {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
+
+#[allow(dead_code)]
+impl TermView {
     /// Export a block by ID to JSON format
     pub fn export_block_json(&self, block_id: u64) -> Option<String> {
         let records = self.render_backend.records();
@@ -261,51 +440,10 @@ impl TermView {
         md
     }
 
-    /// Write the whole session's blocks to a timestamped file under the anvil
-    /// data directory. Exports contain command output, so the file is created
-    /// exclusively with owner-only permissions like the block history.
-    pub fn export_session_to_file(&self, format: SessionExportFormat) -> io::Result<PathBuf> {
-        let dir = gtk::glib::user_data_dir().join("anvil").join("exports");
-        fs::create_dir_all(&dir)?;
-        let stamp = gtk::glib::DateTime::now_local()
-            .ok()
-            .and_then(|now| now.format("%Y%m%d-%H%M%S").ok())
-            .map(|formatted| formatted.to_string())
-            .unwrap_or_else(|| format!("pid{}", std::process::id()));
-        for attempt in 0..100u32 {
-            let path = dir.join(export_file_name(&stamp, format.extension(), attempt));
-            let mut options = OpenOptions::new();
-            options.create_new(true).write(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            match options.open(&path) {
-                Ok(mut file) => {
-                    let result = self
-                        .write_session_export(&mut file, format)
-                        .and_then(|_| file.flush())
-                        .and_then(|_| file.sync_all());
-                    if let Err(error) = result {
-                        drop(file);
-                        let _ = fs::remove_file(&path);
-                        return Err(error);
-                    }
-                    drop(file);
-                    if let Ok(parent) = OpenOptions::new().read(true).open(&dir) {
-                        let _ = parent.sync_all();
-                    }
-                    return Ok(path);
-                }
-                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(err) => return Err(err),
-            }
-        }
-        Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "too many session exports share this timestamp",
-        ))
+    /// Capture only owned, bounded data on GTK's thread. All formatting and I/O
+    /// run in the worker. Oversized sessions fail rather than silently truncate.
+    pub(crate) fn session_export_snapshot(&self) -> io::Result<SessionExportSnapshot> {
+        SessionExportSnapshot::capture(&self.render_backend.records())
     }
 
     /// Copy a block's content to clipboard (prompt + cmd + output).
@@ -331,6 +469,107 @@ mod tests {
     };
     use crate::block_view::{CompletedCommandRecord, UnifiedZoneStore, ZoneOutputSnapshot};
     use std::cell::RefCell;
+
+    fn assert_snapshot_parity(records: &BackendRecords<'_>) {
+        let snapshot = super::SessionExportSnapshot::capture(records).unwrap();
+        let mut json = Vec::new();
+        snapshot
+            .write(
+                &mut json,
+                SessionExportFormat::Json,
+                &super::AtomicUsize::new(0),
+            )
+            .unwrap();
+        assert_eq!(json, records_json(records).as_bytes());
+        let mut expected = format!(
+            "# Terminal Session Export\n\nTotal blocks: {}\n\n---\n\n",
+            records.len()
+        );
+        for (i, record) in records.iter().enumerate() {
+            expected.push_str(&format!("## Block #{}\n\n", i + 1));
+            expected.push_str(&super::record_markdown(record));
+            expected.push_str("\n---\n\n");
+        }
+        let mut markdown = Vec::new();
+        snapshot
+            .write(
+                &mut markdown,
+                SessionExportFormat::Markdown,
+                &super::AtomicUsize::new(0),
+            )
+            .unwrap();
+        assert_eq!(markdown, expected.as_bytes());
+    }
+
+    #[test]
+    fn snapshot_stream_preserves_exact_json_and_markdown_bytes() {
+        let blocks = RefCell::new(std::collections::VecDeque::new());
+        assert_snapshot_parity(&BackendRecords::Blocks(blocks.borrow()));
+        let block: crate::block_view::BlockData = serde_json::from_value(serde_json::json!({
+            "id": 1, "prompt": "user 中文", "cmd": "printf '```'", "cmd_markup": "<b>cmd</b>",
+            "output": "```\noutput 🦀", "exit_code": 1, "estimated_height": 20, "line_count": 2,
+            "cwd": "/tmp/![host](example.invalid)", "start_time_ms": 10, "end_time_ms": 20,
+            "duration_ms": 10
+        }))
+        .unwrap();
+        blocks.borrow_mut().push_back(block);
+        assert_snapshot_parity(&BackendRecords::Blocks(blocks.borrow()));
+        let mut store = UnifiedZoneStore::new();
+        assert_snapshot_parity(&BackendRecords::Metadata(RefCell::new(store).borrow()));
+        store = UnifiedZoneStore::new();
+        store.records.push_back(metadata_record(1));
+        let mut degraded = metadata_record(2);
+        degraded.completion_provenance = crate::block_view::CompletionProvenance::BoundaryInferred;
+        store.records.push_back(degraded);
+        store.insert_snapshot(
+            1,
+            ZoneOutputSnapshot {
+                plain: "```\nretained 中文".into(),
+                truncated: true,
+            },
+        );
+        let store = RefCell::new(store);
+        assert_snapshot_parity(&BackendRecords::Metadata(store.borrow()));
+        // Capture remains independent of later live-store mutation/session changes.
+        let snapshot =
+            super::SessionExportSnapshot::capture(&BackendRecords::Metadata(store.borrow()))
+                .unwrap();
+        let before = records_json(&BackendRecords::Metadata(store.borrow()));
+        store.borrow_mut().records.clear();
+        let mut bytes = Vec::new();
+        snapshot
+            .write(
+                &mut bytes,
+                SessionExportFormat::Json,
+                &super::AtomicUsize::new(0),
+            )
+            .unwrap();
+        assert_eq!(bytes, before.as_bytes());
+    }
+
+    #[test]
+    fn snapshot_budget_rejects_before_cloning_without_truncating() {
+        let mut store = UnifiedZoneStore::new();
+        let mut record = metadata_record(1);
+        record.cmd = "x".repeat(super::MAX_EXPORT_BYTES);
+        store.records.push_back(record);
+        let store = RefCell::new(store);
+        assert!(
+            super::SessionExportSnapshot::capture(&BackendRecords::Metadata(store.borrow()))
+                .is_err()
+        );
+        store.borrow_mut().records.clear();
+        for id in 0..=super::MAX_EXPORT_RECORDS {
+            store
+                .borrow_mut()
+                .records
+                .push_back(metadata_record(id as u64));
+        }
+        assert!(
+            super::SessionExportSnapshot::capture(&BackendRecords::Metadata(store.borrow()))
+                .is_err()
+        );
+    }
 
     #[test]
     fn export_file_names_disambiguate_same_second_collisions() {
