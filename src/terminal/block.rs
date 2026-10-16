@@ -66,6 +66,214 @@ fn export_notice(result: std::io::Result<std::path::PathBuf>) -> String {
 
 /// A separate nonmodal window leaves terminal input and tab switching available.
 /// Only this main-context callback touches GTK; the worker owns plain data.
+#[cfg(test)]
+type PreviewTestHook = Box<dyn FnOnce() + Send>;
+#[cfg(test)]
+thread_local! {
+    static PREVIEW_TEST_HOOK: RefCell<Option<PreviewTestHook>> = const { RefCell::new(None) };
+}
+
+/// Configure once, then preview an immutable worker-prepared snapshot. Closing
+/// either stage never starts the filesystem publisher.
+fn preview_session_export(
+    view: &Rc<TermView>,
+    slot: &Rc<RefCell<Option<crate::block_view::export::SessionExportJob>>>,
+    dialogs: &Rc<RefCell<Option<gtk::Window>>>,
+    sender: &relm4::Sender<VteOutput>,
+    format: crate::block_view::SessionExportFormat,
+) {
+    use crate::block_view::export::{ExportPrivacy, ExportSelection};
+    if slot.borrow().is_some() {
+        return;
+    }
+    if let Some(window) = dialogs.borrow().as_ref() {
+        window.present();
+        return;
+    }
+    let window = gtk::Window::builder()
+        .title("Review session export")
+        .default_width(700)
+        .default_height(520)
+        .build();
+    if let Some(parent) = view.widget().root().and_downcast::<gtk::Window>() {
+        window.set_transient_for(Some(&parent));
+        window.set_destroy_with_parent(true);
+    }
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    content.set_margin_top(16);
+    content.set_margin_bottom(16);
+    content.set_margin_start(16);
+    content.set_margin_end(16);
+    let explanation = gtk::Label::new(Some("Choose all records, block IDs, or inclusive command-start Unix milliseconds. Unknown times are omitted from time ranges. Preview is limited to 64 KiB; retained output may already be truncated or unavailable."));
+    explanation.set_wrap(true);
+    content.append(&explanation);
+    let mode = gtk::DropDown::from_strings(&[
+        "All completed records",
+        "Block IDs",
+        "Time range (Unix ms)",
+    ]);
+    content.append(&mode);
+    let ids = gtk::Entry::builder()
+        .placeholder_text("Block IDs, comma-separated (example: 1,4,9)")
+        .max_length(25000)
+        .build();
+    let start = gtk::Entry::builder()
+        .placeholder_text("Start Unix milliseconds, inclusive")
+        .max_length(20)
+        .build();
+    let end = gtk::Entry::builder()
+        .placeholder_text("End Unix milliseconds, inclusive")
+        .max_length(20)
+        .build();
+    content.append(&ids);
+    content.append(&start);
+    content.append(&end);
+    let original =
+        gtk::CheckButton::with_label("Export ORIGINAL text, including secrets and private paths");
+    content.append(&original);
+    let warning = gtk::Label::new(Some(crate::block_view::export_policy::WARNING));
+    warning.set_wrap(true);
+    content.append(&warning);
+    let status = gtk::Label::new(None);
+    status.set_wrap(true);
+    content.append(&status);
+    let text = gtk::TextView::new();
+    text.set_editable(false);
+    text.set_monospace(true);
+    text.set_wrap_mode(gtk::WrapMode::WordChar);
+    let scroll = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .child(&text)
+        .build();
+    content.append(&scroll);
+    let preview = gtk::Button::with_label("Prepare redacted/original preview");
+    let save = gtk::Button::with_label("Save reviewed export");
+    save.set_sensitive(false);
+    let cancel = gtk::Button::with_label("Cancel (write nothing)");
+    content.append(&preview);
+    content.append(&save);
+    content.append(&cancel);
+    window.set_child(Some(&content));
+    let prepared = Rc::new(RefCell::new(
+        None::<crate::block_view::export::SessionExportSnapshot>,
+    ));
+    let weak_window = window.downgrade();
+    cancel.connect_clicked(move |_| {
+        if let Some(window) = weak_window.upgrade() {
+            window.close();
+        }
+    });
+    let weak_dialogs = Rc::downgrade(dialogs);
+    let cancelled_preview = prepared.clone();
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel_worker = cancelled.clone();
+    window.connect_close_request(move |_| {
+        cancel_worker.store(true, std::sync::atomic::Ordering::Release);
+        cancelled_preview.borrow_mut().take();
+        if let Some(dialogs) = weak_dialogs.upgrade() {
+            dialogs.borrow_mut().take();
+        }
+        gtk::glib::Propagation::Proceed
+    });
+    let weak_view = Rc::downgrade(view);
+    let weak_slot = Rc::downgrade(slot);
+    let weak_window = window.downgrade();
+    let output = sender.clone();
+    let saved = prepared.clone();
+    save.connect_clicked(move |button| {
+        let (Some(view), Some(slot), Some(window)) = (
+            weak_view.upgrade(),
+            weak_slot.upgrade(),
+            weak_window.upgrade(),
+        ) else {
+            return;
+        };
+        if slot.borrow().is_some() || !window.is_visible() {
+            return;
+        }
+        let snapshot = saved.borrow_mut().take();
+        if let Some(snapshot) = snapshot {
+            button.set_sensitive(false);
+            window.close();
+            start_snapshot_export(&view, &slot, &output, format, snapshot);
+        }
+    });
+    let weak_view = Rc::downgrade(view);
+    let weak_slot = Rc::downgrade(slot);
+    let weak_window = window.downgrade();
+    preview.connect_clicked(move |button| {
+        let selection = match mode.selected() {
+            1 => ids.text().split(',').map(|id| id.trim().parse::<u64>()).collect::<Result<Vec<_>, _>>().map(|ids| ExportSelection::Ids {ids}).map_err(|_| "Enter comma-separated numeric block IDs."),
+            2 => start.text().parse::<u64>().and_then(|start_ms| end.text().parse::<u64>().map(|end_ms| ExportSelection::TimeRange {start_ms,end_ms})).map_err(|_| "Enter numeric Unix milliseconds."),
+            _ => Ok(ExportSelection::All),
+        };
+        let selection = match selection { Ok(s) => s, Err(e) => {status.set_text(e);return;} };
+        let Some(view) = weak_view.upgrade() else { return; };
+        let Some(permit) = crate::block_view::export_policy::PreviewPermit::try_acquire() else {
+            status.set_text("Another preview is still preparing or finishing cancellation. No new snapshot was copied. Retry Prepare when it finishes.");
+            return;
+        };
+        let snapshot = match view.selected_export_snapshot(&selection) {Ok(s) => s, Err(e) => {status.set_text(&e.to_string());return;} };
+        let privacy = if original.is_active() {ExportPrivacy::Original} else {ExportPrivacy::Redacted};
+        // Lock range and choice. A different choice requires Cancel and a fresh
+        // dialog, so a stale worker result can never authorize another range.
+        for widget in [mode.clone().upcast::<gtk::Widget>(), ids.clone().upcast(), start.clone().upcast(), end.clone().upcast(), original.clone().upcast()] {widget.set_sensitive(false);}
+        button.set_sensitive(false); status.set_text("Preparing preview… no file has been written.");
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        #[cfg(test)]
+        let test_hook = PREVIEW_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+        let cancelled = cancelled.clone();
+        if let Err(e) = std::thread::Builder::new().name("export-preview".into()).spawn(move || {
+            let _permit = permit;
+            #[cfg(test)]
+            if let Some(hook) = test_hook { hook(); }
+            let result = if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "Preview cancelled; no file written."))
+            } else {
+                snapshot.prepare(privacy, format)
+            };
+            let _ = tx.send(result);
+            // The permit remains held through calculation and result delivery,
+            // including when the preview window was closed long ago.
+        }) {status.set_text(&e.to_string());return;}
+        let weak_window = weak_window.clone(); let weak_slot = weak_slot.clone();
+        let text = text.clone(); let status = status.clone(); let save = save.clone(); let prepared = prepared.clone();
+        gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
+            let Some(window) = weak_window.upgrade() else {return gtk::glib::ControlFlow::Break;};
+            if weak_slot.upgrade().is_none() || !window.is_visible() { window.destroy(); return gtk::glib::ControlFlow::Break; }
+            match rx.try_recv() {
+                Ok(Ok(result)) => {
+                    text.buffer().set_text(&result.preview); *prepared.borrow_mut() = Some(result.snapshot);
+                    status.set_text(if privacy == ExportPrivacy::Original {"ORIGINAL unfiltered snapshot. Review before Save. No file written yet."} else {"Redacted snapshot. Review metadata and content before Save; heuristics may miss secrets."});
+                    save.set_sensitive(true); gtk::glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {status.set_text(&e.to_string());gtk::glib::ControlFlow::Break}
+                Err(std::sync::mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                Err(_) => {status.set_text("Preview worker stopped. Cancel and retry.");gtk::glib::ControlFlow::Break}
+            }
+        });
+    });
+    *dialogs.borrow_mut() = Some(window.clone());
+    window.present();
+    // Pane closure also dismisses an idle or completed preview.
+    let weak_slot = Rc::downgrade(slot);
+    let weak_window = window.downgrade();
+    gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+        let Some(window) = weak_window.upgrade() else {
+            return gtk::glib::ControlFlow::Break;
+        };
+        if weak_slot.upgrade().is_none() {
+            window.destroy();
+            return gtk::glib::ControlFlow::Break;
+        }
+        if !window.is_visible() {
+            return gtk::glib::ControlFlow::Break;
+        }
+        gtk::glib::ControlFlow::Continue
+    });
+}
+
+#[cfg(test)]
 fn start_session_export(
     view: &Rc<TermView>,
     slot: &Rc<RefCell<Option<crate::block_view::export::SessionExportJob>>>,
@@ -78,10 +286,24 @@ fn start_session_export(
         ));
         return;
     }
-    let job = match view
-        .session_export_snapshot()
-        .and_then(|snapshot| snapshot.start(format))
-    {
+    match view.session_export_snapshot() {
+        Ok(snapshot) => start_snapshot_export(view, slot, sender, format, snapshot),
+        Err(error) => {
+            let _ = sender.send(VteOutput::Notice(export_notice(Err(error))));
+        }
+    }
+}
+fn start_snapshot_export(
+    view: &Rc<TermView>,
+    slot: &Rc<RefCell<Option<crate::block_view::export::SessionExportJob>>>,
+    sender: &relm4::Sender<VteOutput>,
+    format: crate::block_view::SessionExportFormat,
+    snapshot: crate::block_view::export::SessionExportSnapshot,
+) {
+    if slot.borrow().is_some() {
+        return;
+    }
+    let job = match snapshot.start(format) {
         Ok(job) => job,
         Err(error) => {
             let _ = sender.send(VteOutput::Notice(export_notice(Err(error))));
@@ -222,6 +444,7 @@ pub struct BlockTerminal {
     /// pane, so a second navigation replaces the open view instead of stacking.
     record_snapshot_dialog: Rc<RefCell<Option<relm4::adw::Dialog>>>,
     session_export: Rc<RefCell<Option<crate::block_view::export::SessionExportJob>>>,
+    session_export_dialog: Rc<RefCell<Option<gtk::Window>>>,
     /// Last result belongs to the regex currently installed in this pane.
     /// Keeping it backend-side prevents navigation after a compile error from
     /// turning that diagnostic into a misleading `(0, 0)` result.
@@ -695,6 +918,7 @@ impl Component for BlockTerminal {
             cross_block_search_memory: Rc::new(RefCell::new(Default::default())),
             record_snapshot_dialog: Rc::new(RefCell::new(None)),
             session_export: Rc::new(RefCell::new(None)),
+            session_export_dialog: Rc::new(RefCell::new(None)),
             search_status: SearchStatus::Idle,
             search_query: None,
             search_live: false,
@@ -863,7 +1087,13 @@ impl Component for BlockTerminal {
                 } else {
                     crate::block_view::SessionExportFormat::Markdown
                 };
-                start_session_export(view, &self.session_export, sender.output_sender(), format);
+                preview_session_export(
+                    view,
+                    &self.session_export,
+                    &self.session_export_dialog,
+                    sender.output_sender(),
+                    format,
+                );
             }
             VteInput::SearchSet(query, use_regex, case_sensitive) => {
                 self.search_status = if let Some(status) =
@@ -985,6 +1215,9 @@ impl Component for BlockTerminal {
 
     fn shutdown(&mut self, _widgets: &mut Self::Widgets, _output: relm4::Sender<Self::Output>) {
         self.session_export.borrow_mut().take();
+        if let Some(window) = self.session_export_dialog.borrow_mut().take() {
+            window.destroy();
+        }
         self.terminate_once();
     }
 }
@@ -998,6 +1231,238 @@ mod tests {
         FindStep, RecordNavigationResult, VteOutput,
     };
     use crate::search::SearchStatus;
+
+    #[test]
+    #[ignore = "requires GTK display; registered in test-gtk-display.sh"]
+    fn session_export_preview_cancel_and_explicit_original_are_safe() {
+        use crate::block_view::export_policy::PreviewPermit;
+        use gtk::prelude::*;
+        use relm4::gtk;
+        use std::{
+            cell::RefCell,
+            rc::Rc,
+            time::{Duration, Instant},
+        };
+        fn pump() {
+            let context = gtk::glib::MainContext::default();
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        fn wait(check: impl Fn() -> bool) {
+            let end = Instant::now() + Duration::from_secs(5);
+            while !check() {
+                assert!(Instant::now() < end, "A06 native condition timed out");
+                pump();
+            }
+        }
+        fn children(window: &gtk::Window) -> Vec<gtk::Widget> {
+            let content = window.child().unwrap();
+            let mut result = Vec::new();
+            let mut current = content.first_child();
+            while let Some(widget) = current {
+                current = widget.next_sibling();
+                result.push(widget);
+            }
+            result
+        }
+        fn button(window: &gtk::Window, label: &str) -> gtk::Button {
+            children(window)
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Button>().ok())
+                .find(|b| b.label().as_deref() == Some(label))
+                .unwrap()
+        }
+        fn original(window: &gtk::Window) -> gtk::CheckButton {
+            children(window)
+                .into_iter()
+                .find_map(|w| w.downcast::<gtk::CheckButton>().ok())
+                .unwrap()
+        }
+        fn visible_preview(window: &gtk::Window) -> String {
+            let scroll = children(window)
+                .into_iter()
+                .find_map(|w| w.downcast::<gtk::ScrolledWindow>().ok())
+                .unwrap();
+            let text = scroll.child().unwrap().downcast::<gtk::TextView>().unwrap();
+            let buffer = text.buffer();
+            buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                .to_string()
+        }
+        fn assert_content(text: &str, unfiltered: bool) {
+            assert!(text.contains("SAFE_NATIVE_EXPORT_MARKER"));
+            for secret in [
+                "fixture-native-prompt",
+                "fixture-native-command",
+                "fixture-native-markup",
+                "fixture-native-output",
+                "fixture-native-directory",
+            ] {
+                assert_eq!(
+                    text.contains(secret),
+                    unfiltered,
+                    "unexpected privacy for {secret}: {text}"
+                );
+            }
+        }
+        crate::child_env::capture_inherited_environment().unwrap();
+        gtk::init().unwrap();
+        let view = crate::block_view::organism_settings_test_view();
+        crate::block_view::export::seed_preview_fixture(&view);
+        let source_before = view.export_session_json();
+        assert_content(&source_before, true);
+        let parent = gtk::Window::builder().child(&view.widget()).build();
+        parent.present();
+        let slot = Rc::new(RefCell::new(None));
+        let dialogs = Rc::new(RefCell::new(None));
+        let (sender, _received) = relm4::channel();
+        let open = || {
+            super::preview_session_export(
+                &view,
+                &slot,
+                &dialogs,
+                &sender,
+                crate::block_view::SessionExportFormat::Json,
+            );
+            dialogs.borrow().as_ref().unwrap().clone()
+        };
+        let directory = gtk::glib::user_data_dir().join("anvil/exports");
+        let files = || {
+            std::fs::read_dir(&directory)
+                .map(|entries| {
+                    entries
+                        .map(|e| e.unwrap().path())
+                        .collect::<std::collections::BTreeSet<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let before = files();
+        // Cancel before preparation. Repeated open must reuse the same window.
+        let window = open();
+        assert_eq!(open(), window);
+        assert!(!original(&window).is_active());
+        let stale_save = button(&window, "Save reviewed export");
+        assert!(!stale_save.is_sensitive());
+        window.close();
+        wait(|| dialogs.borrow().is_none());
+        stale_save.emit_clicked();
+        assert_eq!(files(), before);
+
+        // Hold the actual worker after admission, before CPU preparation. Cancel
+        // cannot free its permit or allow a second captured snapshot/worker.
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        super::PREVIEW_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                entered.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }))
+        });
+        let window = open();
+        let stale_save = button(&window, "Save reviewed export");
+        button(&window, "Prepare redacted/original preview").emit_clicked();
+        wait(|| entered_rx.try_recv().is_ok());
+        assert!(PreviewPermit::is_running());
+        assert!(!original(&window).is_sensitive());
+        window.close();
+        wait(|| dialogs.borrow().is_none());
+        stale_save.emit_clicked();
+        let busy = open();
+        button(&busy, "Prepare redacted/original preview").emit_clicked();
+        assert!(children(&busy)
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .any(|label| label.text().contains("finishing cancellation")));
+        assert!(original(&busy).is_sensitive());
+        assert!(!button(&busy, "Save reviewed export").is_sensitive());
+        assert!(PreviewPermit::is_running());
+        assert_eq!(files(), before);
+        busy.close();
+        wait(|| dialogs.borrow().is_none());
+        release.send(()).unwrap();
+        wait(|| !PreviewPermit::is_running());
+        for _ in 0..25 {
+            pump();
+        }
+        stale_save.emit_clicked();
+        assert_eq!(files(), before);
+        assert!(slot.borrow().is_none());
+        assert_eq!(view.export_session_json(), source_before);
+
+        // Cancel a completed, visibly redacted nonempty preview, then deliberately
+        // emit a stale Save signal to test invalidation rather than visibility alone.
+        let window = open();
+        button(&window, "Prepare redacted/original preview").emit_clicked();
+        let stale_save = button(&window, "Save reviewed export");
+        wait(|| stale_save.is_sensitive());
+        assert_content(&visible_preview(&window), false);
+        window.close();
+        wait(|| dialogs.borrow().is_none());
+        stale_save.emit_clicked();
+        assert_eq!(files(), before);
+        assert_eq!(view.export_session_json(), source_before);
+
+        // Exercise real default-redacted and explicit-Original Save paths, with
+        // ID and timestamp selection respectively. Compare the visible preview
+        // to the exact private file, not a separately reconstructed serializer.
+        for unfiltered in [false, true] {
+            wait(|| !PreviewPermit::is_running());
+            let before_save = files();
+            let window = open();
+            assert!(!original(&window).is_active());
+            original(&window).set_active(unfiltered);
+            let mode = children(&window)
+                .into_iter()
+                .find_map(|w| w.downcast::<gtk::DropDown>().ok())
+                .unwrap();
+            let entries: Vec<_> = children(&window)
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Entry>().ok())
+                .collect();
+            if unfiltered {
+                mode.set_selected(2);
+                entries[1].set_text("100");
+                entries[2].set_text("100");
+            } else {
+                mode.set_selected(1);
+                entries[0].set_text("9001");
+            }
+            button(&window, "Prepare redacted/original preview").emit_clicked();
+            let save = button(&window, "Save reviewed export");
+            wait(|| save.is_sensitive());
+            assert!(!original(&window).is_sensitive());
+            assert!(!mode.is_sensitive());
+            let preview = visible_preview(&window);
+            assert_content(&preview, unfiltered);
+            assert_eq!(files(), before_save);
+            save.emit_clicked();
+            wait(|| slot.borrow().is_none());
+            let after = files();
+            let created: Vec<_> = after.difference(&before_save).collect();
+            assert_eq!(created.len(), 1);
+            let bytes = std::fs::read(created[0]).unwrap();
+            let saved = String::from_utf8(bytes).unwrap();
+            assert_eq!(saved, preview);
+            assert_content(&saved, unfiltered);
+            let json: serde_json::Value = serde_json::from_str(&saved).unwrap();
+            assert_eq!(
+                json["export_metadata"]["privacy"],
+                if unfiltered { "original" } else { "redacted" }
+            );
+            assert_eq!(json["export_metadata"]["omitted_records"], 1);
+            assert_eq!(json["records"].as_array().unwrap().len(), 1);
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(created[0]).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(view.export_session_json(), source_before);
+        }
+        parent.destroy();
+        view.kill();
+    }
 
     #[test]
     #[ignore = "requires GTK display, session bus and xdotool; registered in test-gtk-display.sh"]

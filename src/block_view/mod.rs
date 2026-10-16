@@ -37,6 +37,7 @@ mod chat;
 mod cross_selection;
 mod css;
 pub(crate) mod export;
+pub(crate) mod export_policy;
 mod find;
 mod focus_restore;
 mod fold_preview;

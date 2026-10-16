@@ -6,6 +6,8 @@
 //! bounded snapshot retained beside it, and `output_available: false` with no
 //! `output` key when none is retained.
 
+use super::export_policy::{redact, WARNING};
+pub(crate) use super::export_policy::{ExportPrivacy, ExportSelection};
 use super::session_export_io::{self, Cancellation};
 use gtk::prelude::*;
 use relm4::gtk;
@@ -212,6 +214,8 @@ pub(crate) fn set_test_sync(hook: impl FnOnce(&std::fs::File) -> io::Result<()> 
 }
 
 const MAX_EXPORT_RECORDS: usize = 4096;
+// Bound GTK selection scanning even when a retained history exceeds the copy budget.
+const MAX_EXPORT_SCAN_RECORDS: usize = 65_536;
 const MAX_EXPORT_BYTES: usize = 16 * 1024 * 1024;
 
 enum OwnedRecord {
@@ -241,21 +245,94 @@ impl serde::Serialize for OwnedRecord {
 }
 
 /// Future range/preview selection can consume this boundary without GTK in the worker.
-pub(crate) struct SessionExportSnapshot(Vec<OwnedRecord>);
+#[derive(serde::Serialize)]
+struct ExportMetadata {
+    schema_version: u32,
+    included_fields: &'static str,
+    selection: ExportSelection,
+    privacy: ExportPrivacy,
+    omitted_records: usize,
+    redacted_lines: usize,
+    redacted_directory_fields: usize,
+    truncated_command_records: usize,
+    truncated_output_records: usize,
+    unavailable_output_records: usize,
+    warning: &'static str,
+}
+pub(crate) struct SessionExportSnapshot(Vec<OwnedRecord>, Option<ExportMetadata>);
+pub(crate) struct PreparedExport {
+    pub(crate) snapshot: SessionExportSnapshot,
+    pub(crate) preview: String,
+}
+struct PreviewWriter {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+impl Write for PreviewWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let keep = bytes
+            .len()
+            .min((64 * 1024usize).saturating_sub(self.bytes.len()));
+        self.bytes.extend_from_slice(&bytes[..keep]);
+        self.truncated |= keep < bytes.len();
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 impl SessionExportSnapshot {
     fn capture(records: &BackendRecords<'_>) -> io::Result<Self> {
+        Self::capture_selected(records, &ExportSelection::All, false)
+    }
+    fn capture_selected(
+        records: &BackendRecords<'_>,
+        selection: &ExportSelection,
+        metadata: bool,
+    ) -> io::Result<Self> {
+        selection.validate().map_err(io::Error::other)?;
+        if !matches!(selection, ExportSelection::All) && records.len() > MAX_EXPORT_SCAN_RECORDS {
+            return Err(io::Error::other("history exceeds the 65536-record selection scan budget; export an individual block instead"));
+        }
+        let selected_ids: std::collections::HashSet<_> = match selection {
+            ExportSelection::Ids { ids } => ids.iter().copied().collect(),
+            _ => std::collections::HashSet::new(),
+        };
+        let matches = |record: &BackendRecordRef<'_>| {
+            let (id, start) = match record {
+                BackendRecordRef::Block(r) => (
+                    r.id,
+                    r.timing_is_authoritative()
+                        .then_some(r.start_time_ms)
+                        .flatten(),
+                ),
+                BackendRecordRef::Metadata { record: r, .. } => (
+                    r.id,
+                    r.timing_is_authoritative()
+                        .then_some(r.start_time_ms)
+                        .flatten(),
+                ),
+            };
+            match selection {
+                ExportSelection::Ids { .. } => selected_ids.contains(&id),
+                _ => selection.includes(id, start),
+            }
+        };
+        let selected = if matches!(selection, ExportSelection::All) {
+            records.len()
+        } else {
+            records.iter().filter(matches).count()
+        };
         let too_large = || {
             io::Error::other("session exceeds export snapshot budget (4096 records / 16 MiB); export individual blocks instead")
         };
-        if records.len() > MAX_EXPORT_RECORDS {
+        if selected > MAX_EXPORT_RECORDS {
             return Err(too_large());
         }
-        let mut bytes = records
-            .len()
-            .saturating_mul(std::mem::size_of::<OwnedRecord>());
+        let mut bytes = selected.saturating_mul(std::mem::size_of::<OwnedRecord>());
         // Size every string before cloning any record. This is O(record count),
         // not O(output bytes), and bounds both GTK copy work and worker memory.
-        for record in records.iter() {
+        for record in records.iter().filter(matches) {
             let sizes = match record {
                 BackendRecordRef::Block(r) => [
                     r.prompt.len(),
@@ -285,6 +362,7 @@ impl SessionExportSnapshot {
         Ok(Self(
             records
                 .iter()
+                .filter(matches)
                 .map(|record| match record {
                     BackendRecordRef::Block(r) => OwnedRecord::Block(r.clone()),
                     BackendRecordRef::Metadata { record, snapshot } => {
@@ -292,7 +370,83 @@ impl SessionExportSnapshot {
                     }
                 })
                 .collect(),
+            metadata.then(|| ExportMetadata {
+                schema_version: 1,
+                included_fields: "record ID, command, output when retained, exit/lifecycle, timing, directory; Block records also include prompt and display metadata",
+                selection: selection.clone(),
+                privacy: ExportPrivacy::Redacted,
+                omitted_records: records.len() - selected,
+                redacted_lines: 0,
+                redacted_directory_fields: 0,
+                truncated_command_records: 0,
+                truncated_output_records: 0,
+                unavailable_output_records: 0,
+                warning: WARNING,
+            }),
         ))
+    }
+
+    /// CPU-only worker phase. The returned immutable snapshot is exactly what
+    /// preview and Save consume; the live history is never touched.
+    pub(crate) fn prepare(
+        mut self,
+        privacy: ExportPrivacy,
+        format: SessionExportFormat,
+    ) -> io::Result<PreparedExport> {
+        let metadata = self
+            .1
+            .as_mut()
+            .ok_or_else(|| io::Error::other("preview requires selection metadata"))?;
+        metadata.privacy = privacy;
+        for record in &mut self.0 {
+            let (texts, cwd): (Vec<&mut String>, &mut Option<String>) = match record {
+                OwnedRecord::Block(r) => {
+                    metadata.truncated_output_records += usize::from(r.output_head_dropped);
+                    metadata.truncated_command_records += usize::from(r.command_truncated);
+                    let mut texts = vec![&mut r.prompt, &mut r.cmd, &mut r.output];
+                    if let Some(markup) = r.cmd_markup.as_mut() {
+                        texts.push(markup);
+                    }
+                    (texts, &mut r.cwd)
+                }
+                OwnedRecord::Metadata(r, snapshot) => {
+                    let mut texts = vec![&mut r.cmd];
+                    if let Some(snapshot) = snapshot {
+                        metadata.truncated_output_records += usize::from(snapshot.truncated);
+                        texts.push(&mut snapshot.plain);
+                    } else {
+                        metadata.unavailable_output_records += 1;
+                    }
+                    (texts, &mut r.cwd)
+                }
+            };
+            if privacy == ExportPrivacy::Redacted {
+                for text in texts {
+                    metadata.redacted_lines += redact(text);
+                }
+                if let Some(cwd) = cwd {
+                    *cwd = if cwd.len() < "[REDACTED DIRECTORY]".len() {
+                        "*".repeat(cwd.len())
+                    } else {
+                        "[REDACTED DIRECTORY]".into()
+                    };
+                    metadata.redacted_directory_fields += 1;
+                }
+            }
+        }
+        let mut writer = PreviewWriter {
+            bytes: Vec::new(),
+            truncated: false,
+        };
+        self.write(&mut writer, format, &AtomicUsize::new(0))?;
+        let mut preview = String::from_utf8_lossy(&writer.bytes).into_owned();
+        if writer.truncated {
+            preview.push_str("\n[PREVIEW TRUNCATED at 64 KiB; saved export contains the full selected snapshot]\n");
+        }
+        Ok(PreparedExport {
+            snapshot: self,
+            preview,
+        })
     }
 
     fn write(
@@ -303,6 +457,22 @@ impl SessionExportSnapshot {
     ) -> io::Result<()> {
         match format {
             SessionExportFormat::Json => {
+                if let Some(metadata) = &self.1 {
+                    #[derive(serde::Serialize)]
+                    struct Envelope<'a> {
+                        export_metadata: &'a ExportMetadata,
+                        records: &'a [OwnedRecord],
+                    }
+                    serde_json::to_writer_pretty(
+                        writer,
+                        &Envelope {
+                            export_metadata: metadata,
+                            records: &self.0,
+                        },
+                    )?;
+                    completed.fetch_add(self.0.len(), Ordering::Relaxed);
+                    return Ok(());
+                }
                 // SerializeSeq retains serde_json's exact pretty-array format.
                 use serde::ser::{SerializeSeq, Serializer};
                 let mut serializer = serde_json::Serializer::pretty(writer);
@@ -315,6 +485,9 @@ impl SessionExportSnapshot {
             }
             SessionExportFormat::Markdown => {
                 writeln!(writer, "# Terminal Session Export\n")?;
+                if let Some(metadata) = &self.1 {
+                    writeln!(writer, "Export metadata (selection, privacy, omissions and truncation):\n```json\n{}\n```\n", serde_json::to_string_pretty(metadata)?)?;
+                }
                 writeln!(writer, "Total blocks: {}\n", self.0.len())?;
                 writeln!(writer, "---\n")?;
                 for (index, record) in self.0.iter().enumerate() {
@@ -446,6 +619,13 @@ impl TermView {
         SessionExportSnapshot::capture(&self.render_backend.records())
     }
 
+    pub(crate) fn selected_export_snapshot(
+        &self,
+        selection: &ExportSelection,
+    ) -> io::Result<SessionExportSnapshot> {
+        SessionExportSnapshot::capture_selected(&self.render_backend.records(), selection, true)
+    }
+
     /// Copy a block's content to clipboard (prompt + cmd + output).
     pub fn copy_block_by_id(&self, block_id: u64) {
         let finished = self.finished_blocks.borrow();
@@ -461,6 +641,26 @@ impl TermView {
     }
 }
 
+/// Finalized production record fixture in the real Block backend. No mock
+/// serializer, shell execution or user history is involved.
+#[cfg(test)]
+pub(crate) fn seed_preview_fixture(view: &TermView) {
+    let record: super::BlockData = serde_json::from_value(serde_json::json!({
+        "id": 9001, "prompt": "SECRET=fixture-native-prompt", "cmd": "TOKEN=fixture-native-command",
+        "cmd_markup": "password=fixture-native-markup", "output": "SAFE_NATIVE_EXPORT_MARKER\napi_key=fixture-native-output\n",
+        "cwd": "/home/fixture-native-directory", "exit_code": 1, "estimated_height": 20, "line_count": 2,
+        "completion_provenance":"shell_reported", "start_mark_seen":true,
+        "start_time_ms":100, "end_time_ms":200, "duration_ms":100
+    })).unwrap();
+    let mut second = record.clone();
+    second.id = 9002;
+    second.start_time_ms = Some(300);
+    second.end_time_ms = Some(400);
+    second.cmd = "echo second safe record".into();
+    second.output = "SECOND_RECORD_MARKER".into();
+    view.block_data.borrow_mut().extend([record, second]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -469,6 +669,182 @@ mod tests {
     };
     use crate::block_view::{CompletedCommandRecord, UnifiedZoneStore, ZoneOutputSnapshot};
     use std::cell::RefCell;
+
+    #[test]
+    fn selected_redacted_export_has_metadata_and_never_mutates_history() {
+        use super::{ExportPrivacy, ExportSelection, SessionExportSnapshot};
+        let mut store = UnifiedZoneStore::new();
+        let mut record = metadata_record(1);
+        record.cmd = "TOKEN=fixture-secret-command".into();
+        record.cwd = Some("/private/fixture-directory".into());
+        store.records.push_back(record);
+        store.records.push_back(metadata_record(2));
+        store.insert_snapshot(
+            1,
+            ZoneOutputSnapshot {
+                plain: "safe error\nAuthorization: Bearer fixture-secret-output\n".into(),
+                truncated: true,
+            },
+        );
+        let store = RefCell::new(store);
+        let before = records_json(&BackendRecords::Metadata(store.borrow()));
+        for format in [SessionExportFormat::Json, SessionExportFormat::Markdown] {
+            let snapshot = SessionExportSnapshot::capture_selected(
+                &BackendRecords::Metadata(store.borrow()),
+                &ExportSelection::Ids { ids: vec![1] },
+                true,
+            )
+            .unwrap();
+            let prepared = snapshot.prepare(ExportPrivacy::Redacted, format).unwrap();
+            let mut bytes = Vec::new();
+            prepared
+                .snapshot
+                .write(&mut bytes, format, &super::AtomicUsize::new(0))
+                .unwrap();
+            let text = String::from_utf8(bytes).unwrap();
+            assert_eq!(text, prepared.preview);
+            for secret in [
+                "fixture-secret-command",
+                "fixture-secret-output",
+                "fixture-directory",
+            ] {
+                assert!(!text.contains(secret), "{secret}");
+            }
+            assert!(text.contains("safe error"));
+            if format == SessionExportFormat::Json {
+                let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(json["export_metadata"]["privacy"], "redacted");
+                assert_eq!(json["export_metadata"]["omitted_records"], 1);
+                assert_eq!(json["export_metadata"]["truncated_output_records"], 1);
+                assert_eq!(json["records"].as_array().unwrap().len(), 1);
+            }
+        }
+        let snapshot = SessionExportSnapshot::capture_selected(
+            &BackendRecords::Metadata(store.borrow()),
+            &ExportSelection::All,
+            true,
+        )
+        .unwrap();
+        let original = snapshot
+            .prepare(ExportPrivacy::Original, SessionExportFormat::Json)
+            .unwrap();
+        assert!(original.preview.contains("fixture-secret-command"));
+        assert!(original.preview.contains("fixture-secret-output"));
+        assert!(original.preview.contains("fixture-directory"));
+        assert_eq!(
+            before,
+            records_json(&BackendRecords::Metadata(store.borrow()))
+        );
+    }
+
+    #[test]
+    fn filtered_capture_budget_counts_only_selected_records_and_authoritative_time() {
+        use super::{ExportSelection, SessionExportSnapshot};
+        let mut store = UnifiedZoneStore::new();
+        store.records.push_back(metadata_record(1));
+        let mut large = metadata_record(2);
+        large.cmd = "x".repeat(super::MAX_EXPORT_BYTES);
+        store.records.push_back(large);
+        let mut unknown = metadata_record(3);
+        unknown.completion_provenance = crate::block_view::CompletionProvenance::BoundaryInferred;
+        store.records.push_back(unknown);
+        let store = RefCell::new(store);
+        let records = BackendRecords::Metadata(store.borrow());
+        assert!(SessionExportSnapshot::capture(&records).is_err());
+        let selected = SessionExportSnapshot::capture_selected(
+            &records,
+            &ExportSelection::Ids { ids: vec![1] },
+            true,
+        )
+        .unwrap();
+        assert_eq!(selected.0.len(), 1);
+        drop(records);
+        store.borrow_mut().records.remove(1);
+        let selected = SessionExportSnapshot::capture_selected(
+            &BackendRecords::Metadata(store.borrow()),
+            &ExportSelection::TimeRange {
+                start_ms: 10,
+                end_ms: 10,
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(selected.0.len(), 1);
+        assert_eq!(selected.1.unwrap().omitted_records, 1);
+    }
+
+    #[test]
+    fn block_preview_redacts_every_text_field_and_marks_capture_loss() {
+        use super::{ExportPrivacy, ExportSelection, SessionExportSnapshot};
+        let block: crate::block_view::BlockData = serde_json::from_value(serde_json::json!({
+            "id": 1, "prompt": "SECRET=fixture-prompt", "cmd": "TOKEN=fixture-command", "cmd_markup": "password=fixture-markup",
+            "output": "api_key=fixture-output", "exit_code": 1, "estimated_height": 20, "line_count": 1,
+            "cwd": "/fixture-directory", "command_truncated":true,"output_head_dropped":true
+        })).unwrap();
+        let blocks = RefCell::new(std::collections::VecDeque::from([block]));
+        let before = records_json(&BackendRecords::Blocks(blocks.borrow()));
+        for format in [SessionExportFormat::Json, SessionExportFormat::Markdown] {
+            let prepared = SessionExportSnapshot::capture_selected(
+                &BackendRecords::Blocks(blocks.borrow()),
+                &ExportSelection::All,
+                true,
+            )
+            .unwrap()
+            .prepare(ExportPrivacy::Redacted, format)
+            .unwrap();
+            for secret in [
+                "fixture-prompt",
+                "fixture-command",
+                "fixture-markup",
+                "fixture-output",
+                "fixture-directory",
+            ] {
+                assert!(!prepared.preview.contains(secret));
+            }
+            assert!(prepared.preview.contains("truncated_command_records"));
+            assert!(prepared.preview.contains("truncated_output_records"));
+        }
+        assert_eq!(
+            before,
+            records_json(&BackendRecords::Blocks(blocks.borrow()))
+        );
+    }
+
+    #[test]
+    fn preview_cap_is_explicit_and_saved_output_stays_complete() {
+        use super::{ExportPrivacy, ExportSelection, SessionExportSnapshot};
+        let mut store = UnifiedZoneStore::new();
+        let mut record = metadata_record(1);
+        record.cmd = "界".repeat(40_000);
+        store.records.push_back(record);
+        let store = RefCell::new(store);
+        let snapshot = SessionExportSnapshot::capture_selected(
+            &BackendRecords::Metadata(store.borrow()),
+            &ExportSelection::All,
+            true,
+        )
+        .unwrap();
+        let prepared = snapshot
+            .prepare(ExportPrivacy::Original, SessionExportFormat::Json)
+            .unwrap();
+        assert!(prepared.preview.contains("[PREVIEW TRUNCATED"));
+        assert!(prepared.preview.len() < 66_000);
+        let mut bytes = Vec::new();
+        prepared
+            .snapshot
+            .write(
+                &mut bytes,
+                SessionExportFormat::Json,
+                &super::AtomicUsize::new(0),
+            )
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json["records"][0]["cmd"].as_str().unwrap().chars().count(),
+            40_000
+        );
+        assert_eq!(json["export_metadata"]["unavailable_output_records"], 1);
+    }
 
     fn assert_snapshot_parity(records: &BackendRecords<'_>) {
         let snapshot = super::SessionExportSnapshot::capture(records).unwrap();
