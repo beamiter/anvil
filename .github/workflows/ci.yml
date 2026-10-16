@@ -71,6 +71,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Check Bash integration locale and Unicode editing
+        run: python3 scripts/test-bash-integration-locale.py
+
       - name: Check Files follow ownership
         run: python3 scripts/test-files-follow.py
 
