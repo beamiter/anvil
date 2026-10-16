@@ -31,7 +31,7 @@ export XDG_STATE_HOME="${test_xdg_root}/state"
 export XDG_CACHE_HOME="${test_xdg_root}/cache"
 export XDG_RUNTIME_DIR="${test_xdg_root}/runtime"
 
-for command in dbus-run-session xvfb-run; do
+for command in dbus-run-session xvfb-run xdotool; do
     if ! command -v "${command}" >/dev/null 2>&1; then
         printf 'Error: %s is required for display-backed tests.\n' "${command}" >&2
         exit 1
@@ -53,6 +53,8 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::incremental_find_tests::block_native_find_controls_keep_query_selection_and_tab_focus
+    block_view::incremental_find_tests::chat_native_find_controls_keep_query_selection_and_tab_focus
     block_view::readline_preservation_tests::search_and_native_split_preserve_readline_draft_cursor_and_undo
     agent_task_ui::feedback_tests::task_feedback_keeps_input_draft_and_focus
     block_view::ime_gate::tests::preedit_lifecycle_tracks_each_live_context_without_text

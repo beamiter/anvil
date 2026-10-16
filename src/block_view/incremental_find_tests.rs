@@ -1059,3 +1059,312 @@ fn block_large_replay_preserves_narrowed_native_cursor() {
 fn chat_large_replay_preserves_narrowed_native_cursor() {
     large_replay_preserves_narrowed_native_cursor(crate::config::TerminalMode::Chat);
 }
+
+// Native controls around the real TermView backend. This deliberately does not
+// call Fixture::step (which refocuses the query before each navigation), and it
+// does not claim to exercise the application's top-level dispatcher.
+fn native_find_controls_preserve_query(mode: crate::config::TerminalMode) {
+    use std::process::Command;
+    fn input(args: &[&str]) {
+        let result = Command::new("xdotool").args(args).output().unwrap();
+        assert!(result.status.success(), "xdotool {args:?}: {:?}", result);
+        settle();
+    }
+    fn owns(window: &gtk::Window, widget: &impl IsA<gtk::Widget>) -> bool {
+        gtk::prelude::RootExt::focus(window)
+            .is_some_and(|focus| focus == *widget.as_ref() || focus.is_ancestor(widget))
+    }
+    fn click(window: &gtk::Window, id: &str, widget: &impl IsA<gtk::Widget>) {
+        let widget = widget.as_ref();
+        let point = widget
+            .compute_point(
+                window,
+                &gtk::graphene::Point::new(
+                    widget.width() as f32 / 2.0,
+                    widget.height() as f32 / 2.0,
+                ),
+            )
+            .expect("mapped native control coordinates");
+        input(&[
+            "mousemove",
+            "--window",
+            id,
+            &point.x().round().to_string(),
+            &point.y().round().to_string(),
+        ]);
+        input(&["mousedown", "1"]);
+        // Separate native press/release across multiple frame/debounce turns.
+        settle();
+        input(&["mouseup", "1"]);
+    }
+    let fixture = Rc::new(Fixture::new(mode));
+    let bar = fixture
+        .query
+        .ancestor(gtk::SearchBar::static_type())
+        .unwrap()
+        .downcast::<gtk::SearchBar>()
+        .unwrap();
+    bar.set_child(None::<&gtk::Widget>);
+    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    controls.append(&fixture.query);
+    fixture.query.set_hexpand(true);
+    let previous = gtk::Button::with_label("Previous");
+    let next = gtk::Button::with_label("Next");
+    previous.set_focus_on_click(false);
+    next.set_focus_on_click(false);
+    let case = gtk::ToggleButton::with_label("Aa");
+    case.set_focus_on_click(false);
+    controls.append(&case);
+    controls.append(&previous);
+    controls.append(&next);
+    let weak = Rc::downgrade(&fixture);
+    case.connect_toggled(move |button| {
+        let fixture = weak.upgrade().unwrap();
+        let result = fixture
+            .view
+            .find_in_blocks("needle", false, button.is_active());
+        assert!(
+            matches!(result, find::FindSearchResult::Matches(_)),
+            "{result:?}"
+        );
+    });
+    let outside = gtk::Entry::new();
+    outside.set_placeholder_text(Some("Independent focus owner"));
+    controls.append(&outside);
+    bar.set_child(Some(&controls));
+    bar.connect_entry(&fixture.query);
+    let activations = Rc::new(Cell::new(0usize));
+    let last_current = Rc::new(Cell::new(0usize));
+    for (button, forward) in [(&next, true), (&previous, false)] {
+        let weak = Rc::downgrade(&fixture);
+        let activations = activations.clone();
+        let last_current = last_current.clone();
+        button.connect_clicked(move |_| {
+            let fixture = weak.upgrade().unwrap();
+            let result = if forward {
+                fixture.view.find_next()
+            } else {
+                fixture.view.find_prev()
+            };
+            assert!(
+                matches!(result, find::FindNavigationResult::Progress(_)),
+                "{result:?}"
+            );
+            if let find::FindNavigationResult::Progress(value) = result {
+                last_current.set(value.current);
+            }
+            activations.set(activations.get() + 1);
+        });
+    }
+    let weak = Rc::downgrade(&fixture);
+    let key_activations = activations.clone();
+    let key_current = last_current.clone();
+    fixture.query.connect_activate(move |_| {
+        let fixture = weak.upgrade().unwrap();
+        let result = fixture.view.find_next();
+        assert!(
+            matches!(result, find::FindNavigationResult::Progress(_)),
+            "{result:?}"
+        );
+        if let find::FindNavigationResult::Progress(value) = result {
+            key_current.set(value.current);
+        }
+        key_activations.set(key_activations.get() + 1);
+    });
+    let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let weak = Rc::downgrade(&fixture);
+    let key_activations = activations.clone();
+    let key_current = last_current.clone();
+    controller.connect_key_pressed(move |_, key, _, state| {
+        if matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
+            && state.contains(gtk::gdk::ModifierType::SHIFT_MASK)
+        {
+            let fixture = weak.upgrade().unwrap();
+            let result = fixture.view.find_prev();
+            assert!(
+                matches!(result, find::FindNavigationResult::Progress(_)),
+                "{result:?}"
+            );
+            if let find::FindNavigationResult::Progress(value) = result {
+                key_current.set(value.current);
+            }
+            key_activations.set(key_activations.get() + 1);
+            gtk::glib::Propagation::Stop
+        } else {
+            gtk::glib::Propagation::Proceed
+        }
+    });
+    fixture.query.add_controller(controller);
+    let title = format!("native-find-controls-{}", std::process::id());
+    fixture.window.set_title(Some(&title));
+    settle();
+    let result = Command::new("xdotool")
+        .args(["search", "--name", &title])
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    let id = String::from_utf8(result.stdout)
+        .unwrap()
+        .lines()
+        .last()
+        .unwrap()
+        .to_owned();
+    input(&["windowfocus", "--sync", &id]);
+    assert!(matches!(
+        fixture.search("needle", false),
+        find::FindSearchResult::Matches(_)
+    ));
+    settle();
+    fixture.query.select_region(2, 5);
+    let selection = fixture.query.selection_bounds();
+    let caret = fixture.query.position();
+    assert_eq!(selection, Some((2, 5)));
+    let unchanged = || {
+        assert_eq!(fixture.query.text().as_str(), "needle");
+        assert_eq!(
+            fixture.query.selection_bounds(),
+            selection,
+            "query selection changed"
+        );
+        assert_eq!(fixture.query.position(), caret, "query caret changed");
+    };
+    let activated = |count, current| {
+        wait_until(
+            || activations.get() >= count,
+            "native find activation must complete",
+        );
+        assert_eq!(
+            activations.get(),
+            count,
+            "one action must navigate exactly once"
+        );
+        assert_eq!(
+            last_current.get(),
+            current,
+            "native action must navigate in the requested direction"
+        );
+    };
+    // Search starts at command A; Next must reveal the still-folded output B.
+    assert!(fixture
+        .view
+        .finished_blocks
+        .borrow()
+        .iter()
+        .find(|card| card.id == 2)
+        .unwrap()
+        .is_output_collapsed());
+    click(&fixture.window, &id, &next);
+    activated(1, 2);
+    fixture.assert_match(2, true, "needle");
+    unchanged();
+    assert!(!fixture
+        .view
+        .finished_blocks
+        .borrow()
+        .iter()
+        .find(|card| card.id == 2)
+        .unwrap()
+        .is_output_collapsed());
+    click(&fixture.window, &id, &previous);
+    activated(2, 1);
+    fixture.assert_match(1, false, "needle");
+    unchanged();
+    click(&fixture.window, &id, &case);
+    wait_until(|| case.is_active(), "pointer case toggle must complete");
+    assert!(case.is_active());
+    fixture.assert_ownership();
+    unchanged();
+    input(&["key", "Return"]);
+    activated(3, 2);
+    fixture.assert_match(2, true, "needle");
+    unchanged();
+    input(&["key", "shift+Return"]);
+    activated(4, 1);
+    fixture.assert_match(1, false, "needle");
+    unchanged();
+    input(&["key", "Tab"]);
+    wait_until(
+        || owns(&fixture.window, &case),
+        "native focus must reach case",
+    );
+    assert!(owns(&fixture.window, &case));
+    input(&["key", "space"]);
+    wait_until(|| !case.is_active(), "keyboard case toggle must complete");
+    assert!(!case.is_active());
+    wait_until(
+        || owns(&fixture.window, &case),
+        "native focus must reach case",
+    );
+    assert!(owns(&fixture.window, &case));
+    unchanged();
+    // An ordinary Tab must leave the entry. Space activates the focused native
+    // button and must not be redirected into the query or steal focus back.
+    input(&["key", "Tab"]);
+    wait_until(
+        || owns(&fixture.window, &previous),
+        "native focus must reach previous",
+    );
+    assert!(owns(&fixture.window, &previous), "Tab must focus Previous");
+    input(&["key", "space"]);
+    activated(5, 5);
+    wait_until(
+        || owns(&fixture.window, &previous),
+        "native focus must reach previous",
+    );
+    assert!(owns(&fixture.window, &previous));
+    unchanged();
+    input(&["key", "Tab"]);
+    wait_until(
+        || owns(&fixture.window, &next),
+        "native focus must reach next",
+    );
+    assert!(owns(&fixture.window, &next), "Tab must focus Next");
+    input(&["key", "space"]);
+    activated(6, 1);
+    wait_until(
+        || owns(&fixture.window, &next),
+        "native focus must reach next",
+    );
+    assert!(owns(&fixture.window, &next));
+    unchanged();
+    input(&["key", "Tab"]);
+    wait_until(
+        || owns(&fixture.window, &outside),
+        "native Tab must reach outside editor",
+    );
+    assert!(
+        owns(&fixture.window, &outside),
+        "Tab must reach outside editor"
+    );
+    input(&["type", "outside"]);
+    wait_until(
+        || outside.text().as_str() == "outside",
+        "typing must reach outside editor",
+    );
+    assert_eq!(outside.text().as_str(), "outside");
+    unchanged();
+    // A later pointer navigation may update the match, but must not undo the
+    // user's deliberate move to an unrelated editable widget.
+    click(&fixture.window, &id, &next);
+    wait_until(
+        || owns(&fixture.window, &outside),
+        "native focus must reach outside",
+    );
+    assert!(owns(&fixture.window, &outside));
+    activated(7, 2);
+    unchanged();
+    fixture.window.close();
+}
+
+#[test]
+#[ignore = "requires isolated X11 DISPLAY and xdotool"]
+fn block_native_find_controls_keep_query_selection_and_tab_focus() {
+    native_find_controls_preserve_query(crate::config::TerminalMode::Block);
+}
+
+#[test]
+#[ignore = "requires isolated X11 DISPLAY and xdotool"]
+fn chat_native_find_controls_keep_query_selection_and_tab_focus() {
+    native_find_controls_preserve_query(crate::config::TerminalMode::Chat);
+}
