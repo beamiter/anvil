@@ -46,23 +46,25 @@ fn text(view: &gtk::TextView) -> String {
 
 fn fixture() -> TasksPanelSync {
     let mut sync = super::tests::dashboard_test_sync();
-    let mut snapshot = crate::agent_task::CodexAppServerViewSnapshot::default();
-    snapshot.displayed_turn_ordinal = Some(4);
-    snapshot.agent_text = "CURRENT PROGRESS".into();
-    snapshot.last_error = Some(format!("LATEST ERROR {}", "x".repeat(100_000)));
-    snapshot.turn_history = (1..=3)
-        .map(|ordinal| crate::agent_task::CodexAppServerTurnHistory {
-            ordinal,
-            local_turn_id: crate::agent_task::AgentTurnId::new(),
-            follow_up_feedback: None,
-            agent_text: format!("HISTORY-{ordinal} {}", "界\u{1b}\u{202e}".repeat(20_000)),
-            agent_text_truncated: true,
-            commands: Vec::new(),
-            file_changes: Vec::new(),
-            dropped_updates: 0,
-        })
-        .collect::<Vec<_>>()
-        .into();
+    let snapshot = crate::agent_task::CodexAppServerViewSnapshot {
+        displayed_turn_ordinal: Some(4),
+        agent_text: "CURRENT PROGRESS".into(),
+        last_error: Some(format!("LATEST ERROR {}", "x".repeat(100_000))),
+        turn_history: (1..=3)
+            .map(|ordinal| crate::agent_task::CodexAppServerTurnHistory {
+                ordinal,
+                local_turn_id: crate::agent_task::AgentTurnId::new(),
+                follow_up_feedback: None,
+                agent_text: format!("HISTORY-{ordinal} {}", "界\u{1b}\u{202e}".repeat(20_000)),
+                agent_text_truncated: true,
+                commands: Vec::new(),
+                file_changes: Vec::new(),
+                dropped_updates: 0,
+            })
+            .collect::<Vec<_>>()
+            .into(),
+        ..Default::default()
+    };
     sync.detail.as_mut().unwrap().stream = Some(Box::new(snapshot));
     sync
 }
