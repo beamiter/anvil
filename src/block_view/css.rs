@@ -97,14 +97,14 @@ impl GitBranchCache {
 }
 
 /// Vertical chrome the `.block-active` holder adds around the live VTE:
-/// 4px top margin + 4px bottom margin + 3px top padding + 3px bottom padding
-/// = 14px. The top/bottom borders became `outline`, which does not take part in
+/// 2px top margin + 2px bottom margin + 3px top padding + 3px bottom padding
+/// = 10px. The top/bottom borders became `outline`, which does not take part in
 /// layout, and the 1px each used to contribute moved into the padding.
 ///
 /// Used by the live-surface layout to subtract chrome from the visible page
 /// before computing how many VTE rows fit. Keep both values in sync with the
 /// normal and `.block-active.block-compact` rules below.
-pub(crate) const BLOCK_ACTIVE_VCHROME_PX: i32 = 14;
+pub(crate) const BLOCK_ACTIVE_VCHROME_PX: i32 = 10;
 /// Compact mode: 1px top/bottom margin + 1px top/bottom padding (the border
 /// that used to supply those pixels is now a layout-free `outline`).
 pub(crate) const BLOCK_ACTIVE_COMPACT_VCHROME_PX: i32 = 4;
@@ -875,7 +875,7 @@ fn block_css(config: &Config) -> String {
             outline-color: rgba({acc_r},{acc_g},{acc_b},0.32);
             outline-offset: -1px;
             border-radius: 10px;
-            margin: 4px 8px;
+            margin: 2px 8px;
             padding: 3px 1px 3px 0;
             background-color: {bg_hex};
             box-shadow: 0 2px 8px rgba(0,0,0,0.18);
@@ -1457,6 +1457,18 @@ mod tests {
             assert!(rule_body(&css, ".block-prompt").contains(expected));
             assert!(crate::font::window_font_css(&config).contains(expected));
         }
+    }
+
+    #[test]
+    fn active_card_seams_and_height_budget_match_finished_cards() {
+        let css = block_css(&crate::config::Config::safe_defaults());
+        let normal = rule_body(&css, ".block-active");
+        let compact = rule_body(&css, ".block-active.block-compact");
+        assert!(normal.contains("margin: 2px 8px;"));
+        assert!(compact.contains("margin: 1px 4px;"));
+        assert!(normal.contains("padding: 3px 1px 3px 0;"));
+        assert_eq!(super::BLOCK_ACTIVE_VCHROME_PX, 2 * 2 + 2 * 3);
+        assert_eq!(super::BLOCK_ACTIVE_COMPACT_VCHROME_PX, 2 + 2);
     }
 
     fn rule_body<'a>(css: &'a str, selector: &str) -> &'a str {

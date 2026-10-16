@@ -2072,6 +2072,7 @@ mod tests {
             block.header_row.margin_top(),
         );
         assert!(!block.widget().has_css_class("block-compact"));
+        assert_eq!(roomy.0 + block.widget().margin_bottom(), 4);
 
         // Virtualize before switching: the explicit height request and its
         // parallel BlockData model used to stay at roomy density forever.
@@ -2079,7 +2080,7 @@ mod tests {
         let mut block_data = VecDeque::from([finished_block(Some(0))]);
         block_data[0].estimated_height = roomy_placeholder;
         apply_finished_card_density(std::slice::from_ref(&block), &mut block_data, true);
-        let compact_placeholder = roomy_placeholder - 13;
+        let compact_placeholder = roomy_placeholder - 9;
         assert_eq!(block_data[0].estimated_height, compact_placeholder);
         assert_eq!(block.widget().height_request(), compact_placeholder);
         let compact = (
@@ -2089,6 +2090,7 @@ mod tests {
             block.header_row.margin_top(),
         );
         assert!(block.widget().has_css_class("block-compact"));
+        assert_eq!(compact.0 + block.widget().margin_bottom(), 2);
         assert!(
             compact.0 < roomy.0
                 && compact.1 < roomy.1
@@ -2169,7 +2171,7 @@ mod tests {
                 false
             ));
             assert!(!assistant.has_css_class("block-compact"));
-            assert_eq!(assistant.margin_top(), 4);
+            assert_eq!(assistant.margin_top(), 2);
             assert_eq!(header.margin_start(), 12);
             assert_eq!(header.margin_top(), 6);
             assert_eq!(body.margin_start(), 12);
@@ -3454,10 +3456,10 @@ pub(crate) fn estimated_cell_height_px(config: &Config) -> i32 {
         .max(1.0) as i32
 }
 
-// Non-terminal vertical chrome in a finished card. Roomy cards spend 34px in
-// margins/header/border/padding. Compact removes 6px of outer margins, 4px of
-// header margins and 3px of bottom CSS padding, for an exact 13px reduction.
-const FINISHED_CARD_ROOMY_VCHROME_PX: i32 = 34;
+// Non-terminal vertical chrome in a finished card. Roomy cards spend 30px in
+// margins/header/border/padding. Compact removes 2px of outer margins, 4px of
+// header margins and 3px of bottom CSS padding, for an exact 9px reduction.
+const FINISHED_CARD_ROOMY_VCHROME_PX: i32 = 30;
 const FINISHED_CARD_COMPACT_VCHROME_PX: i32 = 21;
 // Capsule 20px padding + 10px gap, result 20px padding. Added exactly once
 // in both initial estimates and viewport refits; density keeps its old delta.
@@ -3612,8 +3614,9 @@ fn apply_card_density(outer: &gtk::Box, compact: bool) {
         outer.set_margin_end(4);
     } else {
         outer.remove_css_class("block-compact");
-        outer.set_margin_top(4);
-        outer.set_margin_bottom(4);
+        // Match the native renderers: two 2px edges form a 4px seam.
+        outer.set_margin_top(2);
+        outer.set_margin_bottom(2);
         outer.set_margin_start(8);
         outer.set_margin_end(8);
     }
