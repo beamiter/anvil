@@ -38,7 +38,7 @@ pub(crate) fn execution_limitation(
     foreground_known: bool,
     integration_verified: bool,
 ) -> Option<AgentExecutionLimitation> {
-    launch.or_else(|| {
+    launch.or({
         if !foreground_known {
             Some(AgentExecutionLimitation::ForegroundUnknown)
         } else if !integration_verified {
