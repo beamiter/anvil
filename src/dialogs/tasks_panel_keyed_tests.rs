@@ -160,6 +160,42 @@ fn keyed_rows_update_only_changed_widgets_and_prune_archives() {
 
 #[test]
 #[ignore = "requires a native GTK display"]
+fn keyed_selected_row_survives_move_hide_and_reveal() {
+    gtk::init().expect("GTK display");
+    let (controller, actions) = panel();
+    let mut sync = fixture(2);
+    let selected = sync.selected.unwrap();
+    set_sync(&controller, sync.clone());
+    let list = controller.widgets().task_list.clone();
+    let row = controller.model().row_widgets[&selected].row.clone();
+    assert_eq!(list.selected_row(), Some(row.clone()));
+    assert!(row.is_selected());
+    // The selected row itself moves, unlike shifting its index by moving a
+    // different row. No window/focus side effect can repair selection here.
+    rotate_order(&mut sync, 1);
+    set_sync(&controller, sync.clone());
+    assert_eq!(row.index(), 0);
+    assert_eq!(list.selected_row(), Some(row.clone()));
+    assert!(row.is_selected());
+    controller.emit(TasksPanelMsg::DashboardQuery("Task 0".into()));
+    drain();
+    assert!(row.parent().is_none());
+    assert!(
+        !row.is_selected(),
+        "cached hidden row must not retain GTK selection"
+    );
+    assert!(list.selected_row().is_none());
+    assert_eq!(controller.model().sync.selected, Some(selected));
+    controller.emit(TasksPanelMsg::ClearDashboardFilters);
+    drain();
+    assert_eq!(controller.model().row_widgets[&selected].row, row);
+    assert_eq!(list.selected_row(), Some(row.clone()));
+    assert!(row.is_selected());
+    assert!(actions.borrow().is_empty());
+}
+
+#[test]
+#[ignore = "requires a native GTK display"]
 fn keyed_selection_guard_survives_synchronous_callbacks() {
     gtk::init().expect("GTK display");
     let (controller, actions) = panel();

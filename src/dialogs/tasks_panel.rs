@@ -238,6 +238,16 @@ impl TaskRowWidgets {
     }
 }
 
+/// GTK retains the selected bit on a detached row even after clearing the
+/// ListBox's selected-row pointer. Clear it while attached so reinserting the
+/// same widget can select it again. Caller holds the selection signal guard.
+fn detach_task_row(list: &gtk::ListBox, row: &gtk::ListBoxRow) {
+    if row.is_selected() {
+        list.unselect_row(row);
+    }
+    list.remove(row);
+}
+
 /// Restores the previous guard even if GTK synchronously calls user handlers.
 struct SelectionGuard {
     flag: Rc<Cell<bool>>,
@@ -371,7 +381,7 @@ impl TasksPanelModel {
             for old in &self.rendered_rows {
                 if !visible.contains(&old.id) {
                     if let Some(row) = self.row_widgets.get(&old.id) {
-                        widgets.task_list.remove(&row.row);
+                        detach_task_row(&widgets.task_list, &row.row);
                     }
                 }
             }
@@ -379,7 +389,7 @@ impl TasksPanelModel {
                 let row = &self.row_widgets[id].row;
                 if widgets.task_list.row_at_index(index as i32).as_ref() != Some(row) {
                     if row.parent().is_some() {
-                        widgets.task_list.remove(row);
+                        detach_task_row(&widgets.task_list, row);
                     }
                     widgets.task_list.insert(row, index as i32);
                 }
@@ -388,9 +398,13 @@ impl TasksPanelModel {
         // Prune even when only a hidden/archived task changed.
         self.row_widgets.retain(|id, _| live.contains(id));
         if plan.apply_selection {
-            let row = plan
-                .select_index
-                .and_then(|i| widgets.task_list.row_at_index(i as i32));
+            // Resolve the final widget by stable identity after all moves.
+            let row = self
+                .sync
+                .selected
+                .filter(|_| plan.select_index.is_some())
+                .and_then(|id| self.row_widgets.get(&id))
+                .map(|widgets| widgets.row.clone());
             if widgets.task_list.selected_row() != row {
                 widgets.task_list.select_row(row.as_ref());
             }
