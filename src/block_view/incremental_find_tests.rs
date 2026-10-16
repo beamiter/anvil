@@ -4,22 +4,107 @@ use std::time::{Duration, Instant};
 
 const CARD_COUNT: u64 = 12;
 
+// A continuously ready GLib source must not hide the caller's deadline.
+fn dispatch_until(mut before_deadline: impl FnMut() -> bool, mut dispatch: impl FnMut() -> bool) {
+    while before_deadline() && dispatch() {}
+}
+
+fn wait_until_with(
+    mut ready: impl FnMut() -> bool,
+    mut before_deadline: impl FnMut() -> bool,
+    mut settle: impl FnMut(),
+    message: &str,
+) {
+    while !ready() {
+        assert!(before_deadline(), "{message}");
+        settle();
+    }
+    settle();
+}
+
 fn settle() {
     let context = gtk::glib::MainContext::default();
     let start = Instant::now();
     while start.elapsed() < Duration::from_millis(250) {
-        while context.iteration(false) {}
+        dispatch_until(
+            || start.elapsed() < Duration::from_millis(250),
+            || context.iteration(false),
+        );
         std::thread::sleep(Duration::from_millis(2));
     }
 }
 
-fn wait_until(mut ready: impl FnMut() -> bool, message: &str) {
+fn wait_until(ready: impl FnMut() -> bool, message: &str) {
     let deadline = Instant::now() + Duration::from_secs(3);
-    while !ready() {
-        assert!(Instant::now() < deadline, "{message}");
-        settle();
-    }
-    settle();
+    wait_until_with(ready, || Instant::now() < deadline, settle, message);
+}
+
+#[test]
+fn always_ready_dispatch_returns_at_deadline_without_claiming_quiescence() {
+    let tick = std::cell::Cell::new(0);
+    dispatch_until(
+        || tick.get() < 250,
+        || {
+            tick.set(tick.get() + 1);
+            true
+        },
+    );
+    assert_eq!(tick.get(), 250);
+    // The source remains ready; a subsequent bounded drain still does work.
+    dispatch_until(
+        || tick.get() < 500,
+        || {
+            tick.set(tick.get() + 1);
+            true
+        },
+    );
+    assert_eq!(tick.get(), 500);
+}
+
+#[test]
+#[should_panic(expected = "readiness deadline remains enforced")]
+fn always_ready_dispatch_does_not_hide_readiness_timeout() {
+    let tick = std::cell::Cell::new(0);
+    wait_until_with(
+        || false,
+        || tick.get() < 3000,
+        || {
+            let end = tick.get() + 250;
+            dispatch_until(
+                || tick.get() < end,
+                || {
+                    tick.set(tick.get() + 1);
+                    true
+                },
+            );
+        },
+        "readiness deadline remains enforced",
+    );
+}
+
+#[test]
+fn bounded_dispatch_stops_when_idle_and_readiness_still_settles() {
+    let calls = std::cell::Cell::new(0);
+    dispatch_until(
+        || true,
+        || {
+            calls.set(calls.get() + 1);
+            false
+        },
+    );
+    assert_eq!(calls.get(), 1);
+    let settles = std::cell::Cell::new(0);
+    wait_until_with(
+        || settles.get() == 1,
+        || true,
+        || settles.set(settles.get() + 1),
+        "ready",
+    );
+    assert_eq!(
+        settles.get(),
+        2,
+        "successful readiness keeps the final settle"
+    );
 }
 
 fn find_search_entry(widget: &gtk::Widget) -> Option<gtk::SearchEntry> {
