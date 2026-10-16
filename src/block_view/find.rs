@@ -2721,6 +2721,7 @@ pub(super) fn clear_find_state(
 
 #[cfg(test)]
 mod tests {
+    use super::metadata_filter_line;
     #[test]
     fn an_alternate_screen_app_scopes_find_to_the_live_screen() {
         use super::{find_scope, FindScope};
