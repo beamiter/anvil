@@ -309,9 +309,10 @@ fn history_corruption_and_compressed_oversize_survive_recovery_exit() {
     // One 16 MiB+1 allocation, compressed to a tiny on-disk frame. No 256 MiB
     // fixture duplication; the actual production per-frame cap is exercised.
     let compressed = zstd::encode_all(&vec![0u8; MAX_DECODED_RECORD_BYTES + 1][..], 1).unwrap();
-    let error = decode_record(&compressed, true, MAX_DECODED_RECORD_BYTES)
-        .err()
-        .expect("oversized expansion must be rejected");
+    let error = match decode_record(&compressed, true, MAX_DECODED_RECORD_BYTES) {
+        Err(error) => error,
+        Ok(_) => panic!("oversized expansion must be rejected"),
+    };
     assert!(
         error.to_string().contains("expands beyond"),
         "wrong rejection: {error}"
