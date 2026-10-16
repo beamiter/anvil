@@ -4841,7 +4841,7 @@ impl FinishedBlock {
         let original_preview = Rc::new(
             precomputed
                 .output_preview
-                .unwrap_or_else(|| super::fold_preview::from_plain(&strip_ansi(output))),
+                .unwrap_or_else(|| super::fold_preview::from_output(output)),
         );
         let collapsed_summary = gtk::Button::with_label(&collapsed_output_summary(
             output_rows,
@@ -5210,7 +5210,7 @@ impl FinishedBlock {
                                 if next_display.is_none() {
                                     original_preview.as_ref().clone()
                                 } else {
-                                    super::fold_preview::from_plain(&strip_ansi(shown))
+                                    super::fold_preview::from_output(shown)
                                 }
                             });
                             set_folded_summary(
