@@ -2186,7 +2186,7 @@ mod tests {
         compact.block_compact = true;
         assert_eq!(
             estimated_finished_block_height(&compact, 17),
-            estimated_finished_block_height(&roomy, 17) - 13
+            estimated_finished_block_height(&roomy, 17) - 9
         );
     }
 
@@ -2196,7 +2196,7 @@ mod tests {
             assert_eq!(
                 finished_card_refit_height(rows, 20, false)
                     - finished_card_refit_height(rows, 20, true),
-                13
+                9
             );
         }
         assert_eq!(
