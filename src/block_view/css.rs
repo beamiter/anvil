@@ -923,13 +923,13 @@ fn block_css(config: &Config) -> String {
         .chat-command-capsule {{
             margin: 0 0 10px 36px;
             padding: 10px 16px;
-            border-radius: 22px 22px 5px 22px;
+            border-radius: 18px 18px 5px 18px;
             background-color: rgba({acc_r},{acc_g},{acc_b},0.75);
         }}
         .chat-command-terminal {{ background-color: transparent; }}
         .chat-result-card {{
             padding: 8px 1px 12px 0;
-            border-radius: 6px 18px 18px 18px;
+            border-radius: 5px 16px 16px 16px;
             background-color: {block_bg_hex};
         }}
         .chat-composer {{
@@ -1442,6 +1442,19 @@ pub(crate) fn install_block_css(config: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_capsule_corners_match_native_reference_without_changing_padding() {
+        let css = block_css(&Config::safe_defaults());
+        let command = rule_body(&css, ".chat-command-capsule");
+        let result = rule_body(&css, ".chat-result-card");
+        assert!(command.contains("border-radius: 18px 18px 5px 18px;"));
+        assert!(result.contains("border-radius: 5px 16px 16px 16px;"));
+        assert!(rule_body(&css, ".chat-composer").contains("border-radius: 18px;"));
+        assert!(command.contains("padding: 10px 16px;"));
+        assert!(command.contains("margin: 0 0 10px 36px;"));
+        assert!(result.contains("padding: 8px 1px 12px 0;"));
+    }
 
     #[test]
     fn block_text_uses_the_same_fractional_size_and_units_as_window_text() {
