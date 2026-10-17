@@ -207,15 +207,65 @@ pub(crate) fn effective_font_size_css(desc: &str, scale: f64) -> String {
     format!("{}{unit}", base * scale)
 }
 
+/// Preserve Pango's point/absolute-pixel distinction during legacy migration.
+/// Converting pixels at an assumed DPI would change UI text on HiDPI desktops.
+pub(crate) fn ui_font_size_absolute(config: &Config) -> bool {
+    if config.ui_font_size.is_some() {
+        config.ui_font_size_absolute
+    } else {
+        FontDescription::from_string(&config.font_desc).is_size_absolute()
+    }
+}
+
+pub(crate) fn ui_font_size(config: &Config) -> f64 {
+    config.ui_font_size.unwrap_or_else(|| {
+        let font = FontDescription::from_string(&config.font_desc);
+        if font.size() > 0 {
+            f64::from(font.size()) / f64::from(gtk::pango::SCALE)
+        } else {
+            14.0
+        }
+    })
+}
+
+/// Resolve legacy fallbacks once before any group mutation. Every saved
+/// edited state then carries both independent effective groups across restart.
+pub(crate) fn freeze_ui_font(config: &mut Config) {
+    let absolute = ui_font_size_absolute(config);
+    let size = ui_font_size(config);
+    let scale = crate::font_groups::ui_scale(config.default_font_scale, config.ui_font_scale);
+    config.ui_font_size_absolute = absolute;
+    config.ui_font_size = Some(size);
+    config.ui_font_scale = Some(scale);
+}
+
 /// Scope display-wide CSS to this application's window. Explicit text-node
 /// rules override desktop heading/caption sizes and fixed pane-header sizes;
 /// images and decorative connection dots keep their own icon sizing.
 pub(crate) fn window_font_css(config: &Config) -> String {
     let size = effective_font_size_css(&config.font_desc, config.default_font_scale);
+    let ui_scale = crate::font_groups::ui_scale(config.default_font_scale, config.ui_font_scale);
+    let ui_size = match config.ui_font_size {
+        Some(size) => {
+            let unit = if config.ui_font_size_absolute {
+                "px"
+            } else {
+                "pt"
+            };
+            format!("{}{unit}", size * ui_scale)
+        }
+        None => effective_font_size_css(&config.font_desc, ui_scale),
+    };
     format!(
         "window.anvil-font-sync, window.anvil-font-sync label:not(.conn-dot),
          window.anvil-font-sync entry, window.anvil-font-sync text,
-         window.anvil-font-sync textview, window.anvil-font-sync treeview {{ font-size: {size}; }}"
+         window.anvil-font-sync textview, window.anvil-font-sync treeview {{ font-size: {size}; }}
+         window.anvil-font-sync .anvil-ui-font,
+         window.anvil-font-sync .anvil-ui-font label:not(.conn-dot),
+         window.anvil-font-sync .anvil-ui-font entry,
+         window.anvil-font-sync .anvil-ui-font text,
+         window.anvil-font-sync .anvil-ui-font textview,
+         window.anvil-font-sync .anvil-ui-font treeview {{ font-size: {ui_size}; }}"
     )
 }
 
@@ -281,6 +331,119 @@ pub(crate) fn menu_theme_css(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn independent_ui_size_preserves_legacy_pixel_size_and_main_edits() {
+        let mut config = Config::safe_defaults();
+        config.font_desc = "Monospace 16px".into();
+        config.default_font_scale = 1.5;
+        assert_eq!(ui_font_size(&config), 16.0);
+        assert!(ui_font_size_absolute(&config));
+        let legacy = window_font_css(&config);
+        assert!(legacy.contains("font-size: 24px"));
+        config.ui_font_size_absolute = ui_font_size_absolute(&config);
+        config.ui_font_size = Some(ui_font_size(&config));
+        config.ui_font_scale = Some(config.default_font_scale);
+        config.font_desc = "Monospace 40".into();
+        config.default_font_scale = 2.0;
+        let split = window_font_css(&config);
+        assert!(split.contains("font-size: 80pt"));
+        assert!(split.contains("font-size: 24px"));
+        for node in [
+            "label:not(.conn-dot)",
+            "entry",
+            "text",
+            "textview",
+            "treeview",
+        ] {
+            assert!(split.contains(&format!(".anvil-ui-font {node}")));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn ui_font_group_is_independent_on_live_native_widgets() {
+        use relm4::prelude::*;
+        gtk::init().unwrap();
+        crate::startup_ui::install_static_css();
+        let provider = crate::startup_ui::install_dynamic_css_provider();
+        let window = gtk::Window::new();
+        window.add_css_class("anvil-font-sync");
+        window.set_default_size(1600, 1800);
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        window.set_child(Some(&root));
+        let (_, top_scroll) = crate::startup_ui::build_tab_scrolls();
+        let top_label = gtk::Label::new(Some("Top tab"));
+        top_scroll.set_child(Some(&top_label));
+        top_scroll.set_visible(true);
+        let top = crate::top_bar::TopBarModel::builder()
+            .launch(top_scroll.clone())
+            .detach();
+        top.widget().add_css_class("anvil-ui-font");
+        root.append(top.widget());
+        let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        sidebar.add_css_class("anvil-ui-font");
+        let sidebar_label = gtk::Label::new(Some("Sidebar tab"));
+        let sidebar_button = gtk::Button::new();
+        sidebar_button.set_child(Some(&sidebar_label));
+        sidebar.append(&sidebar_button);
+        root.append(&sidebar);
+        let right_sidebar = gtk::Stack::new();
+        right_sidebar.add_css_class("anvil-ui-font");
+        let right_label = gtk::Label::new(Some("AI Chats and Tasks sidebar"));
+        right_sidebar.add_named(&right_label, Some("chats"));
+        root.append(&right_sidebar);
+        let content = gtk::Label::new(Some("Main content"));
+        let split = gtk::Label::new(Some("Second pane"));
+        root.append(&content);
+        root.append(&split);
+        let labels = [top_label, sidebar_label, right_label, content, split];
+        let mut config = Config::safe_defaults();
+        config.font_desc = "Monospace 12px".into();
+        config.ui_font_size_absolute = true;
+        config.ui_font_size = Some(12.0);
+        config.ui_font_scale = Some(1.0);
+        window.present();
+        // Legacy appearance, main-only step, UI-only step, main-only size edit.
+        for (main_size, main_scale, ui_size, ui_scale) in [
+            (12, 1.0, 12.0, 1.0),
+            (12, 1.5, 12.0, 1.0),
+            (12, 1.5, 12.0, 2.0),
+            (18, 1.5, 12.0, 2.0),
+            (12, 0.1, 12.0, 10.0),
+            (12, 10.0, 12.0, 0.1),
+        ] {
+            config.font_desc = format!("Monospace {main_size}px");
+            config.default_font_scale = main_scale;
+            config.ui_font_size = Some(ui_size);
+            config.ui_font_scale = Some(ui_scale);
+            provider.load_from_string(&crate::config_ops::dynamic_css(&config));
+            let main = gtk::glib::MainContext::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
+            while std::time::Instant::now() < deadline {
+                while main.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            for (index, label) in labels.iter().enumerate() {
+                let pixels = if index < 3 {
+                    ui_size * ui_scale
+                } else {
+                    f64::from(main_size) * main_scale
+                };
+                assert_eq!(
+                    label.pango_context().font_description().unwrap().size(),
+                    (pixels * f64::from(gtk::pango::SCALE)).round() as i32
+                );
+                assert!(
+                    label.height() >= label.layout().pixel_size().1,
+                    "mixed font limits must not clip text vertically"
+                );
+            }
+            assert!(top_scroll.height() >= labels[0].layout().pixel_size().1);
+            assert!(sidebar_button.height() >= labels[1].layout().pixel_size().1);
+        }
+        window.close();
+    }
 
     #[test]
     fn effective_size_preserves_pango_units_and_fractional_zoom() {

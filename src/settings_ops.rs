@@ -30,7 +30,11 @@ impl AppModel {
     }
 
     pub(crate) fn apply_settings_font_desc(&mut self, desc: String) {
-        self.config.borrow_mut().font_desc = desc.clone();
+        {
+            let mut config = self.config.borrow_mut();
+            font::freeze_ui_font(&mut config);
+            config.font_desc = desc.clone();
+        }
         self.sync_terminal_configs();
         for tab in &self.tabs {
             for pane in &tab.panes {
@@ -50,7 +54,11 @@ impl AppModel {
     /// touching disk. Both the settings dialog and the hotkey/Ctrl+wheel path
     /// go through here; only the write policy differs.
     pub(crate) fn stage_font_scale(&mut self, scale: f64) {
-        self.config.borrow_mut().default_font_scale = scale;
+        {
+            let mut config = self.config.borrow_mut();
+            font::freeze_ui_font(&mut config);
+            config.default_font_scale = scale;
+        }
         self.sync_terminal_configs();
         self.set_font_scale_all(scale);
         self.apply_dynamic_css();
@@ -62,6 +70,10 @@ impl AppModel {
     pub(crate) fn apply_font_scale_step(&mut self, scale: f64, sender: &ComponentSender<AppModel>) {
         self.stage_font_scale(scale);
         self.show_font_toast();
+        self.schedule_font_persist(sender);
+    }
+
+    fn schedule_font_persist(&self, sender: &ComponentSender<AppModel>) {
         let generation = self.font_persist_generation.get().wrapping_add(1);
         self.font_persist_generation.set(generation);
         let token = Rc::clone(&self.font_persist_generation);
@@ -72,6 +84,62 @@ impl AppModel {
                 sender.input(AppMsg::PersistFontScale);
             }
         });
+    }
+
+    pub(crate) fn apply_group_font_step(
+        &mut self,
+        group: font_groups::FontGroup,
+        delta: f64,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        let scale = {
+            let mut config = self.config.borrow_mut();
+            font::freeze_ui_font(&mut config);
+            let mut content = config.default_font_scale;
+            let mut ui = config.ui_font_scale;
+            let current = match group {
+                font_groups::FontGroup::Ui => font_groups::ui_scale(content, ui),
+                font_groups::FontGroup::Content => content,
+            };
+            font_groups::set_scale(&mut content, &mut ui, group, current + delta);
+            config.default_font_scale = content;
+            config.ui_font_scale = ui;
+            match group {
+                font_groups::FontGroup::Ui => ui.unwrap_or(content),
+                font_groups::FontGroup::Content => content,
+            }
+        };
+        if group == font_groups::FontGroup::Content {
+            self.sync_terminal_configs();
+            self.set_font_scale_all(scale);
+        }
+        self.apply_dynamic_css();
+        self.schedule_font_persist(sender);
+    }
+
+    pub(crate) fn apply_settings_ui_font_size(&mut self, size: f64) {
+        if !size.is_finite() {
+            return;
+        }
+        let mut config = self.config.borrow_mut();
+        font::freeze_ui_font(&mut config);
+        config.ui_font_size = Some(size.clamp(6.0, 72.0));
+        drop(config);
+        self.apply_dynamic_css();
+        self.persist_config();
+    }
+
+    pub(crate) fn apply_settings_ui_font_scale(&mut self, scale: f64) {
+        if !scale.is_finite() {
+            return;
+        }
+        {
+            let mut config = self.config.borrow_mut();
+            font::freeze_ui_font(&mut config);
+            config.ui_font_scale = Some(scale.clamp(0.1, 10.0));
+        }
+        self.apply_dynamic_css();
+        self.persist_config();
     }
 
     pub(crate) fn apply_settings_opacity(&mut self, opacity: f64) {

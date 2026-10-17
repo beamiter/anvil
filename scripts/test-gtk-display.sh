@@ -69,6 +69,7 @@ tests=(
     block_view::blocks::fold_preview_tests::folded_preview_tracks_filters_and_preserves_output
     block_view::chat::tests::live_font_updates_align_chat_block_and_window_text
     font::tests::window_text_tracks_terminal_size_on_startup_and_live_updates
+    font::tests::ui_font_group_is_independent_on_live_native_widgets
     dialogs::tasks_panel::tests::dashboard_filters_preserve_selection_without_retargeting
     dialogs::tasks_panel::tests::dashboard_search_activate_selects_current_visible_result_only
     dialogs::tasks_panel::tests::dashboard_filter_counts_follow_search_not_selected_view

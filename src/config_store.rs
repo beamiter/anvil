@@ -787,6 +787,21 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         "font_scale".into(),
         toml::Value::Float(config.default_font_scale),
     );
+    if let Some(size) = config.ui_font_size {
+        table.insert("ui_font_size".into(), toml::Value::Float(size));
+        table.insert(
+            "ui_font_size_absolute".into(),
+            toml::Value::Boolean(config.ui_font_size_absolute),
+        );
+    } else {
+        table.remove("ui_font_size");
+        table.remove("ui_font_size_absolute");
+    }
+    if let Some(scale) = config.ui_font_scale {
+        table.insert("ui_font_scale".into(), toml::Value::Float(scale));
+    } else {
+        table.remove("ui_font_scale");
+    }
     table.insert(
         "theme".into(),
         toml::Value::String(config.theme_name.clone()),
@@ -1591,6 +1606,8 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "scrollback",
         "font",
         "font_scale",
+        "ui_font_scale",
+        "ui_font_size",
         "theme",
         "colors",
         "keybindings",
@@ -1615,6 +1632,7 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "command_history_max_entries",
         "block_history_path",
         "block_history_compress",
+        "ui_font_size_absolute",
         "block_compact",
         "ascii_organism_enabled",
         "ascii_organism_motion",
@@ -1657,7 +1675,7 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         }
     }
 
-    for key in ["opacity", "font_scale"] {
+    for key in ["opacity", "font_scale", "ui_font_scale", "ui_font_size"] {
         check_type(&mut report, table, key, ExpectedType::Number);
     }
     for key in [
@@ -1701,6 +1719,7 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
     for key in [
         "command_history_enabled",
         "block_history_compress",
+        "ui_font_size_absolute",
         "block_compact",
         "allow_remote_clipboard_write",
         "sidebar_visible",
@@ -1841,6 +1860,8 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
 
     check_number_range(&mut report, table, "opacity", 0.01, 1.0);
     check_number_range(&mut report, table, "font_scale", 0.1, 10.0);
+    check_number_range(&mut report, table, "ui_font_scale", 0.1, 10.0);
+    check_number_range(&mut report, table, "ui_font_size", 0.1, 10000.0);
     check_integer_range(&mut report, table, "scrollback", 0, 1_000_000);
     check_integer_range(&mut report, table, "sidebar_width", 120, 800);
     check_integer_range(&mut report, table, "ai_panel_width", 240, 1_200);
@@ -2050,6 +2071,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn font_groups_save_and_restart_without_changing_the_other_group() {
+        use crate::font_groups::{set_scale, FontGroup};
+        for first in [FontGroup::Content, FontGroup::Ui] {
+            let dir = temporary_directory("font-groups-restart");
+            let path = dir.join("config.toml");
+            let legacy = b"font = 'Monospace 16'\nfont_scale = 1.5\n[future]\nkeep = true\n";
+            write_fixture(&path, legacy);
+            let snapshot = read_validated_snapshot(&path).unwrap();
+            let (mut config, _, _) = config::load_config_from_table(snapshot.table.as_ref());
+            assert_eq!(config.ui_font_scale, None);
+            assert_eq!(config.ui_font_size, None);
+            crate::font::freeze_ui_font(&mut config);
+            let mut content = config.default_font_scale;
+            let mut ui = config.ui_font_scale;
+            set_scale(&mut content, &mut ui, first, 2.0);
+            config.default_font_scale = content;
+            config.ui_font_scale = ui;
+            save_config_to_path(&path, &config, Some(&snapshot.revision)).unwrap();
+            let saved = read_validated_snapshot(&path).unwrap();
+            let (reloaded, _, _) = config::load_config_from_table(saved.table.as_ref());
+            let expected = if first == FontGroup::Content {
+                (2.0, Some(1.5))
+            } else {
+                (1.5, Some(2.0))
+            };
+            assert_eq!(
+                (reloaded.default_font_scale, reloaded.ui_font_scale),
+                expected
+            );
+            assert_eq!(reloaded.ui_font_size, Some(16.0));
+            assert!(!reloaded.ui_font_size_absolute);
+            let mut externally_edited = saved.table.clone().unwrap();
+            externally_edited.insert("font".into(), toml::Value::String("Monospace 36px".into()));
+            let (after_main_edit, _, _) = config::load_config_from_table(Some(&externally_edited));
+            assert_eq!(after_main_edit.ui_font_size, Some(16.0));
+            assert!(!after_main_edit.ui_font_size_absolute);
+            assert_eq!(
+                saved.table.as_ref().unwrap()["future"]["keep"].as_bool(),
+                Some(true)
+            );
+            assert_eq!(saved.validation.errors(), 0);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
     fn reload_snapshot_keeps_values_and_revision_together_after_path_changes() {
         let dir = temporary_directory("reload-snapshot");
         let path = dir.join("config.toml");
@@ -2146,6 +2213,8 @@ mod tests {
         let table = concat!(
             "opacity = nan\n",
             "font_scale = inf\n",
+            "ui_font_scale = nan\n",
+            "ui_font_size = inf\n",
             "font = 'Mono\u{202e}spoof'\n",
             "startup_commands = 'safe\u{200b}looking'\n",
         )
@@ -2153,7 +2222,7 @@ mod tests {
         .unwrap();
         let report = validate_table(Path::new("config.toml"), &table);
 
-        for key in ["opacity", "font_scale"] {
+        for key in ["opacity", "font_scale", "ui_font_scale", "ui_font_size"] {
             assert!(report.issues.iter().any(|issue| {
                 issue.key == key
                     && issue.severity == ConfigIssueSeverity::Warning

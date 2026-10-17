@@ -120,9 +120,12 @@ pub(crate) enum AppMsg {
     SettingsTheme(usize),
     SettingsFontDesc(String),
     SettingsFontScale(f64),
+    SettingsUiFontSize(f64),
+    SettingsUiFontScale(f64),
     /// Debounced write of a font scale already applied by the hotkey or
     /// Ctrl+wheel path.
     PersistFontScale,
+    GroupFontStep(crate::font_groups::FontGroup, f64),
     SettingsOpacity(f64),
     SettingsScrollback(u32),
     SettingsTerminalMode(usize),

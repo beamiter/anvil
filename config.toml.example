@@ -19,6 +19,13 @@ font = "JetBrainsMono Nerd Font Mono 14"
 # set "none" to leave those glyphs to fontconfig's own fallback.
 # icon_font = "Symbols Nerd Font Mono"
 font_scale = 1.0
+# Optional independent sidebar/top-bar size and zoom. Unset values inherit
+# the legacy font appearance until a group is changed. Ctrl+wheel over either
+# bar changes this group; over content changes font_scale.
+# ui_font_scale = 1.0
+# ui_font_size = 14.0
+# false = points, true = absolute pixels (preserved when migrating a px font).
+# ui_font_size_absolute = false
 opacity = 0.95
 scrollback = 5000
 

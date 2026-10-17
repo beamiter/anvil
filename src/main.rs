@@ -25,6 +25,7 @@ mod file_drop;
 mod file_tree;
 mod file_tree_ops;
 mod font;
+mod font_groups;
 mod git_meta_ui;
 mod history_notice;
 mod task_announcements;
@@ -964,6 +965,7 @@ impl SimpleComponent for AppModel {
         sidebar_box.set_width_request(sidebar_width);
         sidebar_box.set_hexpand(false);
         sidebar_box.add_css_class("tab-strip");
+        sidebar_box.add_css_class("anvil-ui-font");
         sidebar_box.append(toggle_row);
         sidebar_box.append(&sidebar_stack);
 
@@ -1029,9 +1031,11 @@ impl SimpleComponent for AppModel {
                 values: dialogs::settings::SettingsValues {
                     theme: current_theme,
                     font: current_font,
-                    font_size: (current_font_desc.size() as f64 / gtk::pango::SCALE as f64)
-                        .max(6.0),
+                    font_desc: config.borrow().font_desc.clone(),
+                    font_size: current_font_desc.size() as f64 / gtk::pango::SCALE as f64,
                     font_scale,
+                    ui_font_size: font::ui_font_size(&config.borrow()),
+                    ui_font_scale: font_groups::ui_scale(font_scale, config.borrow().ui_font_scale),
                     opacity: window_opacity,
                     scrollback: config.borrow().terminal_scrollback_lines as f64,
                     terminal_mode: match config.borrow().terminal_mode {
@@ -1077,6 +1081,12 @@ impl SimpleComponent for AppModel {
                 dialogs::settings::SettingsOutput::FontDesc(desc) => AppMsg::SettingsFontDesc(desc),
                 dialogs::settings::SettingsOutput::FontScale(scale) => {
                     AppMsg::SettingsFontScale(scale)
+                }
+                dialogs::settings::SettingsOutput::UiFontSize(size) => {
+                    AppMsg::SettingsUiFontSize(size)
+                }
+                dialogs::settings::SettingsOutput::UiFontScale(scale) => {
+                    AppMsg::SettingsUiFontScale(scale)
                 }
                 dialogs::settings::SettingsOutput::Opacity(opacity) => {
                     AppMsg::SettingsOpacity(opacity)
@@ -1212,6 +1222,7 @@ impl SimpleComponent for AppModel {
         // stack: the persisted width/visibility behavior stays identical for
         // AI Chats, and Tasks rides the same chrome without its own config.
         let side_stack = gtk::Stack::new();
+        side_stack.add_css_class("anvil-ui-font");
         side_stack.add_named(ai_panel.widget(), Some("chats"));
         side_stack.add_named(tasks_panel.widget(), Some("tasks"));
         side_stack.set_visible_child_name("chats");
@@ -1452,6 +1463,7 @@ impl SimpleComponent for AppModel {
         // from its buttons or the draggable tab strip.
         let top_bar = model.top_bar.widget();
         let top_bar_handle = gtk::WindowHandle::new();
+        top_bar_handle.add_css_class("anvil-ui-font");
         top_bar_handle.set_child(Some(top_bar));
         let toast_overlay = &model.toast_overlay;
         let task_feedback = &model.task_feedback;
@@ -1660,36 +1672,49 @@ impl SimpleComponent for AppModel {
         }
         root.add_controller(key_controller);
 
-        // Ctrl+wheel zooms the font. Capture phase so it wins over VTE's own
-        // scroll handling and over the block view's mouse reporting; both see
-        // the event only when Ctrl is not held.
-        let scroll_controller =
-            gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
-        scroll_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
-        {
+        // Disjoint capture roots route by GTK's actual picked widget ancestry,
+        // never keyboard focus. Stop before terminal mouse reporting/VTE zoom.
+        // Native popovers retain SameNative isolation; divider/background events
+        // outside these roots do not accidentally choose a neighboring group.
+        for (widget, group) in [
+            (
+                top_bar_handle.clone().upcast::<gtk::Widget>(),
+                font_groups::FontGroup::Ui,
+            ),
+            (
+                sidebar_box.clone().upcast::<gtk::Widget>(),
+                font_groups::FontGroup::Ui,
+            ),
+            (
+                side_stack.clone().upcast::<gtk::Widget>(),
+                font_groups::FontGroup::Ui,
+            ),
+            (
+                stack.clone().upcast::<gtk::Widget>(),
+                font_groups::FontGroup::Content,
+            ),
+        ] {
+            let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+            scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+            scroll.set_propagation_limit(gtk::PropagationLimit::SameNative);
             let zsender = sender.clone();
-            scroll_controller.connect_scroll(move |controller, _dx, dy| {
-                if !controller
+            scroll.connect_scroll(move |controller, _dx, dy| {
+                let control = controller
                     .current_event_state()
-                    .contains(gtk::gdk::ModifierType::CONTROL_MASK)
-                {
-                    return glib::Propagation::Proceed;
-                }
-                // Touchpads emit fractional deltas; a zero step would still
-                // claim the event, so let those through untouched.
-                if dy == 0.0 {
-                    return glib::Propagation::Proceed;
-                }
-                let action = if dy < 0.0 {
-                    Action::FontIncrease
+                    .contains(gtk::gdk::ModifierType::CONTROL_MASK);
+                let notches = if controller.unit() == gtk::gdk::ScrollUnit::Surface {
+                    dy / jterm_core::wheel::SURFACE_UNITS_PER_STEP
                 } else {
-                    Action::FontDecrease
+                    dy
                 };
-                zsender.input(AppMsg::Action(action));
+                let Some(delta) = font_groups::wheel_step(control, notches) else {
+                    return glib::Propagation::Proceed;
+                };
+                zsender.input(AppMsg::GroupFontStep(group, delta));
                 glib::Propagation::Stop
             });
+            widget.add_controller(scroll);
         }
-        root.add_controller(scroll_controller);
 
         // Config file hot reload is intentionally disabled in safe mode: a
         // change on disk must not re-enable startup, persistence, remote, or AI
@@ -2285,6 +2310,11 @@ impl SimpleComponent for AppModel {
             AppMsg::SettingsFontDesc(desc) => self.apply_settings_font_desc(desc),
             AppMsg::SettingsFontScale(scale) => self.apply_settings_font_scale(scale),
             AppMsg::PersistFontScale => self.persist_config(),
+            AppMsg::GroupFontStep(group, delta) => {
+                self.apply_group_font_step(group, delta, &sender)
+            }
+            AppMsg::SettingsUiFontSize(size) => self.apply_settings_ui_font_size(size),
+            AppMsg::SettingsUiFontScale(scale) => self.apply_settings_ui_font_scale(scale),
             AppMsg::SettingsOpacity(opacity) => self.apply_settings_opacity(opacity),
             AppMsg::SettingsScrollback(lines) => self.apply_settings_scrollback(lines),
             AppMsg::SettingsTerminalMode(mode) => self.apply_settings_terminal_mode(mode),

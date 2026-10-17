@@ -1826,8 +1826,11 @@ const REMOVE_REMOTE_HOST_LABEL: &str = "Remove remote host";
 pub(crate) struct SettingsValues {
     pub(crate) theme: u32,
     pub(crate) font: u32,
+    pub(crate) font_desc: String,
     pub(crate) font_size: f64,
     pub(crate) font_scale: f64,
+    pub(crate) ui_font_size: f64,
+    pub(crate) ui_font_scale: f64,
     pub(crate) opacity: f64,
     pub(crate) scrollback: f64,
     pub(crate) terminal_mode: u32,
@@ -1954,12 +1957,19 @@ pub(crate) fn font_choices(
     (available_families, selected)
 }
 
-fn font_desc_for_choice(font_names: &[String], selected: u32, size: f64) -> String {
+fn font_desc_for_choice(font_names: &[String], selected: u32, size: f64, base: &str) -> String {
     let family = font_names
         .get(selected as usize)
         .map(String::as_str)
         .unwrap_or("Monospace");
-    format!("{family} {}", size as i32)
+    let mut desc = gtk::pango::FontDescription::from_string(base);
+    desc.set_family(family);
+    if desc.is_size_absolute() {
+        desc.set_absolute_size(size * f64::from(gtk::pango::SCALE));
+    } else {
+        desc.set_size((size * f64::from(gtk::pango::SCALE)).round() as i32);
+    }
+    desc.to_string().to_string()
 }
 
 #[derive(Debug)]
@@ -1973,6 +1983,8 @@ pub(crate) enum SettingsMsg {
     Font(u32),
     FontSize(f64),
     FontScale(f64),
+    UiFontSize(f64),
+    UiFontScale(f64),
     Opacity(f64),
     Scrollback(f64),
     TerminalMode(u32),
@@ -2016,6 +2028,8 @@ pub(crate) enum SettingsOutput {
     Theme(usize),
     FontDesc(String),
     FontScale(f64),
+    UiFontSize(f64),
+    UiFontScale(f64),
     Opacity(f64),
     Scrollback(u32),
     TerminalMode(usize),
@@ -2052,6 +2066,7 @@ pub(crate) struct SettingsModel {
     font_names: Vec<String>,
     values: SettingsValues,
     organism_syncing: Rc<Cell<bool>>,
+    font_syncing: Rc<Cell<bool>>,
     remote_draft: RemoteDraft,
     /// Original immutable profile identity, separate from the editable draft.
     /// Only `None` represents an explicit Add operation.
@@ -2096,8 +2111,10 @@ impl Component for SettingsModel {
                             &model.font_names.iter().map(String::as_str).collect::<Vec<_>>()
                         )),
                         set_selected: model.values.font,
-                        connect_selected_notify[sender] => move |row| {
-                            sender.input(SettingsMsg::Font(row.selected()));
+                        connect_selected_notify[sender, syncing = model.font_syncing.clone()] => move |row| {
+                            if !syncing.get() {
+                                sender.input(SettingsMsg::Font(row.selected()));
+                            }
                         },
                     },
 
@@ -2107,11 +2124,13 @@ impl Component for SettingsModel {
                             model.values.font_size, 6.0, 72.0, 1.0, 4.0, 0.0
                         )),
                         1.0,
-                        0,
+                        3,
                     ) {
-                        set_title: "Font Size",
-                        connect_value_notify[sender] => move |row| {
-                            sender.input(SettingsMsg::FontSize(row.value()));
+                        set_title: "Content Font Size",
+                        connect_value_notify[sender, syncing = model.font_syncing.clone()] => move |row| {
+                            if !syncing.get() {
+                                sender.input(SettingsMsg::FontSize(row.value()));
+                            }
                         },
                     },
 
@@ -2123,9 +2142,37 @@ impl Component for SettingsModel {
                         0.025,
                         3,
                     ) {
-                        set_title: "Font Scale",
-                        connect_value_notify[sender] => move |row| {
-                            sender.input(SettingsMsg::FontScale(row.value()));
+                        set_title: "Content Font Scale",
+                        connect_value_notify[sender, syncing = model.font_syncing.clone()] => move |row| {
+                            if !syncing.get() {
+                                sender.input(SettingsMsg::FontScale(row.value()));
+                            }
+                        },
+                    },
+
+                    #[name(ui_font_size_row)]
+                    adw::SpinRow::new(
+                        Some(&gtk::Adjustment::new(model.values.ui_font_size, 6.0, 72.0, 1.0, 4.0, 0.0)),
+                        1.0, 2,
+                    ) {
+                        set_title: "Sidebar and Top Bar Font Size",
+                        connect_value_notify[sender, syncing = model.font_syncing.clone()] => move |row| {
+                            if !syncing.get() {
+                                sender.input(SettingsMsg::UiFontSize(row.value()));
+                            }
+                        },
+                    },
+
+                    #[name(ui_font_scale_row)]
+                    adw::SpinRow::new(
+                        Some(&gtk::Adjustment::new(model.values.ui_font_scale, 0.1, 10.0, 0.025, 0.1, 0.0)),
+                        0.025, 3,
+                    ) {
+                        set_title: "Sidebar and Top Bar Font Scale",
+                        connect_value_notify[sender, syncing = model.font_syncing.clone()] => move |row| {
+                            if !syncing.get() {
+                                sender.input(SettingsMsg::UiFontScale(row.value()));
+                            }
                         },
                     },
 
@@ -2473,6 +2520,7 @@ impl Component for SettingsModel {
             font_names: init.font_names,
             values: init.values,
             organism_syncing: Rc::new(Cell::new(false)),
+            font_syncing: Rc::new(Cell::new(false)),
             remote_draft: RemoteDraft::default(),
             remote_editing: None,
             remote_dialog: None,
@@ -2521,6 +2569,7 @@ impl Component for SettingsModel {
                 }
                 self.values = values;
                 self.font_names = font_names;
+                self.font_syncing.set(true);
                 let font_notify_guard = widgets.font_row.freeze_notify();
                 widgets.font_row.set_model(Some(&gtk::StringList::new(
                     &self
@@ -2534,6 +2583,11 @@ impl Component for SettingsModel {
                 drop(font_notify_guard);
                 widgets.font_size_row.set_value(self.values.font_size);
                 widgets.font_scale_row.set_value(self.values.font_scale);
+                widgets.ui_font_size_row.set_value(self.values.ui_font_size);
+                widgets
+                    .ui_font_scale_row
+                    .set_value(self.values.ui_font_scale);
+                self.font_syncing.set(false);
                 widgets.opacity_scale.set_value(self.values.opacity);
                 widgets.scrollback_row.set_value(self.values.scrollback);
                 widgets
@@ -2642,12 +2696,32 @@ impl Component for SettingsModel {
                 self.output_font(&sender);
             }
             SettingsMsg::FontSize(size) => {
+                if self.values.font_size == size {
+                    return;
+                }
                 self.values.font_size = size;
                 self.output_font(&sender);
             }
             SettingsMsg::FontScale(scale) => {
+                if self.values.font_scale == scale {
+                    return;
+                }
                 self.values.font_scale = scale;
                 let _ = sender.output(SettingsOutput::FontScale(scale));
+            }
+            SettingsMsg::UiFontSize(size) => {
+                if self.values.ui_font_size == size {
+                    return;
+                }
+                self.values.ui_font_size = size;
+                let _ = sender.output(SettingsOutput::UiFontSize(size));
+            }
+            SettingsMsg::UiFontScale(scale) => {
+                if self.values.ui_font_scale == scale {
+                    return;
+                }
+                self.values.ui_font_scale = scale;
+                let _ = sender.output(SettingsOutput::UiFontScale(scale));
             }
             SettingsMsg::Opacity(opacity) => {
                 self.values.opacity = opacity;
@@ -3257,6 +3331,7 @@ impl SettingsModel {
             &self.font_names,
             self.values.font,
             self.values.font_size,
+            &self.values.font_desc,
         )));
     }
 }
@@ -3344,12 +3419,27 @@ mod tests {
     }
 
     #[test]
+    fn settings_font_edits_preserve_fractional_size_units_weight_and_style() {
+        for (base, absolute) in [
+            ("Monospace Bold Italic 17px", true),
+            ("Monospace Bold Italic 13.5", false),
+        ] {
+            let result = font_desc_for_choice(&["Serif".into()], 0, 18.25, base);
+            let desc = gtk::pango::FontDescription::from_string(&result);
+            assert_eq!(desc.is_size_absolute(), absolute);
+            assert_eq!(desc.size(), (18.25 * f64::from(gtk::pango::SCALE)) as i32);
+            assert_eq!(desc.weight(), gtk::pango::Weight::Bold);
+            assert_eq!(desc.style(), gtk::pango::Style::Italic);
+        }
+    }
+
+    #[test]
     fn missing_generic_family_stays_selected_for_size_changes() {
         let (font_names, selected) = font_choices(vec!["DejaVu Sans Mono".into()], "Monospace");
 
         assert_eq!(font_names[selected as usize], "Monospace");
         assert_eq!(
-            font_desc_for_choice(&font_names, selected, 18.0),
+            font_desc_for_choice(&font_names, selected, 18.0, "Monospace 12"),
             "Monospace 18"
         );
     }
@@ -3361,7 +3451,7 @@ mod tests {
 
         assert_eq!(font_names[selected as usize], configured);
         assert_eq!(
-            font_desc_for_choice(&font_names, selected, 16.0),
+            font_desc_for_choice(&font_names, selected, 16.0, "Monospace 12"),
             "SauceCodePro Nerd Font Mono 16"
         );
     }
@@ -3416,8 +3506,11 @@ mod tests {
             values: SettingsValues {
                 theme: 0,
                 font: 0,
+                font_desc: "Monospace 12".into(),
                 font_size: 12.0,
                 font_scale: 1.0,
+                ui_font_size: 12.0,
+                ui_font_scale: 1.0,
                 opacity: 1.0,
                 scrollback: 5000.0,
                 terminal_mode: 0,
@@ -3444,6 +3537,7 @@ mod tests {
                 remote_hosts: hosts,
             },
             organism_syncing: Rc::new(Cell::new(false)),
+            font_syncing: Rc::new(Cell::new(false)),
             remote_draft: draft,
             remote_editing: editing_profile,
             remote_dialog: None,

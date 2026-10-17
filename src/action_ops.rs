@@ -345,8 +345,14 @@ impl AppModel {
                     dialogs::settings::SettingsValues {
                         theme,
                         font,
-                        font_size: (font_desc.size() as f64 / gtk::pango::SCALE as f64).max(6.0),
+                        font_desc: config.font_desc.clone(),
+                        font_size: font_desc.size() as f64 / gtk::pango::SCALE as f64,
                         font_scale: self.font_scale,
+                        ui_font_size: font::ui_font_size(&config),
+                        ui_font_scale: font_groups::ui_scale(
+                            config.default_font_scale,
+                            config.ui_font_scale,
+                        ),
                         opacity: self.window_opacity,
                         scrollback: config.terminal_scrollback_lines as f64,
                         terminal_mode: match config.terminal_mode {

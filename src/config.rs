@@ -711,6 +711,9 @@ pub struct Config {
     /// the glyphs to fontconfig's global sort.
     pub(crate) icon_font: Option<String>,
     pub(crate) default_font_scale: f64,
+    pub(crate) ui_font_scale: Option<f64>,
+    pub(crate) ui_font_size: Option<f64>,
+    pub(crate) ui_font_size_absolute: bool,
     pub(crate) theme_name: String,
     pub(crate) foreground: RGBA,
     pub(crate) background: RGBA,
@@ -846,6 +849,9 @@ impl Config {
             font_desc: DEFAULT_FONT_DESC.to_string(),
             icon_font: None,
             default_font_scale: 1.0,
+            ui_font_scale: None,
+            ui_font_size: None,
+            ui_font_size_absolute: false,
             theme_name: theme.name.clone(),
             foreground: theme.foreground,
             background: theme.background,
@@ -1292,6 +1298,9 @@ struct FileConfig {
     font: Option<String>,
     icon_font: Option<String>,
     font_scale: Option<f64>,
+    ui_font_scale: Option<f64>,
+    ui_font_size: Option<f64>,
+    ui_font_size_absolute: Option<bool>,
     theme: Option<String>,
     foreground: Option<String>,
     background: Option<String>,
@@ -1406,6 +1415,11 @@ fn file_config_from_table(table: &toml::Table) -> FileConfig {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         font_scale: config_number(table, "font_scale"),
+        ui_font_scale: config_number(table, "ui_font_scale"),
+        ui_font_size: config_number(table, "ui_font_size"),
+        ui_font_size_absolute: table
+            .get("ui_font_size_absolute")
+            .and_then(toml::Value::as_bool),
         theme: table
             .get("theme")
             .and_then(|v| v.as_str())
@@ -2149,6 +2163,15 @@ fn resolve_file_config(fc: FileConfig) -> (Config, Vec<Theme>, KeybindingMap) {
         font_desc,
         icon_font,
         default_font_scale,
+        ui_font_size_absolute: fc.ui_font_size_absolute.unwrap_or(false),
+        ui_font_size: fc
+            .ui_font_size
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.1, 10000.0)),
+        ui_font_scale: fc
+            .ui_font_scale
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.1, 10.0)),
         theme_name: theme.name.clone(),
         foreground,
         background,
