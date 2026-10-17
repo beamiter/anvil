@@ -497,6 +497,11 @@ pub(super) fn exercise_mounted_modes(
                     "unmounted, before destroying the GTK owner"
                 );
                 drop(runtime);
+                // The real Block component's shutdown calls view.kill().
+                // Rc<TermView> drop alone leaves the PTY reader's callback
+                // lists alive, including their runtime owners. Retire that
+                // transport through the same public close path first.
+                view.kill();
                 drop(view);
                 drop(root);
                 settle(Duration::from_millis(120));
@@ -520,6 +525,7 @@ pub(super) fn exercise_mounted_modes(
             let weak_view = Rc::downgrade(&view);
             mounted.remove(&root);
             assert!(!root.is_mapped());
+            view.kill();
             drop(view);
             drop(root);
             settle(Duration::from_millis(120));
