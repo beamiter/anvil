@@ -26,7 +26,7 @@ jobs:
       CARGO_BUILD_JOBS: '1'
       RUST_BACKTRACE: '1'
       BASELINE_SHA: 88c3f4c565cb5b9f8d47d22eb3ad07f47a822ae4
-      CANDIDATE_PARENT_SHA: 9013f05f4ec519c940d25935772db007fdfa8f32
+      CANDIDATE_PARENT_SHA: dd4097a66f216a4b3bd77f7d0ca5817761ce77d0
     steps:
       - name: Check out immutable candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -71,6 +71,7 @@ jobs:
           python3 -I candidate/scripts/build-interaction-smoke.py --record-source baseline observed-baseline
           python3 -I candidate/scripts/build-interaction-smoke.py --record-source candidate observed-candidate
           python3 candidate/scripts/test-interaction-budget.py
+          python3 candidate/scripts/test-interaction-lineage.py
           python3 candidate/scripts/test-interaction-pty-fixture.py
           python3 candidate/scripts/test-interaction-budget-collector.py
           python3 candidate/scripts/test-interaction-smoke.py
