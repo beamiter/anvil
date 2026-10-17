@@ -4,7 +4,7 @@
 //! state. This surface never enters LiveAttention, interprets output, or writes
 //! to the terminal. Its clock owns only native painting and visual retreat.
 
-use super::{HUMAN_INPUT_RETREAT, SURFACE_FRAME_INTERVAL};
+use super::SURFACE_FRAME_INTERVAL;
 use crate::config::{Config, OrganismMotion};
 use gtk::prelude::*;
 use jterm_core::organism::{
@@ -19,20 +19,14 @@ use vte4::TerminalExt;
 pub(crate) const CAPABILITY_DETAIL: &str = "Traditional VTE shows a neutral companion outside the terminal grid. Command activity and alternate-screen state are unavailable, so hover greetings and Hello are unavailable. Sent input briefly hides the companion without moving the terminal. Use the command palette to expand or collapse this neutral companion.";
 pub(crate) const HELLO_UNAVAILABLE: &str = "Hello is unavailable in traditional VTE: command activity and alternate-screen state cannot be verified.";
 
-fn display_frame(motion: OrganismMotion, frame: u64) -> u64 {
-    if motion == OrganismMotion::Full {
-        frame
-    } else {
-        0
-    }
+pub(super) fn display_frame(motion: OrganismMotion, frame: u64) -> u64 {
+    super::surface_time::display_frame(motion == OrganismMotion::Full, frame)
 }
 
-fn retreat_remaining(last_input: Option<Instant>, now: Instant) -> Option<Duration> {
-    last_input.and_then(|at| {
-        HUMAN_INPUT_RETREAT
-            .checked_sub(now.saturating_duration_since(at))
-            .filter(|remaining| !remaining.is_zero())
-    })
+pub(super) fn retreat_remaining(last_input: Option<Instant>, now: Instant) -> Option<Duration> {
+    super::surface_time::input_retreat_remaining(
+        last_input.map(|at| now.saturating_duration_since(at)),
+    )
 }
 
 // Fail closed when a native transform cannot provide a finite, positive
@@ -952,7 +946,7 @@ pub(super) fn exercise_existing_fixture(
         "later input preserves its own full retreat"
     );
     settle(
-        (later + HUMAN_INPUT_RETREAT).saturating_duration_since(Instant::now())
+        (later + super::HUMAN_INPUT_RETREAT).saturating_duration_since(Instant::now())
             + Duration::from_millis(80),
     );
     assert_eq!(surface.glyph.opacity(), 1.0);
@@ -1836,6 +1830,7 @@ fn exercise_expanded_presentation(
 
 #[cfg(test)]
 mod tests {
+    use super::super::HUMAN_INPUT_RETREAT;
     use super::*;
 
     #[test]

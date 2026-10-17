@@ -1,6 +1,10 @@
 //! Native bodies for the experimental ASCII organism.
 
 mod inline_card;
+mod surface_time;
+#[cfg(test)]
+mod surface_time_adapter_tests;
+use surface_time::{input_retreat_remaining, HUMAN_INPUT_RETREAT};
 #[cfg(all(test, target_os = "linux"))]
 mod surface_probe;
 pub(crate) mod vte_surface;
@@ -46,7 +50,6 @@ const POINTER_GREETING_CANDIDATE_CLASS: &str = "organism-greeting-candidate";
 const POINTER_GREETING_DWELL: Duration = LiveAttention::<OrganismPaneToken>::DWELL;
 const POINTER_GREETING_RADIUS: f64 = 32.0;
 
-const HUMAN_INPUT_RETREAT: Duration = Duration::from_millis(900);
 const SURFACE_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 /// Heartbeat while the mind rests or the body is static: life goes on, the
 /// process barely wakes. Kept just under the tick's one-second dt clamp so
@@ -242,8 +245,8 @@ fn interaction_frame_delay(
 ) -> Duration {
     if motion == OrganismMotion::Full && typing_hidden {
         if let Some(age) = input_age {
-            return HUMAN_INPUT_RETREAT
-                .saturating_sub(age)
+            return input_retreat_remaining(Some(age))
+                .unwrap_or_default()
                 .max(Duration::from_millis(1));
         }
     }
@@ -568,7 +571,7 @@ fn surface_mode(
     command_running: bool,
     human_input_age: Option<Duration>,
 ) -> SurfaceMode {
-    if human_input_age.is_some_and(|age| age < HUMAN_INPUT_RETREAT) {
+    if input_retreat_remaining(human_input_age).is_some() {
         SurfaceMode::Typing
     } else if command_running {
         SurfaceMode::Watching
@@ -686,6 +689,25 @@ fn animation_frames(
         baseline
     };
     (baseline, live)
+}
+
+/// Block and Chat share these display epochs; VTE has only the global neutral
+/// epoch. Reduced motion freezes every epoch before the host paints it.
+fn surface_animation_frames(
+    motion: OrganismMotion,
+    global: u64,
+    behavior_origin: u64,
+    cue_origin: u64,
+    mode: SurfaceMode,
+    cue: Option<PresenceCue>,
+) -> (u64, u64, u64) {
+    let (baseline, live) = animation_frames(global, behavior_origin, cue_origin, mode, cue);
+    let full = motion == OrganismMotion::Full;
+    (
+        surface_time::display_frame(full, global),
+        surface_time::display_frame(full, baseline),
+        surface_time::display_frame(full, live),
+    )
 }
 
 fn presence_signal_for_exit(exit_code: Option<i32>) -> Option<PresenceSignal> {
@@ -3129,20 +3151,14 @@ impl OrganismRuntime {
         // advances its target slower than once per frame, so transit alone
         // would stutter the walk animation. Calm motion freezes the frame at
         // zero: first frames only, no wandering, no bob, no flourishes.
-        let (geometry_frame, baseline_frame, live_frame) =
-            if self.motion.get() == OrganismMotion::Full {
-                let global = self.surface_frame.get();
-                let (baseline, live) = animation_frames(
-                    global,
-                    self.surface_behavior_frame_origin.get(),
-                    self.presence_cue_frame_origin.get(),
-                    mode,
-                    self.presence_cue.get(),
-                );
-                (global, baseline, live)
-            } else {
-                (0, 0, 0)
-            };
+        let (geometry_frame, baseline_frame, live_frame) = surface_animation_frames(
+            self.motion.get(),
+            self.surface_frame.get(),
+            self.surface_behavior_frame_origin.get(),
+            self.presence_cue_frame_origin.get(),
+            mode,
+            self.presence_cue.get(),
+        );
         let language = BodyLanguage::from_state(self.shared_life.get());
         let tempo = wander_tempo(language);
         let wander_walking = match ambient {
