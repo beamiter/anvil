@@ -79,6 +79,9 @@ jobs:
       - name: Check Bash integration locale and Unicode editing
         run: python3 scripts/test-bash-integration-locale.py
 
+      - name: Check Bash OSC transport and redirected bytes
+        run: python3 scripts/test-bash-osc-transport.py
+
       - name: Check Files follow ownership
         run: python3 scripts/test-files-follow.py
 

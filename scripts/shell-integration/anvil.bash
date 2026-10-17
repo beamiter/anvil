@@ -50,7 +50,15 @@ unset __anvil_token_fd
 export -n __anvil_command_token
 __anvil_integration_source=${BASH_SOURCE[0]}
 # Send raw OSC payload terminated with BEL.
-__anvil_osc() { printf '\033]%s\007' "$1"; }
+# Integration records belong to the controlling terminal, including when Bash
+# applies a compound command's redirections before invoking DEBUG. Open only
+# for this write: no persistent descriptor can leak into child commands. If
+# there is no controlling terminal, omit the record rather than pollute stdout.
+__anvil_osc_shell_pid=${BASHPID:-$$}
+__anvil_osc() {
+    [[ ${BASHPID:-$$} == "$__anvil_osc_shell_pid" && ${BASH_SUBSHELL:-0} == 0 ]] || return 0
+    builtin printf '\033]%s\007' "$1" 2>/dev/null >/dev/tty || :
+}
 
 if [[ $__anvil_command_token =~ ^[[:xdigit:]]{32}$ ]]; then
     # Announced inside every A..B prompt boundary. Anvil accepts the capability
@@ -150,7 +158,8 @@ __anvil_precmd() {
     # the exact spot where input begins. Use \[...\] so the OSC bytes don't
     # count toward readline's column accounting.
     if [[ -z ${__ANVIL_PS1_HOOKED:-} ]]; then
-        PS1="${PS1}\[$(__anvil_prompt_end)\]"
+        # This marker is prompt data, rendered by Bash after the visible PS1.
+        PS1+=$'\\[\033]133;B\007\\]'
         __ANVIL_PS1_HOOKED=1
     fi
 }
