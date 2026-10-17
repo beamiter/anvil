@@ -296,6 +296,79 @@ def detect_divider(rgb, width, height, *, horizontal, expected, radius):
     return dict(result, position=position, matched=True, reason="distinct-edge")
 
 
+def paired_strip_motion(before, after, width, height, *, horizontal, first, second,
+                        expected, delta):
+    """Conservative alternative when unrelated content leaves an RGB edge.
+
+    Learn a unique, cross-axis-constant 1–2 pixel strip ONLY from the before
+    capture. Two pixels is the existing edge-cluster radius, not an artifact
+    fit. Require exact fill RGB and boundary-sign transport, opposite signed boundaries,
+    and reject even one matching residual row. Unsupported styles fail closed.
+    This observes a visual signature, not semantic widget identity in isolation.
+    """
+    axis, cross = (width, height) if horizontal else (height, width)
+    lo = max(1, min(expected, expected + delta) - 5)
+    hi = min(axis - 1, max(expected, expected + delta) + 5)
+
+    def pixel(rgb, position, row):
+        x, y = (position, row) if horizontal else (row, position)
+        offset = (y * width + x) * 3
+        return tuple(rgb[offset:offset + 3])
+
+    def signature(rgb, start, size, row):
+        return tuple(pixel(rgb, p, row) for p in range(start - 1, start + size + 1))
+
+    def valid(sig):
+        left, fill, right = sig[0], sig[1], sig[-1]
+        if any(color != fill for color in sig[1:-1]): return False
+        entering = tuple(b-a for a,b in zip(left,fill))
+        leaving = tuple(b-a for a,b in zip(fill,right))
+        return (sum(abs(v) for v in entering) >= 24 and
+                sum(abs(v) for v in leaving) >= 24 and
+                all(a*b <= 0 for a,b in zip(entering,leaving)) and
+                any(a*b < 0 for a,b in zip(entering,leaving)))
+
+    def shape(sig):
+        # Background color is not part of the strip: preserve exact fill color
+        # and both signed boundaries, with >=24 contrast independently per row.
+        if not valid(sig): return None
+        sign=lambda value: (value>0)-(value<0)
+        return (sig[1],tuple(sign(b-a) for a,b in zip(sig[0],sig[1])),
+                tuple(sign(b-a) for a,b in zip(sig[-2],sig[-1])))
+
+    def complete(rgb):
+        found=[]
+        for start in range(lo, hi + 1):
+            for size in (1,2):
+                if start + size >= axis: continue
+                sig=shape(signature(rgb,start,size,0))
+                if sig is not None and all(shape(signature(rgb,start,size,row))==sig for row in range(1,cross)):
+                    found.append((start,size,sig))
+        return found
+
+    originals=[item for item in complete(before)
+               if min(abs(first["position"]-item[0]),abs(first["position"]-item[0]-item[1]))<=2]
+    if len(originals)!=1: raise ValueError('before image has no unique complete narrow strip')
+    old,size,sig=originals[0]
+    if sum(item[1:]==(size,sig) for item in complete(before))!=1:
+        raise ValueError("preinput signature is duplicated")
+    targets=[item for item in complete(after) if item[1:]==(size,sig)]
+    if len(targets)!=1 or targets[0][1:]!=(size,sig):
+        raise ValueError('after image does not contain the same unique complete strip')
+    new=targets[0][0]
+    if min(abs(first['position']-old),abs(first['position']-old-size))>2 or min(abs(second['position']-new),abs(second['position']-new-size))>2:
+        raise ValueError('strip does not correspond to dominant edge')
+    if abs(old-expected)>5 or abs(new-expected-delta)>5 or abs(new-old-delta)>2:
+        raise ValueError('strip is outside expected motion bounds')
+    for rgb,site in ((after,old),(before,new)):
+        for start in range(max(1,site-2),min(axis-size-1,site+2)+1):
+            if any(shape(signature(rgb,start,size,row))==sig for row in range(cross)):
+                raise ValueError('matching strip preexists or partially remains')
+    return dict(method='unique-preinput-paired-strip-v1',before_start=old,
+                after_start=new,width=size,fill_and_signed_boundaries=[list(c) for c in sig],
+                complete_cross_axis_pixels=cross,partial_residual_rows=0)
+
+
 def divider_motion(before, after, width, height, *, horizontal, expected, delta):
     """Match one moving edge over the SAME union, then prove disappearance/appearance."""
     integer(delta, "delta", -18, 12)
@@ -311,9 +384,11 @@ def divider_motion(before, after, width, height, *, horizontal, expected, delta)
     if abs(shift - delta) > 2: raise ValueError('divider edge did not follow drag')
     old_after = detect_divider(after, width, height, horizontal=horizontal, expected=first['position'], radius=2)
     new_before = detect_divider(before, width, height, horizontal=horizontal, expected=second['position'], radius=2)
+    proof = dict(method='strict-low-contrast-disappearance')
     if old_after['reason'] != 'low-contrast' or new_before['reason'] != 'low-contrast':
-        raise ValueError('old edge did not disappear or new edge already existed')
-    return dict(before=first, after=second, shift=shift, old_edge_disappeared=True, new_edge_appeared=True)
+        proof = paired_strip_motion(before, after, width, height, horizontal=horizontal,
+                                    first=first, second=second, expected=expected, delta=delta)
+    return dict(before=first, after=second, shift=shift, old_edge_disappeared=True, new_edge_appeared=True, disappearance_proof=proof)
 
 
 def json_value(value):

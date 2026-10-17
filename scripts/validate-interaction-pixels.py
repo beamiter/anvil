@@ -330,7 +330,7 @@ def validate(raw, panes, binary_sha256, evidence_directory=None):
         require(frame.get("widget_root_origin") == calculated == origin and configured >= snapshot["monotonic_ns"],
                 "incorrect composed widget/surface/root frame")
         frame_times[request] = configured; previous_frame = request; previous_time = configured
-    summaries = []
+    summaries = []; divider_proofs = []
     drag_tabs = set()
     previous_end = 0
     try:
@@ -425,7 +425,7 @@ def validate(raw, panes, binary_sha256, evidence_directory=None):
                 center, radius = expected + predicted_shift // 2, abs(predicted_shift) // 2 + 5
                 before_capture, before_position, before_rgb = divider_response(evidence, event, "before", center, radius)
                 after_capture, after_position, after_rgb = divider_response(evidence, event, "after", center, radius)
-                observer.divider_motion(before_rgb, after_rgb, *rect[2:], horizontal=event["horizontal"],
+                motion_proof = observer.divider_motion(before_rgb, after_rgb, *rect[2:], horizontal=event["horizontal"],
                                         expected=expected, delta=predicted_shift)
                 require(chosen_ns <= before_capture["started_ns"] < before_capture["finished_ns"] <= stamp and
                         after_time <= after_capture["started_ns"] < after_capture["finished_ns"] and
@@ -433,6 +433,7 @@ def validate(raw, panes, binary_sha256, evidence_directory=None):
                 pixel_shift = after_position - before_position
                 require(pixel_shift * drag["delta"] > 0 and abs(pixel_shift - shift) <= 2 and
                         exact(event.get("pixel_shift"), pixel_shift), "divider pixels did not follow allocated motion")
+                divider_proofs.append(dict(id=index, **motion_proof))
                 previous_end = after_capture["finished_ns"]
         if panes > 1:
             require(drag_tabs == set(topology), "drag validation did not exercise every active topology tab")
@@ -443,7 +444,7 @@ def validate(raw, panes, binary_sha256, evidence_directory=None):
                 budget_acceptance=False, physical_scanout_proven=False, pixel_metric=METRIC,
                 pixel_key_count=len(summaries), allocation_drag_count=expected_drags,
                 divider_drag="single_pane_no_divider" if panes == 1 else "allocation_and_pixels" if observed else "allocation_only",
-                keys=summaries, missing_gates=["physical scanout", "full-duration idle attribution", "paired full-budget matrix"])
+                keys=summaries, divider_proofs=divider_proofs, missing_gates=["physical scanout", "full-duration idle attribution", "paired full-budget matrix"])
 
 
 def read_json(path):

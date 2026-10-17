@@ -372,7 +372,7 @@ it does not claim a hermetic toolchain or operating-system image.
 ## Short independent virtual-pixel and drag gate (source checkpoint)
 
 The next workflow uses the same historical baseline and exact event-SHA candidate,
-with reviewed source parent f1897ee67778fd4e7fb8b16934657a06732e87d6. The separately
+with reviewed source parent 9013f05f4ec519c940d25935772db007fdfa8f32. The separately
 reviewed Bash locale production fix, its regression test and ordinary CI step
 are preserved byte-for-byte. The fixed historical baseline remains intentional:
 these short gates do not attribute performance changes to A04. A changed master
@@ -579,3 +579,27 @@ Historical geometry would select y266 rather than y484 for baseline8, but those
 new pixels were not captured: this is not retrospective pixel acceptance. Source
 review and a final current-head rebase are required before another short hosted
 gate. The full1200-second performance matrix remains open.
+
+
+### Shape-aware disappearance alternative (source-only successor)
+
+The strict low-contrast old-edge disappearance/new-edge appearance proof remains
+first. If residual content edges prevent it, an alternative derives a visual
+signature solely from the dominant pre-input edge: a complete cross-axis-constant
+solid strip, one or two pixels wide (the existing narrow-edge cluster bound),
+with opposite signed boundaries and at least 24 RGB contrast on EACH row at both
+boundaries. Fill RGB and boundary signs must match exactly across the full height
+and at the destination; exterior background RGB is not the strip signature.
+The pre-input dominant edge must identify one such structure, its signature must
+be unique throughout the shared search union, and even one matching residual row
+at the old site or preexisting destination rejects the alternative. Wide bodies,
+partial/occluded strips, duplicate signatures and changed colors fail closed.
+
+The existing aggregate 24 contrast, 80% ambiguity, expected-location and measured
+displacement bounds remain unchanged. The alternative does not select an ROI or
+learn colors/width from the after image. It proves transported visual structure
+alongside the existing widget allocation/identity proof, not semantic identity
+from RGB alone. Validator output records the proof method and learned pre-input
+signature. Styles without a stable supported signature remain unsupported.
+Retained failed runs stay failed; offline successor replay is diagnostic only.
+No full performance budget or physical scanout is accepted by this source change.

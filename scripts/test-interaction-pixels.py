@@ -379,6 +379,34 @@ class PixelGate(unittest.TestCase):
                                           sample['started_ns'],sample['finished_ns'],bytes(data),position=position)
             with self.assertRaises(ValueError):self.check(raw)
 
+    def test_shape_alternative_full_gate_and_partial_residual_rejection(self):
+        for residual in (False,True):
+            raw=valid(self.directory)
+            for event in raw['pixel_drags']:
+                old,new=32,32+event['allocation_shift'];width,height=event['rect'][2:]
+                for phase,position in [('before',old),('after',new)]:
+                    rgb=bytearray(bytes([20]*3)*(width*height))
+                    for y in range(height):
+                        off=(y*width+position)*3;rgb[off:off+3]=bytes([220]*3)
+                    if phase=='after':
+                        for y in range(12):
+                            off=(y*width+old)*3;rgb[off:off+3]=bytes([80]*3)
+                        if residual:
+                            off=(20*width+old)*3;rgb[off:off+3]=bytes([220]*3)
+                    previous=event[phase];sample=previous['samples'][0]
+                    event[phase]=response(self.directory,'divider',f"drag-{event['id']}-{phase}",event['rect'],
+                                          sample['started_ns'],sample['finished_ns'],bytes(rgb),position=position)
+                    delta=event['allocation_shift']
+                    event[phase].update(gate.observer.detect_divider(bytes(rgb),width,height,horizontal=True,
+                                       expected=32+delta//2,radius=abs(delta)//2+5))
+                event['pixel_shift']=event['after']['position']-event['before']['position']
+            if residual:
+                with self.assertRaises(ValueError):self.check(raw)
+            else:
+                result=self.check(raw)
+                self.assertTrue(all(p['disappearance_proof']['method']=='unique-preinput-paired-strip-v1'
+                                    for p in result['divider_proofs']))
+
     def test_portable_replay_preserves_records_and_image_hashes(self):
         import shutil
         original=copy.deepcopy(self.raw)
