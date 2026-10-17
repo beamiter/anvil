@@ -63,6 +63,7 @@ class OwnershipTests(unittest.TestCase):
             GDK_BACKEND='wayland', DBUS_STARTER_ADDRESS='host-bus', PYTHONOPTIMIZE='1',
             LD_PRELOAD='host.so', PULSE_SERVER='unix:/private/no-pulse'))
         self.assertEqual(env['GDK_BACKEND'], 'x11')
+        self.assertEqual(env['TZ'], 'UTC')
         for key in ('AT_SPI_BUS_ADDRESS','WAYLAND_DISPLAY','DBUS_STARTER_ADDRESS','PYTHONOPTIMIZE','LD_PRELOAD'):
             self.assertNotIn(key, env)
     def test_evidence_failure_still_cleans_only_owned_helpers(self):
@@ -155,7 +156,7 @@ class FlushedSpeechTests(unittest.TestCase):
     message = marker + '12345678]: Ready for review'
     def fixtures(self):
         import datetime
-        start = datetime.datetime(2026,10,16,23,59,59).timestamp()
+        start = datetime.datetime(2026,10,16,23,59,59,tzinfo=datetime.timezone.utc).timestamp()
         return [dict(name='complete',wall_start=start,wall_end=start+0.8,expected=[self.message]),
                 dict(name='quiet',wall_start=start+1,wall_end=start+1.8,expected=[])]
     def log(self, stamp='23:59:59.200000'):
@@ -193,6 +194,49 @@ class AttributionRegressionTests(unittest.TestCase):
             self.assertEqual(guard.checkpoint(),1001)
             with self.assertRaises(AssertionError):
                 guard.checkpoint()
+
+class ShutdownOrderingTests(unittest.TestCase):
+    class Clock:
+        def checkpoint(self): pass
+    class Orca:
+        returncode = None
+        def __init__(self): self.terminated = False
+        def terminate(self): self.terminated = True
+        def poll(self): return self.returncode
+    def test_shutdown_pumps_owned_bus_before_gui_can_be_released(self):
+        orca = self.Orca()
+        state = {'gui_alive':True,'pumps':0}
+        def pump():
+            self.assertTrue(state['gui_alive'])
+            self.assertTrue(orca.terminated)
+            state['pumps'] += 1
+            orca.returncode = 0
+        observer.shutdown_orca(orca,pump,self.Clock())
+        state['gui_alive'] = False
+        self.assertEqual(state['pumps'],1)
+    def test_hung_shutdown_remains_bounded_failure(self):
+        orca = self.Orca()
+        with mock.patch.object(observer.time,'monotonic',side_effect=[10,16]):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                observer.shutdown_orca(orca,lambda:None,self.Clock())
+    def test_signal_or_error_exit_cannot_pass(self):
+        for code in (-9,1):
+            orca = self.Orca()
+            orca.returncode = code
+            with self.assertRaises(AssertionError):
+                observer.shutdown_orca(orca,lambda:None,self.Clock())
+
+class UtcReplayTests(unittest.TestCase):
+    def test_utc_log_replay_does_not_depend_on_observer_timezone(self):
+        import time
+        fixture = FlushedSpeechTests()
+        for zone in ('UTC', 'Etc/GMT-8'):
+            try:
+                with mock.patch.dict(os.environ, {'TZ':zone}):
+                    time.tzset()
+                    observer.verify_flushed_speech(fixture.log(),fixture.fixtures(),fixture.marker)
+            finally:
+                time.tzset()
 
 if __name__ == '__main__':
     unittest.main()

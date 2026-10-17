@@ -406,15 +406,24 @@ class XInput:
             ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_uint),
             ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint)]
         self.x.XGetGeometry.restype = ctypes.c_int
-        root = ctypes.c_ulong(); x = ctypes.c_int(); y = ctypes.c_int()
-        width = ctypes.c_uint(); height = ctypes.c_uint(); border = ctypes.c_uint(); depth = ctypes.c_uint()
-        if not self.x.XGetGeometry(self.display, self.window, ctypes.byref(root), ctypes.byref(x), ctypes.byref(y),
-                ctypes.byref(width), ctypes.byref(height), ctypes.byref(border), ctypes.byref(depth)):
-            raise RuntimeError("cannot verify owned X11 surface geometry")
-        if root.value != self.root or depth.value != 24:
-            raise RuntimeError("owned X11 surface identity changed")
+        def geometry(drawable):
+            root = ctypes.c_ulong(); x = ctypes.c_int(); y = ctypes.c_int()
+            width = ctypes.c_uint(); height = ctypes.c_uint(); border = ctypes.c_uint(); depth = ctypes.c_uint()
+            if not self.x.XGetGeometry(self.display, drawable, ctypes.byref(root), ctypes.byref(x), ctypes.byref(y),
+                    ctypes.byref(width), ctypes.byref(height), ctypes.byref(border), ctypes.byref(depth)):
+                raise RuntimeError("cannot observe owned X11 drawable geometry")
+            return dict(root_xid=root.value, size=[width.value,height.value], depth=depth.value)
+        client = geometry(self.window); root = geometry(self.root)
+        observation = dict(window_xid=self.window, surface_size=client['size'],
+            client_root_xid=client['root_xid'], client_depth=client['depth'],
+            root_window_xid=self.root, root_geometry_root_xid=root['root_xid'],
+            root_size=root['size'], root_depth=root['depth'])
+        # Numeric evidence is printed BEFORE validation or translation can fail.
+        # The collector preserves helper stderr even when initialization fails.
+        print('ANVIL_INPUT_SURFACE_OBSERVATION '+json.dumps(observation,allow_nan=False),file=sys.stderr,flush=True)
         self.refresh_origin()
-        return dict(window_xid=self.window, surface_size=[width.value, height.value], surface_root_origin=list(self.origin))
+        observation['surface_root_origin'] = list(self.origin)
+        return observation
 
     def refresh_origin(self):
         x, y, child = ctypes.c_int(), ctypes.c_int(), ctypes.c_ulong()
@@ -570,7 +579,9 @@ def main():
                 def input_started(pid):
                     evidence["input_helper_pid"] = pid
                     ownership.refresh()
-                xinput = input_module.InputClient(process.pid, env, check_cancelled, input_started)
+                def input_observed(identity):
+                    evidence.setdefault("input_surface_observations", []).append(identity)
+                xinput = input_module.InputClient(process.pid, env, check_cancelled, input_started, input_observed)
             else:
                 xinput = XInput(process.pid)
             evidence["window_origin"] = list(xinput.origin)

@@ -26,7 +26,7 @@ jobs:
       CARGO_BUILD_JOBS: '1'
       RUST_BACKTRACE: '1'
       BASELINE_SHA: 88c3f4c565cb5b9f8d47d22eb3ad07f47a822ae4
-      CANDIDATE_PARENT_SHA: da722752dc170ea2fcbd15a21d90f750e44632fc
+      CANDIDATE_PARENT_SHA: d4f84b359165638377711e726ebb3d85ceacac44
     steps:
       - name: Check out immutable candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -78,6 +78,7 @@ jobs:
           python3 candidate/scripts/test-interaction-pixel-observer.py
           python3 candidate/scripts/test-interaction-input-helper.py
           python3 candidate/scripts/test-interaction-native-coordinates.py
+          python3 candidate/scripts/test-interaction-surface-roles.py
           python3 candidate/scripts/test-interaction-pixel-client.py
           python3 candidate/scripts/test-interaction-pixels.py
           python3 candidate/scripts/test-interaction-pixel-gate.py

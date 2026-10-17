@@ -61,7 +61,7 @@ class Contract(unittest.TestCase):
 spec=importlib.util.spec_from_file_location('worker',sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 class Input:
  def __init__(self,pid):self.origin=(0,0);self.x=self;self.display=1
- def surface_identity(self):return dict(window_xid=17,surface_size=[1600,1000],surface_root_origin=[0,0])
+ def surface_identity(self):return dict(window_xid=17,client_root_xid=1,root_window_xid=1,root_geometry_root_xid=1,client_depth=32,root_depth=24,root_size=[1600,1000],surface_size=[1600,1000],surface_root_origin=[0,0])
  def keypress(self):return time.monotonic_ns()
  def XSync(self,*args):
   signal.signal(signal.SIGTERM,signal.SIG_IGN)
@@ -102,7 +102,7 @@ from pathlib import Path
 spec=importlib.util.spec_from_file_location('worker',sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 class Input:
  def __init__(self,pid):self.origin=(0,0);self.x=self;self.display=1
- def surface_identity(self):return dict(window_xid=17,surface_size=[1600,1000],surface_root_origin=[0,0])
+ def surface_identity(self):return dict(window_xid=17,client_root_xid=1,root_window_xid=1,root_geometry_root_xid=1,client_depth=32,root_depth=24,root_size=[1600,1000],surface_size=[1600,1000],surface_root_origin=[0,0])
  def keypress(self):return time.monotonic_ns()
  def XSync(self,*args):
   signal.signal(signal.SIGTERM,signal.SIG_IGN)

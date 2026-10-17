@@ -18,7 +18,7 @@ mkdir -p "$sandbox"/{home,config,cache,data,runtime}
 chmod 700 "$sandbox/runtime"
 # No inherited bus, accessibility, display, audio, loader or Python settings.
 printf 'pcm.!default { type null }\nctl.!default { type hw card -1 }\n' > "$sandbox/alsa.conf"
-env -i PATH=/usr/bin:/bin HOME="$sandbox/home" \
+env -i TZ=UTC PATH=/usr/bin:/bin HOME="$sandbox/home" \
 XDG_CONFIG_HOME="$sandbox/config" XDG_CACHE_HOME="$sandbox/cache" \
 XDG_DATA_HOME="$sandbox/data" XDG_RUNTIME_DIR="$sandbox/runtime" \
 PULSE_SERVER="unix:$sandbox/runtime/no-pulse" \

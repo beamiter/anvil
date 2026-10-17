@@ -29,10 +29,33 @@ def active_tab(snapshot):
     return tabs[index]
 
 
+def validate_surface_identity(identity):
+    """Client geometry is not captured RGB: permit 24/32 clients on a 24-depth root."""
+    if type(identity) is not dict: raise ValueError('missing observed X11 surface identity')
+    for field in ('window_xid','client_root_xid','root_window_xid','root_geometry_root_xid'):
+        if type(identity.get(field)) is not int or not 0 < identity[field] <= 0xffffffff:
+            raise ValueError('invalid observed X11 drawable identity')
+    if identity['client_root_xid'] != identity['root_window_xid'] or identity['root_geometry_root_xid'] != identity['root_window_xid']:
+        raise ValueError('client/root drawable identity mismatch')
+    if identity['window_xid'] == identity['root_window_xid']:
+        raise ValueError('owned application cannot be the root drawable')
+    if type(identity.get('root_depth')) is not int or identity['root_depth'] != 24:
+        raise ValueError('unsupported captured root depth')
+    if type(identity.get('client_depth')) is not int or identity['client_depth'] not in (24,32):
+        raise ValueError('unsupported input-only client depth')
+    if type(identity.get('root_size')) is not list or any(type(v) is not int for v in identity['root_size']) or identity['root_size'] != [1600,1000]:
+        raise ValueError('unsupported isolated root geometry')
+    if type(identity.get('surface_size')) is not list or any(type(v) is not int for v in identity['surface_size']) or identity['surface_size'] != [1600,1000]:
+        raise ValueError('client has not reached fixed geometry')
+    origin = coordinates(identity.get('surface_root_origin'), 2)
+    if any(type(v) is not int or v < 0 for v in origin): raise ValueError('invalid client root origin')
+
+
 def native_coordinate_frame(snapshot, identity):
     """Widget→surface is inverse of the EXPLICIT signed surface→widget vector."""
     if type(identity) is not dict or type(identity.get('window_xid')) is not int or not 0 < identity['window_xid'] <= 0xffffffff:
         raise ValueError('invalid owned native window identity')
+    validate_surface_identity(identity)
     frame = snapshot['native_frame']
     if type(frame) is not dict or frame.get('units') != 'logical_pixels_at_scale_1' or type(frame.get('scale_factor')) is not int or frame['scale_factor'] != 1:
         raise ValueError('missing or unsupported native coordinate frame')

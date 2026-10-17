@@ -24,7 +24,7 @@ def child_environment(source):
                'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS', 'DISPLAY', 'XAUTHORITY',
                'ANVIL_A11_OWNED_SESSION', 'PULSE_SERVER', 'SPEECHD_ADDRESS', 'ALSA_CONFIG_PATH')
     env = {key: source[key] for key in allowed if key in source}
-    env.update(GTK_A11Y='atspi', GDK_BACKEND='x11', GSETTINGS_BACKEND='memory', LC_ALL='C.UTF-8')
+    env.update(GTK_A11Y='atspi', GDK_BACKEND='x11', GSETTINGS_BACKEND='memory', LC_ALL='C.UTF-8', TZ='UTC')
     return env
 
 def cleanup_children(children, files):
@@ -121,8 +121,8 @@ def verify_flushed_speech(log, phases, marker):
         match = re.match(r'(\d{2}:\d{2}:\d{2}\.\d+) - SPEECH OUTPUT:', line)
         check(match is not None, 'speech presentation lacks timestamp')
         clock = datetime.datetime.strptime(match.group(1), '%H:%M:%S.%f').time()
-        anchor = datetime.datetime.fromtimestamp(phases[0]['wall_start'])
-        candidates = [datetime.datetime.combine(anchor.date() + datetime.timedelta(days=day), clock).timestamp()
+        anchor = datetime.datetime.fromtimestamp(phases[0]['wall_start'], datetime.timezone.utc)
+        candidates = [datetime.datetime.combine(anchor.date() + datetime.timedelta(days=day), clock, tzinfo=datetime.timezone.utc).timestamp()
                       for day in (-1, 0, 1)]
         stamp = min(candidates, key=lambda value: abs(value - phases[0]['wall_start']))
         records.extend((stamp, message) for message in messages)
@@ -136,6 +136,19 @@ def verify_flushed_speech(log, phases, marker):
         check(speech == phase['expected'], ('Orca phase presentation', phase['name'], speech, phase['expected']))
         phase['orca_presented'] = speech
 
+
+def shutdown_orca(orca, pump, clock_guard):
+    # SIGTERM is handled by Orca46 shutdownOnSignal -> shutdown. Keep the
+    # owned GTK accessible objects and bus alive until it unregisters itself.
+    clock_guard.checkpoint()
+    orca.terminate()
+    deadline = time.monotonic() + 5
+    while orca.poll() is None:
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired('owned Orca graceful shutdown', 5)
+        pump()
+    clock_guard.checkpoint()
+    check(orca.returncode == 0, f'Orca did not shut down gracefully: {orca.returncode}')
 
 def main():
     p = argparse.ArgumentParser()
@@ -163,8 +176,8 @@ def main():
     fixture = None
     result = {'passed': False, 'native_executed': True, 'token': token,
               'orca_presentation_verified': False, 'audible_output_verified': False,
-              'speech_clock': 'same-host local wall clock, Orca HH:MM:SS.microseconds',
-              'timezone': list(time.tzname),
+              'speech_clock': 'UTC wall clock, Orca HH:MM:SS.microseconds',
+              'timezone': 'UTC', 'observer_timezone': list(time.tzname),
               'scope': 'production delivery helper and reducer; synthetic lifecycle, not full AppModel/runtime'}
     def start(argv, log):
         out = open(evidence / log, 'w')
@@ -280,18 +293,17 @@ def main():
         check(json.loads(finished.read_text())['phases'] == index == 21, 'incomplete scenario suite')
         result['phases'] = phases
         result['phase_count'] = index
+        check(orca.poll() is None, 'Orca exited before completion')
+        # The GTK fixture is still pumping while waiting for finish.ack.
+        # Do not destroy its accessibility tree before Orca's graceful cleanup.
+        shutdown_orca(orca, pump, clock_guard)
+        speech_log = orca_log.read_text(errors='strict')
+        check('ORCA: Shutdown complete' in speech_log, 'Orca shutdown completion missing')
+        verify_flushed_speech(speech_log, phases, marker)
         (evidence / 'finish.ack').touch()
         exit_code = fixture.wait(timeout=10)
+        clock_guard.checkpoint()
         check(exit_code == 0, 'GTK fixture failed after final phase')
-        check(orca.poll() is None, 'Orca exited before completion')
-        # Graceful TERM flushes Orca's owned debug file. A hang or forced kill
-        # cannot yield a passing speech result. Final cleanup still owns it.
-        clock_guard.checkpoint()
-        orca.terminate()
-        orca_exit = orca.wait(timeout=5)
-        clock_guard.checkpoint()
-        check(orca_exit == 0, f'Orca did not shut down gracefully: {orca_exit}')
-        verify_flushed_speech(orca_log.read_text(errors='strict'), phases, marker)
         result.update(passed=True, orca_presentation_verified=True)
     except Exception as error:
         result['error'] = repr(error)

@@ -372,7 +372,7 @@ it does not claim a hermetic toolchain or operating-system image.
 ## Short independent virtual-pixel and drag gate (source checkpoint)
 
 The next workflow uses the same historical baseline and exact event-SHA candidate,
-with reviewed source parent da722752dc170ea2fcbd15a21d90f750e44632fc. The separately
+with reviewed source parent d4f84b359165638377711e726ebb3d85ceacac44. The separately
 reviewed Bash locale production fix, its regression test and ordinary CI step
 are preserved byte-for-byte. The fixed historical baseline remains intentional:
 these short gates do not attribute performance changes to A04. A changed master
@@ -520,3 +520,26 @@ Primary implementation references: GNOME GTK tag 4.14.5, gtk/gtkpaned.c
 (gtk_window_native_get_surface_transform), and gtk/gtkmain.c event translation.
 This source checkpoint has no new native/display result. A later master rebase
 requires separate parent-pin review before publication.
+
+
+### Input-window versus captured-root depth
+
+Run38983716068 on d4f84b3 compiled both instrumented binaries successfully, then
+failed the first baseline1-control initialization at a combined root/depth guard.
+Owned cleanup was verified empty; no new pixel or drag case completed. Because
+that guard omitted rejected values, the historical artifact does not establish
+whether the failing predicate was root identity or client depth.
+
+Input-only client geometry and captured pixels have separate contracts. The helper
+now queries both client and root drawables, records their actual root IDs, depths
+and sizes before any validation/translation failure, and the parent preserves the
+initial observation before validation. Client geometry may have depth24 or32;
+it is never interpreted as pixel bytes. Client/root IDs must match the actual
+owned display root, the root must be depth24 and fixed1600x1000, and the client
+must reach its configured1600x1000 geometry. Other depths/roots fail closed.
+
+The independent observer still captures the root, and its existing actual-image
+checks remain unchanged: depth24, little-endian32-bit BGRX, exact stride/masks and
+bounded ROI. No pixel format tolerance, XTest bounds or drag criterion is changed.
+This source correction does not prove which predicate failed in the earlier run;
+the next reviewed hosted gate will retain explicit numeric diagnostics either way.

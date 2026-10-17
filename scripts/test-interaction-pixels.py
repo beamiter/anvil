@@ -117,7 +117,7 @@ def valid(directory, panes=8, mode="observe", horizontal=True):
             raw["pixel_drags"].append(event)
     raw["setup_snapshot"] = copy.deepcopy(raw["snapshots"][-1])
     raw["raw_probe"]["painted_markers"] = [[k["pid"], k["sequence"], k["injected_ns"] + 2] for k in raw["keys"]]
-    raw['surface_identity']=dict(window_xid=17,surface_size=[1600,1000],surface_root_origin=[0,0])
+    raw['surface_identity']=dict(window_xid=17,client_root_xid=1,root_window_xid=1,root_geometry_root_xid=1,client_depth=32,root_depth=24,root_size=[1600,1000],surface_size=[1600,1000],surface_root_origin=[0,0])
     raw['input_coordinate_frames']=[]
     for snapshot in raw['snapshots']:
         snapshot['gtk_runtime_version']=[4,14,5]

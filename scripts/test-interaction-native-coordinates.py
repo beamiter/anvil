@@ -19,7 +19,7 @@ class NativeCoordinates(unittest.TestCase):
         native=dict(units='logical_pixels_at_scale_1',scale_factor=1,window_xid=17,
                     surface_size=[1600,1000],widget_size=[1590,990],native_api_offset=list(api),
                     surface_to_widget_translation=[-x for x in api])
-        return dict(request=5,monotonic_ns=1,native_frame=native,window_size=[1590,990]),dict(window_xid=17,surface_size=[1600,1000],surface_root_origin=list(root))
+        return dict(request=5,monotonic_ns=1,native_frame=native,window_size=[1590,990]),dict(window_xid=17,client_root_xid=1,root_window_xid=1,root_geometry_root_xid=1,client_depth=32,root_depth=24,root_size=[1600,1000],surface_size=[1600,1000],surface_root_origin=list(root))
     def test_api_sign_inverse_translation_and_root_composition(self):
         for api,root,expected in [((5,5),(0,0),[5,5]),((-3,-4),(20,30),[17,26]),((0,0),(20,30),[20,30]),((5.25,-.5),(0,1),[5.25,.5])]:
             snap,identity=self.frame(api,root)

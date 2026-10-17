@@ -10,7 +10,7 @@ spec = importlib.util.spec_from_file_location('input_pipe_client', Path(__file__
 pipe = importlib.util.module_from_spec(spec); spec.loader.exec_module(pipe)
 
 class InputClient(pipe.PixelClient):
-    def __init__(self, pid, env, check_cancelled, on_spawn):
+    def __init__(self, pid, env, check_cancelled, on_spawn, on_observation=lambda identity: None):
         self.check_cancelled = check_cancelled
         self.buffer = b''; self.sequence = 0; self.last_completed_ns = None
         self.process = subprocess.Popen([sys.executable, '-I', str(Path(__file__).with_name('interaction-input-helper.py'))],
@@ -20,6 +20,8 @@ class InputClient(pipe.PixelClient):
         # Initialization and every request use the same five-second parent deadline.
         response = self.command('initialize', pid=pid)
         self.identity = response['identity']
+        on_observation(self.identity)
+        pipe.validate_surface_identity(self.identity)
         self.native_frame = None
         self.origin = tuple(self.identity['surface_root_origin'])
         if len(self.origin) != 2 or any(type(v) is not int or not 0 <= v < maximum for v,maximum in zip(self.origin,(1600,1000))):
