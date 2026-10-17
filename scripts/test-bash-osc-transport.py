@@ -72,18 +72,22 @@ def cleanup_owned(pid, fd, original_tty):
     return errors
 
 
-def session(integrated, commands):
+def session(integrated, commands, cwd_token=None):
     with tempfile.TemporaryDirectory(prefix='anvil-osc-') as temp:
         root = Path(temp)
         rc = root / 'rc'
         rc.write_text("set +o history\nPS1='F13READY> '\nPS2='F13CONT> '\n" +
                       (f'source "{INTEGRATION}"\n' if integrated else ''))
+        child_env = dict(PATH='/usr/bin:/bin', HOME=temp, LC_ALL='C.UTF-8',
+                         TERM='xterm-256color', INPUTRC='/dev/null', HISTFILE='/dev/null')
+        if cwd_token is not None:
+            child_env['ANVIL_CWD_TOKEN'] = cwd_token
         pid, fd = pty.fork()
         if pid == 0:
             try:
+                os.chdir(temp)  # Keep OSC 7 paths inside the synthetic owned fixture.
                 os.execve('/bin/bash', ['bash', '--noprofile', '--rcfile', str(rc), '-i'],
-                          dict(PATH='/usr/bin:/bin', HOME=temp, LC_ALL='C.UTF-8',
-                               TERM='xterm-256color', INPUTRC='/dev/null', HISTFILE='/dev/null'))
+                          child_env)
             except BaseException:
                 os._exit(127)
         original_tty = None
@@ -197,6 +201,33 @@ class Cleanup(unittest.TestCase):
 
 
 class Transport(unittest.TestCase):
+    def test_authenticated_cwd_uses_real_tty_and_scrubs_token(self):
+        token = '01234567-89ab-4cde-8123-0123456789ab'
+        state = (
+            '[[ ! ${ANVIL_CWD_TOKEN+x} ]] && '
+            '[[ $__anvil_cwd_token == ' + shlex.quote(token) + ' ]] && '
+            '[[ $(export -p) != *ANVIL_CWD_TOKEN* ]] && '
+            '[[ $(export -p) != *__anvil_cwd_token* ]]; '
+            'printf "%s" "$?" > "$HOME/token-state"; '
+            'env > "$HOME/child-env"'
+        )
+        outputs, files = session(True, [
+            state, '(exit 7)', 'printf "%s" "$?" > "$HOME/user-status"'
+        ], cwd_token=token)
+        self.assertEqual(files['token-state'], b'0')
+        self.assertEqual(files['user-status'], b'7')
+        self.assertNotIn(b'ANVIL_CWD_TOKEN=', files['child-env'])
+        self.assertNotIn(b'__anvil_cwd_token=', files['child-env'])
+        self.assertNotIn(token.encode(), files['child-env'])
+        for output in outputs:
+            records = re.findall(rb'\x1b\]7;([^\x07]*)\x07', output)
+            self.assertEqual(len(records), 1, output)
+            self.assertTrue(records[0].startswith(
+                b'file://anvil-' + token.encode() + b'/'), records)
+        print(json.dumps({'authenticated_cwd_pty_hex': [o.hex() for o in outputs],
+                          'token_state': files['token-state'].decode(),
+                          'user_status': files['user-status'].decode()}))
+
     def test_redirected_user_bytes_match_without_integration(self):
         commands = [
             "for x in a b; do printf '%s' \"$x\"; done > \"$HOME/compound\"",

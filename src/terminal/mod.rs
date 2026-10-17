@@ -323,10 +323,15 @@ mod tests {
                 "-c",
                 r#"
 source "$1"
-[[ ! ${ANVIL_CWD_TOKEN+x} ]]
-[[ $__anvil_cwd_token == "$2" ]]
-[[ $(export -p) != *ANVIL_CWD_TOKEN* ]]
-cwd_sequence=$(__anvil_report_cwd)
+[[ ! ${ANVIL_CWD_TOKEN+x} ]] || exit 11
+[[ $__anvil_cwd_token == "$2" ]] || exit 12
+[[ $(export -p) != *ANVIL_CWD_TOKEN* ]] || exit 13
+[[ $(export -p) != *__anvil_cwd_token* ]] || exit 14
+# Test payload/authentication separately from the real controlling-TTY transport.
+# A command substitution intentionally cannot emit transport records.
+cwd_sequence=
+__anvil_osc() { cwd_sequence=$1; }
+__anvil_report_cwd
 [[ $cwd_sequence == *"7;file://anvil-$2/"* ]]
 "#,
                 "anvil-cwd-token-test",
