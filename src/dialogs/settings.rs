@@ -1974,7 +1974,7 @@ fn font_desc_for_choice(font_names: &[String], selected: u32, size: f64, base: &
 
 #[derive(Debug)]
 pub(crate) enum SettingsMsg {
-    Toggle(SettingsValues, Vec<String>, adw::ApplicationWindow),
+    Toggle(Box<SettingsValues>, Vec<String>, adw::ApplicationWindow),
     SyncAsciiOrganism {
         enabled: bool,
         motion: u32,
@@ -2567,7 +2567,7 @@ impl Component for SettingsModel {
                     root.force_close();
                     return;
                 }
-                self.values = values;
+                self.values = *values;
                 self.font_names = font_names;
                 self.font_syncing.set(true);
                 let font_notify_guard = widgets.font_row.freeze_notify();
@@ -3416,6 +3416,11 @@ mod tests {
         assert!(!EDIT_REMOTE_HOST_LABEL.is_empty());
         assert!(!REMOVE_REMOTE_HOST_LABEL.is_empty());
         assert_ne!(EDIT_REMOTE_HOST_LABEL, REMOVE_REMOTE_HOST_LABEL);
+    }
+
+    #[test]
+    fn settings_messages_keep_large_reflection_payloads_boxed() {
+        assert!(std::mem::size_of::<SettingsMsg>() <= 64);
     }
 
     #[test]

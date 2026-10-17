@@ -342,7 +342,7 @@ impl AppModel {
                     .position(|candidate| candidate.name == config.theme_name)
                     .unwrap_or(0) as u32;
                 self.settings.emit(dialogs::settings::SettingsMsg::Toggle(
-                    dialogs::settings::SettingsValues {
+                    Box::new(dialogs::settings::SettingsValues {
                         theme,
                         font,
                         font_desc: config.font_desc.clone(),
@@ -391,7 +391,7 @@ impl AppModel {
                         notifications: config.notify_long_blocks,
                         remote_clipboard: config.allow_remote_clipboard_write,
                         remote_hosts: config.remote_hosts.clone(),
-                    },
+                    }),
                     font_names,
                     self.window.clone(),
                 ));
