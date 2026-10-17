@@ -1,6 +1,8 @@
 //! Native bodies for the experimental ASCII organism.
 
 mod inline_card;
+#[cfg(test)]
+mod surface_adapter_trace;
 mod surface_time;
 #[cfg(test)]
 mod surface_time_adapter_tests;
@@ -6722,6 +6724,7 @@ mod tests {
         assert!(runtime.surface_timer.borrow().is_none());
         assert!(runtime.surface_timer_deadline.get().is_none());
         assert!(crate::block_view::organism_settings_test_pty_bytes(&view).is_empty());
+        surface_adapter_trace::exercise_block(&runtime, &view, &settle);
         vte_surface::exercise_existing_fixture(
             &window,
             &window_overlay,

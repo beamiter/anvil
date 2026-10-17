@@ -50,3 +50,36 @@ geometry, occlusion, focus retreat, local/background ownership and hidden
 accessibility nodes across Block, Chat and VTE before further surface-state
 abstraction. This slice does not change any of their widget, geometry, focus,
 capability, accessibility or PTY paths.
+
+## Shared native adapter trace (second slice)
+
+The existing display fixture now runs the same named sequence against its real
+Block/Chat runtime and its real VTE companion: Full, Calm, input retreat, expired
+input, background, focus return, Static, Full again, disabled, reenabled.
+`surface_adapter_trace` owns the sequence and expected observations; each host
+applies it through its existing settings, focus and refresh paths. Accepted
+input is supplied at the timestamp evidence seam, without emitting a terminal
+commit or inventing a command outcome.
+
+Each step checks primary paint, card visibility and the actual pending wake.
+Expected differences are explicit: Static leaves Block's inline card and its
+semantic maintenance wake, while VTE keeps a neutral fixed glyph with no wake.
+Background retains Block's maintenance wake but retires VTE's source. Disabling
+from Full must destroy the captured source and remain retired after draining
+longer than the old frame interval. PTY recorder bytes must be empty both before
+and after every step's drain, as well as at entry and exit. VTE's exact neutral
+glyph is checked at every observation.
+
+This adds adapter coverage, not a new product state abstraction. It changes no
+production geometry, timer, capability or accessibility path. The Block/Chat
+routing is still shared rather than a separately mounted native Chat run. A
+single shared geometry/occlusion/local-versus-remote/accessibility trace remains
+out of scope; the existing dedicated native tests continue to cover those
+boundaries. Pure trace-table/negative-driver tests do not count as running the
+native adapters; native acceptance requires the exact commit's display gate.
+
+The trace's background step means pane ownership: Block loses its presence
+owner, while VTE moves actual GTK focus to the existing sibling entry. It is
+not an OS-window deactivation test. Input expiry is supplied through the
+monotonic timestamp evidence seam rather than waiting 900ms in each adapter;
+the earlier dedicated native expiry fixture still tests the real deadline.

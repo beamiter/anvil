@@ -883,6 +883,7 @@ pub(super) fn exercise_existing_fixture(
     };
     // Extended presentation uses the same native fixture and terminal.
     exercise_expanded_presentation(&surface, terminal, view, entry, &split, &config, settle);
+    exercise_shared_adapter_trace(&surface, terminal, view, entry, &config, settle);
     let settled_allocation = allocation();
     surface.frame.set(54);
     surface.refresh();
@@ -1241,6 +1242,77 @@ fn exercise_production_grid_fixture(
             || focus.is_ancestor(original_terminal)
     }));
     assert!(terminal.pty().is_none());
+}
+
+#[cfg(test)]
+fn exercise_shared_adapter_trace(
+    surface: &Rc<VteCompanion>,
+    terminal: &vte4::Terminal,
+    view: &crate::block_view::TermView,
+    entry: &gtk::Entry,
+    config: &Rc<RefCell<Config>>,
+    settle: &impl Fn(Duration),
+) {
+    use super::surface_adapter_trace::{run, Host, Observed};
+    assert!(crate::block_view::organism_settings_test_pty_bytes(view).is_empty());
+    run(Host::NeutralVte, |step| {
+        let old_source = surface
+            .source
+            .borrow()
+            .as_ref()
+            .and_then(|(id, _)| gtk::glib::MainContext::default().find_source_by_id(id));
+        {
+            let mut config = config.borrow_mut();
+            config.ascii_organism_enabled = step.enabled;
+            config.ascii_organism_motion = Some(step.motion);
+        }
+        if step.focused {
+            assert!(terminal.grab_focus());
+        } else {
+            assert!(entry.grab_focus());
+        }
+        surface.last_input.set(Some(if step.retreat {
+            Instant::now()
+        } else {
+            Instant::now() - super::HUMAN_INPUT_RETREAT
+        }));
+        surface.refresh();
+        assert!(
+            crate::block_view::organism_settings_test_pty_bytes(view).is_empty(),
+            "before settle: {}",
+            step.name
+        );
+        settle(Duration::from_millis(120));
+        surface.refresh();
+        assert!(
+            crate::block_view::organism_settings_test_pty_bytes(view).is_empty(),
+            "after settle: {}",
+            step.name
+        );
+        if !step.enabled {
+            // The preceding Full step owns a live source. Disable must retire
+            // that exact epoch, with no revival after a former frame interval.
+            assert!(old_source.is_some_and(|source| source.is_destroyed()));
+            assert!(surface.geometry_idle.borrow().is_none());
+        }
+        let context = RenderContext::new(Behavior::Idle, BodyLanguage::default(), false);
+        assert_eq!(
+            surface.glyph.text().as_str(),
+            sticky_glyph_with_context(context, display_frame(step.motion, surface.frame.get()))
+                .as_ref(),
+            "VTE stays neutral through {}",
+            step.name
+        );
+        Observed {
+            primary_painted: surface.glyph.is_mapped() && surface.glyph.opacity() == 1.0,
+            card_visible: surface.card.is_visible(),
+            wake_pending: surface.source.borrow().is_some(),
+        }
+    });
+    config.borrow_mut().ascii_organism_motion = Some(OrganismMotion::Full);
+    surface.last_input.set(None);
+    surface.refresh();
+    assert!(crate::block_view::organism_settings_test_pty_bytes(view).is_empty());
 }
 
 #[cfg(test)]
