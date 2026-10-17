@@ -16717,9 +16717,27 @@ pub(crate) struct BlockAgentEvidence {
 /// Nonexecuting PTY fixture shared with the organism's display regressions.
 #[cfg(test)]
 pub(crate) fn organism_settings_test_view() -> Rc<TermView> {
+    organism_settings_test_view_for_mode(crate::config::TerminalMode::Block, None)
+}
+
+/// Select the actual production constructor layout, rather than relabeling a
+/// Block fixture as Chat. The spawner alone is replaced by a raw recorder.
+#[cfg(test)]
+pub(crate) fn organism_settings_test_view_for_mode(
+    mode: crate::config::TerminalMode,
+    font_desc: Option<&str>,
+) -> Rc<TermView> {
+    assert!(matches!(
+        mode,
+        crate::config::TerminalMode::Block | crate::config::TerminalMode::Chat
+    ));
+    let mut config = crate::config::Config::safe_defaults();
+    if let Some(font_desc) = font_desc {
+        config.font_desc = font_desc.to_string();
+    }
     let view: Rc<TermView> = TermView::new_with_spawner(
-        &crate::config::Config::safe_defaults(),
-        &crate::config::TerminalMode::Block,
+        &config,
+        &mode,
         &["sh".to_string()],
         None,
         false,
@@ -16731,9 +16749,17 @@ pub(crate) fn organism_settings_test_view() -> Rc<TermView> {
     )
     .expect("nonexecuting organism test PTY")
     .into();
+    assert_eq!(view.config.borrow().terminal_mode, mode);
     view.bstate.set(BlockState::AwaitingCommand);
     view.block_onboarding.history_resolved(false);
     view
+}
+
+/// Keep only the recorder alive after the pane/runtime are dropped, so the
+/// unmount drain can still prove that no stale callback wrote terminal bytes.
+#[cfg(test)]
+pub(crate) fn organism_settings_test_recorder(view: &TermView) -> Rc<OwnedPty> {
+    view.pty.clone()
 }
 
 // The nonexecuting display fixture has no shell to emit PromptEnd. Seed its

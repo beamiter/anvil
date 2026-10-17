@@ -83,3 +83,45 @@ owner, while VTE moves actual GTK focus to the existing sibling entry. It is
 not an OS-window deactivation test. Input expiry is supplied through the
 monotonic timestamp evidence seam rather than waiting 900ms in each adapter;
 the earlier dedicated native expiry fixture still tests the real deadline.
+
+
+## Independently mounted modes and capability gate (new third-slice candidate)
+
+The existing display fixture additionally constructs separate Block and Chat
+panes through `TermView::new_with_spawner`, selecting each actual layout. Only
+the child-process spawner is replaced by a nonexecuting raw PTY recorder. It
+mounts each pane in the same native window and attaches its runtime through the
+production `OrganismHub::attach_ascii_organism_to_view` method. An in-memory hub
+avoids persistence; it does not replace attachment or capability decisions.
+
+Both local layouts run the original ten-step trace, 120ms drains, and zero-PTY
+assertions before and after every drain. The ordinary Block control still must
+paint in every eligible step. Default Chat additionally reports actual terminal
+and sprite measurements: if its native compact prompt cannot fit the full idle
+body plus grid-aligned margins/gutter, the expected body is hidden while card and
+wake assertions remain intact. A separate Chat constructor uses the actual
+`monospace 32` terminal font configuration and must both measure larger cells and
+paint in every eligible step. No widget allocation or body size is overridden.
+The fit oracle uses measured dimensions and simple aligned legal intervals,
+never the production placement function or the observed paint result. Their log
+identities are now separately `Block` and `Chat`; VTE still runs its existing
+neutral adapter and exact-neutral-glyph oracle. No VTE semantic reaction or
+universal scheduler is introduced.
+
+Each constructor also runs through the actual remote attachment gate and global
+settings refresh for all ten settings/ownership steps. These cases assert no
+eligible pane/runtime, rejected interaction, and zero recorder bytes. Remote
+is only the production capability argument: no network connection is made.
+
+After the local trace, a fresh Full source is started and the pane is unmounted
+and destroyed, including release of the fixture's own root-widget reference.
+The recorder outlives the pane, proving zero bytes after a 120ms
+drain, while weak pane/runtime references and the captured source prove that the
+old epoch cannot resurrect. This is destruction coverage; merely hiding a live
+Block/Chat pane intentionally retains its maintenance heartbeat. Remote panes
+are independently released and checked after the same drain.
+
+This is a newly rebuilt candidate, not recovery of the former unpublished patch.
+Static/source checks do not establish native success. Exact-head hosted display
+CI must execute these cases before acceptance; full A09 geometry/occlusion and
+cross-mode accessibility acceptance remains open.

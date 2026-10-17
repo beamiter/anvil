@@ -6724,7 +6724,14 @@ mod tests {
         assert!(runtime.surface_timer.borrow().is_none());
         assert!(runtime.surface_timer_deadline.get().is_none());
         assert!(crate::block_view::organism_settings_test_pty_bytes(&view).is_empty());
-        surface_adapter_trace::exercise_block(&runtime, &view, &settle);
+        surface_adapter_trace::exercise_block(
+            surface_adapter_trace::Host::Block,
+            false,
+            &runtime,
+            &view,
+            &settle,
+        );
+        surface_adapter_trace::exercise_mounted_modes(&window, &window_overlay, &settle);
         vte_surface::exercise_existing_fixture(
             &window,
             &window_overlay,
