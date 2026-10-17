@@ -5,6 +5,7 @@ from pathlib import Path
 import pty
 import re
 import select
+import shlex
 import signal
 import subprocess
 import tempfile
@@ -247,9 +248,42 @@ class Transport(unittest.TestCase):
         self.assertEqual(counts, [0, 1, 0, 1])
 
     def test_no_persistent_descriptor_in_child(self):
-        command = "python3 -c 'import os; print([n for n in os.listdir(\"/proc/self/fd\") if int(n)>2 and os.path.exists(\"/proc/self/fd/\"+n)])' > \"$HOME/fds\""
-        _, files = session(True, [command])
-        self.assertEqual(files['fds'], b'[]\n')
+        inventory = """import json, os
+result = {}
+for name in os.listdir('/proc/self/fd'):
+    fd = int(name)
+    if fd <= 2:
+        continue
+    try:
+        target = os.readlink('/proc/self/fd/' + name)
+        stat = os.fstat(fd)
+    except FileNotFoundError:
+        continue  # The temporary listdir descriptor has already closed.
+    result[name] = [target, stat.st_dev, stat.st_ino, stat.st_mode]
+print(json.dumps(result, sort_keys=True))
+"""
+        def capture(name):
+            return 'python3 -c ' + shlex.quote(inventory) + f' > "$HOME/{name}"'
+        # The runner may already own inherited descriptors. Compare exact
+        # inventories in the SAME Bash before/after sourcing, rather than
+        # incorrectly assuming every descriptor above stderr is our leak.
+        commands = [capture('before'), f'source "{INTEGRATION}"', capture('after'),
+                    'exec {injected_fd}>"$HOME/injected"', capture('positive'),
+                    'exec {injected_fd}>&-', capture('restored')]
+        # Deliberately inherit an owned descriptor to reproduce the CI premise.
+        with tempfile.TemporaryFile() as inherited:
+            os.set_inheritable(inherited.fileno(), True)
+            _, files = session(False, commands)
+            snapshots = {name: json.loads(files[name]) for name in
+                         ['before', 'after', 'positive', 'restored']}
+            self.assertIn(str(inherited.fileno()), snapshots['before'])
+        self.assertEqual(snapshots['after'], snapshots['before'])
+        self.assertEqual(snapshots['restored'], snapshots['before'])
+        self.assertNotEqual(snapshots['positive'], snapshots['before'])
+        added = set(snapshots['positive']) - set(snapshots['before'])
+        self.assertEqual(len(added), 1)
+        self.assertTrue(snapshots['positive'][added.pop()][0].endswith('/injected'))
+        print(json.dumps({'descriptor_inventories': snapshots}, sort_keys=True))
 
     def test_no_controlling_tty_fails_closed(self):
         # A new session with only pipes has no controlling terminal. No fallback

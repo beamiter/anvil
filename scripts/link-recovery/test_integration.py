@@ -42,6 +42,10 @@ class IntegrationTests(unittest.TestCase):
         self.assertNotIn('sudo', text)
         self.assertNotIn('||', text.split('shift', 1)[1])
         self.assertNotIn('PYTHONOPTIMIZE', text)
+        self.assertIn("CDPATH='' cd", text)
+        self.assertNotIn('/bin/sh -c', text)
+        self.assertIn('/usr/bin/env ANVIL_HOSTED_FIXTURE=1 /usr/bin/python3 -s', text)
+        self.assertIn('"$fixture/run_suite.py" "${1:?absolute compiled probe path required}" "${2:?new private evidence directory required}"', text)
 
     def test_failure_artifacts_follow_case_cleanup(self):
         tree = ast.parse((extract.ROOT/'run_suite.py').read_text())
@@ -64,6 +68,11 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn('--offline --locked', text)
         self.assertNotIn('pull_request_target', text)
         self.assertNotIn('continue-on-error', text)
+        native = text.split('      - name: Native SKIPPED until compatible environment is authorized\n', 1)[1].split('      - name:', 1)[0]
+        self.assertIn('        if: ${{ false }}\n', native)
+        self.assertEqual(text.count('sh scripts/link-recovery/run-hosted.sh'), 1)
+        self.assertIn('name: Source and locked build; native SKIPPED', text)
+        self.assertIn('zero backend lanes executed. Source/build success is not native acceptance.', text)
         import re
         actions = re.findall(r'uses: (\S+)', text)
         self.assertEqual(len(actions), 2)

@@ -69,7 +69,7 @@ def valid(directory, panes=8, mode="observe", horizontal=True):
     for tab in base_tabs:
         for i, pane in enumerate(tab["panes"]):
             bounds = [20 + (i % 4) * 380, 80 + (i // 4) * 200, 380, 200]
-            pane.update(columns=80, rows=24, bounds=bounds,
+            pane.update(pane_id=i, columns=80, rows=24, bounds=bounds,
                         pixel_geometry=dict(cell_width=2, cell_height=4, bounds=list(bounds)))
     raw["snapshots"] = []
     for index, key in enumerate(raw["keys"]):
@@ -101,8 +101,15 @@ def valid(directory, panes=8, mode="observe", horizontal=True):
         after = copy.deepcopy(before); after.update(request=index * 3 + 3, monotonic_ns=base + 80)
         after["dividers"][0]["position"] += shift
         after["dividers"][0]["x" if horizontal else "y"] += shift
-        for field in (after["tabs"][active]["panes"][0]["bounds"], after["tabs"][active]["panes"][0]["pixel_geometry"]["bounds"]):
-            field[2 if horizontal else 3] += shift
+        axis=0 if horizontal else 1
+        center=before['dividers'][0]['x' if horizontal else 'y']
+        for p in after['tabs'][active]['panes']:
+            edge=p['bounds'][axis]+p['bounds'][axis+2]
+            if edge==center:
+                p['bounds'][axis+2]+=shift;p['pixel_geometry']['bounds'][axis+2]+=shift
+            elif p['bounds'][axis]==center:
+                p['bounds'][axis]+=shift;p['bounds'][axis+2]-=shift
+                p['pixel_geometry']['bounds'][axis]+=shift;p['pixel_geometry']['bounds'][axis+2]-=shift
         raw["snapshots"] += [before, after]
         raw["drags"].append(dict(id=index, injected_ns=base + 70, delta=delta))
         raw["allocation_drags"].append(dict(id=index, delta=delta, shift=shift, before=before, after=after))
@@ -134,9 +141,23 @@ def valid(directory, panes=8, mode="observe", horizontal=True):
         raw['input_coordinate_frames'].append(dict(snapshot_request=snapshot['request'],native_frame=copy.deepcopy(snapshot['native_frame']),
             surface_identity=copy.deepcopy(raw['surface_identity']),widget_root_origin=[0.0,0.0],configured_ns=snapshot['monotonic_ns']+1))
 
+    raw['divider_sampling_plans']=[]
     for allocation in raw['allocation_drags']:
         allocation['model']=gate.client.expected_drag(allocation['before'],allocation['delta'],raw['window_origin'])
         allocation['pointer_observation']=dict(start_root=allocation['model']['pointer_start_root'],end_root=allocation['model']['pointer_end_root'])
+        plan=gate.client.divider_sampling_plan(allocation['before'],raw['window_origin'])
+        allocation['sampling_plan']=plan
+        raw['divider_sampling_plans'].append(dict(id=allocation['id'],snapshot_request=allocation['before']['request'],chosen_ns=allocation['before']['monotonic_ns']+2,plan=copy.deepcopy(plan)))
+        allocation['sampling_after']=gate.client.verify_divider_sampling_after(plan,allocation['after'],raw['window_origin'])
+        if mode=='observe':
+            event=raw['pixel_drags'][allocation['id']];event['sampling_plan']=plan;event['rect']=plan['rect']
+            for phase in ('before','after'):event[phase]['rect']=plan['rect']
+        allocation['sampling_plan']=gate.client.divider_sampling_plan(allocation['before'],raw['window_origin'])
+        allocation['sampling_after']=gate.client.verify_divider_sampling_after(allocation['sampling_plan'],allocation['after'],raw['window_origin'])
+        if mode=='observe':
+            event=raw['pixel_drags'][allocation['id']];plan=allocation['sampling_plan']
+            event['sampling_plan']=copy.deepcopy(plan);event['rect']=plan['rect']
+            event['before']['rect']=plan['rect'];event['after']['rect']=plan['rect']
     return raw
 
 
@@ -176,7 +197,8 @@ class PixelGate(unittest.TestCase):
                             padding_rgb=[0, 0, 0], width=64, height=6))
 
     def test_vertical_divider_roundtrip(self):
-        self.check(valid(self.directory, horizontal=False))
+        with self.assertRaisesRegex(ValueError, "horizontal-separator sampling unsupported"):
+            valid(self.directory, horizontal=False)
 
     def test_requires_existing_smoke_cleanup_and_echo_validation(self):
         self.reject(lambda r: r["cleanup"].update(verified_empty=False))
@@ -374,6 +396,13 @@ class PixelGate(unittest.TestCase):
         self.reject(lambda r:r['input_coordinate_frames'][0]['native_frame'].update(window_xid=99))
         self.reject(lambda r:r['surface_identity'].update(window_xid=99))
         self.reject(lambda r:r['input_coordinate_frames'][0].update(widget_root_origin=[5,5]))
+
+    def test_sampling_plan_must_precede_input_and_match_geometry(self):
+        self.reject(lambda r:r['divider_sampling_plans'][0].__setitem__('chosen_ns',r['drags'][0]['injected_ns']+1))
+        self.reject(lambda r:r['divider_sampling_plans'][0]['plan']['rect'].__setitem__(1,484))
+        self.reject(lambda r:r['allocation_drags'][0]['sampling_after'].__setitem__('covered_interval',[0,48]))
+        self.reject(lambda r:r['pixel_drags'][0].__setitem__('sampling_plan',{}))
+        self.reject(lambda r:r.__setitem__('divider_sampling_plans',[]))
 
     def test_narrow_handle_prediction_and_observed_pointer_fail_closed(self):
         for field,value in [('wide_handle',True),('direction','rtl'),('min_position',900),

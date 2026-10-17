@@ -113,6 +113,87 @@ def divider_rect(divider, origin):
     return rect, 32
 
 
+def divider_sampling_plan(snapshot, origin):
+    """Pre-input, allocation-only ROI choice. Never inspects captured RGB."""
+    frame = snapshot.get('native_frame', {})
+    if type(frame.get('scale_factor')) is not int or frame['scale_factor'] != 1:
+        raise ValueError('divider sampling requires measured scale one')
+    divider = snapshot['dividers'][0]
+    if divider.get('horizontal') is not True:
+        raise ValueError('header-free horizontal-separator sampling unsupported')
+    origin = coordinates(origin, 2)
+    center = origin[0] + finite(divider['x'])
+    handles=divider['handle_bounds_local']
+    if type(handles) is not list or len(handles)!=1: raise ValueError('missing unique measured handle')
+    handle=coordinates(handles[0],4);paned=coordinates(divider['paned_bounds'],4)
+    if min(handle[2:]+paned[2:])<=0: raise ValueError('invalid measured handle extent')
+    handle_interval=[math.ceil(origin[1]+paned[1]+handle[1]),math.floor(origin[1]+paned[1]+handle[1]+handle[3])]
+    roi_left,roi_right=round(center)-32,round(center)+32
+    panes = []
+    for pane in active_tab(snapshot)['panes']:
+        if pane.get('mapped') is not True: continue
+        if type(pane.get('pane_id')) is not int or pane['pane_id']<0 or type(pane.get('pid')) is not int or pane['pid']<=0:
+            raise ValueError('invalid adjacent pane identity')
+        bounds = coordinates(pane['bounds'], 4)
+        terminal = coordinates(pane['pixel_geometry']['bounds'], 4)
+        if min(bounds[2:] + terminal[2:]) <= 0: raise ValueError('nonpositive adjacent content geometry')
+        left, top = max(bounds[0],terminal[0]), max(bounds[1],terminal[1])
+        right, bottom = min(bounds[0]+bounds[2],terminal[0]+terminal[2]), min(bounds[1]+bounds[3],terminal[1]+terminal[3])
+        if right <= left or bottom <= top: raise ValueError('empty terminal-content intersection')
+        cross = [math.ceil(origin[1]+top),math.floor(origin[1]+bottom)]
+        pane_cross = [math.ceil(origin[1]+bounds[1]),math.floor(origin[1]+bounds[1]+bounds[3])]
+        panes.append(dict(pane_id=pane['pane_id'],pid=pane['pid'],
+            left=origin[0]+bounds[0],right=origin[0]+bounds[0]+bounds[2],
+            content_interval=cross,pane_interval=pane_cross,
+            excluded_noncontent_intervals=[span for span in ([pane_cross[0],cross[0]],[cross[1],pane_cross[1]]) if span[1]>span[0]]))
+    panes.sort(key=lambda p:(p['pane_id'],p['pid']))
+    left_candidates = [p for p in panes if p['right'] <= center]
+    right_candidates = [p for p in panes if p['left'] >= center]
+    if not left_candidates or not right_candidates: raise ValueError('divider lacks two adjacent content sides')
+    left_edge=max(p['right'] for p in left_candidates);right_edge=min(p['left'] for p in right_candidates)
+    if len({p['pid'] for p in panes})!=len(panes) or len({p['pane_id'] for p in panes})!=len(panes): raise ValueError('duplicate adjacent pane identity')
+    if abs((left_edge+right_edge)/2-center)>1 or not 0 <= right_edge-left_edge <= handle[2]:
+        raise ValueError('leaf allocation edges do not locate chosen divider')
+    left=[p for p in left_candidates if p['right']==left_edge]
+    right=[p for p in right_candidates if p['left']==right_edge]
+    candidates=[]
+    for a in left:
+        for b in right:
+            interval=[max(a['content_interval'][0],b['content_interval'][0],handle_interval[0]),min(a['content_interval'][1],b['content_interval'][1],handle_interval[1])]
+            if interval[1] <= interval[0]: continue
+            candidates.append(dict(left_pid=a['pid'],right_pid=b['pid'],left_pane_id=a['pane_id'],right_pane_id=b['pane_id'],
+                interval=interval,axis_coverage=[a['left'],b['right']],eligible=interval[1]-interval[0]>=48 and a['left']<=roi_left and roi_right<=b['right']))
+    candidates.sort(key=lambda p:(-(p['interval'][1]-p['interval'][0]),p['interval'][0],p['left_pane_id'],p['right_pane_id']))
+    eligible=[p for p in candidates if p['eligible']]
+    if not eligible: raise ValueError('no adequate header-free divider span')
+    chosen=eligible[0]
+    selected_left=next(p for p in left if p['pid']==chosen['left_pid'])
+    selected_right=next(p for p in right if p['pid']==chosen['right_pid'])
+    if selected_left['left']>round(center)-32 or selected_right['right']<round(center)+32:
+        raise ValueError('adjacent panes too narrow for fixed divider ROI')
+    start=(chosen['interval'][0]+chosen['interval'][1]-48)//2
+    rect=[round(center)-32,start,64,48]
+    if rect[0]<0 or rect[1]<0 or rect[0]+64>1600 or rect[1]+48>1000:
+        raise ValueError('header-free divider ROI outside isolated screen')
+    return dict(method='adjacent-terminal-content-longest-span-v1',tab_id=active_tab(snapshot)['tab_id'],
+        paned_identity=divider['paned_identity'],adjacent_edges=[left_edge,right_edge],handle_interval=handle_interval,
+        adjacent_content=left+right,candidate_intervals=candidates,chosen=chosen,rect=rect,expected=32)
+
+
+def verify_divider_sampling_after(plan, after, origin):
+    """Check fixed preselected cross-span against the same content identities."""
+    observed=divider_sampling_plan(after,origin)
+    if observed['tab_id']!=plan['tab_id'] or observed['paned_identity']!=plan['paned_identity']:
+        raise ValueError('sampling changed tab/divider identity')
+    chosen=plan['chosen']; start,end=plan['rect'][1],plan['rect'][1]+plan['rect'][3]
+    matches=[p for p in observed['candidate_intervals'] if all(p[k]==chosen[k] for k in ('left_pid','right_pid','left_pane_id','right_pane_id'))]
+    if len(matches)!=1 or not matches[0]['interval'][0] <= start < end <= matches[0]['interval'][1]:
+        raise ValueError('preselected divider span lost same adjacent content coverage')
+    if not matches[0]['axis_coverage'][0]<=plan['rect'][0]<plan['rect'][0]+plan['rect'][2]<=matches[0]['axis_coverage'][1]:
+        raise ValueError('preselected ROI crosses an unrelated pane after movement')
+    return dict(left_pid=chosen['left_pid'],right_pid=chosen['right_pid'],interval=matches[0]['interval'],covered_interval=[start,end],axis_coverage=matches[0]['axis_coverage'])
+
+
 def expected_drag(snapshot, delta, origin):
     """GTK 4.14.5 gtkpaned.c: expanded handle origin, int update_drag, unclamped LTR.
 

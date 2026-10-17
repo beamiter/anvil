@@ -351,6 +351,24 @@ fn semantic_task_results_reach_atspi_and_orca() {
         &f.dir.join("finished.json"),
         serde_json::json!({"phases":f.phase,"pid":std::process::id()}),
     );
+    // Wake Orca's Python signal handler through its subscribed public name
+    // event; this neutral teardown label is not a task announcement.
+    wait_file(&f.dir.join("shutdown.request"));
+    let shutdown_name = format!("A11 fixture shutdown {token}");
+    f.window.set_title(Some(&shutdown_name));
+    pump();
+    assert_eq!(
+        gtk::prelude::GtkWindowExt::focus(&f.window),
+        Some(f.owner.clone())
+    );
+    assert_eq!(f.input.text(), "unfinished synthetic draft");
+    atomic_json(
+        &f.dir.join("shutdown.ack.json"),
+        serde_json::json!({
+            "pid":std::process::id(), "name":shutdown_name,
+            "focus_preserved":true, "draft_preserved":true
+        }),
+    );
     wait_file(&f.dir.join("finish.ack"));
     f.window.close();
 }

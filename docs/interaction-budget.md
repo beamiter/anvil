@@ -372,7 +372,7 @@ it does not claim a hermetic toolchain or operating-system image.
 ## Short independent virtual-pixel and drag gate (source checkpoint)
 
 The next workflow uses the same historical baseline and exact event-SHA candidate,
-with reviewed source parent d4f84b359165638377711e726ebb3d85ceacac44. The separately
+with reviewed source parent f1897ee67778fd4e7fb8b16934657a06732e87d6. The separately
 reviewed Bash locale production fix, its regression test and ordinary CI step
 are preserved byte-for-byte. The fixed historical baseline remains intentional:
 these short gates do not attribute performance changes to A04. A changed master
@@ -543,3 +543,39 @@ checks remain unchanged: depth24, little-endian32-bit BGRX, exact stride/masks a
 bounded ROI. No pixel format tolerance, XTest bounds or drag criterion is changed.
 This source correction does not prove which predicate failed in the earlier run;
 the next reviewed hosted gate will retain explicit numeric diagnostics either way.
+
+
+### Geometry-selected header-free divider ROI
+
+Run38985221575 retained four independently replayed one-pane PASS cases and
+verified empty cleanup. Runtime metadata proves a32-depth application client on
+a24-depth root. Its baseline8 pointer motions+12/−12/+12 produced the predicted
+allocations+6/−18/+6. The second drag's strict old-edge disappearance test rejected
+a residual edge in the pane header intersecting the old midpoint capture ROI.
+The original failed images and unchanged thresholds are retained.
+
+Before input, the new plan uses only measured allocations: identify leaf panes
+adjacent to each side of the chosen vertical separator, clip terminal content to
+its pane, intersect the two content intervals with the measured handle span, and
+choose the longest eligible interval (ties by top coordinate and pane identity).
+The fixed64×48 ROI must fit those adjacent panes and the1600×1000 root. Its48-pixel
+cross span must be entirely within both terminal-content intervals. Non-content
+intervals conservatively exclude measured headers/chrome, with no fixed header
+height or pixel-dependent selection. All candidates, exclusions, chosen pane IDs,
+ROI and choice timestamp are retained before input, including control mode.
+
+After movement, the same preselected adjacent pane identities must still cover
+the fixed ROI span; the validator recomputes the original choice from the linked
+pre-input snapshot. It never changes the ROI based on after pixels. Missing spans,
+insufficient height/width, unknown scales, identity or bounds failures stop the
+gate. Horizontal separators are explicitly unsupported by this narrow sampling
+contract because the required strip can intersect their full-width pane header.
+Current1/8/32-total scenarios use the root vertical separator; no32-visible claim.
+
+Input schedule, GTK drag model, allocation/pixel tolerances, unique-edge union and
+old-edge disappearance/new-edge appearance tests are unchanged. Observer pixels,
+cleanup, native-coordinate composition and disposable Rust overlay are unchanged.
+Historical geometry would select y266 rather than y484 for baseline8, but those
+new pixels were not captured: this is not retrospective pixel acceptance. Source
+review and a final current-head rebase are required before another short hosted
+gate. The full1200-second performance matrix remains open.

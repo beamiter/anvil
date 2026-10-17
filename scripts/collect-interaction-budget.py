@@ -689,11 +689,14 @@ def main():
                     delta = 12 if index % 2 == 0 else -12
                     drag_model = pixel_module.expected_drag(drag_before_snapshot, delta, xinput.origin) if args.pixel_gate else None
                     predicted_shift = drag_model["expected_allocation_shift"] if drag_model else delta
+                    sampling_plan = pixel_module.divider_sampling_plan(drag_before_snapshot,xinput.origin) if args.pixel_gate else None
+                    if sampling_plan is not None:
+                        evidence.setdefault("divider_sampling_plans", []).append(dict(id=index,snapshot_request=drag_before_snapshot["request"],chosen_ns=time.monotonic_ns(),plan=sampling_plan))
                     pixel_drag = None
                     if pixel:
-                        rect, expected = pixel_module.divider_rect(divider, xinput.origin)
+                        rect, expected = sampling_plan["rect"], sampling_plan["expected"]
                         pixel_drag = dict(id=index, tab_id=actual_tab["tab_id"], rect=rect, horizontal=divider["horizontal"],
-                                          delta=delta, before_snapshot=drag_before_snapshot)
+                                          delta=delta, before_snapshot=drag_before_snapshot, sampling_plan=sampling_plan)
                         evidence["pixel_drags"].append(pixel_drag)
                         pixel_drag["before"] = pixel.request(kind="divider", name=f"drag-{index}-before", rect=rect,
                             horizontal=divider["horizontal"], expected=expected + predicted_shift // 2, radius=abs(predicted_shift) // 2 + 5)
@@ -702,8 +705,9 @@ def main():
                         sleep_cancellable(.1)
                         after_drag = control("snapshot")
                         moved = after_drag["dividers"][0]
+                        sampling_after = pixel_module.verify_divider_sampling_after(sampling_plan,after_drag,xinput.origin)
                         shift = pixel_module.allocation_shift(drag_before_snapshot, after_drag, predicted_shift)
-                        evidence["allocation_drags"].append(dict(id=index, delta=delta, shift=shift, model=drag_model, pointer_observation=xinput.last_drag_pointer,
+                        evidence["allocation_drags"].append(dict(id=index, delta=delta, shift=shift, sampling_plan=sampling_plan, sampling_after=sampling_after, model=drag_model, pointer_observation=xinput.last_drag_pointer,
                             before=drag_before_snapshot, after=after_drag))
                         for visible_tab in after_drag["tabs"]:
                             for visible_pane in visible_tab["panes"]:

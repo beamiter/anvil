@@ -211,20 +211,32 @@ class ShutdownOrderingTests(unittest.TestCase):
             self.assertTrue(orca.terminated)
             state['pumps'] += 1
             orca.returncode = 0
-        observer.shutdown_orca(orca,pump,self.Clock())
+        observer.shutdown_orca(orca,pump,self.Clock(),lambda:None,lambda:True)
         state['gui_alive'] = False
         self.assertEqual(state['pumps'],1)
     def test_hung_shutdown_remains_bounded_failure(self):
         orca = self.Orca()
         with mock.patch.object(observer.time,'monotonic',side_effect=[10,16]):
             with self.assertRaises(subprocess.TimeoutExpired):
-                observer.shutdown_orca(orca,lambda:None,self.Clock())
+                observer.shutdown_orca(orca,lambda:None,self.Clock(),lambda:None,lambda:True)
+    def test_missing_wake_cannot_pass_even_after_clean_exit(self):
+        orca = self.Orca()
+        orca.returncode = 0
+        with mock.patch.object(observer.time,'monotonic',side_effect=[10,11,16]):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                observer.shutdown_orca(orca,lambda:None,self.Clock(),lambda:None,lambda:False)
+    def test_late_wake_and_exit_cannot_pass(self):
+        orca = self.Orca()
+        orca.returncode = 0
+        with mock.patch.object(observer.time,'monotonic',side_effect=[10,16]):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                observer.shutdown_orca(orca,lambda:None,self.Clock(),lambda:None,lambda:True)
     def test_signal_or_error_exit_cannot_pass(self):
         for code in (-9,1):
             orca = self.Orca()
             orca.returncode = code
             with self.assertRaises(AssertionError):
-                observer.shutdown_orca(orca,lambda:None,self.Clock())
+                observer.shutdown_orca(orca,lambda:None,self.Clock(),lambda:None,lambda:True)
 
 class UtcReplayTests(unittest.TestCase):
     def test_utc_log_replay_does_not_depend_on_observer_timezone(self):
@@ -237,6 +249,32 @@ class UtcReplayTests(unittest.TestCase):
                     observer.verify_flushed_speech(fixture.log(),fixture.fixtures(),fixture.marker)
             finally:
                 time.tzset()
+
+class WakeEvidenceTests(unittest.TestCase):
+    def data(self):
+        return [dict(pid=7,type='object:property-change:accessible-name',name='shutdown',role='frame')], dict(pid=7,name='shutdown',focus_preserved=True,draft_preserved=True)
+    def test_valid_wake_requires_event_and_ack(self):
+        events, ack = self.data()
+        self.assertTrue(observer.validate_shutdown_wake(events,ack,7,'shutdown'))
+        self.assertFalse(observer.validate_shutdown_wake([],ack,7,'shutdown'))
+        self.assertFalse(observer.validate_shutdown_wake(events,None,7,'shutdown'))
+    def test_transient_focus_activation_and_announcements_fail(self):
+        for kind in ('object:announcement','object:state-changed:focused','window:activate'):
+            events, ack = self.data()
+            events.append(dict(pid=7,type=kind,name='A11 draft owner',role='entry'))
+            with self.assertRaises(AssertionError):
+                observer.validate_shutdown_wake(events,ack,7,'shutdown')
+    def test_duplicate_and_foreign_wake_fail(self):
+        events, ack = self.data()
+        for rows in (events*2,[dict(events[0],pid=8)]):
+            with self.assertRaises(AssertionError):
+                observer.validate_shutdown_wake(rows,ack,7,'shutdown')
+    def test_slow_ack_cannot_cross_absolute_deadline(self):
+        orca = ShutdownOrderingTests.Orca()
+        orca.returncode = 0
+        with mock.patch.object(observer.time,'monotonic',side_effect=[10,11,16]):
+            with self.assertRaises(AssertionError):
+                observer.shutdown_orca(orca,lambda:None,ShutdownOrderingTests.Clock(),lambda:None,lambda:True)
 
 if __name__ == '__main__':
     unittest.main()

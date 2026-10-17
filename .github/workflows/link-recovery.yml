@@ -1,4 +1,4 @@
-name: Native link recovery boundary
+name: Link recovery source and build (native SKIPPED)
 
 on:
   workflow_dispatch:
@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   owned-boundary:
-    name: Isolated owned portal and handler only
+    name: Source and locked build; native SKIPPED
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     defaults:
@@ -43,7 +43,7 @@ jobs:
           mkdir -m 0700 evidence
           git rev-parse HEAD > evidence/commit.txt
           test "$(cat evidence/commit.txt)" = "$GITHUB_SHA"
-          printf '%s\n' 'Native boundary not yet executed; missing success evidence is not a pass.' > evidence/status.txt
+          printf '%s\n' 'Native SKIPPED: environment blocked by UID mapping refusal; zero backend lanes executed. Source/build success is not native acceptance.' > evidence/status.txt
       - name: Install official native dependencies
         run: |
           sudo apt-get update
@@ -70,7 +70,11 @@ jobs:
           python3 scripts/link-recovery/extract.py --check
           sha256sum scripts/link-recovery/target/debug/anvil-owned-launch-boundary > evidence/binary.sha256
           git diff --exit-code
-      - name: Run isolated owned backend cases
+      # The previous hosted run was denied UID mapping. Keep both push and
+      # manual runs source/build-only until an explicitly authorized compatible
+      # environment is configured in a separately reviewed workflow change.
+      - name: Native SKIPPED until compatible environment is authorized
+        if: ${{ false }}
         run: |
           sh scripts/link-recovery/run-hosted.sh --hosted-native-approved \
             "$PWD/scripts/link-recovery/target/debug/anvil-owned-launch-boundary" \

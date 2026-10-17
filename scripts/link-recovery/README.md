@@ -2,6 +2,12 @@
 
 This fixture exercises the actual terminal async dispatch/classification and ownership helpers against an owned portal and desktop handler. It never opens a real browser, contacts a public URL, changes real desktop defaults, or accesses a user clipboard. Passing it establishes backend behavior only; GTK prompt, accessibility, widget lifecycle and clipboard acceptance remain separate.
 
+## Current hosted status
+
+Native execution is disabled by a constant-false workflow step guard for both push and manual runs. Run 38983716142 on d4f84b359165638377711e726ebb3d85ceacac44 passed exact core89d locked fetch/build and all 17 Python source tests, then failed closed at UID mapping with `Operation not permitted`. No backend lane ran. The uploaded 14-file artifact SHA-256 is `71acb362b0bf9d143d28450ef046629c046964d1efd6b5dcc0f5a56289aaf9fe`.
+
+Current CI performs source checks and the exact locked build, uploads an explicit native-SKIPPED status, and cannot establish native acceptance even when green. Re-enabling requires a separately reviewed workflow change for an explicitly authorized environment already supporting unprivileged UID mapping and network namespaces. No automatic retry, privilege escalation, security-policy change, or isolation bypass is permitted.
+
 ## Invocation and permissions
 
 The dedicated `.github/workflows/link-recovery.yml` runs on a disposable Ubuntu 24.04 host. It uses pinned checkout/upload actions, read-only repository permission and disabled checkout credentials. Official apt packages provide GLib/GIO, PyGObject, D-Bus and util-linux; the official Rust toolchain builds the locked fixture. Dependency fetching happens before native isolation. The workflow records commit, source hashes, Rust/Cargo versions, native package versions, GLib runtime version and binary SHA-256.

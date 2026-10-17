@@ -390,6 +390,17 @@ def validate(raw, panes, binary_sha256, evidence_directory=None):
             require(exact(allocation.get("model"), model), "recorded drag prediction differs from measured pre-injection model")
             require(exact(allocation.get('pointer_observation'), dict(start_root=model['pointer_start_root'],
                         end_root=model['pointer_end_root'])), "actual pointer observations differ from predicted drag")
+            plans=raw.get('divider_sampling_plans')
+            require(type(plans) is list and len(plans)==3, "missing pre-injection sampling plans")
+            planned=plans[index]
+            require(exact(planned.get('id'),index) and exact(planned.get('snapshot_request'),before_snapshot['request']), "sampling plan identity mismatch")
+            chosen_ns=integer(planned.get('chosen_ns'),'sampling choice timestamp',1)
+            require(before_time<=chosen_ns<=stamp, "sampling choice was not before injection")
+            sampling_plan=client.divider_sampling_plan(before_snapshot,origin)
+            require(exact(planned.get('plan'),sampling_plan), "recorded pre-injection sampling choice mismatch")
+            require(exact(allocation.get('sampling_plan'),sampling_plan), "sampling plan is not the pre-input geometry-derived choice")
+            sampling_after=client.verify_divider_sampling_after(sampling_plan,after_snapshot,origin)
+            require(exact(allocation.get('sampling_after'),sampling_after), "sampling lost same adjacent content after movement")
             predicted_shift = model['expected_allocation_shift']
             shift = client.allocation_shift(before_snapshot, after_snapshot, predicted_shift)
             require(exact(allocation.get("shift"), shift), "recorded allocation shift differs from geometry")
@@ -408,14 +419,15 @@ def validate(raw, panes, binary_sha256, evidence_directory=None):
                         exact(event.get("before_snapshot"), before_snapshot) and exact(event.get("after_snapshot"), after_snapshot) and
                         exact(event.get("allocation_shift"), shift), "pixel drag allocation linkage mismatch")
                 divider = before_snapshot["dividers"][0]
-                rect, expected = client.divider_rect(divider, origin)
+                rect, expected = sampling_plan["rect"], sampling_plan["expected"]
+                require(exact(event.get("sampling_plan"),sampling_plan), "pixel ROI plan differs from allocation plan")
                 require(exact(event.get("rect"), rect) and exact(event.get("horizontal"), divider["horizontal"]), "pixel divider ROI mismatch")
                 center, radius = expected + predicted_shift // 2, abs(predicted_shift) // 2 + 5
                 before_capture, before_position, before_rgb = divider_response(evidence, event, "before", center, radius)
                 after_capture, after_position, after_rgb = divider_response(evidence, event, "after", center, radius)
                 observer.divider_motion(before_rgb, after_rgb, *rect[2:], horizontal=event["horizontal"],
                                         expected=expected, delta=predicted_shift)
-                require(before_time <= before_capture["started_ns"] < before_capture["finished_ns"] <= stamp and
+                require(chosen_ns <= before_capture["started_ns"] < before_capture["finished_ns"] <= stamp and
                         after_time <= after_capture["started_ns"] < after_capture["finished_ns"] and
                         after_capture["finished_ns"] - stamp <= MAX_RESPONSE_NS, "divider captures do not bracket drag/geometry")
                 pixel_shift = after_position - before_position

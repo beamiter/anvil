@@ -137,18 +137,42 @@ def verify_flushed_speech(log, phases, marker):
         phase['orca_presented'] = speech
 
 
-def shutdown_orca(orca, pump, clock_guard):
+def validate_shutdown_wake(events, acknowledgement, fixture_pid, wake_name):
+    check(all(event['pid'] == fixture_pid for event in events), 'foreign shutdown event')
+    check(not any(event['type'].startswith(('object:announcement',
+                  'object:state-changed:focused', 'window:activate')) for event in events),
+          'shutdown wake announced, moved focus or activated a window')
+    matching = [event for event in events
+                if event['type'].startswith('object:property-change:accessible-name')
+                and event['name'] == wake_name and event['role'] == 'frame']
+    check(len(matching) <= 1, 'duplicate shutdown wake')
+    if acknowledgement is None or not matching:
+        return False
+    check(acknowledgement['pid'] == fixture_pid and acknowledgement['name'] == wake_name,
+          'wrong wake ownership')
+    check(acknowledgement['focus_preserved'] and acknowledgement['draft_preserved'],
+          'wake stole focus/draft')
+    return True
+
+def shutdown_orca(orca, pump, clock_guard, request_wake, wake_observed):
     # SIGTERM is handled by Orca46 shutdownOnSignal -> shutdown. Keep the
     # owned GTK accessible objects and bus alive until it unregisters itself.
     clock_guard.checkpoint()
-    orca.terminate()
     deadline = time.monotonic() + 5
-    while orca.poll() is None:
+    orca.terminate()
+    request_wake()
+    while True:
+        clock_guard.checkpoint()
         if time.monotonic() >= deadline:
-            raise subprocess.TimeoutExpired('owned Orca graceful shutdown', 5)
+            raise subprocess.TimeoutExpired('owned Orca graceful shutdown and wake', 5)
+        exited = orca.poll() is not None
+        observed = wake_observed()
+        if exited and observed:
+            check(time.monotonic() < deadline, 'shutdown evidence arrived after deadline')
+            break
         pump()
-    clock_guard.checkpoint()
     check(orca.returncode == 0, f'Orca did not shut down gracefully: {orca.returncode}')
+
 
 def main():
     p = argparse.ArgumentParser()
@@ -235,7 +259,7 @@ def main():
         check(wm.poll() is None, 'owned window manager failed')
         Atspi.init()
         listener = Atspi.EventListener.new(event_received)
-        for event_type in ['object:announcement', 'object:state-changed:focused', 'window:activate']:
+        for event_type in ['object:announcement', 'object:state-changed:focused', 'window:activate', 'object:property-change:accessible-name']:
             registered = listener.register(event_type)
             check(registered, f'failed to register {event_type}')
         orca_log = evidence / 'orca-debug.log'
@@ -296,7 +320,18 @@ def main():
         check(orca.poll() is None, 'Orca exited before completion')
         # The GTK fixture is still pumping while waiting for finish.ack.
         # Do not destroy its accessibility tree before Orca's graceful cleanup.
-        shutdown_orca(orca, pump, clock_guard)
+        wake_name = f'A11 fixture shutdown {token}'
+        wake_start = len(events)
+        def request_wake():
+            temporary = evidence / 'shutdown.request.tmp'
+            temporary.write_text('owned observer shutdown wake\n')
+            temporary.replace(evidence / 'shutdown.request')
+        def wake_observed():
+            ack = evidence / 'shutdown.ack.json'
+            value = json.loads(ack.read_text()) if ack.exists() else None
+            return validate_shutdown_wake(events[wake_start:], value, fixture.pid, wake_name)
+        shutdown_orca(orca, pump, clock_guard, request_wake, wake_observed)
+        result['shutdown_wake'] = events[wake_start:]
         speech_log = orca_log.read_text(errors='strict')
         check('ORCA: Shutdown complete' in speech_log, 'Orca shutdown completion missing')
         verify_flushed_speech(speech_log, phases, marker)
