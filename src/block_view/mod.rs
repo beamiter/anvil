@@ -19921,6 +19921,40 @@ mod tests {
         }
     }
 
+    // A prefix is sufficient between D and the next A, but not after the
+    // corpus fixture has returned to its final prompt. Keep this count oracle
+    // pure so missing-record negative controls need neither GTK nor a PTY.
+    fn assert_session_parity_finalized_count(finalized_ids: &[u64], expected_count: usize) {
+        assert_eq!(
+            finalized_ids.len(),
+            expected_count,
+            "the complete fixture must finalize every expected completion"
+        );
+    }
+
+    #[test]
+    fn session_parity_final_count_accepts_complete_and_empty_fixtures() {
+        assert_session_parity_finalized_count(&[], 0);
+        assert_session_parity_finalized_count(&[41], 1);
+        assert_session_parity_finalized_count(&[41, 72], 2);
+    }
+
+    #[test]
+    fn session_parity_final_count_rejects_empty_records_for_a_completion() {
+        assert!(std::panic::catch_unwind(|| {
+            assert_session_parity_finalized_count(&[], 1);
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn session_parity_final_count_rejects_a_missing_tail() {
+        assert!(std::panic::catch_unwind(|| {
+            assert_session_parity_finalized_count(&[41], 2);
+        })
+        .is_err());
+    }
+
     // These use the existing ReaderHarness and its existing test PTY. They
     // are CI regressions; the isolated pure harness does not run them.
     // Shared raw-byte corpus through the production reader/parser/lifecycle owner.
@@ -20005,6 +20039,13 @@ mod tests {
                     chunking
                 );
             }
+            // All completion-bearing fixtures end with the next A/B prompt.
+            // Do not require this at D: completion fan-out precedes finalize.
+            let expected_count = fixture.steps.last().unwrap().expected.completed.len();
+            assert_session_parity_finalized_count(
+                &harness.backend.finalized_ids.borrow(),
+                expected_count,
+            );
         }
     }
 
