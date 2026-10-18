@@ -28,7 +28,13 @@ def require(condition, message):
 
 
 def number(value, label, positive=False):
-    require(type(value) in (int, float) and math.isfinite(value), f"{label}: invalid number")
+    require(type(value) in (int, float), f"{label}: invalid number")
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:
+        # JSON integers need not fit the finite float domain used by timings.
+        finite = False
+    require(finite, f"{label}: invalid number")
     require(value > 0 if positive else value >= 0, f"{label}: invalid range")
     return value
 
@@ -176,6 +182,7 @@ def compare(baseline, candidate):
         if panes == 1:
             stats["drag_to_after_paint_ms"] = {"not_applicable": "single_pane_no_divider"}
         input_ratio = stats[SERIES[0]]["candidate"]["p95"] / stats[SERIES[0]]["baseline"]["p95"]
+        number(input_ratio, f"{panes}.input_p95_ratio")
         gates = {"input_p95_within_15_percent": input_ratio <= 1.15,
                  "dispatch_target_16ms": max(b["dispatch_ms"]) <= 16,
                  "consumer_target_16ms": max(b["consumer_ms"]) <= 16,
@@ -208,10 +215,11 @@ def main():
     args = parser.parse_args()
     try:
         result = compare(read(args.baseline), read(args.candidate))
-    except (ValueError, TypeError, OSError, KeyError) as error:
+        output = json.dumps(result, indent=2, allow_nan=False)
+    except (ValueError, TypeError, OSError, KeyError, OverflowError) as error:
         print(json.dumps({"schema": 1, "pass": False, "invalid_evidence": str(error)}))
         return 2
-    print(json.dumps(result, indent=2, allow_nan=False))
+    print(output)
     return 0 if result["pass"] else 1
 
 

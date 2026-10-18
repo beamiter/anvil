@@ -6,7 +6,25 @@ on:
     paths:
       - '.github/workflows/interaction-smoke.yml'
       - 'scripts/*interaction*'
+      - 'scripts/qa-cross-selection-pointer.py'
       - 'docs/interaction-budget.md'
+      # Product, build and embedded/runtime resources used by the paired binaries.
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - '.cargo/**'
+      - 'rust-toolchain'
+      - 'rust-toolchain.toml'
+      - 'config.toml.example'
+      - 'scripts/completions/**'
+      - 'scripts/shell-integration/**'
+      - 'scripts/notebooks/**'
+      - 'scripts/workflows/**'
+      - 'data/**'
+      # Post-processing-only changes have an independent pure Python CI job.
+      - '!scripts/compare-interaction-budget.py'
+      - '!scripts/test-interaction-budget.py'
 
 permissions:
   contents: read
@@ -26,7 +44,8 @@ jobs:
       CARGO_BUILD_JOBS: '1'
       RUST_BACKTRACE: '1'
       BASELINE_SHA: 88c3f4c565cb5b9f8d47d22eb3ad07f47a822ae4
-      CANDIDATE_PARENT_SHA: dd4097a66f216a4b3bd77f7d0ca5817761ce77d0
+      # Reviewed migration parent; future native changes require a new source review.
+      CANDIDATE_PARENT_SHA: ba88ab234e0f189525cf54f061b71a2f1a1b5fb0
     steps:
       - name: Check out immutable candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -54,6 +73,7 @@ jobs:
           mkdir -p evidence binaries
           test "$(git -C baseline rev-parse HEAD)" = "$BASELINE_SHA"
           test "$(git -C candidate rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C candidate show -s --format=%P HEAD | wc -w)" -eq 1
           test "$(git -C candidate rev-parse HEAD^)" = "$CANDIDATE_PARENT_SHA"
           python3 - <<'PYCODE'
           import json, os

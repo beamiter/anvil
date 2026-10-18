@@ -20,6 +20,29 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  interaction-contracts:
+    name: Pure interaction evidence contracts (no native acceptance)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out immutable contract candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate pure comparator and lineage contracts
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 --version
+          PYTHONOPTIMIZE=0 python3 scripts/test-interaction-budget.py
+          PYTHONOPTIMIZE=1 python3 scripts/test-interaction-budget.py
+          PYTHONOPTIMIZE=0 python3 scripts/test-interaction-lineage.py
+          PYTHONOPTIMIZE=1 python3 scripts/test-interaction-lineage.py
+
   rust:
     name: Rust quality, smoke tests, and bundle
     runs-on: ubuntu-24.04

@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Synthetic contract tests. No native runtime evidence is generated."""
 import copy
+import contextlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location("budget", Path(__file__).with_name("compare-interaction-budget.py"))
 budget = importlib.util.module_from_spec(spec)
@@ -207,9 +210,115 @@ class Contract(unittest.TestCase):
         with self.assertRaises(ValueError): budget.validate(b)
 
     def test_nonfinite_negative_boolean_zero_latency(self):
-        for v in (float("nan"), float("inf"), -1, True, 0):
+        for v in (float("nan"), float("inf"), -float("inf"), -1, True, 0):
             b = fixture(); b["scenarios"][0]["input_to_after_paint_ms"][0] = v
             with self.assertRaises(ValueError): budget.validate(b)
+
+    def test_all_numeric_measurements_reject_unrepresentable_and_nonfinite_values(self):
+        scalar_fields = ("warmup_seconds", "output_seconds", "idle_seconds", "cpu_seconds",
+                         "blocked_write_ms", "max_write_lag_ms")
+        for value in (10 ** 400, -(10 ** 400), float("nan"), float("inf"), -float("inf")):
+            for key in scalar_fields + budget.SERIES:
+                with self.subTest(key=key, value=value):
+                    b = fixture()
+                    if key in budget.SERIES:
+                        b["scenarios"][0][key][0] = value
+                    else:
+                        b["scenarios"][0][key] = value
+                    with self.assertRaisesRegex(ValueError, "invalid number"):
+                        budget.validate(b)
+
+    def test_finite_p95_inputs_cannot_produce_a_nonfinite_ratio(self):
+        a, b = fixture(), fixture()
+        a["scenarios"][0]["input_to_after_paint_ms"] = [float.fromhex("0x0.0000000000001p-1022")] * 300
+        b["scenarios"][0]["input_to_after_paint_ms"] = [sys.float_info.max] * 300
+        budget.validate(a)
+        budget.validate(b)
+        with self.assertRaisesRegex(ValueError, "input_p95_ratio: invalid number"):
+            budget.compare(a, b)
+
+    def test_finite_positive_extremes_preserve_relative_comparison(self):
+        for value in (float.fromhex("0x0.0000000000001p-1022"), sys.float_info.min,
+                      sys.float_info.max, 10 ** 300):
+            with self.subTest(value=value):
+                a, b = fixture(), fixture()
+                for run in (a, b):
+                    run["scenarios"][0]["input_to_after_paint_ms"] = [value] * 300
+                result = budget.compare(a, b)
+                self.assertTrue(result["pass"])
+                self.assertEqual(result["scenarios"][0]["input_p95_ratio"], 1.0)
+                json.dumps(result, allow_nan=False)
+
+    def test_cli_serialization_failure_is_structured_invalid_evidence(self):
+        for value in (float("nan"), float("inf"), -float("inf")):
+            with self.subTest(value=value):
+                output = io.StringIO()
+                with mock.patch.object(sys, "argv", ["compare", "baseline", "candidate"]), \
+                        mock.patch.object(budget, "read", return_value=fixture()), \
+                        mock.patch.object(budget, "compare", return_value={"pass": True, "unexpected": value}), \
+                        contextlib.redirect_stdout(output):
+                    status = budget.main()
+                self.assertEqual(status, 2)
+                result = json.loads(output.getvalue())
+                self.assertEqual(result["schema"], 1)
+                self.assertFalse(result["pass"])
+                self.assertIn("invalid_evidence", result)
+
+    def test_cli_numeric_edges_have_json_output_and_correct_status(self):
+        with tempfile.TemporaryDirectory() as d:
+            left, right = Path(d) / "baseline.json", Path(d) / "candidate.json"
+            invalid_values = (10 ** 400, -(10 ** 400), float("nan"), float("inf"), -float("inf"))
+            cases = [(value, 10.0, 2) for value in invalid_values]
+            cases += [(10.0, value, 2) for value in invalid_values]
+            cases += [(float.fromhex("0x0.0000000000001p-1022"), sys.float_info.max, 2),
+                      (sys.float_info.max, sys.float_info.max, 0), (10.0, 11.5, 0), (10.0, 11.501, 1)]
+            for baseline_value, candidate_value, expected_code in cases:
+                with self.subTest(baseline=baseline_value, candidate=candidate_value):
+                    a, b = fixture(), fixture()
+                    a["scenarios"][0]["input_to_after_paint_ms"] = [baseline_value] * 300
+                    b["scenarios"][0]["input_to_after_paint_ms"] = [candidate_value] * 300
+                    left.write_text(json.dumps(a))
+                    right.write_text(json.dumps(b))
+                    process = subprocess.run([sys.executable, str(Path(budget.__file__)), str(left), str(right)],
+                                             capture_output=True, text=True, check=False)
+                    self.assertEqual(process.returncode, expected_code, process.stderr)
+                    self.assertEqual(process.stderr, "")
+                    result = json.loads(process.stdout)
+                    self.assertEqual(result["schema"], 1)
+                    self.assertEqual(result["pass"], expected_code == 0)
+                    if expected_code == 2:
+                        self.assertIsInstance(result["invalid_evidence"], str)
+                        self.assertTrue(result["invalid_evidence"])
+                    else:
+                        self.assertEqual(result["acceptance"], "presentation_proxy_only_display_acceptance_open")
+
+    def test_cli_derived_workload_overflow_keeps_finite_input_contract(self):
+        with tempfile.TemporaryDirectory() as d:
+            left, right = Path(d) / "baseline.json", Path(d) / "candidate.json"
+            for duration, expected_code in ((10 ** 300, 0), (10 ** 308, 2)):
+                with self.subTest(duration=duration):
+                    # Both inputs are finite. Only the latter's derived byte
+                    # target cannot be converted for the existing 1% range.
+                    self.assertEqual(budget.number(duration, "output_seconds"), duration)
+                    a, b = fixture(), fixture()
+                    for run in (a, b):
+                        c = run["scenarios"][0]
+                        c["output_seconds"] = duration
+                        c["output_bytes"] = c["consumed_bytes"] = c["panes"] * 256 * 1024 * duration
+                    left.write_text(json.dumps(a))
+                    right.write_text(json.dumps(b))
+                    process = subprocess.run([sys.executable, str(Path(budget.__file__)), str(left), str(right)],
+                                             capture_output=True, text=True, check=False)
+                    self.assertEqual(process.returncode, expected_code, process.stderr)
+                    self.assertEqual(process.stderr, "")
+                    result = json.loads(process.stdout)
+                    self.assertEqual(result["schema"], 1)
+                    self.assertEqual(result["pass"], expected_code == 0)
+                    if expected_code == 2:
+                        self.assertIsInstance(result["invalid_evidence"], str)
+                        self.assertTrue(result["invalid_evidence"])
+                    else:
+                        self.assertEqual(result["acceptance"], "presentation_proxy_only_display_acceptance_open")
 
     def test_missing_and_duplicate_json(self):
         b = fixture(); del b["environment"]["compiler"]
