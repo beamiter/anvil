@@ -507,6 +507,7 @@ pub enum VteInput {
     NextCommand,
     ReturnToLive,
     CopyCurrentCommand,
+    CompareCommandOutput,
     /// Block-view only: write the whole session's blocks to a Markdown / JSON
     /// file under the anvil data directory.
     ExportSessionMarkdown,
@@ -927,6 +928,11 @@ impl Component for VteTerminal {
             VteInput::CrossBlockSearch => {
                 let _ = sender.output(VteOutput::Notice(vte_block_mode_only_notice(
                     "Cross-block search",
+                )));
+            }
+            VteInput::CompareCommandOutput => {
+                let _ = sender.output(VteOutput::Notice(vte_block_mode_only_notice(
+                    "Command output comparison",
                 )));
             }
             VteInput::PreviousCommand

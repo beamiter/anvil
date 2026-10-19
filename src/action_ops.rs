@@ -648,6 +648,9 @@ impl AppModel {
             Action::CopyCurrentCommand => {
                 self.emit_block_action(VteInput::CopyCurrentCommand, "Current-command copy")
             }
+            Action::CompareCommandOutput => {
+                self.emit_block_action(VteInput::CompareCommandOutput, "Command output comparison")
+            }
         }
     }
 }

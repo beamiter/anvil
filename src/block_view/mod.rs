@@ -47,6 +47,7 @@ pub(crate) use focus_restore::restore_live_focus_deferred;
 mod history;
 mod ime_gate;
 mod onboarding;
+mod output_compare;
 #[allow(dead_code)]
 mod palette;
 mod paste_feedback;
@@ -27674,7 +27675,9 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         let mut first = test_block(30, "printf '你好 🦀'", Some(0));
         first.cwd = Some("/workspace/项目/very-long-folder-name-to-exercise-narrow-layout".into());
         first.duration_ms = Some(1250);
-        let second = test_block(2, "printf second", Some(1));
+        first.output = "old result\nshared result\n".into();
+        let mut second = test_block(2, "printf second", Some(1));
+        second.output = "new result\nshared result\n".into();
         let records = Rc::new(RefCell::new(VecDeque::from([first, second])));
         let cards = Rc::new(RefCell::new(
             records
@@ -27787,16 +27790,63 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             harness.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty(),
             "opening review must not write PTY bytes"
         );
+        let compare = find_named_button(dialog.upcast_ref(), "Compare selected output")
+            .expect("production comparison action");
+        assert!(compare.is_sensitive());
+        compare.emit_clicked();
+        pump();
+        let comparison = window.visible_dialog().expect("comparison dialog opened");
+        assert_ne!(comparison, dialog);
+        let copy_comparison =
+            find_named_button(comparison.upcast_ref(), "Copy displayed comparison")
+                .expect("production comparison copy action");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !copy_comparison.is_sensitive() {
+            assert!(
+                Instant::now() < deadline,
+                "comparison worker did not finish"
+            );
+            pump();
+        }
+        copy_comparison.emit_clicked();
+        let compared = gtk::glib::MainContext::default()
+            .block_on(copy_comparison.clipboard().read_text_future())
+            .unwrap()
+            .unwrap();
+        assert!(compared.contains("Before · Block #30"));
+        assert!(compared.contains("After · Block #2"));
+        assert!(compared.contains("-old result\n+new result\n"));
+        assert!(compared.contains("Retained text only"));
+        assert_eq!(*selected.borrow(), HashSet::from([30, 2]));
+        assert!(harness.pty.drain_test_slave(PTY_REPLY_WAIT).is_empty());
+        comparison.force_close();
+        pump();
+        assert_eq!(window.visible_dialog(), Some(dialog.clone()));
         // Optional real GTK snapshot for the delivery artifact.
         if let Ok(directory) = std::env::var("ANVIL_REVIEW_SCREENSHOT_DIR") {
             std::fs::create_dir_all(&directory).unwrap();
             for (name, width) in [("wide", 900), ("narrow", 360)] {
                 window.set_default_size(width, 680);
                 pump();
-                for action in [
-                    &insert,
-                    &find_named_button(dialog.upcast_ref(), "Copy commands").unwrap(),
-                ] {
+                let copy_action = find_named_button(dialog.upcast_ref(), "Copy commands").unwrap();
+                let actions = [&insert, &copy_action, &compare];
+                // The dialog switches between a centered dialog and a sheet
+                // on resize. Wait for its native animation before checking
+                // the final allocation of every footer action.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < deadline
+                    && (window.width() > width + 8
+                        || actions.iter().any(|action| {
+                            action.compute_bounds(&window).is_none_or(|bounds| {
+                                bounds.y() < 0.0
+                                    || bounds.y() + bounds.height() > window.height() as f32
+                            })
+                        }))
+                {
+                    pump();
+                }
+                assert!(window.width() <= width + 8, "review must fit width {width}");
+                for action in actions {
                     let bounds = action
                         .compute_bounds(&window)
                         .expect("mapped review action");
@@ -27805,7 +27855,11 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
                         bounds.x() >= 0.0 && bounds.x() + bounds.width() <= window.width() as f32
                     );
                     assert!(
-                        bounds.y() >= 0.0 && bounds.y() + bounds.height() <= window.height() as f32
+                        bounds.y() >= 0.0 && bounds.y() + bounds.height() <= window.height() as f32,
+                        "review action {:?} must fit {}×{}: {bounds:?}",
+                        action.label(),
+                        window.width(),
+                        window.height(),
                     );
                 }
                 let paintable = gtk::WidgetPaintable::new(Some(&window));

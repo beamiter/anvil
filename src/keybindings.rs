@@ -143,6 +143,7 @@ pub(crate) enum Action {
     NextCommand,
     ReturnToLive,
     CopyCurrentCommand,
+    CompareCommandOutput,
 }
 
 impl Action {
@@ -258,6 +259,7 @@ impl Action {
             Action::NextCommand => "Next command",
             Action::ReturnToLive => "Return to live input",
             Action::CopyCurrentCommand => "Copy current command",
+            Action::CompareCommandOutput => "Compare command output",
         }
     }
 
@@ -360,6 +362,7 @@ impl Action {
             Action::NextCommand => Some("next_command"),
             Action::ReturnToLive => Some("return_to_live"),
             Action::CopyCurrentCommand => Some("copy_current_command"),
+            Action::CompareCommandOutput => Some("compare_command_output"),
         }
     }
 
@@ -470,6 +473,7 @@ impl Action {
             Action::NextCommand,
             Action::ReturnToLive,
             Action::CopyCurrentCommand,
+            Action::CompareCommandOutput,
         ]
     }
 
@@ -1458,6 +1462,7 @@ toggle_block_collapsed = "F10"
             (Action::NextCommand, "next_command", "F6"),
             (Action::ReturnToLive, "return_to_live", "F7"),
             (Action::CopyCurrentCommand, "copy_current_command", "F8"),
+            (Action::CompareCommandOutput, "compare_command_output", "F9"),
         ];
         let before_up = map.lookup(&parse("Ctrl+Up").unwrap());
         let before_down = map.lookup(&parse("Ctrl+Down").unwrap());

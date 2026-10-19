@@ -4,8 +4,14 @@ The JSON and Markdown session-export actions open a review dialog. Nothing is
 written until **Save reviewed export**. Cancel or closing the review window
 writes nothing, including while the CPU-only preview worker is running.
 
-Choose all completed records, comma-separated block IDs, or an inclusive range
-of authoritative command-start timestamps in Unix milliseconds. Unknown times
+If cards are selected, or Unified has an explicitly chosen command, the dialog
+starts with **Current selection**. That option captures the exact IDs when the
+dialog opens; changing the terminal selection or switching panes cannot change
+them. It never falls back to all records. A missing or duplicate ID stops the
+entire export so a partly retained selection cannot become a misleading file.
+
+You can also choose all completed records, comma-separated block IDs, or an
+inclusive range of authoritative command-start timestamps in Unix milliseconds. Unknown times
 are omitted from time-range selections. The snapshot is taken when **Prepare**
 is pressed; later terminal activity is not added. Range and privacy controls
 are locked for this preview. Cancel and reopen to change them.

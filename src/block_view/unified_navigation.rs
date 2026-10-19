@@ -161,6 +161,7 @@ pub(super) struct NavigationBar {
     pub(super) find: gtk::Button,
     pub(super) browse: gtk::Button,
     pub(super) copy: gtk::Button,
+    pub(super) compare: gtk::Button,
     pub(super) live: gtk::Button,
     text_labels: Vec<gtk::Label>,
     width: Rc<Cell<i32>>,
@@ -233,6 +234,11 @@ impl NavigationBar {
             "Browse completed commands in this terminal",
         );
         let copy = button("edit-copy-symbolic", "", "Copy the current command");
+        let compare = button(
+            "view-dual-symbolic",
+            "",
+            "Compare output with the previous run of this command in the same folder",
+        );
         let live = button("go-bottom-symbolic", "Live", "Return to live input");
         let root = gtk::Overlay::new();
         root.set_child(Some(&row));
@@ -265,6 +271,7 @@ impl NavigationBar {
             find,
             browse,
             copy,
+            compare,
             live,
             text_labels,
             width,
@@ -393,6 +400,7 @@ impl NavigationBar {
         self.live
             .set_sensitive(reading || summary.selected.is_some());
         self.copy.set_sensitive(summary.copyable);
+        self.compare.set_sensitive(summary.selected.is_some());
         let text = summary.selected.clone().unwrap_or_else(|| {
             if summary.count == 0 {
                 "Commands appear with shell integration".into()
@@ -481,6 +489,7 @@ impl TermView {
             (&bar.find, Action::ToggleSearch),
             (&bar.browse, Action::CrossBlockSearch),
             (&bar.copy, Action::CopyCurrentCommand),
+            (&bar.compare, Action::CompareCommandOutput),
             (&bar.live, Action::ReturnToLive),
         ] {
             let dispatch = dispatch.clone();

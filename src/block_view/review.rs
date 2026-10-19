@@ -1,5 +1,6 @@
 //! A read-only, identity-bound review of finished cards. Output stays in its
 //! native VTE (including images); opening review never copies a transcript.
+//! An explicit Compare action captures only the two bounded retained outputs.
 use super::*;
 use relm4::adw;
 use relm4::adw::prelude::*;
@@ -306,7 +307,9 @@ pub(super) fn install_with_context(
                 body.append(&section);
             }
             let scroller = gtk::ScrolledWindow::builder().hscrollbar_policy(gtk::PolicyType::Never).vexpand(true).child(&body).build();
-            toolbar.set_content(Some(&scroller));
+            let content = gtk::Box::new(Orientation::Vertical, 0);
+            content.append(&scroller);
+            toolbar.set_content(Some(&content));
             let footer = gtk::Box::new(Orientation::Vertical, 8);
             footer.set_margin_start(16);
             footer.set_margin_end(16);
@@ -315,6 +318,13 @@ pub(super) fn install_with_context(
             let status = label("Nothing has been inserted. Escape closes review.");
             status.set_selectable(false);
             status.set_accessible_role(gtk::AccessibleRole::Status);
+            status.set_margin_start(16);
+            status.set_margin_end(16);
+            status.set_margin_top(8);
+            // Wrapping feedback belongs to the height-for-width content
+            // layout. A bottom bar can otherwise retain its one-line height
+            // when the dialog becomes a narrow sheet, clipping its actions.
+            content.prepend(&status);
             let insert = gtk::Button::with_label("Insert at prompt · does not run");
             insert.add_css_class("suggested-action");
             let command = complete_reviewed_command(&snapshot, &ids);
@@ -345,7 +355,32 @@ pub(super) fn install_with_context(
                 button.clipboard().set_text(&copy_command);
                 copy_status.set_text("Commands copied. Nothing was inserted or run.");
             });
-            footer.append(&status);
+            let compare = gtk::Button::with_label("Compare selected output");
+            compare.set_sensitive(snapshot.len() == 2 && ids.len() == 2);
+            compare.set_tooltip_text(Some("Compare exactly two completed commands in terminal order"));
+            let compare_records = Rc::downgrade(&records);
+            let compare_snapshot = snapshot.clone();
+            let compare_ids = ids.clone();
+            let compare_status = status.clone();
+            compare.connect_clicked(move |button| {
+                let Some(records) = compare_records.upgrade() else { return; };
+                let current = records.borrow();
+                let valid = compare_snapshot.len() == compare_ids.len()
+                    && compare_snapshot.iter().all(|reviewed| current.iter().any(|record| {
+                        record.id == reviewed.id && ReviewRecord::from_record(record) == *reviewed
+                    }));
+                if !valid {
+                    compare_status.set_text("A reviewed block was removed or changed. Close and review the selection again.");
+                    button.set_sensitive(false);
+                    return;
+                }
+                if let Err(message) = super::output_compare::show(
+                    button.upcast_ref(), current.iter().map(BackendRecordRef::Block), &compare_ids,
+                ) {
+                    compare_status.set_text(message);
+                }
+            });
+            footer.append(&compare);
             footer.append(&copy);
             footer.append(&insert);
             toolbar.add_bottom_bar(&footer);

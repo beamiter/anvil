@@ -174,6 +174,10 @@ fn unified_navigation_preserves_native_ownership_and_follows_live() {
     ));
     settle();
     assert!(bar.copy.is_sensitive());
+    assert!(bar.compare.is_sensitive());
+    bar.compare.emit_clicked();
+    assert!(actions.borrow().contains(&Action::CompareCommandOutput));
+    assert_eq!(view.navigated_record_id.get(), Some(2));
     view.active_vte.select_all();
     assert!(view.active_vte.has_selection());
     assert!(outside.grab_focus());
@@ -202,6 +206,7 @@ fn unified_navigation_preserves_native_ownership_and_follows_live() {
         "native scroll retires old command cursor"
     );
     assert!(bar.status.text().starts_with("Reading history"));
+    assert!(!bar.compare.is_sensitive());
     // The outer container has no authority over the native history position.
     view.block_scroll
         .vadjustment()
@@ -313,6 +318,7 @@ fn unified_navigation_preserves_native_ownership_and_follows_live() {
             &bar.find,
             &bar.browse,
             &bar.copy,
+            &bar.compare,
             &bar.live,
         ] {
             let bounds = button.compute_bounds(&window).unwrap();

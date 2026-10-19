@@ -383,9 +383,24 @@ Command jumps use authenticated row locations. If the location is no longer
 provable, Anvil offers the existing read-only retained snapshot or a clear
 Browse hint. Copy current command uses the explicitly chosen retained record,
 preserves multiline commands, and leaves the native text selection untouched.
-The four new palette actions have optional configuration keys but no new
+These palette actions have optional configuration keys but no new
 default shortcuts. See [Unified navigation](docs/unified-navigation.md) for
 the cursor, copy, and keyboard rules.
+
+**Compare command output** adds a read-only difference view for repeated runs.
+In Block/Chat, select two finished cards and choose this palette action or
+**Compare selected output** in Review. In Unified, choose a command with
+Previous/Next or Browse, then use the compare icon to compare it with the
+nearest earlier retained command having the same recorded text and folder.
+Both stable IDs, start times, commands, folders, and exit statuses stay visible.
+The bounded worker reports added/removed lines and makes retained-output or
+comparison limits explicit. Images and terminal layout are outside text comparison.
+
+Session export now starts with the current visual selection when one exists;
+its range menu still offers all completed records, explicit IDs, and time ranges.
+The selected IDs are captured when the dialog opens, so later navigation cannot
+change the target. Missing or duplicate IDs stop the whole export. See
+[Reviewed session export](docs/session-export.md) for preview and saved formats.
 
 The supported Kitty subset is direct, static `a=T` display (`i`, `c/r/C`,
 PNG/RGB/RGBA) plus `a=q`; transmit-only storage, `I`, crop/z/relative placement,

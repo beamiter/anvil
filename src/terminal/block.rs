@@ -90,6 +90,11 @@ fn preview_session_export(
         window.present();
         return;
     }
+    let visual_selection = view.explicit_export_selection();
+    let selection_label = match &visual_selection {
+        Some(ExportSelection::Ids { ids }) => format!("Current selection ({} blocks)", ids.len()),
+        _ => "Current selection (none)".to_string(),
+    };
     let window = gtk::Window::builder()
         .title("Review session export")
         .default_width(700)
@@ -104,14 +109,18 @@ fn preview_session_export(
     content.set_margin_bottom(16);
     content.set_margin_start(16);
     content.set_margin_end(16);
-    let explanation = gtk::Label::new(Some("Choose all records, block IDs, or inclusive command-start Unix milliseconds. Unknown times are omitted from time ranges. Preview is limited to 64 KiB; retained output may already be truncated or unavailable."));
+    let explanation = gtk::Label::new(Some("Choose the captured block selection, all records, block IDs, or inclusive command-start Unix milliseconds. The captured selection keeps its original IDs when terminal focus changes; missing IDs stop the whole export. Unknown times are omitted from time ranges. Preview is limited to 64 KiB; retained output may already be truncated or unavailable."));
     explanation.set_wrap(true);
     content.append(&explanation);
     let mode = gtk::DropDown::from_strings(&[
         "All completed records",
         "Block IDs",
         "Time range (Unix ms)",
+        &selection_label,
     ]);
+    if visual_selection.is_some() {
+        mode.set_selected(3);
+    }
     content.append(&mode);
     let ids = gtk::Entry::builder()
         .placeholder_text("Block IDs, comma-separated (example: 1,4,9)")
@@ -205,6 +214,7 @@ fn preview_session_export(
         let selection = match mode.selected() {
             1 => ids.text().split(',').map(|id| id.trim().parse::<u64>()).collect::<Result<Vec<_>, _>>().map(|ids| ExportSelection::Ids {ids}).map_err(|_| "Enter comma-separated numeric block IDs."),
             2 => start.text().parse::<u64>().and_then(|start_ms| end.text().parse::<u64>().map(|end_ms| ExportSelection::TimeRange {start_ms,end_ms})).map_err(|_| "Enter numeric Unix milliseconds."),
+            3 => visual_selection.clone().ok_or("No blocks were selected when this export opened. Close it, select blocks, and open Export again."),
             _ => Ok(ExportSelection::All),
         };
         let selection = match selection { Ok(s) => s, Err(e) => {status.set_text(e);return;} };
@@ -1130,6 +1140,11 @@ impl Component for BlockTerminal {
                     .map_or_else(|message| message, |_| "Copied the current command.");
                 let _ = sender.output(VteOutput::Notice(message.into()));
             }
+            VteInput::CompareCommandOutput => {
+                if let Err(message) = view.compare_command_output() {
+                    let _ = sender.output(VteOutput::Notice(message.into()));
+                }
+            }
             VteInput::ExportSessionMarkdown | VteInput::ExportSessionJson => {
                 let format = if matches!(msg, VteInput::ExportSessionJson) {
                     crate::block_view::SessionExportFormat::Json
@@ -1510,6 +1525,40 @@ mod tests {
             );
             assert_eq!(view.export_session_json(), source_before);
         }
+        for captured_id in [9001, 9999] {
+            wait(|| !PreviewPermit::is_running());
+            let before_selection = files();
+            crate::block_view::export::set_preview_selection_fixture(&view, &[captured_id]);
+            let window = open();
+            let mode = children(&window)
+                .into_iter()
+                .find_map(|widget| widget.downcast::<gtk::DropDown>().ok())
+                .unwrap();
+            assert_eq!(mode.selected(), 3, "visual selection is the default scope");
+            // A later selection change must not retarget this already-open preview.
+            crate::block_view::export::set_preview_selection_fixture(&view, &[9002]);
+            button(&window, "Prepare redacted/original preview").emit_clicked();
+            let save = button(&window, "Save reviewed export");
+            if captured_id == 9001 {
+                wait(|| save.is_sensitive());
+                let json: serde_json::Value =
+                    serde_json::from_str(&visible_preview(&window)).unwrap();
+                assert_eq!(json["records"].as_array().unwrap().len(), 1);
+                assert_eq!(json["records"][0]["id"], 9001);
+                assert!(!visible_preview(&window).contains("SECOND_RECORD_MARKER"));
+            } else {
+                assert!(
+                    !save.is_sensitive(),
+                    "missing selection cannot fall back to all records"
+                );
+                assert!(visible_preview(&window).is_empty());
+            }
+            window.close();
+            wait(|| dialogs.borrow().is_none());
+            assert_eq!(files(), before_selection);
+            assert_eq!(view.export_session_json(), source_before);
+        }
+        crate::block_view::export::set_preview_selection_fixture(&view, &[]);
         parent.destroy();
         view.kill();
     }

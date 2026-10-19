@@ -179,6 +179,8 @@ remote_hosts = []
 # Optional selected-output actions; neither has a default shortcut.
 # collapse_selected_blocks = "F8"
 # expand_selected_blocks = "F9"
+# Compare two selected cards, or the selected Unified command's previous run.
+# compare_command_output = "F10"  # no default shortcut
 # resize_pane_left = "Ctrl+Shift+Alt+Left"
 # resize_pane_right = "Ctrl+Shift+Alt+Right"
 # resize_pane_up = "Ctrl+Shift+Alt+Up"

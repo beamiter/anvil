@@ -19,6 +19,16 @@ impl ExportSelection {
             Self::Ids { ids } if ids.is_empty() || ids.len() > 4096 => {
                 Err("Choose 1–4096 block IDs.")
             }
+            Self::Ids { ids }
+                if ids
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                    != ids.len() =>
+            {
+                Err("Choose each block ID only once.")
+            }
             Self::TimeRange { start_ms, end_ms } if start_ms > end_ms => {
                 Err("Start must precede end.")
             }
@@ -168,6 +178,7 @@ mod tests {
         .validate()
         .is_err());
         assert!(ExportSelection::Ids { ids: vec![] }.validate().is_err());
+        assert!(ExportSelection::Ids { ids: vec![7, 7] }.validate().is_err());
     }
 }
 

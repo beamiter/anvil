@@ -78,6 +78,7 @@ These actions are in the command palette and may be assigned in `[keybindings]`:
 | Next command | `next_command` | None |
 | Return to live | `return_to_live` | None |
 | Copy current command | `copy_current_command` | None |
+| Compare command output | `compare_command_output` | None |
 
 Existing Find, Browse, and line-scroll bindings are unchanged. In particular,
 Ctrl+Up/Down continue to scroll lines. Return and Space activate a focused
@@ -90,6 +91,30 @@ navigation, current-command copy, and Return to live actions refuse while the
 full-screen program owns the pane. The existing Browse dialog can still offer
 a retained read-only snapshot; unavailable row authority prevents it from
 moving the full-screen terminal viewport.
+
+## Compare repeated commands
+
+Choose a completed command with Previous, Next, or Browse. The compare icon
+and **Compare command output** palette action find the nearest earlier
+retained record with the same raw recorded command text and the same known
+folder. Unknown folders cannot match one another, shortened commands cannot
+choose a previous run, and an evicted previous snapshot is not silently
+replaced by a different run. If either output snapshot is unavailable, the
+action explains why comparison is unavailable.
+
+The read-only dialog shows both stable record IDs, local start times when
+authoritative, command text, folder, exit status, and command provenance.
+Comparison runs on a bounded background worker. Removed lines use `-`, added
+lines use `+`, and retained unchanged lines use a space. Capture truncation,
+input bounds, coarse alignment, and report limits remain explicit. The
+comparison covers retained text; it does not compare graphics or terminal
+layout. **Copy displayed comparison** includes its metadata and limit notes.
+Opening, closing, and copying this view do not insert or run a command.
+
+The same palette action compares exactly two explicitly selected finished
+cards in Block/Chat. Their Review dialog also provides **Compare selected
+output**; the pair stays in terminal order even when its numeric IDs are not
+sorted. Missing selected IDs refuse the complete operation.
 
 ## Focused validation
 

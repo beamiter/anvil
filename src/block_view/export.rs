@@ -323,6 +323,18 @@ impl SessionExportSnapshot {
         } else {
             records.iter().filter(matches).count()
         };
+        if matches!(selection, ExportSelection::Ids { .. }) {
+            let found_ids: std::collections::HashSet<_> = records
+                .iter()
+                .filter(matches)
+                .map(BackendRecordRef::id)
+                .collect();
+            if found_ids != selected_ids || selected != found_ids.len() {
+                return Err(io::Error::other(
+                    "A selected block is no longer retained or unique. Select the complete set again; nothing was exported.",
+                ));
+            }
+        }
         let too_large = || {
             io::Error::other("session exceeds export snapshot budget (4096 records / 16 MiB); export individual blocks instead")
         };
@@ -626,6 +638,18 @@ impl TermView {
         SessionExportSnapshot::capture_selected(&self.render_backend.records(), selection, true)
     }
 
+    /// Capture the visual selection before an export dialog can change focus.
+    /// Keep even retired IDs here so preparation refuses a partial selection.
+    pub(crate) fn explicit_export_selection(&self) -> Option<ExportSelection> {
+        let mut ids: Vec<_> = if self.unified_navigation.is_some() {
+            self.navigated_record_id.get().into_iter().collect()
+        } else {
+            self.selected_block_ids.borrow().iter().copied().collect()
+        };
+        ids.sort_unstable();
+        (!ids.is_empty()).then_some(ExportSelection::Ids { ids })
+    }
+
     /// Copy a block's content to clipboard (prompt + cmd + output).
     pub fn copy_block_by_id(&self, block_id: u64) {
         let finished = self.finished_blocks.borrow();
@@ -659,6 +683,11 @@ pub(crate) fn seed_preview_fixture(view: &TermView) {
     second.cmd = "echo second safe record".into();
     second.output = "SECOND_RECORD_MARKER".into();
     view.block_data.borrow_mut().extend([record, second]);
+}
+
+#[cfg(test)]
+pub(crate) fn set_preview_selection_fixture(view: &TermView, ids: &[u64]) {
+    *view.selected_block_ids.borrow_mut() = ids.iter().copied().collect();
 }
 
 #[cfg(test)]
@@ -771,6 +800,36 @@ mod tests {
         .unwrap();
         assert_eq!(selected.0.len(), 1);
         assert_eq!(selected.1.unwrap().omitted_records, 1);
+    }
+
+    #[test]
+    fn selected_export_refuses_missing_or_duplicate_ids_without_partial_output() {
+        use super::{ExportPrivacy, ExportSelection, SessionExportSnapshot};
+        let mut store = UnifiedZoneStore::new();
+        store.records.push_back(metadata_record(30));
+        store.records.push_back(metadata_record(2));
+        let store = RefCell::new(store);
+        let records = BackendRecords::Metadata(store.borrow());
+        for ids in [vec![30, 99], vec![30, 30], Vec::new()] {
+            assert!(SessionExportSnapshot::capture_selected(
+                &records,
+                &ExportSelection::Ids { ids },
+                true,
+            )
+            .is_err());
+        }
+        let prepared = SessionExportSnapshot::capture_selected(
+            &records,
+            &ExportSelection::Ids { ids: vec![2, 30] },
+            true,
+        )
+        .unwrap()
+        .prepare(ExportPrivacy::Original, SessionExportFormat::Json)
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&prepared.preview).unwrap();
+        assert_eq!(json["records"][0]["id"], 30);
+        assert_eq!(json["records"][1]["id"], 2);
+        assert_eq!(json["records"].as_array().unwrap().len(), 2);
     }
 
     #[test]
