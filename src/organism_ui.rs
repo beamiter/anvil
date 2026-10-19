@@ -5250,20 +5250,28 @@ mod tests {
     fn rhythm_explanation_uses_the_final_context_and_never_the_status_live_region() {
         let source = include_str!("organism_ui.rs");
         let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
-        let explain = production
-            .split("fn explain_body(")
-            .nth(1)
-            .unwrap()
-            .split("fn human_input_age(")
-            .next()
-            .unwrap();
+        // Stop at each rustfmt-indented method boundary. Unrelated inspection
+        // methods may legitimately read the latest status between these methods.
+        let method = |signature| {
+            production
+                .split_once(signature)
+                .unwrap()
+                .1
+                .split_once("\n    }\n")
+                .unwrap()
+                .0
+        };
+        let explain = method("    fn explain_body(");
+        let state = method("    fn refresh_state(");
         assert!(
             production.contains("explained_body_context: Cell<Option<(Behavior, WatchRhythm)>>")
         );
         assert!(explain.contains("context.map(|context| (context.behavior, context.watch_rhythm))"));
         assert!(explain.contains("self.explained_body_context.replace(explained) != explained"));
-        assert!(explain.contains("gtk::accessible::Property::Description(&words)"));
-        assert!(explain.contains("self.state.set_tooltip_text(Some(&detail))"));
+        assert!(explain.contains("self.refresh_state(self.shared_life.get())"));
+        assert!(state.contains("self.explained_body_context.get()"));
+        assert!(state.contains("gtk::accessible::Property::Description(&words)"));
+        assert!(state.contains("self.state.set_tooltip_text(Some(&detail))"));
         for excluded in [
             "self.status",
             "desired_rhythm",
@@ -5271,15 +5279,14 @@ mod tests {
             "output_rhythm",
             "transition",
         ] {
-            assert!(!explain.contains(excluded));
+            assert!(
+                !explain.contains(excluded) && !state.contains(excluded),
+                "the final body explanation must not depend on {excluded}"
+            );
         }
-        let refresh = production
-            .split("fn refresh_surface(&self, view: &TermView, now: Instant) {")
-            .nth(1)
-            .unwrap()
-            .split("fn apply_settings(")
-            .next()
-            .unwrap();
+        assert!(method("    fn refresh_surface(")
+            .contains("self.refresh_surface_with_attention(view, now, true)"));
+        let refresh = method("    fn refresh_surface_with_attention(");
         assert!(
             refresh
                 .find("snapshot.map_or(context, |snapshot| snapshot.presentation)")
@@ -9850,7 +9857,14 @@ mod tests {
 
     #[test]
     fn reactions_and_presence_cues_start_on_their_canonical_frame() {
-        let global = 57;
+        // Weighted sprite cadence can revisit the canonical pose at any
+        // hard-coded tick. Find a real alternate pose for the epoch regression.
+        let global = (1..240)
+            .find(|&frame| {
+                sprite_frame(Behavior::Celebrate, BodyLanguage::default(), false, frame)
+                    != Behavior::Celebrate.sprite()
+            })
+            .expect("Celebrate must expose an alternate live frame in the sampled cycle");
         let (baseline, live) = animation_frames(global, global, 0, SurfaceMode::Reacting, None);
         assert_eq!((baseline, live), (0, 0));
         assert_eq!(

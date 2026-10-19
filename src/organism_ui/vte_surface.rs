@@ -66,14 +66,30 @@ fn presentation(expanded: bool, full_fits: bool, fallback_fits: bool) -> Present
     }
 }
 
-fn neutral_candidates() -> [String; 4] {
+// Adult Idle's weighted full-body clip lasts 160 frames; its compact glyph
+// repeats every 60. Reserve their complete joint cycle once at construction.
+const NEUTRAL_FRAME_PERIOD: u64 = 480;
+
+fn neutral_candidates() -> (Vec<String>, usize) {
     let context = RenderContext::new(Behavior::Idle, BodyLanguage::default(), false);
-    [
-        sprite_frame_with_context(context, 0).into_owned(),
-        sprite_frame_with_context(context, 35).into_owned(),
-        sticky_glyph_with_context(context, 0).into_owned(),
-        sticky_glyph_with_context(context, 55).into_owned(),
-    ]
+    let mut candidates = Vec::new();
+    for frame in 0..NEUTRAL_FRAME_PERIOD {
+        let text = sprite_frame_with_context(context, frame);
+        if !candidates.iter().any(|known| known == text.as_ref()) {
+            candidates.push(text.into_owned());
+        }
+    }
+    let full_count = candidates.len();
+    for frame in 0..NEUTRAL_FRAME_PERIOD {
+        let text = sticky_glyph_with_context(context, frame);
+        if !candidates[full_count..]
+            .iter()
+            .any(|known| known == text.as_ref())
+        {
+            candidates.push(text.into_owned());
+        }
+    }
+    (candidates, full_count)
 }
 
 fn contains_edges(outer: [f32; 4], inner: [f32; 4]) -> bool {
@@ -94,7 +110,8 @@ pub(crate) struct VteCompanion {
     glyph: gtk::Label,
     capability: gtk::Label,
     expanded_slot: gtk::Overlay,
-    candidates: [gtk::Label; 4],
+    candidates: Vec<gtk::Label>,
+    full_count: usize,
     expanded: Cell<bool>,
     mounting: Cell<bool>,
     presentation: Cell<Presentation>,
@@ -154,19 +171,23 @@ impl VteCompanion {
         expanded_slot.set_can_target(false);
         expanded_slot.set_focusable(false);
         expanded_slot.set_overflow(gtk::Overflow::Hidden);
-        let candidates = neutral_candidates().map(|text| {
-            let candidate = gtk::Label::builder()
-                .accessible_role(gtk::AccessibleRole::Presentation)
-                .label(text)
-                .build();
-            candidate.add_css_class("monospace");
-            candidate.set_can_target(false);
-            candidate.set_focusable(false);
-            candidate.set_opacity(0.0);
-            // GTK owns Hidden during map/unmap. Presentation leaf labels are
-            // omitted by the accessibility backend without overriding it.
-            candidate
-        });
+        let (texts, full_count) = neutral_candidates();
+        let candidates: Vec<_> = texts
+            .into_iter()
+            .map(|text| {
+                let candidate = gtk::Label::builder()
+                    .accessible_role(gtk::AccessibleRole::Presentation)
+                    .label(text)
+                    .build();
+                candidate.add_css_class("monospace");
+                candidate.set_can_target(false);
+                candidate.set_focusable(false);
+                candidate.set_opacity(0.0);
+                // GTK owns Hidden during map/unmap. Presentation leaf labels are
+                // omitted by the accessibility backend without overriding it.
+                candidate
+            })
+            .collect();
         expanded_slot.set_child(Some(&candidates[0]));
         for candidate in &candidates[1..] {
             expanded_slot.add_overlay(candidate);
@@ -193,6 +214,7 @@ impl VteCompanion {
             capability: label,
             expanded_slot,
             candidates,
+            full_count,
             expanded: Cell::new(false),
             mounting: Cell::new(false),
             presentation: Cell::new(Presentation::Compact),
@@ -405,9 +427,13 @@ impl VteCompanion {
         if !self.expanded.get() {
             return presentation(false, false, self.candidate_fits(&self.glyph));
         }
-        let full_fits = self.candidates[..2].iter().all(|c| self.candidate_fits(c));
-        let fallback_fits =
-            !full_fits && self.candidates[2..].iter().all(|c| self.candidate_fits(c));
+        let full_fits = self.candidates[..self.full_count]
+            .iter()
+            .all(|c| self.candidate_fits(c));
+        let fallback_fits = !full_fits
+            && self.candidates[self.full_count..]
+                .iter()
+                .all(|c| self.candidate_fits(c));
         presentation(true, full_fits, fallback_fits)
     }
 
@@ -794,7 +820,7 @@ fn fixture_state(surface: &VteCompanion, terminal: &vte4::Terminal) -> String {
         surface.frame.get(),
         surface.revision.get(),
         focus.as_ref().map(|widget| widget.type_().name()),
-        surface.candidates.each_ref().map(|candidate| candidate.opacity()),
+        surface.candidates.iter().map(|candidate| candidate.opacity()).collect::<Vec<_>>(),
         root.as_ref().map(|root| {
             let controllers = root.observe_controllers();
             (0..controllers.n_items()).filter_map(|index| {
@@ -1197,7 +1223,7 @@ fn exercise_production_grid_fixture(
     );
     assert!(expanded_req.1 .0 > compact_req.1 .0);
     config.borrow_mut().ascii_organism_motion = Some(OrganismMotion::Full);
-    for frame in 0..120 {
+    for frame in 0..NEUTRAL_FRAME_PERIOD {
         surface.frame.set(frame);
         surface.refresh();
         assert_eq!(requisition(), expanded_req);
@@ -1588,7 +1614,7 @@ fn exercise_expanded_presentation(
     assert!(surface.capability.is_mapped());
     assert_accessible_hidden(&surface.capability, false);
     config.borrow_mut().ascii_organism_motion = Some(OrganismMotion::Full);
-    for frame in 0..120 {
+    for frame in 0..NEUTRAL_FRAME_PERIOD {
         surface.frame.set(frame);
         surface.refresh();
         assert_eq!(
@@ -1599,6 +1625,13 @@ fn exercise_expanded_presentation(
                 .count(),
             1
         );
+        let text = sprite_frame_with_context(
+            RenderContext::new(Behavior::Idle, BodyLanguage::default(), false),
+            frame,
+        );
+        assert!(surface.candidates[..surface.full_count]
+            .iter()
+            .any(|c| c.opacity() == 1.0 && c.text().as_str() == text.as_ref()));
         assert_eq!(requisition(), expanded_req);
         assert_eq!((terminal.width(), terminal.height()), expanded_terminal);
     }
@@ -1698,9 +1731,11 @@ fn exercise_expanded_presentation(
         settle(Duration::from_millis(20));
         assert_eq!(requisition(), expanded_req);
         if surface.current_presentation() == Presentation::Fallback {
-            assert!(surface.candidates[..2].iter().all(|c| c.opacity() == 0.0));
+            assert!(surface.candidates[..surface.full_count]
+                .iter()
+                .all(|c| c.opacity() == 0.0));
             assert_eq!(
-                surface.candidates[2..]
+                surface.candidates[surface.full_count..]
                     .iter()
                     .filter(|c| c.opacity() == 1.0)
                     .count(),
@@ -1764,15 +1799,17 @@ fn exercise_expanded_presentation(
         settle(Duration::from_millis(20));
         assert_eq!(requisition(), expanded_req);
         if surface.current_presentation() == Presentation::Fallback {
-            assert!(surface.candidates[..2].iter().all(|c| c.opacity() == 0.0));
+            assert!(surface.candidates[..surface.full_count]
+                .iter()
+                .all(|c| c.opacity() == 0.0));
             assert_eq!(
-                surface.candidates[2..]
+                surface.candidates[surface.full_count..]
                     .iter()
                     .filter(|c| c.opacity() == 1.0)
                     .count(),
                 1
             );
-            assert!(surface.candidates[2..]
+            assert!(surface.candidates[surface.full_count..]
                 .iter()
                 .all(|c| surface.candidate_fits(c)));
             let clock = surface.current_host().unwrap().frame_clock().unwrap();
@@ -1906,22 +1943,87 @@ mod tests {
     use super::*;
 
     #[test]
-    fn neutral_presentation_candidates_cover_the_joint_120_frame_period() {
+    #[ignore = "requires DISPLAY"]
+    fn neutral_candidates_preserve_native_paint_and_fallback_geometry() {
+        gtk::init().expect("gtk display");
+        relm4::adw::init().expect("native companion fixture window");
+        // Reuse the existing nonexecuting terminal and all VTE assertions
+        // independently of the Block companion's unrelated state scenarios.
+        let view = crate::block_view::organism_settings_test_view();
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let entry = gtk::Entry::new();
+        content.append(&entry);
+        content.append(&view.widget());
+        let overlay = gtk::Overlay::new();
+        overlay.set_child(Some(&content));
+        let window = relm4::adw::Window::builder()
+            .default_width(700)
+            .default_height(500)
+            .content(&overlay)
+            .build()
+            .upcast::<gtk::Window>();
+        let main = gtk::glib::MainContext::default();
+        let settle = |delay: Duration| {
+            let started = Instant::now();
+            while started.elapsed() < delay {
+                while main.iteration(false) {}
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        window.present();
+        settle(Duration::from_millis(120));
+        assert!(view.widget().is_mapped());
+        crate::block_view::organism_settings_test_clean_prompt(&view);
+        crate::block_view::organism_settings_test_first_command(&view);
+        exercise_existing_fixture(&window, &overlay, &content, &entry, &view, &settle);
+        assert!(crate::block_view::organism_settings_test_pty_bytes(&view).is_empty());
+        window.close();
+        settle(Duration::from_millis(40));
+    }
+
+    #[test]
+    fn neutral_presentation_candidates_cover_the_joint_480_frame_period() {
         let context = RenderContext::new(Behavior::Idle, BodyLanguage::default(), false);
-        let candidates = neutral_candidates();
+        let (candidates, full_count) = neutral_candidates();
+        assert_eq!(full_count, 7);
+        assert_eq!(candidates.len() - full_count, 2);
+        assert_eq!(candidates[0], Behavior::Idle.sprite());
+        assert!(candidates[..full_count]
+            .iter()
+            .all(|text| text.lines().count() == 3));
+        assert!(candidates[full_count..]
+            .iter()
+            .all(|text| text.lines().count() == 1));
         let expected: std::collections::BTreeSet<_> = candidates.iter().cloned().collect();
+        assert_eq!(
+            expected.len(),
+            candidates.len(),
+            "each frame paints exactly one native label"
+        );
         let mut actual = std::collections::BTreeSet::new();
-        for frame in 0..120 {
+        for frame in 0..NEUTRAL_FRAME_PERIOD {
             let sprite = sprite_frame_with_context(context, frame);
             assert_eq!(sprite.lines().count(), 3);
             assert!(sprite.is_ascii() && sprite.lines().all(|line| line.len() <= 7));
+            assert_eq!(
+                sprite,
+                sprite_frame_with_context(context, frame + NEUTRAL_FRAME_PERIOD)
+            );
             actual.insert(sprite.into_owned());
             let compact = sticky_glyph_with_context(context, frame);
             assert_eq!(compact.len(), 5);
+            assert_eq!(
+                compact,
+                sticky_glyph_with_context(context, frame + NEUTRAL_FRAME_PERIOD)
+            );
             actual.insert(compact.into_owned());
         }
         assert_eq!(actual, expected);
-        assert_eq!(actual.len(), 4);
+        assert_eq!(actual.len(), 9);
+        for frame in u64::MAX - NEUTRAL_FRAME_PERIOD + 1..=u64::MAX {
+            assert!(expected.contains(sprite_frame_with_context(context, frame).as_ref()));
+            assert!(expected.contains(sticky_glyph_with_context(context, frame).as_ref()));
+        }
     }
 
     #[test]
@@ -1983,7 +2085,7 @@ mod tests {
     }
 
     #[test]
-    fn native_envelope_measures_the_same_four_widgets_that_it_paints() {
+    fn native_envelope_measures_the_same_candidate_widgets_that_it_paints() {
         let source = include_str!("vte_surface.rs");
         let production = source.split("#[cfg(test)]").next().unwrap();
         assert!(!production.contains("gtk::Grid"));
@@ -1993,7 +2095,13 @@ mod tests {
         assert!(production.contains(".accessible_role(gtk::AccessibleRole::Presentation)"));
         assert!(!production.contains("accessible::State::Hidden"));
         assert!(!production.contains("set_height_request"));
+        assert_eq!(
+            production.matches("neutral_candidates()").count(),
+            2,
+            "candidate enumeration runs only in its definition and constructor"
+        );
         let refresh = production.split("pub(crate) fn refresh").nth(1).unwrap();
+        assert!(!refresh.contains("neutral_candidates("));
         assert!(
             refresh.find("if self.closed.get()").unwrap()
                 < refresh.find("if self.mounting.get()").unwrap()
