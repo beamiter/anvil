@@ -96,7 +96,12 @@ def validate(run):
     env = run.get("environment", {})
     require(isinstance(env, dict), "environment must be an object")
     for key in ENV_KEYS:
-        require(key in env and env[key] is not None and env[key] != "", f"missing environment {key}")
+        value = env.get(key)
+        if key == "scale":
+            number(value, f"environment.{key}", positive=True)
+        else:
+            require(type(value) is str and value.strip(),
+                    f"environment.{key}: expected nonempty string")
     for key in ENV_DIGEST_KEYS:
         digest(env[key], 64, f"environment.{key}")
     require(env["build_profile"] == "release", "release build required")

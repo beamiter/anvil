@@ -45,7 +45,7 @@ jobs:
       RUST_BACKTRACE: '1'
       BASELINE_SHA: 88c3f4c565cb5b9f8d47d22eb3ad07f47a822ae4
       # Reviewed migration parent; future native changes require a new source review.
-      CANDIDATE_PARENT_SHA: ba88ab234e0f189525cf54f061b71a2f1a1b5fb0
+      CANDIDATE_PARENT_SHA: bdf5ead01f700ba238e298eab484816d10b002ef
     steps:
       - name: Check out immutable candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1

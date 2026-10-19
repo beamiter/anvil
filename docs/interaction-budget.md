@@ -187,6 +187,14 @@ evidence. The JSON carries `presentation_proxy_only_display_acceptance_open` eve
 on success. Every 1/8/32 job must provide both paired repetitions; this single-pair
 CLI does not claim whole-matrix completeness or assert a source is trustworthy.
 
+The comparator environment identity fields are nonempty, non-whitespace strings,
+except `scale`, which is a finite positive JSON number (integer or float, never a
+boolean). Digests retain their exact hexadecimal length checks. Text identities
+are compared exactly without trimming or coercion; equivalent integer/float scale
+values such as `1` and `1.0` are compatible. Equal malformed identities do not
+establish a comparable pair. This validation does not change measurement windows,
+sample-count bounds, or any performance gate.
+
 ## Implemented source checkpoint and exact boundaries
 
 `prepare-interaction-budget.py SOURCE NEW_TREE` applies the same five-file

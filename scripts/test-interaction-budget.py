@@ -20,7 +20,8 @@ spec.loader.exec_module(budget)
 def fixture(panes=8):
     # Syntactically valid digests and measurements are only synthetic contract data.
     env = {k: "fixed" for k in budget.ENV_KEYS}
-    env.update(build_profile="release", backend="x11", renderer="cairo")
+    env.update(build_profile="release", backend="x11", renderer="cairo",
+               scale=1, geometry="1600x1000")
     env.update({key: "b" * 64 for key in budget.ENV_DIGEST_KEYS})
     c = dict(panes=panes, surface="block", topology="two_tabs_16_each" if panes == 32 else "one_tab",
              owned_pty_dispatch_count=300, reader_ctx_consumer_count=300,
@@ -150,12 +151,93 @@ class Contract(unittest.TestCase):
     def test_environment_pair_and_pane_mismatch(self):
         for key in budget.ENV_KEYS:
             a, b = fixture(), fixture()
-            b["environment"][key] = "d" * 64 if key in budget.ENV_DIGEST_KEYS else "different"
+            b["environment"][key] = ("d" * 64 if key in budget.ENV_DIGEST_KEYS else
+                                      2 if key == "scale" else "different")
             with self.assertRaises(ValueError):
                 budget.compare(a, b)
         b = fixture(); b["pair_id"] = "other"
         with self.assertRaises(ValueError): budget.compare(fixture(), b)
         with self.assertRaises(ValueError): budget.compare(fixture(), fixture(32))
+
+    def test_environment_text_identities_reject_empty_and_wrong_types(self):
+        invalid = (None, True, False, 0, 1.0, "", " \t\n", [], {}, ["identity"],
+                   {"identity": "value"}, float("nan"), float("inf"))
+        for key in (key for key in budget.ENV_KEYS if key != "scale"):
+            for value in invalid:
+                for roles in (("baseline",), ("candidate",), ("baseline", "candidate")):
+                    with self.subTest(key=key, value=value, roles=roles):
+                        runs = {role: fixture() for role in ("baseline", "candidate")}
+                        for role in roles:
+                            runs[role]["environment"][key] = value
+                        with self.assertRaisesRegex(ValueError, "environment\\." + key):
+                            budget.compare(runs["baseline"], runs["candidate"])
+
+    def test_scale_rejects_boolean_aliases_nonfinite_and_invalid_values(self):
+        invalid = (None, True, False, "1", "fixed", "", [], {}, 0, -1, -0.5,
+                   float("nan"), float("inf"), -float("inf"), 10 ** 400)
+        for value in invalid:
+            for roles in (("baseline",), ("candidate",), ("baseline", "candidate")):
+                with self.subTest(value=value, roles=roles):
+                    runs = {role: fixture() for role in ("baseline", "candidate")}
+                    for role in roles:
+                        runs[role]["environment"]["scale"] = value
+                    with self.assertRaisesRegex(ValueError, "environment\\.scale"):
+                        budget.compare(runs["baseline"], runs["candidate"])
+
+    def test_environment_identity_preserves_valid_types_and_exact_pairing(self):
+        for baseline_scale, candidate_scale in ((1, 1), (1.0, 1.0), (1, 1.0), (1.0, 1)):
+            with self.subTest(baseline=baseline_scale, candidate=candidate_scale):
+                a, b = fixture(), fixture()
+                a["environment"]["scale"] = baseline_scale
+                b["environment"]["scale"] = candidate_scale
+                self.assertTrue(budget.compare(a, b)["pass"])
+        a, b = fixture(), fixture()
+        a["environment"]["cpu"] = b["environment"]["cpu"] = "Synthetic CPU, 4 cores"
+        self.assertTrue(budget.compare(a, b)["pass"])
+        b["environment"]["cpu"] += " "
+        with self.assertRaisesRegex(ValueError, "incomparable environment: cpu"):
+            budget.compare(a, b)
+
+    def test_cli_environment_false_passes_are_structured_invalid_evidence(self):
+        # Both equal malformed identities and a bool/int alias previously passed.
+        cases = (("machine_boot_id", {}, {}), ("cpu", [], []),
+                 ("kernel", " \t\n", " \t\n"), ("scale", True, 1),
+                 ("scale", 1, True), ("scale", "1", "1"))
+        with tempfile.TemporaryDirectory() as d:
+            left, right = Path(d) / "baseline.json", Path(d) / "candidate.json"
+            for key, baseline_value, candidate_value in cases:
+                with self.subTest(key=key, baseline=baseline_value, candidate=candidate_value):
+                    a, b = fixture(), fixture()
+                    a["environment"][key] = baseline_value
+                    b["environment"][key] = candidate_value
+                    left.write_text(json.dumps(a))
+                    right.write_text(json.dumps(b))
+                    process = subprocess.run([sys.executable, str(Path(budget.__file__)), str(left), str(right)],
+                                             capture_output=True, text=True, check=False)
+                    self.assertEqual(process.returncode, 2, process.stdout + process.stderr)
+                    self.assertEqual(process.stderr, "")
+                    result = json.loads(process.stdout)
+                    self.assertFalse(result["pass"])
+                    self.assertIn("environment." + key, result["invalid_evidence"])
+
+    def test_cli_scale_numeric_overflow_and_nonfinite_tokens_are_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            left, right = Path(d) / "baseline.json", Path(d) / "candidate.json"
+            for token in ("1e400", "-1e400", "Infinity", "-Infinity", "NaN"):
+                for roles in (("baseline",), ("candidate",), ("baseline", "candidate")):
+                    with self.subTest(token=token, roles=roles):
+                        for role, path in (("baseline", left), ("candidate", right)):
+                            run = fixture()
+                            if role in roles:
+                                run["environment"]["scale"] = "RAW_SCALE_NUMBER"
+                            path.write_text(json.dumps(run).replace('"RAW_SCALE_NUMBER"', token))
+                        process = subprocess.run([sys.executable, str(Path(budget.__file__)), str(left), str(right)],
+                                                 capture_output=True, text=True, check=False)
+                        self.assertEqual(process.returncode, 2, process.stdout + process.stderr)
+                        self.assertEqual(process.stderr, "")
+                        result = json.loads(process.stdout)
+                        self.assertFalse(result["pass"])
+                        self.assertIn("environment.scale", result["invalid_evidence"])
 
     def test_source_binary_and_environment_digest_shapes(self):
         fields = [(None, "source_sha", 40), (None, "binary_sha256", 64)]
