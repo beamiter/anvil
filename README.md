@@ -11,6 +11,10 @@ restoration as the only copy of work in progress.
 
 ## Highlights
 
+- Native [Vim9 IDE workbench](docs/VIM9_IDE.md): real Vim 9 in VTE, GTK project
+  and buffer navigation, save controls, project search, Problems, asynchronous
+  builds with output, and capability-aware language actions. Start with
+  `anvil --ide ~/project` or `Ctrl+Alt+I`.
 - VTE and block-aware terminal modes
 - Tabs, backend-inheriting nested split panes, pane zoom, directional focus,
   and session restore

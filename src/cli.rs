@@ -26,6 +26,8 @@ pub(crate) struct LaunchOptions {
     pub(crate) no_restore: bool,
     pub(crate) safe_mode: bool,
     pub(crate) mode: Option<Mode>,
+    /// Open the native Vim9 workbench instead of restoring terminal tabs.
+    pub(crate) ide: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +158,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<ParsedAr
                 config_path = Some(PathBuf::from(path));
             }
             "--no-restore" => launch.no_restore = true,
+            "--ide" => launch.ide = true,
             "--safe-mode" => {
                 launch.safe_mode = true;
                 launch.no_restore = true;
@@ -293,6 +296,9 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<ParsedAr
             return Err("--safe-mode cannot be combined with --execute".to_string());
         }
     }
+    if launch.ide && (launch.execute.is_some() || launch.mode.is_some() || launch.safe_mode) {
+        return Err("--ide cannot be combined with --execute, --mode, or --safe-mode".into());
+    }
 
     Ok(ParsedArgs {
         config_path,
@@ -304,14 +310,16 @@ pub(crate) const HELP: &str = r#"anvil — a Block-first terminal workspace
 
 Usage:
   anvil [OPTIONS] [DIRECTORY]
+  anvil --ide [DIRECTORY|FILE]
   anvil [OPTIONS] --execute COMMAND [ARG...]
 
 Global options:
   -c, --config PATH           Use an alternate config file for this process
 
 Launch options:
-  -d, --working-directory DIR  Start in DIR
+  -d, --working-directory PATH Start in PATH (directory, or file with --ide)
   -e, --execute COMMAND ...    Run a command instead of the configured shell
+      --ide                   Open the native Vim9 IDE for a directory or file
       --mode block|vte|unified|chat
                                Override the terminal backend for this window
       --no-restore             Start a fresh workspace
@@ -332,6 +340,8 @@ Utilities:
 
 Examples:
   anvil ~/project
+  anvil --ide ~/project
+  anvil --ide ~/project/src/main.rs
   anvil --mode block --no-restore
   anvil --safe-mode
   anvil --doctor --json
@@ -372,6 +382,7 @@ mod tests {
                 no_restore: false,
                 safe_mode: false,
                 mode: Some(Mode::Block),
+                ide: false,
             })
         );
     }
@@ -392,6 +403,31 @@ mod tests {
             panic!("expected run")
         };
         assert_eq!(options.mode, Some(Mode::Unified));
+    }
+
+    #[test]
+    fn vim9_ide_launch_preserves_project_path_and_rejects_shell_modes() {
+        let Command::Run(options) = parse_command(&["--ide", "project with spaces"]).unwrap()
+        else {
+            panic!("expected Vim9 IDE launch");
+        };
+        assert!(options.ide);
+        assert_eq!(
+            options.working_directory,
+            Some(PathBuf::from("project with spaces"))
+        );
+        assert!(options.execute.is_none());
+        for args in [
+            vec!["--ide", "--execute", "bash"],
+            vec!["--ide", "--mode", "unified"],
+            vec!["--ide", "--safe-mode"],
+            vec!["--ide", "--doctor"],
+        ] {
+            assert!(
+                parse_command(&args).is_err(),
+                "accepted conflicting flags: {args:?}"
+            );
+        }
     }
 
     #[test]

@@ -44,6 +44,7 @@ mod host {
 
 mod jsh_ops;
 mod keybindings;
+mod launch_path;
 mod navigation_ui;
 mod notebook;
 mod organism_ui;
@@ -66,6 +67,7 @@ mod tab_strip;
 mod task_ops;
 mod terminal;
 mod top_bar;
+mod vim9_ide;
 mod vte_pty;
 mod workflow_ops;
 mod workflows;
@@ -923,6 +925,7 @@ impl SimpleComponent for AppModel {
             .launch(top_tab_scroll.clone())
             .forward(sender.input_sender(), |output| match output {
                 top_bar::TopBarOutput::OpenPalette => AppMsg::Action(Action::ToggleCommandPalette),
+                top_bar::TopBarOutput::OpenVim9Ide => AppMsg::Action(Action::OpenVim9Ide),
                 top_bar::TopBarOutput::ToggleSidebar => AppMsg::ToggleSidebar,
                 top_bar::TopBarOutput::ToggleTabPlacement => {
                     AppMsg::Action(Action::ToggleTabPlacement)
@@ -2856,6 +2859,20 @@ fn main() {
             }
             init_logging();
             init_input_method_env();
+            if options.ide {
+                let application = adw::Application::builder()
+                    .application_id(host::APP_ID)
+                    .flags(gio::ApplicationFlags::NON_UNIQUE)
+                    .build();
+                let root = options.working_directory.clone().unwrap_or_else(|| {
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
+                });
+                application.connect_activate(move |app| {
+                    vim9_ide::open(app.upcast_ref(), None, root.clone());
+                });
+                let _ = application.run_with_args(&["anvil"]);
+                return;
+            }
             // NON_UNIQUE: each launch is its own process with its own window.
             // Session persistence uses per-process snapshots so instances do
             // not overwrite one another.
@@ -2885,18 +2902,7 @@ fn init_logging() {
 
 fn validate_launch_options(options: &mut cli::LaunchOptions) -> Result<(), String> {
     if let Some(directory) = options.working_directory.as_mut() {
-        let canonical = std::fs::canonicalize(&*directory)
-            .map_err(|err| format!("cannot open directory {}: {err}", directory.display()))?;
-        if !canonical.is_dir() {
-            return Err(format!("{} is not a directory", canonical.display()));
-        }
-        if canonical.to_str().is_none() {
-            return Err(format!(
-                "working directory {} contains non-UTF-8 bytes and cannot be passed to the terminal safely",
-                canonical.display()
-            ));
-        }
-        *directory = canonical;
+        *directory = launch_path::resolve(directory, options.ide)?;
     }
     if let Some(argv) = &options.execute {
         let executable = argv.first().expect("CLI parser rejects empty commands");
@@ -3448,6 +3454,37 @@ mod launch_validation_tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn file_targets_are_valid_only_for_ide_launches() {
+        let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "anvil-ide-target-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let _cleanup = TestDirectory(root.clone());
+        let existing = root.join("existing file.txt");
+        let new_file = root.join("new file.txt");
+        std::fs::write(&existing, "preserved\n").unwrap();
+        for ide in [false, true] {
+            for (target, accepted) in [
+                (&root, true),
+                (&existing, ide),
+                (&new_file, ide),
+                (&root.join("missing/new.txt"), false),
+            ] {
+                let mut options = cli::LaunchOptions {
+                    working_directory: Some(target.clone()),
+                    ide,
+                    ..cli::LaunchOptions::default()
+                };
+                assert_eq!(validate_launch_options(&mut options).is_ok(), accepted);
+            }
+        }
+        assert_eq!(std::fs::read_to_string(existing).unwrap(), "preserved\n");
+        assert!(!new_file.exists());
     }
 
     #[test]

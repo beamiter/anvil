@@ -856,7 +856,7 @@ pub(crate) fn build_tab_scrolls() -> (gtk::ScrolledWindow, gtk::ScrolledWindow) 
     top.set_propagate_natural_width(false);
     top.add_css_class("top-tab-scroll");
     top.set_visible(false);
-    top.set_margin_start(128);
+    top.set_margin_start(164);
     top.set_margin_end(104);
 
     (sidebar, top)

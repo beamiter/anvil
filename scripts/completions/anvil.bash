@@ -55,7 +55,7 @@ _anvil()
     local options="
         -h --help -V --version
         -c --config -d --working-directory -e --execute
-        --mode --no-restore --safe-mode
+        --mode --no-restore --safe-mode --ide
         --doctor --json --check-config --restore-config-backup
         --config-path --init-config --print-default-config
         --shell-integration --generate-completion --completion

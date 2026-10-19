@@ -293,6 +293,33 @@ impl AppModel {
             Action::ToggleSidebar => {
                 self.set_sidebar_visible(!self.sidebar_visible, true);
             }
+            Action::OpenVim9Ide => {
+                if self.safe_mode {
+                    self.show_toast("Vim9 IDE is unavailable in safe mode.");
+                    return;
+                }
+                if self.tabs.get(self.active).is_some_and(|tab| {
+                    tab.panes.get(tab.active_pane).is_some_and(|pane| {
+                        pane.cwd_external
+                            || tab
+                                .remote
+                                .as_ref()
+                                .is_some_and(|remote| remote.pane_id == pane.id)
+                    })
+                }) {
+                    self.show_toast(
+                        "Vim9 IDE opens local projects. Select a local terminal pane first.",
+                    );
+                    return;
+                }
+                let root = self
+                    .active_cwd()
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| std::path::PathBuf::from("/"));
+                if let Err(error) = crate::vim9_ide::launch(root) {
+                    self.show_toast(format!("Cannot open Vim9 IDE: {error}"));
+                }
+            }
             Action::ToggleCommandPalette => {
                 self.refresh_workflows_async(sender);
                 let history = self.config.borrow().command_history_path.clone();

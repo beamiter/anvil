@@ -1,0 +1,132 @@
+# Native Vim9 IDE
+
+The Vim9 workbench gives real Vim 9 a native GTK interface. Vim owns text,
+normal/insert/visual modes, registers, macros, undo, buffers, splits, and your
+existing Vim configuration. A dedicated VTE renders its interactive PTY; native
+widgets communicate with a bundled Vim9script bridge through a private,
+authenticated local connection.
+
+## Start a project
+
+```sh
+anvil --ide ~/project
+anvil --ide ~/project/src/main.rs
+```
+
+You can also use the editor icon in the terminal toolbar, choose **Open Vim9
+IDE workbench** in the command palette, or press **Ctrl+Alt+I**. These entries
+use the local pane's working directory. Each workbench launches as a separate
+process: closing the original terminal window does not terminate the editor or
+discard its modified buffers. Existing terminal workspace restore is not run
+in the `--ide` process.
+
+The runtime requires **Vim 9+ with `+vim9script`, `+channel`, `+job`, `+timers`, and `+quickfix`**. It uses
+`vim` from PATH. Set `JTERM_VIM9_BIN` to a specific Vim executable when needed:
+
+```sh
+JTERM_VIM9_BIN=/usr/local/bin/vim anvil --ide ~/project
+```
+
+An unsupported or missing Vim produces a visible launch error. The application
+does not install an editor, overwrite `.vimrc`, or install language servers.
+The bridge is bundled with the shared core and extracted to its managed script
+cache automatically.
+
+`--ide` accepts a project directory, an existing file, or a new filename whose
+parent directory already exists. Pass the target positionally or with
+`--working-directory PATH`. A new file becomes a named Vim buffer and is written
+only when saved. Normal terminal launches still require a directory. `--ide` cannot be combined with
+`--execute`, `--mode`, or `--safe-mode`. Managed SSH panes are not local IDE
+project roots; select a local pane or launch a local checkout explicitly.
+
+## Workbench layout
+
+| Area | Behavior |
+| --- | --- |
+| Project | Browse one directory at a time, filter filenames, open files, refresh, and move to the parent directory. Directory reads run off the GTK thread and are bounded to 1,024 entries. |
+| Open buffers | Shows real Vim buffer names, current-buffer marker and modified marker. Activate a row to switch with Vim's normal buffer rules. |
+| Editor | Real Vim in VTE; normal Vim editing, mappings, mouse and input methods remain active. |
+| Search project | Press Enter to run a project text search and publish results in Vim quickfix and the native Problems list. Requires `rg` in Vim's environment. Progress, errors, match counts and omitted-result counts are visible below the build controls. |
+| Problems | Displays filename, line, column, severity/type and message. Activate a result to open its exact location. F8/Shift+F8 navigate Vim diagnostics. |
+| Build | Edit the visible shell command and press Build/F5. Builds run asynchronously in the project root. Cancel stops the active build. Exit status and a bounded output tail are shown in the native Build output tab; parsed diagnostics populate Problems. |
+| Status | Live Vim mode, filename, modified flag, cursor location, buffer count, and bridge connection state. |
+
+The default build suggestion is `cargo check` for a Cargo project, `make` for a
+Makefile, or `cmake --build build` for a CMake project. The command runs only
+after an explicit Build/F5 action. Review or replace it for the project. Vim's
+`errorformat` controls compiler-output parsing; select an appropriate `:compiler`
+in Vim when its default format does not match your toolchain. Native snapshots
+retain up to 256 buffers and diagnostics, marking truncated counts with `+`.
+Project text search retains up to 256 matches in both Vim quickfix and the native
+Problems view; omitted-match counts are displayed explicitly. The normal Vim
+quickfix and language-server interfaces remain available, with the same search
+result cap. Native Build output shows the most recent 80 retained output lines.
+
+The New file button opens a native filename chooser and creates a named Vim
+buffer; the file is written when you save it. The file picker can open any local
+UTF-8 path. Sidebar navigation stays inside the project root, including symlink targets. It does not recursively index
+large repositories or follow a folder outside that root automatically.
+
+## Shortcuts
+
+| Scope | Shortcut | Action |
+| --- | --- | --- |
+| Terminal workspace | Ctrl+Alt+I | Open Vim9 IDE for the local pane |
+| IDE | Ctrl+Shift+P | Focus the native file filter; Enter opens its first match |
+| IDE | Ctrl+Shift+O | Native file picker |
+| IDE | Ctrl+S | Save current buffer |
+| IDE | Ctrl+Shift+S | Save all buffers |
+| IDE | F5 | Run the visible build command |
+| IDE | F8 / Shift+F8 | Next / previous diagnostic |
+
+These IDE shortcuts apply only inside the dedicated editor window. Plain
+Ctrl+P and Ctrl+O remain available to Vim for completion and jump navigation;
+the native file actions use Shift to keep those Vim keys intact. Other keys
+go to Vim or the focused native control. In terminal configuration,
+`[keybindings].open_vim9_ide` overrides the launch shortcut.
+
+## Language services
+
+The bridge detects commands supplied by your Vim configuration. The native
+buttons enable only when their provider is present:
+
+| Native action | Vim command |
+| --- | --- |
+| Definition | `LspGotoDefinition`, with native tags as a fallback |
+| Hover | `LspHover` |
+| References | `LspShowReferences` |
+| Rename | `LspRename` with a validated symbol name |
+| Format | `LspFormat` |
+
+These are the commands exposed by the Vim9 LSP integration the bridge supports.
+Install/configure language servers in Vim as you normally would. Disabled
+buttons explain the missing capability. Completion, snippets, debugging,
+Git workflows and other plugin features remain available through Vim; this
+workbench does not claim to supply its own LSP server, debugger or Git client.
+
+## Saving and closing
+
+Save buttons send typed bridge requests. File navigation uses Vim's normal
+editing rules, so an unsaved current buffer may prevent a switch when `hidden`
+is disabled. Busy command/operator/completion states are reported instead of
+injecting Ex commands into user input. Finish the operation or press Escape,
+then retry the action.
+
+The window close button asks Vim to quit gracefully. Modified buffers keep the
+window open. Save them and close again, or enter `:qa!` in Vim only when you
+intend to discard those changes. No forced quit is hidden behind a GUI close
+button. A disconnected bridge leaves the real Vim terminal available so you
+can save and quit using Vim directly.
+
+## Validation
+
+CLI tests cover directory/file/new-file launch validation, unchanged terminal
+directory requirements, spaces in project paths, and incompatible mode flags.
+Shared-core tests cover command encoding, authenticated transport, file path
+handling and bounded snapshots. An opt-in native GTK smoke test exercises a real
+Vim PTY, native save/build controls, diagnostics, and modified-buffer close protection. Run it under a
+graphical display (for example Xvfb) with the required Vim:
+
+```sh
+cargo test native_vim9_edit_save_build_and_modified_close -- --ignored --test-threads=1
+```

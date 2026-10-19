@@ -40,6 +40,7 @@ fn agent_presentation(available: bool, active: bool) -> (&'static str, &'static 
 #[derive(Debug)]
 pub(crate) enum TopBarOutput {
     OpenPalette,
+    OpenVim9Ide,
     ToggleSidebar,
     ToggleTabPlacement,
     ToggleAgent,
@@ -119,6 +120,20 @@ impl Component for TopBarModel {
                     add_css_class: "flat",
                     connect_clicked[sender] => move |_| {
                         let _ = sender.output(TopBarOutput::ToggleTabPlacement);
+                    },
+                },
+
+                gtk::Button {
+                    set_icon_name: "text-editor-symbolic",
+                    set_focus_on_click: false,
+                    set_tooltip_text: Some("Open Vim9 IDE (Ctrl+Alt+I)"),
+                    update_property: &[
+                        gtk::accessible::Property::Label("Open Vim9 IDE"),
+                        gtk::accessible::Property::KeyShortcuts("Control+Alt+I"),
+                    ],
+                    add_css_class: "flat",
+                    connect_clicked[sender] => move |_| {
+                        let _ = sender.output(TopBarOutput::OpenVim9Ide);
                     },
                 },
             },

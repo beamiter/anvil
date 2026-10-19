@@ -164,6 +164,7 @@ remote_hosts = []
 # toggle_search = "Ctrl+Shift+F"
 # cross_block_search = "Ctrl+Shift+G"
 # toggle_command_palette = "Ctrl+Shift+P"
+# open_vim9_ide = "Ctrl+Alt+I"
 # open_history_palette = "Ctrl+Shift+H"
 # toggle_settings = "Ctrl+Shift+O"
 # reload_config = "Ctrl+Shift+R"

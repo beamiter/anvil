@@ -31,6 +31,7 @@ pub(crate) enum Action {
     OpacityDecrease,
     ToggleSearch,
     ToggleCommandPalette,
+    OpenVim9Ide,
     OpenPalette,
     OpenHistoryPalette,
     ToggleSettings,
@@ -161,6 +162,7 @@ impl Action {
             Action::OpacityDecrease => "Opacity decrease",
             Action::ToggleSearch => "Toggle search",
             Action::ToggleCommandPalette => "Command palette",
+            Action::OpenVim9Ide => "Open Vim9 IDE workbench",
             Action::OpenPalette => "Palette: search everything",
             Action::OpenHistoryPalette => "Palette: search history",
             Action::ToggleSettings => "Toggle settings panel",
@@ -277,6 +279,7 @@ impl Action {
             Action::OpacityDecrease => Some("opacity_decrease"),
             Action::ToggleSearch => Some("toggle_search"),
             Action::ToggleCommandPalette => Some("toggle_command_palette"),
+            Action::OpenVim9Ide => Some("open_vim9_ide"),
             Action::OpenPalette => Some("open_palette"),
             Action::OpenHistoryPalette => Some("open_history_palette"),
             Action::ToggleSettings => Some("toggle_settings"),
@@ -392,6 +395,7 @@ impl Action {
             Action::OpacityDecrease,
             Action::ToggleSearch,
             Action::ToggleCommandPalette,
+            Action::OpenVim9Ide,
             Action::OpenPalette,
             Action::OpenHistoryPalette,
             Action::ToggleSettings,
@@ -602,6 +606,7 @@ impl KeybindingMap {
         bind("Ctrl+Alt+minus", Action::OpacityDecrease);
         bind("Ctrl+Shift+F", Action::ToggleSearch);
         bind("Ctrl+Shift+P", Action::ToggleCommandPalette);
+        bind("Ctrl+Alt+I", Action::OpenVim9Ide);
         // Preserve Ctrl+R and Ctrl+P for shell/readline history navigation.
         bind("Ctrl+Shift+H", Action::OpenHistoryPalette);
         bind("Ctrl+Shift+O", Action::ToggleSettings);
@@ -1302,6 +1307,7 @@ history_palette = "F10"
             ("Ctrl+Alt+minus", Action::OpacityDecrease),
             ("Ctrl+Shift+F", Action::ToggleSearch),
             ("Ctrl+Shift+P", Action::ToggleCommandPalette),
+            ("Ctrl+Alt+I", Action::OpenVim9Ide),
             ("Ctrl+Shift+H", Action::OpenHistoryPalette),
             ("Ctrl+Shift+O", Action::ToggleSettings),
             ("Ctrl+Shift+R", Action::ReloadConfig),
