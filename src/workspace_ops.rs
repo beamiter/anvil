@@ -5,6 +5,7 @@
 //! does not introduce another model, message loop, or UI framework.
 
 use super::*;
+use jterm_core::pane_layout::{directional_focus_target, PaneRect, Rect as PaneBounds};
 
 const PERSISTENCE_FAILURE_NOTICE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -2768,45 +2769,32 @@ impl AppModel {
         }
         let holder: gtk::Widget = tab.holder.clone().upcast();
         let api = tab.active_pane;
-        let focused_widget = tab.panes[api].widget();
-        let Some(fb) = focused_widget.compute_bounds(&holder) else {
-            return;
-        };
-        let fcx = fb.x() + fb.width() / 2.0;
-        let fcy = fb.y() + fb.height() / 2.0;
+        // Use the same edge-and-overlap policy as the GPU frontends. Centers
+        // can point diagonally through an uneven split and skip the actual
+        // neighboring pane. Hidden/zoom-detached panes are not focus targets.
+        let rects: Vec<PaneRect> = tab
+            .panes
+            .iter()
+            .enumerate()
+            .filter_map(|(session, pane)| {
+                let widget = pane.widget();
+                if !widget.is_mapped() {
+                    return None;
+                }
+                let bounds = widget.compute_bounds(&holder)?;
+                Some(PaneRect {
+                    session,
+                    rect: PaneBounds {
+                        x: bounds.x(),
+                        y: bounds.y(),
+                        width: bounds.width(),
+                        height: bounds.height(),
+                    },
+                })
+            })
+            .collect();
 
-        let mut best: Option<(f32, usize)> = None;
-        for (i, pane) in tab.panes.iter().enumerate() {
-            if i == api {
-                continue;
-            }
-            let w = pane.widget();
-            let Some(b) = w.compute_bounds(&holder) else {
-                continue;
-            };
-            let cx = b.x() + b.width() / 2.0;
-            let cy = b.y() + b.height() / 2.0;
-            let dx = cx - fcx;
-            let dy = cy - fcy;
-            let in_dir = match direction {
-                Direction::Left => dx < -1.0,
-                Direction::Right => dx > 1.0,
-                Direction::Up => dy < -1.0,
-                Direction::Down => dy > 1.0,
-            };
-            if !in_dir {
-                continue;
-            }
-            let dist = match direction {
-                Direction::Left | Direction::Right => dx.abs() + dy.abs() * 0.1,
-                Direction::Up | Direction::Down => dy.abs() + dx.abs() * 0.1,
-            };
-            if best.is_none() || dist < best.unwrap().0 {
-                best = Some((dist, i));
-            }
-        }
-
-        if let Some((_, i)) = best {
+        if let Some(i) = directional_focus_target(&rects, api, direction) {
             let next_pane_id = self.tabs[self.active].panes[i].id;
             let search_transition = self.begin_search_pane_transition(Some(next_pane_id));
             let focus_transfer = self.begin_organism_focus_transfer(Some(next_pane_id), false);
@@ -2816,6 +2804,7 @@ impl AppModel {
             self.tabs[self.active].panes[i]
                 .terminal
                 .emit(VteInput::GrabFocus);
+            self.refresh_active_pane_headers();
         }
     }
 

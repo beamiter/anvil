@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use std::{cell::RefCell, collections::HashMap, marker::PhantomData, rc::Rc};
+// @pane_layout
 extern crate self as log;
 #[macro_export]
 macro_rules! error { ($($arg:tt)*) => { let _ = format!($($arg)*); }; }
@@ -46,6 +47,9 @@ mod gtk {
     #[derive(Clone)]
     pub struct Widget(pub u64);
     impl Widget {
+        pub fn is_mapped(&self) -> bool {
+            true
+        }
         pub fn upcast<T>(self) -> T
         where
             T: From<Self>,
@@ -71,12 +75,6 @@ mod gtk {
             80.0
         }
     }
-}
-enum Direction {
-    Left,
-    Right,
-    Up,
-    Down,
 }
 struct Pane {
     id: u64,

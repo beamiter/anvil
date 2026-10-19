@@ -97,6 +97,9 @@ pub(crate) enum Action {
     CollapseAllBlocks,
     /// Unfold every finished block's output.
     ExpandAllBlocks,
+    /// Fold or unfold only the explicit selection; palette-only by default.
+    CollapseSelectedBlocks,
+    ExpandSelectedBlocks,
     /// Fold or unfold the selected block (or the newest one).
     ToggleBlockCollapsed,
     /// Put the commands from the current block selection back into the live
@@ -233,6 +236,8 @@ impl Action {
             Action::DeleteSelectedBlocks => "Delete selected blocks",
             Action::CollapseAllBlocks => "Collapse all blocks",
             Action::ExpandAllBlocks => "Expand all blocks",
+            Action::CollapseSelectedBlocks => "Collapse selected output",
+            Action::ExpandSelectedBlocks => "Expand selected output",
             Action::ToggleBlockCollapsed => "Collapse or expand block",
             Action::ReinputSelectedCommands => "Reinput selected commands",
             Action::ToggleDebugDashboard => "Toggle debug dashboard",
@@ -328,6 +333,8 @@ impl Action {
             Action::DeleteSelectedBlocks => Some("delete_selected_blocks"),
             Action::CollapseAllBlocks => Some("collapse_all_blocks"),
             Action::ExpandAllBlocks => Some("expand_all_blocks"),
+            Action::CollapseSelectedBlocks => Some("collapse_selected_blocks"),
+            Action::ExpandSelectedBlocks => Some("expand_selected_blocks"),
             Action::ToggleBlockCollapsed => Some("toggle_block_collapsed"),
             Action::ReinputSelectedCommands => Some("reinput_selected_commands"),
             Action::ToggleDebugDashboard => Some("toggle_debug_dashboard"),
@@ -431,6 +438,8 @@ impl Action {
             Action::DeleteSelectedBlocks,
             Action::CollapseAllBlocks,
             Action::ExpandAllBlocks,
+            Action::CollapseSelectedBlocks,
+            Action::ExpandSelectedBlocks,
             Action::ToggleBlockCollapsed,
             Action::ReinputSelectedCommands,
             Action::ToggleDebugDashboard,
@@ -449,6 +458,8 @@ impl Action {
     /// keys remain the values returned by [`Self::config_key`].
     pub(crate) fn from_config_key(key: &str) -> Option<Action> {
         let alias = match key {
+            "block:collapse_selected" => Some(Action::CollapseSelectedBlocks),
+            "block:expand_selected" => Some(Action::ExpandSelectedBlocks),
             "history_palette" => Some(Action::OpenHistoryPalette),
             "workflows_palette" => Some(Action::OpenWorkflows),
             _ => None,
@@ -461,13 +472,7 @@ impl Action {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Direction {
-    Left,
-    Right,
-    Up,
-    Down,
-}
+pub(crate) use jterm_core::pane_layout::PaneDirection as Direction;
 
 /// Translate a GTK key event into a toolkit-neutral [`Chord`], or `None`
 /// for keysyms no chord string can name (numpad keysyms, bare modifiers,
@@ -840,6 +845,33 @@ impl KeybindingMap {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selected_output_actions_are_discoverable_bindable_and_do_not_reserve_keys() {
+        let defaults = KeybindingMap::from_defaults();
+        for (action, key, alias) in [
+            (
+                Action::CollapseSelectedBlocks,
+                "collapse_selected_blocks",
+                "block:collapse_selected",
+            ),
+            (
+                Action::ExpandSelectedBlocks,
+                "expand_selected_blocks",
+                "block:expand_selected",
+            ),
+        ] {
+            assert_eq!(Action::from_config_key(key), Some(action));
+            assert_eq!(Action::from_config_key(alias), Some(action));
+            assert!(Action::all_actions().contains(&action));
+            assert!(defaults.binding_display(&action).is_empty());
+            for name in [key, alias] {
+                let table = format!("'{name}' = 'F8'").parse::<toml::Table>().unwrap();
+                let customized = KeybindingMap::from_user_overrides(&table).unwrap();
+                assert_eq!(customized.lookup(&parse("F8").unwrap()), Some(action));
+            }
+        }
+    }
+
     #[test]
     fn live_hello_is_discoverable_and_has_no_default_shortcut() {
         assert!(super::Action::all_actions().contains(&super::Action::AsciiOrganismHello));

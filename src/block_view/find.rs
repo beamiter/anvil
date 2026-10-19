@@ -915,6 +915,7 @@ fn record_outcome_matches_filters(record: BackendRecordRef<'_>, filters: &BlockF
     outcome_matches_filters(classification_command, record.exit_code(), filters)
 }
 
+#[cfg(test)]
 fn has_metadata_filters(filters: &BlockFilters) -> bool {
     has_command_lifecycle_filters(filters) || filters.bookmarked_only || filters.background_only
 }
@@ -1023,9 +1024,9 @@ fn metadata_filter_line<'a>(
     }
 }
 
-/// An empty text query with active metadata filters is a block browser rather
-/// than an idle picker. Represent each eligible record once, choosing the
-/// first meaningful line on the requested surface.
+/// An empty text query is a block browser, with optional metadata filters.
+/// Represent each eligible record once, choosing the first meaningful line
+/// on the requested surface.
 fn metadata_filter_hit(
     record: BackendRecordRef<'_>,
     scope: CrossBlockSearchScope,
@@ -1098,7 +1099,14 @@ fn metadata_filter_hits_with_budget<'a>(
             );
         }
         scan_budget.consume_bytes(record.command().len());
-        if scope.includes_output() {
+        // All/Cmd browse resolves directly from command metadata. Do not
+        // charge or inspect a multi-megabyte output which this row never uses.
+        // Output-only browsing and commandless background records retain the
+        // existing bounded-output preview behavior.
+        if scope == CrossBlockSearchScope::Output
+            || (scope == CrossBlockSearchScope::All
+                && first_meaningful_line(record.command()).is_none())
+        {
             scan_budget.consume_bytes(record.output().unwrap_or("").len());
         }
         let budget_stopped = scan_budget.exhausted();
@@ -2356,10 +2364,11 @@ impl TermView {
     /// enough context (line number + the raw line + cmd preview) to drive a
     /// palette UI that lets the user pick one and jump to it.
     ///
-    /// Errors only on invalid regex; an empty pattern returns an empty report
-    /// so the caller can clear results without a special branch. When the
-    /// scan budget stops the walk early, `scan_incomplete` is set so the UI
-    /// can disclose that later records were not examined.
+    /// An empty pattern browses one representative row per eligible retained
+    /// record, with optional metadata filters. Queries above 8 KiB and regexes
+    /// that fail compilation or its size budget return an error. When a scan
+    /// slice stops early, `scan_incomplete` and `resume` let the UI disclose the
+    /// partial result and continue from the same query's retained cursor.
     ///
     /// `filters` is applied per record, before its lines are scanned: the
     /// predicates already existed and had no surface that could reach them, so
@@ -2408,9 +2417,6 @@ impl TermView {
         resume: Option<&CrossBlockSearchCursor>,
     ) -> Result<CrossBlockSearchReport, String> {
         if pattern.is_empty() {
-            if !has_metadata_filters(filters) {
-                return Ok(CrossBlockSearchReport::finished(Vec::new()));
-            }
             let start_index = resume.map(|cursor| cursor.record_index).unwrap_or(0);
             let bookmarks = self.bookmarks.snapshot();
             let records = self.render_backend.records();
@@ -2430,13 +2436,16 @@ impl TermView {
             });
         }
 
-        let compiled_pattern = cross_block_pattern(pattern, options);
-        let re = regex::RegexBuilder::new(&compiled_pattern)
-            .case_insensitive(!options.case_sensitive)
-            .multi_line(true)
-            .size_limit(CROSS_BLOCK_REGEX_SIZE_LIMIT)
-            .build()
-            .map_err(|e| format!("{e}"))?;
+        let mut prepared = self.prepared_search.borrow_mut();
+        let re = prepared.prepare(
+            pattern,
+            super::prepared_search::PatternOptions {
+                case_sensitive: options.case_sensitive,
+                regex: options.regex,
+                whole_word: options.whole_word,
+            },
+            CROSS_BLOCK_REGEX_SIZE_LIMIT,
+        )?;
 
         let bookmarks = self.bookmarks.snapshot();
         let records = self.render_backend.records();
@@ -2444,7 +2453,7 @@ impl TermView {
         let (hits, resume) = pattern_search_hits_with_budget(
             records.iter(),
             PatternSearchQuery {
-                re: &re,
+                re,
                 options,
                 scope,
                 max_hits,
@@ -2721,6 +2730,7 @@ pub(super) fn clear_find_state(
 
 #[cfg(test)]
 mod tests {
+    include!("metadata_browse_tests.rs");
     use super::metadata_filter_line;
     #[test]
     fn an_alternate_screen_app_scopes_find_to_the_live_screen() {

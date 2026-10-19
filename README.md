@@ -291,10 +291,13 @@ them while the query keeps focus; the result scan and the VTE highlight used
 after activation share the exact same options. `All / Cmd / Out` restricts the
 scan to all text, commands, or output, with `Ctrl+O` cycling the scope before
 the 500-hit cap is applied. `Failed`, `Slow`, `Bookmarked`, and `Background` compose before
-that cap; with an empty text query, any filter turns the palette into a metadata
-browser with one representative row for each eligible retained block that has
+that cap. An empty text query immediately opens a metadata browser, with optional
+filters and one representative row for each eligible retained block that has
 meaningful text on the selected surface. Queries above 8 KiB are rejected
-before regex compilation, whose heap budget is capped independently. Result
+before regex compilation, whose heap budget is capped independently. A pane-owned
+one-query cache reuses prepared expressions, including invalid regex results,
+across continuation slices and refreshes. `All`/`Cmd` browse rows use command
+metadata without spending the budget on unneeded output. Result
 status includes the current position; `↑/↓` wraps, `Home/End` selects either
 edge, and `PageUp/PageDown` moves ten rows while keeping the row visible and
 the query focused. `Enter` jumps and closes; `Shift+Enter` keeps the palette
@@ -599,6 +602,16 @@ stale keyboard focus cannot activate an invisible action on an old card.
 Jump-to-oldest failed/slow/pinned, previous-failed, and pinned-navigation
 actions remain available in the command palette and can be assigned in
 `[keybindings]`, but have no default shortcuts.
+
+**Collapse selected output** and **Expand selected output** apply to the complete
+explicit finished-card selection. They have no default shortcut; bind
+`collapse_selected_blocks` / `expand_selected_blocks` in `[keybindings]` if desired.
+A stale selection refuses the entire batch, empty selection does not target the
+newest card, and cards without collapsible output stay unchanged. The completion
+notice counts only changed cards. These actions preserve selection, focus, and
+live input while updating the virtualization heights once. See
+[Block workspace navigation and triage](docs/block-workspace.md) for browse
+semantics, shared pane navigation, and focused regression commands.
 
 ## Installing and updating jsh
 

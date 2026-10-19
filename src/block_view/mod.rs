@@ -50,9 +50,12 @@ mod onboarding;
 #[allow(dead_code)]
 mod palette;
 mod paste_feedback;
+mod prepared_search;
 mod review;
 mod scroll;
+mod selection_folding;
 mod selection_hold;
+pub(crate) use selection_folding::FoldSelectionResult;
 mod unified_chrome;
 mod unified_images;
 pub(crate) mod watch_batch;
@@ -4537,6 +4540,8 @@ pub struct TermView {
     /// cursor into it, so Ctrl+F highlights all hits and Next/Prev step through
     /// them (Warp's FindWithinBlock). Tags are stripped on close via clear_find.
     find_state: Rc<RefCell<FindState>>,
+    /// One compiled cross-block query reused by scan slices and refreshes.
+    prepared_search: RefCell<prepared_search::PreparedSearch>,
     current_cwd: Rc<RefCell<String>>,
     /// Frame-clock resize tick armed by `resize_kick` while a pane resize
     /// settles; `None` at rest so an idle pane holds no frame-clock callback.
@@ -14488,6 +14493,7 @@ impl TermView {
             scroll_debouncer: scroll_debouncer.clone(),
             sticky_organism_slot,
             find_state,
+            prepared_search: RefCell::new(prepared_search::PreparedSearch::default()),
             current_cwd: current_cwd.clone(),
             menu_keybindings,
             resize_tick_id,
@@ -16215,11 +16221,50 @@ impl TermView {
     /// keeps the space the output used to take and the scrollbar lies. One
     /// layout pass at the end, not one per card.
     pub fn set_all_blocks_collapsed(&self, collapsed: bool) -> usize {
+        self.apply_blocks_collapsed(collapsed, None)
+    }
+
+    /// Fold or unfold only the explicit selected finished cards. No selection
+    /// means no action; stale identities refuse the whole batch. The selection,
+    /// keyboard owner and live shell are never changed by this operation.
+    pub(crate) fn set_selected_blocks_collapsed(&self, collapsed: bool) -> FoldSelectionResult {
+        if self.fullscreen.get()
+            || self.bstate.get() == BlockState::AltScreen
+            || !self.render_backend.supports_block_mutation()
+        {
+            return FoldSelectionResult::Unavailable;
+        }
+        let plan = {
+            let selected = self.selected_block_ids.borrow();
+            let finished = self.finished_blocks.borrow();
+            selection_folding::selected_indices(finished.iter().map(|card| card.id), &selected)
+        };
+        let indices = match plan {
+            Ok(indices) => indices,
+            Err(result) => return result,
+        };
+        match self.apply_blocks_collapsed(collapsed, Some(&indices)) {
+            0 => FoldSelectionResult::NoChange,
+            count => FoldSelectionResult::Changed(count),
+        }
+    }
+
+    /// Apply one synchronous batch and update virtualization once. Indices are
+    /// validated against the complete selected identity set before entry.
+    fn apply_blocks_collapsed(&self, collapsed: bool, indices: Option<&[usize]>) -> usize {
         if self.fullscreen.get() || !self.render_backend.supports_block_mutation() {
             return 0;
         }
         let moved = {
             let finished = self.finished_blocks.borrow();
+            let all_indices;
+            let indices = match indices {
+                Some(indices) => indices,
+                None => {
+                    all_indices = (0..finished.len()).collect::<Vec<_>>();
+                    &all_indices
+                }
+            };
             let config = self.config.borrow();
             let fallback_cols =
                 bounded_finished_vte_columns(self.active.borrow().grid_cols() as i64);
@@ -16228,7 +16273,8 @@ impl TermView {
                 &self.block_data,
                 self.failure_marker_redraw.as_ref(),
                 |block_data| {
-                    for (index, card) in finished.iter().enumerate() {
+                    for &index in indices {
+                        let card = &finished[index];
                         if !card.set_collapsed(collapsed) {
                             continue;
                         }
@@ -17000,6 +17046,7 @@ pub(crate) fn organism_settings_test_pty_bytes(view: &TermView) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    include!("selection_folding_tests.rs");
     use super::{
         agent_command_is_safe, agent_prompt_boundary_is_trusted, append_bounded_section,
         append_typed_command_shadow, approved_command_submission_payload,

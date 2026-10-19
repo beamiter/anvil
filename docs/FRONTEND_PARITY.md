@@ -11,8 +11,8 @@ platform safety boundary.
 
 | Area | Required behavior in both frontends |
 | --- | --- |
-| Tabs and panes | New tabs, close/duplicate/reorder/mark/pin, top/sidebar tabs, drag-to-split, zoom, focus and resize actions. A split inherits the focused leaf's backend and cwd. Spawn failure leaves the old layout intact. |
-| Block mode | Structured running/finished blocks, selection, search and filters, failure markers/navigation, pinning, clear/undo-clear, re-input, Markdown/JSON export, long-output private scrolling, running Stop and jump controls, and bounded virtualization. |
+| Tabs and panes | New tabs, close/duplicate/reorder/mark/pin, top/sidebar tabs, drag-to-split, zoom, focus and resize actions. Directional focus uses the shared rectangle-edge/overlap selector and skips unmapped panes. A split inherits the focused leaf's backend and cwd. Spawn failure leaves the old layout intact. |
+| Block mode | Structured running/finished blocks, exact selected-output folding, empty-query history browsing, pane-owned prepared search, search and filters, failure markers/navigation, pinning, clear/undo-clear, re-input, Markdown/JSON export, long-output private scrolling, running Stop and jump controls, and bounded virtualization. |
 | VTE mode | Conventional VTE behavior, shell integration, OSC title/cwd/bell/notification handling, search, clipboard controls, and remote/container launch. |
 | AI Chats | Persistent right panel, chat library and search, new/rename/archive/delete, per-chat draft and block context, streaming, Stop/Retry, strict request-to-chat ownership, width/visibility persistence, and bounded session restore. |
 | Shell Agent | Approval-gated proposals and exact-command review. Automatic execution is allowed only after a private shell capability handshake and insert-then-exact-readback verification; unsupported shells, remote/host bridges, and lost identity fail closed. |
@@ -34,6 +34,8 @@ frontend's canonical key:
 - `open_history_palette` and `history_palette`
 - `open_workflows` and `workflows_palette`
 - `open_palette` and `toggle_command_palette`
+- `block:collapse_selected` and `collapse_selected_blocks`
+- `block:expand_selected` and `expand_selected_blocks`
 
 Indexed remote actions are `connect_remote_1` through `connect_remote_9` in
 both frontends.

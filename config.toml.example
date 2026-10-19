@@ -176,6 +176,9 @@ remote_hosts = []
 # scroll_down = "Ctrl+Down"
 # show_remote_picker = "Ctrl+Shift+S"
 # connect_remote_1 = "F4"  # direct-connect saved remote 1; supports 1 through 9
+# Optional selected-output actions; neither has a default shortcut.
+# collapse_selected_blocks = "F8"
+# expand_selected_blocks = "F9"
 # resize_pane_left = "Ctrl+Shift+Alt+Left"
 # resize_pane_right = "Ctrl+Shift+Alt+Right"
 # resize_pane_up = "Ctrl+Shift+Alt+Up"

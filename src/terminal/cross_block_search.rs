@@ -64,17 +64,7 @@ fn memory(
 }
 
 fn idle_status() -> &'static str {
-    "Type to search. F5 refreshes; Shift+Enter jumps and advances; Ctrl+Shift+U resets."
-}
-
-fn has_search_intent(
-    query: &str,
-    failed_only: bool,
-    slow_only: bool,
-    bookmarked_only: bool,
-    background_only: bool,
-) -> bool {
-    !query.is_empty() || failed_only || slow_only || bookmarked_only || background_only
+    "Browse blocks or type to search. F5 refreshes; Shift+Enter jumps and advances; Ctrl+Shift+U resets."
 }
 
 fn bookmark_action_label(bookmarked: bool) -> &'static str {
@@ -382,6 +372,22 @@ fn search_status(total: usize, selected: Option<usize>, scan_incomplete: bool) -
     }
 }
 
+fn search_status_for_query(
+    total: usize,
+    selected: Option<usize>,
+    scan_incomplete: bool,
+    query: &str,
+) -> String {
+    let status = search_status(total, selected, scan_incomplete);
+    if query.is_empty() {
+        status
+            .replace("matches", "blocks")
+            .replace("match", "block")
+    } else {
+        status
+    }
+}
+
 /// Continue slices share the same empty-state copy as the first rebuild so a
 /// bookmarked-only scan that finds nothing after idle resume does not fall
 /// back to generic "No matches."
@@ -390,13 +396,14 @@ fn overlay_scan_status(
     selected: Option<usize>,
     scan_incomplete: bool,
     bookmarked_empty: Option<&str>,
+    query: &str,
 ) -> String {
     if total == 0 && !scan_incomplete {
         if let Some(message) = bookmarked_empty {
             return message.to_string();
         }
     }
-    search_status(total, selected, scan_incomplete)
+    search_status_for_query(total, selected, scan_incomplete, query)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -718,7 +725,7 @@ pub(super) fn toggle(
         .build();
 
     let filter_entry = gtk::SearchEntry::new();
-    filter_entry.set_placeholder_text(Some("Search across blocks…"));
+    filter_entry.set_placeholder_text(Some("Browse blocks or type to search…"));
     filter_entry.set_hexpand(true);
     filter_entry.set_margin_start(12);
     filter_entry.set_margin_end(12);
@@ -815,11 +822,13 @@ pub(super) fn toggle(
         let hits = hits.clone();
         let scan_incomplete = scan_incomplete.clone();
         let status_label = status_label.clone();
+        let filter_entry = filter_entry.clone();
         list_box.connect_row_selected(move |_, row| {
-            status_label.set_text(&search_status(
+            status_label.set_text(&search_status_for_query(
                 hits.borrow().len(),
                 row.map(|row| row.index() as usize),
                 scan_incomplete.get(),
+                filter_entry.text().as_str(),
             ));
         });
     }
@@ -882,18 +891,6 @@ pub(super) fn toggle(
                 list_box.remove(&child);
             }
             row_bookmark_buttons.borrow_mut().clear();
-            if !has_search_intent(
-                &query,
-                filters.failed_only,
-                filters.slow_only,
-                filters.bookmarked_only,
-                filters.background_only,
-            ) {
-                hits.borrow_mut().clear();
-                scan_incomplete.set(false);
-                status_label.set_text(idle_status());
-                return;
-            }
             if let Some(message) = query_error(&query) {
                 hits.borrow_mut().clear();
                 scan_incomplete.set(false);
@@ -924,6 +921,7 @@ pub(super) fn toggle(
                         } else {
                             None
                         },
+                        &query,
                     );
                     status_label.set_text(&status);
                     let jumpable = view.jumpable_search_hits(&results);
@@ -977,10 +975,11 @@ pub(super) fn toggle(
                             let already = hits.borrow().len();
                             if already >= CROSS_BLOCK_SEARCH_LIMIT {
                                 scan_incomplete.set(false);
-                                status_label.set_text(&search_status(
+                                status_label.set_text(&search_status_for_query(
                                     already,
                                     list_box.selected_row().map(|row| row.index() as usize),
                                     false,
+                                    &query,
                                 ));
                                 pending_scan_continue_idle.borrow_mut().take();
                                 return gtk::glib::ControlFlow::Break;
@@ -1024,6 +1023,7 @@ pub(super) fn toggle(
                                         list_box.selected_row().map(|row| row.index() as usize),
                                         more.scan_incomplete,
                                         bookmarked_empty,
+                                        &query,
                                     ));
                                     *cursor.borrow_mut() = more.resume;
                                     if cursor.borrow().is_some() {
@@ -1064,10 +1064,6 @@ pub(super) fn toggle(
         let status_label = status_label.clone();
         let filter_entry = filter_entry.clone();
         let retained_hit = retained_hit.clone();
-        let failed_toggle = failed_toggle.clone();
-        let slow_toggle = slow_toggle.clone();
-        let bookmarked_toggle = bookmarked_toggle.clone();
-        let background_toggle = background_toggle.clone();
         Rc::new(move |preserve_selection: bool| {
             cancel_refresh_tick(pending_refresh_tick.as_ref());
             let generation = search_generation.get().wrapping_add(1);
@@ -1090,22 +1086,6 @@ pub(super) fn toggle(
             } else {
                 None
             };
-            if !has_search_intent(
-                filter_entry.text().as_str(),
-                failed_toggle.is_active(),
-                slow_toggle.is_active(),
-                bookmarked_toggle.is_active(),
-                background_toggle.is_active(),
-            ) {
-                while let Some(child) = list_box.first_child() {
-                    list_box.remove(&child);
-                }
-                hits.borrow_mut().clear();
-                row_bookmark_buttons.borrow_mut().clear();
-                scan_incomplete.set(false);
-                status_label.set_text(idle_status());
-                return;
-            }
             if let Some(message) = query_error(filter_entry.text().as_str()) {
                 while let Some(child) = list_box.first_child() {
                     list_box.remove(&child);
@@ -1651,15 +1631,7 @@ pub(super) fn toggle(
     *dialog_slot.borrow_mut() = Some(dialog.clone());
     let parent = view.widget();
     dialog.present(Some(&parent));
-    if has_search_intent(
-        &remembered.query,
-        remembered.failed_only,
-        remembered.slow_only,
-        remembered.bookmarked_only,
-        remembered.background_only,
-    ) {
-        schedule_rebuild(false);
-    }
+    schedule_rebuild(false);
     filter_entry.grab_focus();
 }
 
@@ -1667,12 +1639,12 @@ pub(super) fn toggle(
 mod tests {
     use super::{
         bookmark_action_label, bookmark_change_status, dialog_toggle_plan, enter_key_route,
-        focus_confirms_result, has_search_intent, hit_outcome_class, hit_outcome_label,
-        idle_status, is_plain_refresh_key, is_selected_bookmark_key, jump_outcome, memory,
-        overlay_scan_status, query_error, refresh_selection_index, refresh_status, search_status,
-        selection_index, should_step, BookmarkKeyLatch, BookmarkKeyPress, CrossBlockHit,
-        DialogTogglePlan, EnterKeyRoute, JumpOutcome, RecordNavigationResult, RefreshKeyLatch,
-        RefreshKeyPress, RefreshTickSlot, SelectionAnchor, SelectionMove,
+        focus_confirms_result, hit_outcome_class, hit_outcome_label, idle_status,
+        is_plain_refresh_key, is_selected_bookmark_key, jump_outcome, memory, overlay_scan_status,
+        query_error, refresh_selection_index, refresh_status, search_status,
+        search_status_for_query, selection_index, should_step, BookmarkKeyLatch, BookmarkKeyPress,
+        CrossBlockHit, DialogTogglePlan, EnterKeyRoute, JumpOutcome, RecordNavigationResult,
+        RefreshKeyLatch, RefreshKeyPress, RefreshTickSlot, SelectionAnchor, SelectionMove,
         CROSS_BLOCK_SEARCH_DEBOUNCE, CROSS_BLOCK_SEARCH_LIMIT,
         CROSS_BLOCK_SEARCH_QUERY_LIMIT_BYTES,
     };
@@ -2094,17 +2066,6 @@ mod tests {
     }
 
     #[test]
-    fn metadata_filters_are_search_intent_without_text() {
-        assert!(!has_search_intent("", false, false, false, false));
-        assert!(has_search_intent("needle", false, false, false, false));
-        assert!(has_search_intent("", true, false, false, false));
-        assert!(has_search_intent("", false, true, false, false));
-        assert!(has_search_intent("", false, false, true, false));
-        assert!(has_search_intent("", false, false, false, true));
-        assert!(has_search_intent("", true, true, true, true));
-    }
-
-    #[test]
     fn cross_block_search_memory_is_bounded_and_keeps_all_filters() {
         let options = CrossBlockSearchOptions {
             case_sensitive: true,
@@ -2158,7 +2119,8 @@ mod tests {
                 0,
                 None,
                 false,
-                Some("No bookmarked blocks in retained history.")
+                Some("No bookmarked blocks in retained history."),
+                "needle",
             ),
             "No bookmarked blocks in retained history."
         );
@@ -2167,7 +2129,8 @@ mod tests {
                 0,
                 None,
                 true,
-                Some("No bookmarked blocks in retained history.")
+                Some("No bookmarked blocks in retained history."),
+                "needle",
             ),
             search_status(0, None, true),
             "an incomplete scan keeps the budget copy even under Bookmarked"
@@ -2177,11 +2140,17 @@ mod tests {
                 1,
                 Some(0),
                 false,
-                Some("No bookmarked blocks in retained history.")
+                Some("No bookmarked blocks in retained history."),
+                "needle",
             ),
             "1 of 1 match"
         );
         assert_eq!(search_status(1, Some(0), false), "1 of 1 match");
+        assert_eq!(
+            search_status_for_query(2, Some(0), false, ""),
+            "1 of 2 blocks"
+        );
+        assert_eq!(search_status_for_query(0, None, false, ""), "No blocks.");
         assert_eq!(
             search_status(CROSS_BLOCK_SEARCH_LIMIT, Some(36), false),
             "37 of 500 matches (capped) — refine your query."
@@ -2227,7 +2196,7 @@ mod tests {
     fn continuous_review_advances_only_after_a_live_jump() {
         assert_eq!(
             idle_status(),
-            "Type to search. F5 refreshes; Shift+Enter jumps and advances; Ctrl+Shift+U resets."
+            "Browse blocks or type to search. F5 refreshes; Shift+Enter jumps and advances; Ctrl+Shift+U resets."
         );
         assert_eq!(refresh_status(), "Refreshing blocks…");
         assert!(should_step(JumpOutcome::Close, true));

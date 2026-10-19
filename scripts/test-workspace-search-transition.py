@@ -2,9 +2,11 @@
 """Run actual AppModel pane transitions against deterministic widget boundaries.
 
 No GTK/PTY or model services are launched. Rust methods are extracted unchanged
-from workspace_ops.rs; only external controllers/tree operations are stubbed.
+from workspace_ops.rs; the geometry selector is loaded from the locked core
+dependency. Only external controllers/tree operations are stubbed.
 """
 from pathlib import Path
+import json
 import os
 import re
 import subprocess
@@ -25,6 +27,15 @@ def item(source, marker):
 def main():
     source = Path(os.environ.get('WORKSPACE_SEARCH_SOURCE', ROOT / 'src/workspace_ops.rs')).read_text().split('#[cfg(test)]')[0]
     fixture = (ROOT / 'scripts/workspace_search_transition_harness.rs').read_text()
+    metadata = json.loads(subprocess.run(
+        [os.environ.get('CARGO', 'cargo'), 'metadata', '--locked', '--format-version=1'],
+        cwd=ROOT, check=True, text=True, stdout=subprocess.PIPE,
+    ).stdout)
+    core = next(package for package in metadata['packages'] if package['name'] == 'jterm_core')
+    pane_layout = Path(core['manifest_path']).parent / 'src/pane_layout.rs'
+    fixture = fixture.replace('// @pane_layout',
+        '#[path = ' + json.dumps(str(pane_layout), ensure_ascii=False) + ']\nmod pane_layout;\n'
+        'use pane_layout::{directional_focus_target, PaneDirection as Direction, PaneRect, Rect as PaneBounds};')
     methods = ['pub(crate) fn cycle_pane_focus(', 'pub(crate) fn focus_pane_directional(', 'pub(crate) fn close_pane(',
                'pub(crate) fn rollback_failed_split(', 'pub(crate) fn find_pane(',
                'pub(crate) fn close_tab(', 'pub(crate) fn close_tabs(', 'pub(crate) fn select_tab(']

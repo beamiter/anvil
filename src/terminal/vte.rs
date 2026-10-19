@@ -491,6 +491,8 @@ pub enum VteInput {
     /// Block-view only: fold / unfold every finished block's output at once.
     CollapseAllBlocks,
     ExpandAllBlocks,
+    CollapseSelectedBlocks,
+    ExpandSelectedBlocks,
     /// Block-view only: fold or unfold the selected block (or the newest one).
     ToggleBlockCollapsed,
     /// Block-view only: put all selected commands back into the input editor.
@@ -879,6 +881,8 @@ impl Component for VteTerminal {
             }
             VteInput::CollapseAllBlocks
             | VteInput::ExpandAllBlocks
+            | VteInput::CollapseSelectedBlocks
+            | VteInput::ExpandSelectedBlocks
             | VteInput::ToggleBlockCollapsed => {
                 let _ = sender.output(VteOutput::Notice(vte_block_mode_only_notice(
                     "Block folding",

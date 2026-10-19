@@ -517,6 +517,8 @@ mod tests {
         for action in [
             Action::CollapseAllBlocks,
             Action::ExpandAllBlocks,
+            Action::CollapseSelectedBlocks,
+            Action::ExpandSelectedBlocks,
             Action::ToggleBlockCollapsed,
         ] {
             let entries = gather(

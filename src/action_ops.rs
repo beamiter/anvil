@@ -500,6 +500,12 @@ impl AppModel {
             Action::ExpandAllBlocks => {
                 self.emit_block_action(VteInput::ExpandAllBlocks, "Block folding");
             }
+            Action::CollapseSelectedBlocks => {
+                self.emit_block_action(VteInput::CollapseSelectedBlocks, "Selected output folding");
+            }
+            Action::ExpandSelectedBlocks => {
+                self.emit_block_action(VteInput::ExpandSelectedBlocks, "Selected output folding");
+            }
             Action::ToggleBlockCollapsed => {
                 self.emit_block_action(VteInput::ToggleBlockCollapsed, "Block folding");
             }

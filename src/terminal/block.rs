@@ -1057,6 +1057,11 @@ impl Component for BlockTerminal {
                 let folded = view.set_all_blocks_collapsed(collapse);
                 let _ = sender.output(VteOutput::Notice(fold_all_notice(collapse, folded)));
             }
+            VteInput::CollapseSelectedBlocks | VteInput::ExpandSelectedBlocks => {
+                let collapse = matches!(msg, VteInput::CollapseSelectedBlocks);
+                let result = view.set_selected_blocks_collapsed(collapse);
+                let _ = sender.output(VteOutput::Notice(result.notice(collapse)));
+            }
             VteInput::ToggleBlockCollapsed => {
                 if let Some(message) =
                     toggle_collapsed_notice(view.toggle_selected_block_collapsed())
