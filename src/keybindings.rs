@@ -138,6 +138,10 @@ pub(crate) enum Action {
     ToggleTasksPanel,
     /// Search command and output lines across all completed blocks.
     CrossBlockSearch,
+    PreviousCommand,
+    NextCommand,
+    ReturnToLive,
+    CopyCurrentCommand,
 }
 
 impl Action {
@@ -248,6 +252,10 @@ impl Action {
             Action::OpenAgent => "Toggle Shell Agent",
             Action::ToggleTasksPanel => "Toggle agent Tasks panel",
             Action::CrossBlockSearch => "Search across blocks (ripgrep)",
+            Action::PreviousCommand => "Previous command",
+            Action::NextCommand => "Next command",
+            Action::ReturnToLive => "Return to live input",
+            Action::CopyCurrentCommand => "Copy current command",
         }
     }
 
@@ -345,6 +353,10 @@ impl Action {
             Action::OpenAgent => Some("open_agent"),
             Action::ToggleTasksPanel => Some("toggle_tasks_panel"),
             Action::CrossBlockSearch => Some("cross_block_search"),
+            Action::PreviousCommand => Some("previous_command"),
+            Action::NextCommand => Some("next_command"),
+            Action::ReturnToLive => Some("return_to_live"),
+            Action::CopyCurrentCommand => Some("copy_current_command"),
         }
     }
 
@@ -450,6 +462,10 @@ impl Action {
             Action::OpenAgent,
             Action::ToggleTasksPanel,
             Action::CrossBlockSearch,
+            Action::PreviousCommand,
+            Action::NextCommand,
+            Action::ReturnToLive,
+            Action::CopyCurrentCommand,
         ]
     }
 
@@ -1404,6 +1420,31 @@ toggle_block_collapsed = "F10"
             map.lookup(&parse("F10").unwrap()),
             Some(Action::ToggleBlockCollapsed)
         );
+    }
+
+    #[test]
+    fn unified_navigation_is_opt_in_and_keeps_shell_line_scroll_defaults() {
+        let mut map = KeybindingMap::from_defaults();
+        let bindings = [
+            (Action::PreviousCommand, "previous_command", "F5"),
+            (Action::NextCommand, "next_command", "F6"),
+            (Action::ReturnToLive, "return_to_live", "F7"),
+            (Action::CopyCurrentCommand, "copy_current_command", "F8"),
+        ];
+        let before_up = map.lookup(&parse("Ctrl+Up").unwrap());
+        let before_down = map.lookup(&parse("Ctrl+Down").unwrap());
+        let mut table = toml::Table::new();
+        for (action, key, chord) in &bindings {
+            assert!(Action::all_actions().contains(action));
+            assert!(map.binding_display(action).is_empty());
+            table.insert((*key).into(), toml::Value::String((*chord).into()));
+        }
+        map.apply_user_overrides(&table).unwrap();
+        for (action, _, chord) in bindings {
+            assert_eq!(map.lookup(&parse(chord).unwrap()), Some(action));
+        }
+        assert_eq!(map.lookup(&parse("Ctrl+Up").unwrap()), before_up);
+        assert_eq!(map.lookup(&parse("Ctrl+Down").unwrap()), before_down);
     }
 
     #[test]

@@ -58,6 +58,7 @@ mod selection_hold;
 pub(crate) use selection_folding::FoldSelectionResult;
 mod unified_chrome;
 mod unified_images;
+mod unified_navigation;
 pub(crate) mod watch_batch;
 pub(crate) mod watch_reader;
 mod zone_history;
@@ -4393,6 +4394,8 @@ pub struct TermView {
     /// Pane-local, one-shot guidance for an empty Block document. It is a
     /// non-measuring overlay and never participates in card/notice ownership.
     block_onboarding: BlockOnboarding,
+    /// A compact, space-occupying toolbar for the continuous terminal only.
+    unified_navigation: Option<unified_navigation::NavigationBar>,
     /// Space-occupying card region below the surface. Used by a backend whose
     /// document cannot scroll to a mounted card; empty and hidden otherwise.
     notice_dock: gtk::Box,
@@ -5255,6 +5258,11 @@ trait RenderBackend {
     /// no scroll, no focus, no selection.
     fn can_scroll_to_record(&self, _block_id: u64) -> bool {
         false
+    }
+    /// Read the same exact row proof as record navigation without scrolling.
+    /// Used only when an explicit navigation request starts from a viewport.
+    fn record_scroll_value(&self, _block_id: u64) -> Option<f64> {
+        None
     }
     /// Resolve one result page without moving focus or scroll state. The
     /// default retains backend-specific lookup/proof semantics; mounted-card
@@ -6150,6 +6158,9 @@ impl ResetAwareParserSplitter {
 /// no finished-block widgets or other block chrome.
 struct UnifiedBackend {
     vte: Terminal,
+    navigation: unified_navigation::NavigationBar,
+    user_scrolled_up: Rc<Cell<bool>>,
+    unread_count: Rc<Cell<u32>>,
     /// Same construction-time policy bit as the SubmissionSurface. Unified's
     /// stable full-size grid selects `false`.
     rebase_prompt_anchor_on_row_delta: bool,
@@ -9713,7 +9724,7 @@ impl RenderBackend for UnifiedBackend {
     fn hard_reset(&self) {
         self.zone_marker.borrow_mut().close_zone(None);
         self.chrome.clear_authority();
-        find::clear_find_state(self.find_state_for_cb.as_ref(), &self.vte);
+        find::invalidate_find_state(self.find_state_for_cb.as_ref(), &self.vte);
         self.kitty_assembler.borrow_mut().reset();
         self.kitty_pending_admission.borrow_mut().take();
         self.image_layer.hard_reset();
@@ -9784,6 +9795,10 @@ impl RenderBackend for UnifiedBackend {
         self.chrome
             .proven_zone_scroll_value(&self.vte, block_id)
             .is_some()
+    }
+
+    fn record_scroll_value(&self, block_id: u64) -> Option<f64> {
+        self.chrome.proven_zone_scroll_value(&self.vte, block_id)
     }
 
     fn completed_search_surfaces(
@@ -9979,7 +9994,7 @@ impl RenderBackend for UnifiedBackend {
     fn reset_scroll_lock(&self) {}
 
     fn user_scrolled_up(&self) -> bool {
-        false
+        self.user_scrolled_up.get()
     }
 
     fn finalize_block(
@@ -9987,7 +10002,7 @@ impl RenderBackend for UnifiedBackend {
         record: &CompletedCommandRecord,
         payload: &dyn BlockRenderPayloadAccessor,
     ) {
-        find::clear_find_state(self.find_state_for_cb.as_ref(), &self.vte);
+        find::invalidate_find_state(self.find_state_for_cb.as_ref(), &self.vte);
         let max_zones = self.config_for_cb.borrow().max_visible_blocks as usize;
         // The engine keeps the raw ring alive through the whole finalize
         // fan-out, so this bounded read still sees the command's bytes. No
@@ -10023,11 +10038,17 @@ impl RenderBackend for UnifiedBackend {
         );
         self.kitty_assembler.borrow_mut().reset_in_flight();
         self.kitty_pending_admission.borrow_mut().take();
+        if !record.is_background && self.user_scrolled_up.get() {
+            self.unread_count
+                .set(self.unread_count.get().saturating_add(1));
+        }
+        self.navigation.request_refresh();
     }
 
     // The block chrome is permanently absent. The organism overlay still has
     // to be suppressed while an alternate-screen application owns the VTE.
     fn enter_alt_screen_chrome(&self) {
+        self.navigation.set_suspended(true);
         self.chrome.set_alt_screen(true);
         self.image_layer.set_alt_screen(true);
         let active = self.active_rc.borrow();
@@ -10036,14 +10057,19 @@ impl RenderBackend for UnifiedBackend {
     }
 
     fn exit_alt_screen_chrome(&self) {
+        self.navigation.set_suspended(false);
         self.chrome.set_alt_screen(false);
         self.image_layer.set_alt_screen(false);
         self.active_rc.borrow().set_live_organism_alt_screen(false);
     }
 
-    fn enter_fullscreen(&self) {}
+    fn enter_fullscreen(&self) {
+        self.navigation.set_suspended(true);
+    }
 
-    fn exit_fullscreen(&self) {}
+    fn exit_fullscreen(&self) {
+        self.navigation.set_suspended(false);
+    }
 
     fn kitty_feed(&self, payload: &[u8]) -> kitty_graphics::FeedStatus {
         self.kitty_pending_admission.borrow_mut().take();
@@ -11866,6 +11892,7 @@ impl TermView {
         let unified = mode.is_unified();
         let unified_zones: Rc<RefCell<UnifiedZoneStore>> =
             Rc::new(RefCell::new(UnifiedZoneStore::new()));
+        let unified_navigation = unified.then(unified_navigation::NavigationBar::new);
         if unified {
             let holder = active.borrow().widget().clone();
             holder.remove_css_class("block-compact");
@@ -12111,6 +12138,9 @@ impl TermView {
             root.append(&chat_frame);
             Some(observer)
         } else {
+            if let Some(navigation) = &unified_navigation {
+                root.append(&navigation.root);
+            }
             root.append(&scroll_overlay);
             None
         };
@@ -12984,6 +13014,12 @@ impl TermView {
                 active_rc.borrow().unified_chrome_surface.set_visible(true);
                 Rc::new(UnifiedBackend {
                     vte: active_vte_rc,
+                    navigation: unified_navigation
+                        .as_ref()
+                        .expect("Unified navigation")
+                        .clone(),
+                    user_scrolled_up: user_scrolled_up.clone(),
+                    unread_count: unread_count.clone(),
                     rebase_prompt_anchor_on_row_delta,
                     active_rc,
                     block_scroll_rc,
@@ -13173,7 +13209,7 @@ impl TermView {
         // far enough and the holder (prompt) slides off the bottom. So: at-bottom
         // ⟺ holder top is above the viewport's bottom edge. Sampled on idle so it
         // reflects the settled post-scroll layout.
-        {
+        if !unified {
             let user_scrolled = user_scrolled_up.clone();
             let fab = jump_fab.downgrade();
             let unread = unread_count.clone();
@@ -13260,42 +13296,8 @@ impl TermView {
                 });
         }
 
-        // ── Unified scroll-position detector ──────────────────────────────
-        // The outer scroller holds one full-viewport surface, so its
-        // adjustment never moves and the detector above never fires. Reading
-        // history here means scrolling the VTE's own adjustment, which is what
-        // must drive the same flag: the sticky running header and the jump FAB
-        // both key off it, and both were unreachable in this mode without it.
-        if unified {
-            let user_scrolled = user_scrolled_up.clone();
-            let fab = jump_fab.downgrade();
-            let unread = unread_count.clone();
-            let fullscreen = fullscreen.clone();
-            if let Some(adjustment) = gtk::prelude::ScrollableExt::vadjustment(&active_vte) {
-                adjustment.connect_value_changed(move |adj| {
-                    let Some(fab) = fab.upgrade() else {
-                        return;
-                    };
-                    if fullscreen.get() {
-                        user_scrolled.set(false);
-                        unread.set(0);
-                        fab.set_visible(false);
-                        return;
-                    }
-                    // One row of slack: a partially scrolled last row still
-                    // counts as following the bottom.
-                    let at_bottom = adj.value() >= adj.upper() - adj.page_size() - 1.0;
-                    user_scrolled.set(!at_bottom);
-                    if at_bottom {
-                        unread.set(0);
-                        fab.set_visible(false);
-                    } else {
-                        set_jump_fab_label(&fab, unread.get());
-                        fab.set_visible(true);
-                    }
-                });
-            }
-        }
+        // Unified binds both native adjustment signals after Rc construction.
+        // Its outer scroller must never overwrite that independent history state.
 
         // ── Re-clamp input height on viewport resize ──────────────────────
         // `changed` fires during the viewport's size-allocate, after layout. We
@@ -13333,7 +13335,7 @@ impl TermView {
         }
 
         // ── Jump-to-bottom FAB click: return to the live prompt ───────────
-        {
+        if !unified {
             let scroll = block_scroll.downgrade();
             let programmatic = programmatic_scroll.clone();
             let user_scrolled = user_scrolled_up.clone();
@@ -14424,6 +14426,7 @@ impl TermView {
             block_scroll,
             block_list,
             block_onboarding,
+            unified_navigation,
             notice_dock,
             active_vte,
             contents_generation,
@@ -16946,7 +16949,9 @@ pub(crate) fn organism_settings_test_view_for_mode(
 ) -> Rc<TermView> {
     assert!(matches!(
         mode,
-        crate::config::TerminalMode::Block | crate::config::TerminalMode::Chat
+        crate::config::TerminalMode::Block
+            | crate::config::TerminalMode::Chat
+            | crate::config::TerminalMode::Unified
     ));
     let mut config = crate::config::Config::safe_defaults();
     if let Some(font_desc) = font_desc {
@@ -17047,6 +17052,7 @@ pub(crate) fn organism_settings_test_pty_bytes(view: &TermView) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     include!("selection_folding_tests.rs");
+    include!("unified_navigation_tests.rs");
     use super::{
         agent_command_is_safe, agent_prompt_boundary_is_trusted, append_bounded_section,
         append_typed_command_shadow, approved_command_submission_payload,

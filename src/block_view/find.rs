@@ -1490,6 +1490,7 @@ impl TermView {
         use_regex: bool,
         case_sensitive: bool,
     ) -> FindSearchResult {
+        self.clear_unified_navigation_cursor();
         self.find_in_blocks_at(query, use_regex, case_sensitive, None, true)
     }
 
@@ -1742,13 +1743,6 @@ impl TermView {
             }
         }
 
-        if surfaces.is_empty() {
-            return if scan_limited {
-                FindSearchResult::ScanLimit
-            } else {
-                FindSearchResult::NoMatches
-            };
-        }
         let capped = match_limited || scan_limited;
         let live_stamp = live_observed.then_some(live_stamp_at_start);
         {
@@ -1766,6 +1760,16 @@ impl TermView {
             st.highlighted_terminals = highlighted_terminals;
             st.live_anchor = live_anchor;
             st.live_stamp = live_stamp;
+        }
+        // A valid zero-hit query still observes the surface. Keep its light
+        // query/stamp so new output or completion can invalidate it; no fake
+        // surface or match is needed to make Next rebuild the open query.
+        if total == 0 {
+            return if scan_limited {
+                FindSearchResult::ScanLimit
+            } else {
+                FindSearchResult::NoMatches
+            };
         }
         if let Some(resume) = resume {
             let cursor = resumed_find_cursor(&self.find_state.borrow().surfaces, resume);
@@ -2080,6 +2084,7 @@ impl TermView {
     }
 
     fn step_find(&self, direction: FindDirection) -> FindNavigationResult {
+        self.clear_unified_navigation_cursor();
         // Invalidate before the one-hit/at-boundary shortcut: native output
         // can erase its selection or add hits without moving our old cursor.
         if !self.live_find_is_current() {
@@ -2266,7 +2271,14 @@ impl TermView {
                 None => return FindFocusResult::Invalidated,
             }
         };
-        if surface.is_live && surface.block_id == 0 && (surface.vte_cursor.is_none() || wrap_once) {
+        // Block/Chat's running surface must exclude older native scrollback.
+        // Unified already planned the whole authenticated native domain above,
+        // including its viewport/history wrap; it has no running-card anchor.
+        if surface.is_live
+            && surface.block_id == 0
+            && !self.is_unified()
+            && (surface.vte_cursor.is_none() || wrap_once)
+        {
             let anchor = self.find_state.borrow().live_anchor;
             let Some(anchor) = anchor else {
                 return FindFocusResult::Invalidated;
@@ -2520,6 +2532,7 @@ impl TermView {
         block_id: u64,
         is_output: bool,
     ) -> RecordNavigationResult {
+        let _navigation_guard = self.unified_navigation.as_ref().map(|bar| bar.guard());
         let Some(target) = self
             .render_backend
             .record_search_target(block_id, is_output)
@@ -2539,6 +2552,9 @@ impl TermView {
             // forever.
             if result != RecordNavigationResult::NoMatchingRecord {
                 self.navigated_record_id.set(Some(block_id));
+            }
+            if let Some(bar) = &self.unified_navigation {
+                bar.request_refresh();
             }
             return result;
         };
@@ -2726,6 +2742,20 @@ pub(super) fn clear_find_state(
     // The UI's no-record fallback installs a regex directly on the live VTE,
     // outside `FindState`; always clear it before a new structured pass too.
     active_vte.search_set_regex(None::<&vte4::Regex>, 0);
+}
+
+/// A persistent surface changed underneath an open Find. Clearing its native
+/// regex must still tell the next step to rebuild the retained UI query.
+pub(super) fn invalidate_find_state(
+    find_state: &std::cell::RefCell<FindState>,
+    active_vte: &vte4::Terminal,
+) {
+    let active = {
+        let state = find_state.borrow();
+        state.query.is_some() || state.invalidated || active_vte.search_get_regex().is_some()
+    };
+    clear_find_state(find_state, active_vte);
+    find_state.borrow_mut().invalidated = active;
 }
 
 #[cfg(test)]

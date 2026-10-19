@@ -596,6 +596,18 @@ impl AppModel {
             Action::CrossBlockSearch => {
                 self.emit_block_action(VteInput::CrossBlockSearch, "Cross-block search");
             }
+            Action::PreviousCommand => {
+                self.emit_block_action(VteInput::PreviousCommand, "Unified command navigation")
+            }
+            Action::NextCommand => {
+                self.emit_block_action(VteInput::NextCommand, "Unified command navigation")
+            }
+            Action::ReturnToLive => {
+                self.emit_block_action(VteInput::ReturnToLive, "Return to live")
+            }
+            Action::CopyCurrentCommand => {
+                self.emit_block_action(VteInput::CopyCurrentCommand, "Current-command copy")
+            }
         }
     }
 }

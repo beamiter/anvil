@@ -132,6 +132,8 @@ pub(crate) fn invalid_regex_message(error: impl std::fmt::Display) -> String {
 #[derive(Debug)]
 pub(crate) enum SearchMsg {
     Toggle,
+    /// Explicit pane-owned affordances open Find without toggling it closed.
+    Open,
     Changed(String),
     /// `Aa` in the find bar: match the query's exact case.
     CaseSensitive(bool),
@@ -308,8 +310,8 @@ impl Component for SearchModel {
         root: &Self::Root,
     ) {
         match msg {
-            SearchMsg::Toggle => {
-                let open = !root.is_search_mode();
+            SearchMsg::Toggle | SearchMsg::Open => {
+                let open = matches!(msg, SearchMsg::Open) || !root.is_search_mode();
                 root.set_search_mode(open);
                 if open {
                     widgets.entry.grab_focus();

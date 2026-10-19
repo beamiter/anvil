@@ -565,6 +565,7 @@ fn create_pane(
             undo,
         },
         VteOutput::SearchStatus(status) => AppMsg::SearchStatus(pane_id, status),
+        VteOutput::FindRequested => AppMsg::FindInPane(pane_id),
         VteOutput::BlockFinished {
             command,
             exit_code,
@@ -2351,6 +2352,26 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::SettingsRemoteHosts { expected, hosts } => {
                 self.apply_settings_remote_hosts(expected, hosts, &sender)
+            }
+            AppMsg::FindInPane(pane_id) => {
+                // A navigation button names its owner. Do not wait for GTK's
+                // separate Focused message or let a delayed click open Find in
+                // a different tab after the original pane was hidden/closed.
+                if let Some((ti, pi)) = self.find_pane(pane_id).filter(|(ti, _)| *ti == self.active)
+                {
+                    if self.tabs[ti].active_pane != pi {
+                        if let Some(terminal) = self.active_terminal() {
+                            terminal.emit(VteInput::SearchClear);
+                        }
+                        let transfer = self.begin_organism_focus_transfer(Some(pane_id), false);
+                        self.tabs[ti].active_pane = pi;
+                        self.finish_organism_focus_transfer(transfer);
+                        self.refresh_pane_headers(ti);
+                        self.retitle_tab_from_active_pane(ti, &sender);
+                        self.refresh_bottom_bar();
+                    }
+                    self.search.emit(search::SearchMsg::Open);
+                }
             }
             AppMsg::SearchChanged {
                 text,

@@ -159,6 +159,7 @@ pub(crate) enum AppMsg {
     SearchNext,
     SearchPrev,
     SearchClose,
+    FindInPane(u64),
     SearchStatus(u64, crate::search::SearchStatus),
     SetTabWidth(u32),
     RenameTab(u64, String),

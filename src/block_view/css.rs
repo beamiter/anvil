@@ -417,6 +417,39 @@ fn block_css(config: &Config) -> String {
         .block-list {{
             background-color: {bg_hex};
         }}
+        .unified-navigation {{
+            color: {dim_fg};
+            background-color: {block_bg_hex};
+            border-bottom: 1px solid rgba({fg_r},{fg_g},{fg_b},0.12);
+            padding: 3px 6px;
+            font-size: 0.85em;
+        }}
+        .unified-navigation button {{
+            color: {fg_hex};
+            min-width: 18px;
+            min-height: 22px;
+            padding: 3px 4px;
+            border-radius: 6px;
+        }}
+        .unified-navigation button:disabled {{
+            color: rgba({fg_r},{fg_g},{fg_b},0.30);
+        }}
+        .unified-navigation button:hover {{
+            color: {fg_hex};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.10);
+        }}
+        .unified-navigation-status {{
+            color: {ok_hex};
+            font-weight: bold;
+            padding: 0 5px;
+        }}
+        .unified-navigation-status.reading {{
+            color: {fg_hex};
+        }}
+        .unified-navigation-command {{
+            font-family: {font_stack};
+            margin: 0 4px;
+        }}
         .block-onboarding {{
             color: {dim_fg};
             background-color: rgba({fg_r},{fg_g},{fg_b},0.055);

@@ -349,9 +349,11 @@ the completed record's real commandless-output identity in both Block and
 Unified modes. Background records have no command lifecycle, so they never
 match Failed, exact-exit, Slow, or duration-bound predicates even if defensive
 legacy input carries contradictory fields; result rows likewise suppress those
-raw exit and duration values. Empty-query browsing produces only
-rows backed by retained output: `All` and `Out` use the first meaningful output
-line, while `Cmd` and records without retained output produce no synthetic hit.
+raw exit and duration values. Empty-query browsing lists retained commands
+without requiring a filter: `All` prefers the first meaningful command line,
+and `Cmd` lists command rows without reading their output. `Out` uses the first
+meaningful retained output line. Commandless background records in `All` also
+require retained output; absent text never becomes a synthetic hit.
 Bookmarked search is pane-local and runtime-only in both Block and Unified modes.
 Use the visible star on any result or `Ctrl+Shift+B` on the selected result;
 `Bookmarked` composes with the other metadata filters before scope and the
@@ -367,6 +369,23 @@ rejected rather than silently resized:
 ```toml
 terminal_mode = "unified"
 ```
+
+A compact navigation row keeps **Live** or **Reading history** visible above
+the terminal, together with the number of commands completed while you read.
+Use **Previous/Next command**, **Find**, **Browse**, **Copy current command**,
+and **Return to live** without disturbing the shell's normal key bindings.
+The controls fit narrow splits as labelled icons, and the row yields its
+space to alternate-screen applications. Return to live scrolls the actual
+VTE history to the bottom and restores input focus; native wheel scrolling
+and ordinary text selection stay available.
+
+Command jumps use authenticated row locations. If the location is no longer
+provable, Anvil offers the existing read-only retained snapshot or a clear
+Browse hint. Copy current command uses the explicitly chosen retained record,
+preserves multiline commands, and leaves the native text selection untouched.
+The four new palette actions have optional configuration keys but no new
+default shortcuts. See [Unified navigation](docs/unified-navigation.md) for
+the cursor, copy, and keyboard rules.
 
 The supported Kitty subset is direct, static `a=T` display (`i`, `c/r/C`,
 PNG/RGB/RGBA) plus `a=q`; transmit-only storage, `I`, crop/z/relative placement,

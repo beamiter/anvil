@@ -503,6 +503,10 @@ pub enum VteInput {
     /// Block-view only: jump to the previous / next failed block.
     JumpToPrevFailed,
     JumpToNextFailed,
+    PreviousCommand,
+    NextCommand,
+    ReturnToLive,
+    CopyCurrentCommand,
     /// Block-view only: write the whole session's blocks to a Markdown / JSON
     /// file under the anvil data directory.
     ExportSessionMarkdown,
@@ -566,6 +570,8 @@ pub enum VteOutput {
     /// Current find-in-terminal result. Both backends emit the same state so
     /// the window search bar never has to infer a count or regex failure.
     SearchStatus(SearchStatus),
+    /// Open Find for the emitting pane, without relying on focus event timing.
+    FindRequested,
     /// A finished block, with the full reconstructed command + exit + a
     /// captured-output sample. Drives agent-mode's run-observe loop. Emitted
     /// by BlockTerminal only (the plain VTE wrapper has no block concept).
@@ -922,6 +928,14 @@ impl Component for VteTerminal {
                 let _ = sender.output(VteOutput::Notice(vte_block_mode_only_notice(
                     "Cross-block search",
                 )));
+            }
+            VteInput::PreviousCommand
+            | VteInput::NextCommand
+            | VteInput::ReturnToLive
+            | VteInput::CopyCurrentCommand => {
+                let _ = sender.output(VteOutput::Notice(
+                    "Command navigation is available in Unified mode.".into(),
+                ));
             }
             VteInput::AskAiAboutSelectedBlock => {
                 let _ = sender.output(VteOutput::Notice(ask_ai_empty_notice().to_string()));

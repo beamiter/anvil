@@ -469,6 +469,7 @@ fn search_in_scope(
     use_regex: bool,
     case_sensitive: bool,
 ) -> (SearchStatus, bool) {
+    view.clear_unified_navigation_cursor();
     if view.find_scope() == FindScope::LiveScreen {
         // Drops any block hits (and the live terminal's regex) first.
         view.clear_find();
@@ -877,6 +878,30 @@ impl Component for BlockTerminal {
                 // back into the view, and the gesture lives on a widget the
                 // view itself owns.
                 TermView::install_canvas_context_menu(&view);
+                TermView::install_unified_navigation(&view, {
+                    let sender = sender.clone();
+                    move |action| match action {
+                        crate::keybindings::Action::PreviousCommand => {
+                            sender.input(VteInput::PreviousCommand)
+                        }
+                        crate::keybindings::Action::NextCommand => {
+                            sender.input(VteInput::NextCommand)
+                        }
+                        crate::keybindings::Action::ReturnToLive => {
+                            sender.input(VteInput::ReturnToLive)
+                        }
+                        crate::keybindings::Action::CopyCurrentCommand => {
+                            sender.input(VteInput::CopyCurrentCommand)
+                        }
+                        crate::keybindings::Action::CrossBlockSearch => {
+                            sender.input(VteInput::CrossBlockSearch)
+                        }
+                        crate::keybindings::Action::ToggleSearch => {
+                            let _ = sender.output(VteOutput::FindRequested);
+                        }
+                        _ => {}
+                    }
+                });
                 // The live card had no Ctrl+click at all: a running command's
                 // URLs and claude's OSC 8 links underlined on hover and did
                 // nothing. The handler denies every other click, so selection,
@@ -1086,6 +1111,25 @@ impl Component for BlockTerminal {
             VteInput::JumpToNextFailed => {
                 report_record_navigation(&sender, view, &snapshot_dialog, view.jump_to_failed(1))
             }
+            VteInput::PreviousCommand | VteInput::NextCommand => {
+                match view.navigate_unified_command(matches!(msg, VteInput::PreviousCommand)) {
+                    Ok(result) => report_record_navigation(&sender, view, &snapshot_dialog, result),
+                    Err(message) => {
+                        let _ = sender.output(VteOutput::Notice(message.into()));
+                    }
+                }
+            }
+            VteInput::ReturnToLive => {
+                if let Err(message) = view.return_to_live() {
+                    let _ = sender.output(VteOutput::Notice(message.into()));
+                }
+            }
+            VteInput::CopyCurrentCommand => {
+                let message = view
+                    .copy_current_unified_command()
+                    .map_or_else(|message| message, |_| "Copied the current command.");
+                let _ = sender.output(VteOutput::Notice(message.into()));
+            }
             VteInput::ExportSessionMarkdown | VteInput::ExportSessionJson => {
                 let format = if matches!(msg, VteInput::ExportSessionJson) {
                     crate::block_view::SessionExportFormat::Json
@@ -1119,6 +1163,7 @@ impl Component for BlockTerminal {
                 let _ = sender.output(VteOutput::SearchStatus(self.search_status.clone()));
             }
             VteInput::SearchNext | VteInput::SearchPrev => {
+                view.clear_unified_navigation_cursor();
                 let step: isize = if matches!(msg, VteInput::SearchNext) {
                     1
                 } else {
@@ -1163,9 +1208,9 @@ impl Component for BlockTerminal {
                             ..
                         }
                     );
-                    let result = if !active {
-                        FindNavigationResult::Inactive
-                    } else if step > 0 {
+                    // Even an old zero-hit result can be invalidated by new
+                    // output. Ask the view before deciding to keep its count.
+                    let result = if step > 0 {
                         view.find_next()
                     } else {
                         view.find_prev()
