@@ -2887,9 +2887,8 @@ fn evict_finished_block_prefix(
     evicted_count
 }
 
-/// Bring a selected block into the upper third of the viewport. `compute_point`
-/// returns viewport-relative coordinates, so add the current adjustment before
-/// calculating the new absolute scroll position.
+/// Translate a viewport-relative displacement into a clamped absolute scroll
+/// position by adding the current adjustment.
 fn scroll_value_for_viewport_point(
     current: f64,
     point_y: f64,
@@ -2900,17 +2899,189 @@ fn scroll_value_for_viewport_point(
     (current + point_y).clamp(lower, (upper - page_size).max(lower))
 }
 
-fn scroll_finished_block_into_view(block: &FinishedBlock, scroll: &ScrolledWindow) {
-    let widget = block.widget().clone();
-    let scroll = scroll.clone();
-    glib::idle_add_local_once(move || {
-        if let Some(point) = widget.compute_point(&scroll, &gtk::graphene::Point::new(0.0, 0.0)) {
-            let adj = scroll.vadjustment();
-            let max_value = (adj.upper() - adj.page_size()).max(adj.lower());
-            let target = adj.value() + point.y() as f64 - adj.page_size() / 3.0;
-            adj.set_value(target.clamp(adj.lower(), max_value));
+/// Reveal a selected card with the smallest scroll that makes it fully visible.
+/// `top` is relative to the current viewport, not the document. Oversized cards
+/// align their command/header at the top instead of oscillating between edges.
+fn scroll_value_for_viewport_rect(
+    current: f64,
+    top: f64,
+    height: f64,
+    lower: f64,
+    upper: f64,
+    page_size: f64,
+) -> f64 {
+    const EDGE_EPSILON_PX: f64 = 0.5;
+    let delta = if page_size <= 0.0 {
+        0.0
+    } else if height > page_size {
+        if top.abs() > EDGE_EPSILON_PX {
+            top
+        } else {
+            0.0
         }
+    } else if top < -EDGE_EPSILON_PX {
+        top
+    } else if top + height > page_size + EDGE_EPSILON_PX {
+        top + height - page_size
+    } else {
+        0.0
+    };
+    scroll_value_for_viewport_point(current, delta, lower, upper, page_size)
+}
+
+#[derive(Debug, PartialEq)]
+enum SelectedCardScrollStep {
+    Wait,
+    Adjust(f64),
+    Converged,
+    Aborted,
+}
+
+/// A tick runs before layout. Skip its first sample, then require unchanged
+/// allocated geometry on distinct frames after the last correction. The cap
+/// aborts unsettled work; reaching it is never evidence of convergence.
+struct SelectedCardScrollSettle {
+    last_frame: Option<i64>,
+    frames: u8,
+    quiet_frames: u8,
+    last_geometry: Option<[f64; 5]>,
+    expected_value: f64,
+}
+
+impl SelectedCardScrollSettle {
+    fn new(current: f64) -> Self {
+        Self {
+            last_frame: None,
+            frames: 0,
+            quiet_frames: 0,
+            last_geometry: None,
+            expected_value: current,
+        }
+    }
+
+    fn step(
+        &mut self,
+        frame: i64,
+        current: f64,
+        bounds: Option<(f64, f64)>,
+        range: [f64; 3],
+    ) -> SelectedCardScrollStep {
+        let [lower, upper, page] = range;
+        let expected = self.expected_value.clamp(lower, (upper - page).max(lower));
+        // Respect a wheel, scrollbar, or other navigation after this request.
+        if (current - expected).abs() > 0.5 {
+            return SelectedCardScrollStep::Aborted;
+        }
+        // A legitimate live-range clamp becomes the baseline even when this
+        // frame has no usable allocation yet. Later range growth must not turn
+        // that accepted clamp into apparent user scrolling.
+        self.expected_value = expected;
+        if self.last_frame == Some(frame) {
+            return SelectedCardScrollStep::Wait;
+        }
+        let first_frame = self.last_frame.replace(frame).is_none();
+        self.frames += 1;
+        if self.frames > 12 {
+            return SelectedCardScrollStep::Aborted;
+        }
+        if first_frame {
+            return SelectedCardScrollStep::Wait;
+        }
+        let Some((top, height)) = bounds.filter(|&(_, height)| height > 0.0 && page > 0.0) else {
+            self.quiet_frames = 0;
+            self.last_geometry = None;
+            return SelectedCardScrollStep::Wait;
+        };
+        let geometry = [top, height, lower, upper, page];
+        let target = scroll_value_for_viewport_rect(current, top, height, lower, upper, page);
+        let unchanged = self.last_geometry.replace(geometry) == Some(geometry);
+        self.expected_value = target;
+        if target != current {
+            self.quiet_frames = 0;
+            return SelectedCardScrollStep::Adjust(target);
+        }
+        let revealed = if height > page {
+            top.abs() <= 0.5
+        } else {
+            top >= -0.5 && top + height <= page + 0.5
+        };
+        // A clamped no-op can still leave the card clipped while `upper` is
+        // stale. Stable numbers alone are not a successful reveal.
+        if !revealed {
+            self.quiet_frames = 0;
+            return SelectedCardScrollStep::Wait;
+        }
+        self.quiet_frames = if unchanged { self.quiet_frames + 1 } else { 0 };
+        if self.quiet_frames >= 2 {
+            SelectedCardScrollStep::Converged
+        } else {
+            SelectedCardScrollStep::Wait
+        }
+    }
+}
+
+fn scroll_finished_block_into_view(block: &FinishedBlock, scroll: &ScrolledWindow) {
+    if !scroll.is_mapped() {
+        return;
+    }
+    let widget = block.widget().downgrade();
+    let generation = Rc::downgrade(&block.selection_feedback_generation);
+    let requested_generation = block.selection_feedback_generation.get();
+    let settle = RefCell::new(SelectedCardScrollSettle::new(scroll.vadjustment().value()));
+    let tick_id: Rc<RefCell<Option<gtk::TickCallbackId>>> = Rc::new(RefCell::new(None));
+    let unmap_id: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::new(RefCell::new(None));
+    let tick_for_unmap = tick_id.clone();
+    let unmap_for_unmap = unmap_id.clone();
+    *unmap_id.borrow_mut() = Some(scroll.connect_unmap(move |scroll| {
+        if let Some(id) = tick_for_unmap.borrow_mut().take() {
+            id.remove();
+        }
+        if let Some(id) = unmap_for_unmap.borrow_mut().take() {
+            scroll.disconnect(id);
+        }
+    }));
+    let tick_for_callback = tick_id.clone();
+    let id = scroll.add_tick_callback(move |scroll, clock| {
+        let finish = || {
+            tick_for_callback.borrow_mut().take();
+            if let Some(id) = unmap_id.borrow_mut().take() {
+                scroll.disconnect(id);
+            }
+            glib::ControlFlow::Break
+        };
+        // Every selection sync advances this generation. Weak ownership also
+        // prevents an evicted card's request following its pooled widget shell.
+        let (Some(widget), Some(generation)) = (widget.upgrade(), generation.upgrade()) else {
+            return finish();
+        };
+        if !scroll.is_mapped()
+            || generation.get() != requested_generation
+            || !widget.has_css_class("block-selection-active")
+            || !widget.is_ancestor(scroll)
+        {
+            return finish();
+        }
+        let adj = scroll.vadjustment();
+        let bounds = widget
+            .compute_bounds(scroll)
+            .map(|bounds| (f64::from(bounds.y()), f64::from(bounds.height())));
+        let step = settle.borrow_mut().step(
+            clock.frame_counter(),
+            adj.value(),
+            bounds,
+            [adj.lower(), adj.upper(), adj.page_size()],
+        );
+        match step {
+            SelectedCardScrollStep::Adjust(target) => adj.set_value(target),
+            SelectedCardScrollStep::Converged | SelectedCardScrollStep::Aborted => return finish(),
+            SelectedCardScrollStep::Wait => {}
+        }
+        // Ticks are Update-phase callbacks, not an allocation guarantee. Queue
+        // layout explicitly; the next distinct frame can verify its result.
+        scroll.queue_allocate();
+        glib::ControlFlow::Continue
     });
+    *tick_id.borrow_mut() = Some(id);
 }
 
 /// HOME/END move through the outer history canvas. END repeats for a few layout
@@ -16875,7 +17046,8 @@ mod tests {
     };
     use super::{
         completed_block_retention_plan, plan_deleted_block_restore,
-        scroll_value_for_viewport_point, snapshot_deleted_order,
+        scroll_value_for_viewport_point, scroll_value_for_viewport_rect, snapshot_deleted_order,
+        SelectedCardScrollSettle, SelectedCardScrollStep,
     };
     use super::{ResetAwareParserState, MAX_LOCAL_APC_PAYLOAD_BYTES};
     use crate::agent::{AgentExecutionRef, AgentSession};
@@ -25756,6 +25928,318 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn selected_card_scroll_keeps_fully_visible_cards_stationary() {
+        for (top, height) in [(100.0, 72.0), (0.0, 72.0), (528.0, 72.0), (0.0, 600.0)] {
+            assert_eq!(
+                scroll_value_for_viewport_rect(1000.0, top, height, 0.0, 3000.0, 600.0),
+                1000.0,
+                "top={top}, height={height}",
+            );
+        }
+    }
+
+    #[test]
+    fn selected_card_scroll_reveals_only_the_clipped_edge() {
+        for (top, height, expected) in [
+            (-20.0, 72.0, 980.0),
+            (-100.0, 72.0, 900.0),
+            (550.0, 72.0, 1022.0),
+            (650.0, 72.0, 1122.0),
+            (-20.0, 600.0, 980.0),
+            (20.0, 600.0, 1020.0),
+        ] {
+            assert_eq!(
+                scroll_value_for_viewport_rect(1000.0, top, height, 0.0, 3000.0, 600.0),
+                expected,
+                "top={top}, height={height}",
+            );
+        }
+    }
+
+    #[test]
+    fn selected_card_scroll_tolerates_half_pixel_edge_rounding() {
+        for (top, expected) in [
+            (-0.49, 1000.0),
+            (-0.5, 1000.0),
+            (-0.51, 999.49),
+            (528.49, 1000.0),
+            (528.5, 1000.0),
+            (528.51, 1000.51),
+        ] {
+            let target = scroll_value_for_viewport_rect(1000.0, top, 72.0, 0.0, 3000.0, 600.0);
+            assert!(
+                (target - expected).abs() < 1e-9,
+                "top={top}, target={target}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_card_scroll_keeps_oversized_card_headers_visible() {
+        for (top, expected) in [
+            (-900.0, 100.0),
+            (-100.0, 900.0),
+            (-0.51, 999.49),
+            (-0.5, 1000.0),
+            (0.0, 1000.0),
+            (0.5, 1000.0),
+            (0.51, 1000.51),
+            (100.0, 1100.0),
+            (650.0, 1650.0),
+        ] {
+            let target = scroll_value_for_viewport_rect(1000.0, top, 800.0, 0.0, 3000.0, 600.0);
+            assert!(
+                (target - expected).abs() < 1e-9,
+                "top={top}, target={target}"
+            );
+            let next_top = top - (target - 1000.0);
+            assert_eq!(
+                scroll_value_for_viewport_rect(target, next_top, 800.0, 0.0, 3000.0, 600.0),
+                target,
+                "oversized card must not oscillate between its top and bottom",
+            );
+        }
+    }
+
+    #[test]
+    fn selected_card_scroll_clamps_to_live_adjustment_bounds() {
+        for (current, top, height, lower, upper, page, expected) in [
+            (100.0, -200.0, 72.0, 20.0, 1000.0, 200.0, 20.0),
+            (700.0, 200.0, 72.0, 20.0, 1000.0, 200.0, 772.0),
+            (700.0, 500.0, 72.0, 20.0, 1000.0, 200.0, 800.0),
+            (100.0, -200.0, 800.0, 20.0, 1000.0, 200.0, 20.0),
+            (700.0, 500.0, 800.0, 20.0, 1000.0, 200.0, 800.0),
+            (20.0, 10.0, 72.0, 20.0, 100.0, 200.0, 20.0),
+            (20.0, -10.0, 72.0, 20.0, 10.0, 200.0, 20.0),
+            (100.0, 40.0, 72.0, 20.0, 1000.0, 0.0, 100.0),
+        ] {
+            assert_eq!(
+                scroll_value_for_viewport_rect(current, top, height, lower, upper, page),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn selected_card_scroll_is_minimal_bounded_and_idempotent() {
+        for page in [1.0, 72.0, 200.0, 600.0] {
+            for height in [0.0, 1.0, 72.0, 200.0, 600.0, 800.0] {
+                for current in [20.0, 100.0, 1000.0, 2400.0] {
+                    for top in [-1200.0, -100.0, -0.5, 0.0, 0.5, 100.0, 550.0, 1200.0] {
+                        let target = scroll_value_for_viewport_rect(
+                            current, top, height, 20.0, 3000.0, page,
+                        );
+                        assert!((20.0..=3000.0 - page).contains(&target));
+                        let next_top = top - (target - current);
+                        assert_eq!(
+                            scroll_value_for_viewport_rect(
+                                target, next_top, height, 20.0, 3000.0, page,
+                            ),
+                            target,
+                            "page={page}, height={height}, current={current}, top={top}",
+                        );
+                        if height <= page {
+                            // Feasible adjustments are [card_bottom - page, card_top].
+                            // Outside the half-pixel tolerance, the nearest point is
+                            // the unique minimum movement that reveals the whole card.
+                            let visible = top >= -0.5 && top + height <= page + 0.5;
+                            let nearest = if visible {
+                                current
+                            } else {
+                                current.clamp(current + top + height - page, current + top)
+                            };
+                            assert_eq!(target, nearest.clamp(20.0, 3000.0 - page));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_card_settle_waits_for_layout_and_verifies_the_corrected_rectangle() {
+        use SelectedCardScrollStep::{Adjust, Converged, Wait};
+        let mut settle = SelectedCardScrollSettle::new(1000.0);
+        let range = [0.0, 3000.0, 600.0];
+        assert_eq!(settle.step(10, 1000.0, Some((528.0, 72.0)), range), Wait);
+        // Selection reveals a review shelf in the layout after the first tick.
+        assert_eq!(
+            settle.step(11, 1000.0, Some((528.0, 116.0)), range),
+            Adjust(1044.0)
+        );
+        // Another callback in the SAME frame still sees the old allocation.
+        assert_eq!(settle.step(11, 1044.0, Some((528.0, 116.0)), range), Wait);
+        assert_eq!(settle.step(12, 1044.0, Some((484.0, 116.0)), range), Wait);
+        assert_eq!(settle.step(13, 1044.0, Some((484.0, 116.0)), range), Wait);
+        assert_eq!(
+            settle.step(14, 1044.0, Some((484.0, 116.0)), range),
+            Converged
+        );
+    }
+
+    #[test]
+    fn selected_card_settle_rechecks_height_changes_after_a_scroll() {
+        use SelectedCardScrollStep::{Adjust, Converged, Wait};
+        let mut settle = SelectedCardScrollSettle::new(1000.0);
+        let range = [0.0, 3000.0, 600.0];
+        assert_eq!(settle.step(1, 1000.0, Some((550.0, 72.0)), range), Wait);
+        assert_eq!(
+            settle.step(2, 1000.0, Some((550.0, 72.0)), range),
+            Adjust(1022.0)
+        );
+        // Realization triggered by scrolling grows the card on the next layout.
+        assert_eq!(
+            settle.step(3, 1022.0, Some((528.0, 116.0)), range),
+            Adjust(1066.0)
+        );
+        assert_eq!(settle.step(4, 1066.0, Some((484.0, 116.0)), range), Wait);
+        assert_eq!(settle.step(5, 1066.0, Some((484.0, 116.0)), range), Wait);
+        assert_eq!(
+            settle.step(6, 1066.0, Some((484.0, 116.0)), range),
+            Converged
+        );
+    }
+
+    #[test]
+    fn selected_card_settle_yields_to_external_scroll_but_accepts_live_clamping() {
+        use SelectedCardScrollStep::{Aborted, Wait};
+        let mut settle = SelectedCardScrollSettle::new(1000.0);
+        assert_eq!(
+            settle.step(1, 1000.0, Some((100.0, 72.0)), [0.0, 3000.0, 600.0]),
+            Wait
+        );
+        assert_eq!(
+            settle.step(2, 980.0, Some((120.0, 72.0)), [0.0, 3000.0, 600.0]),
+            Aborted
+        );
+        let mut clamped = SelectedCardScrollSettle::new(1000.0);
+        assert_eq!(
+            clamped.step(1, 800.0, Some((100.0, 72.0)), [0.0, 1400.0, 600.0]),
+            Wait
+        );
+        assert_eq!(
+            clamped.step(2, 800.0, Some((100.0, 72.0)), [0.0, 1400.0, 600.0]),
+            Wait
+        );
+    }
+
+    #[test]
+    fn selected_card_settle_resets_quiet_frames_for_any_geometry_change() {
+        use SelectedCardScrollStep::{Converged, Wait};
+        for changed in [
+            [101.0, 72.0, 0.0, 3000.0, 600.0],
+            [100.0, 73.0, 0.0, 3000.0, 600.0],
+            [100.0, 72.0, 1.0, 3000.0, 600.0],
+            [100.0, 72.0, 0.0, 3001.0, 600.0],
+            [100.0, 72.0, 0.0, 3000.0, 601.0],
+        ] {
+            let mut settle = SelectedCardScrollSettle::new(1000.0);
+            for frame in 1..=3 {
+                assert_eq!(
+                    settle.step(frame, 1000.0, Some((100.0, 72.0)), [0.0, 3000.0, 600.0]),
+                    Wait
+                );
+            }
+            let [top, height, lower, upper, page] = changed;
+            let bounds = Some((top, height));
+            let range = [lower, upper, page];
+            assert_eq!(settle.step(4, 1000.0, bounds, range), Wait);
+            assert_eq!(settle.step(5, 1000.0, bounds, range), Wait);
+            assert_eq!(settle.step(6, 1000.0, bounds, range), Converged);
+        }
+    }
+
+    #[test]
+    fn selected_card_settle_exhaustion_and_missing_allocations_abort() {
+        use SelectedCardScrollStep::{Aborted, Wait};
+        for missing in [false, true] {
+            let mut settle = SelectedCardScrollSettle::new(1000.0);
+            for frame in 1..=12 {
+                let bounds = if missing {
+                    None
+                } else {
+                    Some((100.0, 72.0 + (frame % 2) as f64))
+                };
+                assert_eq!(
+                    settle.step(frame, 1000.0, bounds, [0.0, 3000.0, 600.0]),
+                    Wait
+                );
+            }
+            assert_eq!(settle.step(13, 1000.0, None, [0.0, 3000.0, 600.0]), Aborted);
+        }
+        for (bounds, range) in [
+            (Some((0.0, 0.0)), [0.0, 3000.0, 600.0]),
+            (Some((0.0, 72.0)), [0.0, 3000.0, 0.0]),
+        ] {
+            let mut settle = SelectedCardScrollSettle::new(1000.0);
+            for frame in 1..=12 {
+                assert_eq!(settle.step(frame, 1000.0, bounds, range), Wait);
+            }
+            assert_eq!(settle.step(13, 1000.0, bounds, range), Aborted);
+        }
+    }
+
+    #[test]
+    fn selected_card_settle_same_frame_duplicates_cannot_overscroll() {
+        use SelectedCardScrollStep::{Aborted, Adjust, Wait};
+        let mut first = SelectedCardScrollSettle::new(1000.0);
+        let mut duplicate = SelectedCardScrollSettle::new(1000.0);
+        let bounds = Some((100.0, 800.0));
+        let range = [0.0, 3000.0, 600.0];
+        assert_eq!(first.step(1, 1000.0, bounds, range), Wait);
+        assert_eq!(duplicate.step(1, 1000.0, bounds, range), Wait);
+        assert_eq!(first.step(2, 1000.0, bounds, range), Adjust(1100.0));
+        assert_eq!(duplicate.step(2, 1100.0, bounds, range), Aborted);
+    }
+
+    #[test]
+    fn selected_card_settle_stable_but_clipped_is_not_convergence() {
+        use SelectedCardScrollStep::{Aborted, Wait};
+        for (bounds, range) in [
+            (Some((550.0, 72.0)), [0.0, 1600.0, 600.0]),
+            (Some((-20.0, 72.0)), [1000.0, 3000.0, 600.0]),
+            (Some((20.0, 800.0)), [0.0, 1600.0, 600.0]),
+        ] {
+            let mut settle = SelectedCardScrollSettle::new(1000.0);
+            for frame in 1..=12 {
+                assert_eq!(settle.step(frame, 1000.0, bounds, range), Wait);
+            }
+            assert_eq!(settle.step(13, 1000.0, bounds, range), Aborted);
+        }
+    }
+
+    #[test]
+    fn selected_card_settle_retains_a_clamp_before_the_first_layout() {
+        use SelectedCardScrollStep::{Adjust, Wait};
+        let mut settle = SelectedCardScrollSettle::new(1000.0);
+        assert_eq!(
+            settle.step(1, 800.0, Some((900.0, 72.0)), [0.0, 1400.0, 600.0]),
+            Wait,
+        );
+        assert_eq!(
+            settle.step(2, 800.0, Some((900.0, 72.0)), [0.0, 3000.0, 600.0]),
+            Adjust(1172.0),
+        );
+    }
+
+    #[test]
+    fn selected_card_settle_retains_a_clamp_during_missing_allocation() {
+        use SelectedCardScrollStep::{Adjust, Wait};
+        for missing in [None, Some((900.0, 0.0))] {
+            let mut settle = SelectedCardScrollSettle::new(1000.0);
+            assert_eq!(
+                settle.step(1, 1000.0, Some((700.0, 72.0)), [0.0, 3000.0, 600.0]),
+                Wait,
+            );
+            assert_eq!(settle.step(2, 800.0, missing, [0.0, 1400.0, 600.0]), Wait);
+            assert_eq!(
+                settle.step(3, 800.0, Some((900.0, 72.0)), [0.0, 3000.0, 600.0]),
+                Adjust(1172.0),
+            );
         }
     }
 
