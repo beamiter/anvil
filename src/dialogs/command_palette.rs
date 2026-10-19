@@ -109,6 +109,7 @@ pub(crate) enum PaletteMsg {
 pub(crate) enum PaletteOutput {
     Action(Action),
     AsciiOrganismHello(Option<u64>),
+    InspectAsciiOrganism(Option<u64>),
     SetVteCompanionExpanded(Option<u64>, bool),
     TypeCommand(String),
     AskAi(String),
@@ -567,6 +568,9 @@ impl PaletteModel {
         let output = match accept {
             Accept::Action(Action::AsciiOrganismHello) => {
                 PaletteOutput::AsciiOrganismHello(workflow_target)
+            }
+            Accept::Action(Action::InspectAsciiOrganism) => {
+                PaletteOutput::InspectAsciiOrganism(workflow_target)
             }
             Accept::Action(Action::ExpandVteCompanion) => {
                 PaletteOutput::SetVteCompanionExpanded(workflow_target, true)

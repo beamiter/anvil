@@ -154,6 +154,43 @@ impl AppModel {
         }
     }
 
+    pub(crate) fn inspect_ascii_organism(&self, pane_id: Option<u64>) {
+        if self.safe_mode {
+            self.show_toast("ASCII companion is unavailable in safe mode.");
+            return;
+        }
+        if !self.config.borrow().ascii_organism_enabled {
+            self.show_toast("ASCII companion is off. Enable it in Settings to begin.");
+            return;
+        }
+        let Some((tab_index, pane_index)) = pane_id.and_then(|id| self.find_pane(id)) else {
+            self.show_toast("The original companion pane is no longer available.");
+            return;
+        };
+        if !hello_target_is_current(pane_id, self.active_pane_id()) {
+            self.show_toast("The original companion pane is not active.");
+            return;
+        }
+        let tab = &self.tabs[tab_index];
+        let pane = &tab.panes[pane_index];
+        if pane.cwd_external
+            || tab
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.pane_id == pane.id)
+        {
+            self.show_toast("Companion inspection is available in a local pane.");
+            return;
+        }
+        if let Some(view) = pane.terminal.term_view() {
+            if let Err(message) = self.organism_hub.inspect(&self.window, &view) {
+                self.show_toast(message);
+            }
+        } else {
+            self.organism_hub.inspect_vte(&self.window);
+        }
+    }
+
     fn emit_block_action(&self, input: VteInput, feature: &str) {
         let pane = self
             .tabs
@@ -321,6 +358,9 @@ impl AppModel {
             }
             Action::AsciiOrganismHello => {
                 self.greet_ascii_organism(self.active_pane_id());
+            }
+            Action::InspectAsciiOrganism => {
+                self.inspect_ascii_organism(self.active_pane_id());
             }
             // These actions require the palette's captured opening target.
             // A generic action dispatch must never retarget the current pane.

@@ -35,6 +35,7 @@ pub(crate) enum Action {
     OpenHistoryPalette,
     ToggleSettings,
     AsciiOrganismHello,
+    InspectAsciiOrganism,
     ExpandVteCompanion,
     CollapseVteCompanion,
     ReloadConfig,
@@ -163,6 +164,7 @@ impl Action {
             Action::OpenHistoryPalette => "Palette: search history",
             Action::ToggleSettings => "Toggle settings panel",
             Action::AsciiOrganismHello => "Say hello to ASCII organism",
+            Action::InspectAsciiOrganism => "Inspect ASCII companion",
             Action::ExpandVteCompanion => "Expand VTE neutral companion",
             Action::CollapseVteCompanion => "Collapse VTE neutral companion",
             Action::ReloadConfig => "Reload configuration",
@@ -277,6 +279,7 @@ impl Action {
             Action::OpenHistoryPalette => Some("open_history_palette"),
             Action::ToggleSettings => Some("toggle_settings"),
             Action::AsciiOrganismHello => Some("ascii_organism_hello"),
+            Action::InspectAsciiOrganism => Some("inspect_ascii_organism"),
             Action::ExpandVteCompanion | Action::CollapseVteCompanion => None,
             Action::ReloadConfig => Some("reload_config"),
             Action::OpenWelcome => None,
@@ -390,6 +393,7 @@ impl Action {
             Action::OpenHistoryPalette,
             Action::ToggleSettings,
             Action::AsciiOrganismHello,
+            Action::InspectAsciiOrganism,
             Action::ExpandVteCompanion,
             Action::CollapseVteCompanion,
             Action::ReloadConfig,
@@ -861,6 +865,30 @@ impl KeybindingMap {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inspection_is_discoverable_bindable_and_has_no_default_chord() {
+        let action = Action::InspectAsciiOrganism;
+        let defaults = KeybindingMap::from_defaults();
+        assert!(Action::all_actions().contains(&action));
+        assert!(defaults
+            .all_bound_actions()
+            .iter()
+            .any(|(candidate, _)| *candidate == action));
+        assert!(defaults.binding_display(&action).is_empty());
+        assert_eq!(
+            Action::from_config_key("inspect_ascii_organism"),
+            Some(action)
+        );
+        let overrides = "inspect_ascii_organism = 'F10'"
+            .parse::<toml::Table>()
+            .unwrap();
+        let customized = KeybindingMap::from_user_overrides(&overrides).unwrap();
+        assert_eq!(
+            customized.lookup(&jterm_core::keybindings::parse("F10").unwrap()),
+            Some(action)
+        );
+    }
+
     #[test]
     fn selected_output_actions_are_discoverable_bindable_and_do_not_reserve_keys() {
         let defaults = KeybindingMap::from_defaults();

@@ -1353,6 +1353,17 @@ Settings also offers eight explained poses and a preview-only Say hello button,
 even while the live companion is off. Previewing never runs terminal commands or
 changes its memory. Hiding/closing settings stops every preview frame source.
 
+The command palette's **Inspect ASCII companion** action opens a snapshot of
+this pane's actual companion: its pose and reason, current command activity,
+last reaction, unresolved work, growth, and eight named state levels. These
+levels describe the simulated companion, not the user. The snapshot uses no
+polling or animation source, changes no life or memory state, and remains
+readable without retaining a closed pane. Reopen it to refresh. The optional
+`[keybindings] inspect_ascii_organism = "F10"` binding has no default chord.
+Traditional VTE explains its neutral-display capability instead of inventing
+command outcomes. Live watch captions now explain output rhythm for both human
+commands and Shell Agent work; quiet output explicitly remains unfinished work.
+
 Lifetime growth is now visible as well as named in the badge: juvenile bodies
 use rounder ears, larger eyes, and quicker micro-motion; adult keeps the
 canonical silhouette; seasoned gains a notched ear and a slower cadence. These

@@ -53,6 +53,8 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    organism_ui::inspector::tests::snapshot_dialog_is_scrollable_and_closes_without_an_animation_source
+    organism_ui::tests::inspection_captures_real_state_without_attention_or_lifecycle_changes
     agent::capability_display_tests::capability_reason_label_tooltip_and_repeated_transitions
     vte_pty::tests::native_bridge_pairs_remain_raw_and_do_not_leak_across_exec
     terminal::block::tests::session_export_preview_cancel_and_explicit_original_are_safe

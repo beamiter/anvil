@@ -1175,6 +1175,9 @@ impl SimpleComponent for AppModel {
                 dialogs::command_palette::PaletteOutput::AsciiOrganismHello(pane_id) => {
                     AppMsg::AsciiOrganismHello(pane_id)
                 }
+                dialogs::command_palette::PaletteOutput::InspectAsciiOrganism(pane_id) => {
+                    AppMsg::InspectAsciiOrganism(pane_id)
+                }
                 dialogs::command_palette::PaletteOutput::SetVteCompanionExpanded(
                     pane_id,
                     expanded,
@@ -2640,6 +2643,7 @@ impl SimpleComponent for AppModel {
                 self.run_workflow_from_path(path, pane_id, &sender);
             }
             AppMsg::AsciiOrganismHello(pane_id) => self.greet_ascii_organism(pane_id),
+            AppMsg::InspectAsciiOrganism(pane_id) => self.inspect_ascii_organism(pane_id),
             AppMsg::SetVteCompanionExpanded(pane_id, expanded) => {
                 self.set_vte_companion_expanded(pane_id, expanded);
             }
