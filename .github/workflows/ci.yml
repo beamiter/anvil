@@ -65,6 +65,8 @@ jobs:
             libgtk-4-dev \
             libadwaita-1-dev \
             libvte-2.91-gtk4-dev \
+            vim \
+            ripgrep \
             libxtst6 \
             python3 \
             python3-venv \
@@ -127,6 +129,16 @@ jobs:
         id: tests
         shell: bash
         run: xvfb-run --auto-servernum cargo test --all-targets --locked --no-fail-fast 2>&1 | tee test.log
+
+      - name: Check native Vim9 editing and navigation
+        timeout-minutes: 10
+        env:
+          GDK_BACKEND: x11
+          GSK_RENDERER: cairo
+          GTK_A11Y: none
+        run: |
+          dbus-run-session -- xvfb-run --auto-servernum \
+            cargo test --locked vim9_ide -- --include-ignored --test-threads=1
 
       - name: Check task accessibility observer failure controls
         run: |

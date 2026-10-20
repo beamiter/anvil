@@ -44,16 +44,17 @@ project roots; select a local pane or launch a local checkout explicitly.
 | Area | Behavior |
 | --- | --- |
 | Project | Browse one directory at a time, filter filenames, open files, refresh, and move to the parent directory. Directory reads run off the GTK thread and are bounded to 1,024 entries. |
-| Open buffers | Shows real Vim buffer names, current-buffer marker and modified marker. Activate a row to switch with Vim's normal buffer rules. |
+| Quick open | Ctrl+Shift+P opens a native fuzzy picker across the project. Type a filename or path, use ↑/↓ to select, and press Enter to open. Indexing runs in the background and reports progress, errors, and truncation. Refresh rebuilds the index. |
+| Open buffers | Shows real Vim buffer names, current-buffer marker and modified marker. Activate a row or use previous/next controls to switch; Close current buffer preserves modified-buffer protection. Split vertically/horizontally creates real Vim windows. |
 | Editor | Real Vim in VTE; normal Vim editing, mappings, mouse and input methods remain active. |
 | Search project | Press Enter to run a project text search and publish results in Vim quickfix and the native Problems list. Requires `rg` in Vim's environment. Progress, errors, match counts and omitted-result counts are visible below the build controls. |
 | Problems | Displays filename, line, column, severity/type and message. Activate a result to open its exact location. F8/Shift+F8 navigate Vim diagnostics. |
 | Build | Edit the visible shell command and press Build/F5. Builds run asynchronously in the project root. Cancel stops the active build. Exit status and a bounded output tail are shown in the native Build output tab; parsed diagnostics populate Problems. |
-| Status | Live Vim mode, filename, modified flag, cursor location, buffer count, and bridge connection state. |
+| Status | Live Vim mode, filename, modified flag, cursor location and total lines, filetype, encoding, window/buffer counts, and bridge connection state. |
 
-The default build suggestion is `cargo check` for a Cargo project, `make` for a
+The default build suggestion is `cargo check --message-format=short` for a Cargo project, `make` for a
 Makefile, or `cmake --build build` for a CMake project. The command runs only
-after an explicit Build/F5 action. Review or replace it for the project. Vim's
+after an explicit Build/F5 action. **Save all + Build** first saves every modified buffer and runs the command only if every save succeeds; ordinary Build/F5 uses files already on disk. Review or replace the command for the project. Vim's
 `errorformat` controls compiler-output parsing; select an appropriate `:compiler`
 in Vim when its default format does not match your toolchain. Native snapshots
 retain up to 256 buffers and diagnostics, marking truncated counts with `+`.
@@ -64,26 +65,32 @@ result cap. Native Build output shows the most recent 80 retained output lines.
 
 The New file button opens a native filename chooser and creates a named Vim
 buffer; the file is written when you save it. The file picker can open any local
-UTF-8 path. Sidebar navigation stays inside the project root, including symlink targets. It does not recursively index
-large repositories or follow a folder outside that root automatically.
+UTF-8 path. Sidebar navigation stays inside the project root, including symlink targets. The directory browser stays separate from Quick open: it reads one folder at a time. Quick open invokes `rg --files --hidden -0` in the project root, respects ignore rules, and does not follow directory symlinks. It retains at most 20,000 files and shows the best 100 matches. Reopening the picker reuses its index; use Refresh after adding, renaming, or removing files. Missing `rg` and indexing errors are shown in the picker.
 
 ## Shortcuts
 
 | Scope | Shortcut | Action |
 | --- | --- | --- |
 | Terminal workspace | Ctrl+Alt+I | Open Vim9 IDE for the local pane |
-| IDE | Ctrl+Shift+P | Focus the native file filter; Enter opens its first match |
+| IDE | Ctrl+Shift+P | Quick open a project file with fuzzy path matching |
+| IDE | Ctrl+Shift+G | Go to line or line:column |
+| IDE | Ctrl+Shift+F | Focus project text search |
+| IDE | Ctrl+Shift+B | Focus the build command |
 | IDE | Ctrl+Shift+O | Native file picker |
 | IDE | Ctrl+S | Save current buffer |
 | IDE | Ctrl+Shift+S | Save all buffers |
+| IDE | Ctrl+Shift+PageUp / PageDown | Previous / next buffer |
+| IDE | Ctrl+Shift+W | Close the current buffer, retaining unsaved-change protection |
 | IDE | F5 | Run the visible build command |
 | IDE | F8 / Shift+F8 | Next / previous diagnostic |
 
-These IDE shortcuts apply only inside the dedicated editor window. Plain
-Ctrl+P and Ctrl+O remain available to Vim for completion and jump navigation;
+These IDE shortcuts apply inside the dedicated editor window, while no native text-entry field or dialog is active. Escape returns from a native field to Vim before using editor shortcuts. Plain
+Ctrl+P, Ctrl+O, Ctrl+G, and Ctrl+W remain available to Vim for completion, jump navigation, file information, and window commands;
 the native file actions use Shift to keep those Vim keys intact. Other keys
 go to Vim or the focused native control. In terminal configuration,
 `[keybindings].open_vim9_ide` overrides the launch shortcut.
+
+Escape in a native search/build field returns focus to Vim. Escape in the quick picker or go-to dialog closes that dialog. The folder filter follows the selected row when Enter is pressed. Header buttons show/hide the project and output panels while preserving the editor session; starting a build or search reveals the corresponding output tab.
 
 ## Language services
 
@@ -120,11 +127,13 @@ can save and quit using Vim directly.
 
 ## Validation
 
+The GTK CI job installs Vim and ripgrep and runs the native Vim9 regression explicitly under Xvfb.
+
 CLI tests cover directory/file/new-file launch validation, unchanged terminal
 directory requirements, spaces in project paths, and incompatible mode flags.
 Shared-core tests cover command encoding, authenticated transport, file path
 handling and bounded snapshots. An opt-in native GTK smoke test exercises a real
-Vim PTY, native save/build controls, diagnostics, and modified-buffer close protection. Run it under a
+Vim PTY, fuzzy opening of a nested file, typed line/column navigation, real editor splits, protected buffer close, explicit save-all-and-build, native save/build controls, diagnostics, and modified-buffer close protection. Run it under a
 graphical display (for example Xvfb) with the required Vim:
 
 ```sh

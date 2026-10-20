@@ -11,6 +11,9 @@ use std::rc::Rc;
 use std::time::Duration;
 use vte4::prelude::*;
 
+#[path = "vim9_ide_navigation.rs"]
+mod navigation;
+
 fn visible(text: &str) -> String {
     jterm_core::review_input::safe_inline_display(text, 1024)
 }
@@ -90,6 +93,12 @@ struct Browser {
 
 impl Browser {
     fn render(&self) {
+        let selected = self.list.selected_row().and_then(|row| {
+            self.shown
+                .borrow()
+                .get(row.index() as usize)
+                .map(|entry| entry.0.clone())
+        });
         self.list.remove_all();
         let needle = self.query.text().to_lowercase();
         let entries = self.entries.borrow();
@@ -114,6 +123,12 @@ impl Browser {
             self.list.append(&row);
             shown.push((entry.path.clone(), entry.is_dir));
         }
+        let selected_index = shown
+            .iter()
+            .position(|entry| Some(&entry.0) == selected.as_ref())
+            .unwrap_or(0);
+        self.list
+            .select_row(self.list.row_at_index(selected_index as i32).as_ref());
     }
 
     fn navigate(this: &Rc<Self>, directory: PathBuf) {
@@ -173,9 +188,12 @@ impl Browser {
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     browser.busy.set(false);
                     browser.list.set_sensitive(true);
-                    browser.message.set_label(
-                        "Project directory reader stopped. Reopen the workbench to retry.",
-                    );
+                    browser
+                        .up
+                        .set_sensitive(*browser.directory.borrow() != browser.root);
+                    browser
+                        .message
+                        .set_label("Project directory reader stopped. Use Refresh to retry.");
                     glib::ControlFlow::Break
                 }
             }
@@ -208,7 +226,7 @@ impl Browser {
 
 fn default_build(root: &Path) -> &'static str {
     if root.join("Cargo.toml").is_file() {
-        "cargo check"
+        "cargo check --message-format=short"
     } else if root.join("Makefile").is_file() {
         "make"
     } else if root.join("CMakeLists.txt").is_file() {
@@ -342,6 +360,33 @@ pub(crate) fn open(
     header.pack_start(&new_file);
     let open_file = button("document-open-symbolic", "Open file (Ctrl+Shift+O)");
     header.pack_start(&open_file);
+    let quick_open = button(
+        "system-search-symbolic",
+        "Quick open project file (Ctrl+Shift+P)",
+    );
+    header.pack_start(&quick_open);
+    {
+        let weak = window.downgrade();
+        let session = session.clone();
+        let editor = editor.clone();
+        let message = message.clone();
+        let index = Rc::new(RefCell::new(None));
+        quick_open.connect_clicked(move |_| {
+            let Some(window) = weak.upgrade() else { return };
+            if window.visible_dialog().is_some() {
+                return;
+            }
+            let index = index
+                .borrow_mut()
+                .get_or_insert_with(|| {
+                    Rc::new(RefCell::new(jterm_core::vim9::Vim9ProjectIndex::start(
+                        session.root(),
+                    )))
+                })
+                .clone();
+            navigation::QuickOpen::show(&window, index, &session, &editor, &message);
+        });
+    }
     let save = command_button(
         &session,
         &editor,
@@ -390,6 +435,22 @@ pub(crate) fn open(
     search.set_hexpand(true);
     search.set_tooltip_text(Some("Search project text and populate Vim quickfix"));
     tools.append(&search);
+    navigation::editor_escape(&search, &editor);
+    let go_to_line = button("go-jump-symbolic", "Go to line (Ctrl+Shift+G)");
+    tools.append(&go_to_line);
+    {
+        let weak = window.downgrade();
+        let session = session.clone();
+        let editor = editor.clone();
+        let message = message.clone();
+        go_to_line.connect_clicked(move |_| {
+            if let Some(window) = weak.upgrade() {
+                if window.visible_dialog().is_none() {
+                    navigation::go_to_line(&window, &session, &editor, &message);
+                }
+            }
+        });
+    }
     let mut language_actions = [
         (
             "definition",
@@ -485,12 +546,14 @@ pub(crate) fn open(
     location.set_margin_end(8);
     location.add_css_class("caption");
     let query = gtk::SearchEntry::new();
-    query.set_placeholder_text(Some("Filter files (Ctrl+Shift+P)"));
+    query.set_placeholder_text(Some("Filter this folder"));
     query.set_margin_start(6);
     query.set_margin_end(6);
     let files = gtk::ListBox::new();
     files.set_selection_mode(gtk::SelectionMode::Single);
     files.add_css_class("navigation-sidebar");
+    navigation::list_navigation(&query, &files);
+    navigation::editor_escape(&query, &editor);
     project.append(&project_heading);
     project.append(&location);
     project.append(&query);
@@ -524,7 +587,9 @@ pub(crate) fn open(
     let weak = Rc::downgrade(&browser);
     query.connect_activate(move |_| {
         if let Some(browser) = weak.upgrade() {
-            Browser::activate(&browser, 0);
+            browser.render();
+            let index = browser.list.selected_row().map_or(0, |row| row.index());
+            Browser::activate(&browser, index);
         }
     });
     let weak = Rc::downgrade(&browser);
@@ -557,6 +622,58 @@ pub(crate) fn open(
     buffers_heading.set_margin_top(8);
     project.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     project.append(&buffers_heading);
+    let buffer_controls = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    buffer_controls.set_margin_start(4);
+    let previous_buffer = command_button(
+        &session,
+        &editor,
+        &message,
+        "go-previous-symbolic",
+        "Previous buffer (Ctrl+Shift+PageUp)",
+        || Vim9Command::PreviousBuffer,
+    );
+    let next_buffer = command_button(
+        &session,
+        &editor,
+        &message,
+        "go-next-symbolic",
+        "Next buffer (Ctrl+Shift+PageDown)",
+        || Vim9Command::NextBuffer,
+    );
+    let close_buffer = command_button(
+        &session,
+        &editor,
+        &message,
+        "window-close-symbolic",
+        "Close current buffer (Ctrl+Shift+W)",
+        || Vim9Command::CloseCurrentBuffer,
+    );
+    let split_vertical = command_button(
+        &session,
+        &editor,
+        &message,
+        "view-dual-symbolic",
+        "Split editor vertically",
+        || Vim9Command::Split { vertical: true },
+    );
+    let split_horizontal = command_button(
+        &session,
+        &editor,
+        &message,
+        "view-more-symbolic",
+        "Split editor horizontally",
+        || Vim9Command::Split { vertical: false },
+    );
+    for button in [
+        &previous_buffer,
+        &next_buffer,
+        &close_buffer,
+        &split_vertical,
+        &split_horizontal,
+    ] {
+        buffer_controls.append(button);
+    }
+    project.append(&buffer_controls);
     project.append(&buffer_scroll);
     {
         let session = session.clone();
@@ -595,9 +712,18 @@ pub(crate) fn open(
     build_output.set_right_margin(10);
     build_output.set_top_margin(8);
     build_output.update_property(&[gtk::accessible::Property::Label("Build output")]);
+    let output_note = label("");
+    output_note.add_css_class("caption");
+    output_note.set_margin_start(10);
+    output_note.set_margin_end(10);
+    output_note.set_margin_top(6);
+    output_note.set_visible(false);
+    let build_output_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    build_output_box.append(&output_note);
+    build_output_box.append(&scroll(&build_output));
     let output_stack = gtk::Stack::new();
     output_stack.add_titled(&problem_box, Some("problems"), "Problems");
-    output_stack.add_titled(&scroll(&build_output), Some("output"), "Build output");
+    output_stack.add_titled(&build_output_box, Some("output"), "Build output");
     output_stack.set_vexpand(true);
     let output_tabs = gtk::StackSwitcher::new();
     output_tabs.set_stack(Some(&output_stack));
@@ -624,6 +750,26 @@ pub(crate) fn open(
     main_split.set_shrink_end_child(false);
     main_split.set_position(260);
     main_split.set_vexpand(true);
+    let toggle_project = button("view-sidebar-symbolic", "Show or hide project panel");
+    {
+        let project = project.clone();
+        let editor = editor.clone();
+        toggle_project.connect_clicked(move |_| {
+            project.set_visible(!project.is_visible());
+            editor.grab_focus();
+        });
+    }
+    header.pack_end(&toggle_project);
+    let toggle_output = button("view-list-symbolic", "Show or hide output panel");
+    {
+        let output_box = output_box.clone();
+        let editor = editor.clone();
+        toggle_output.connect_clicked(move |_| {
+            output_box.set_visible(!output_box.is_visible());
+            editor.grab_focus();
+        });
+    }
+    header.pack_end(&toggle_output);
     {
         let session = session.clone();
         let targets = diagnostic_targets.clone();
@@ -659,6 +805,13 @@ pub(crate) fn open(
         "Shell command run in this project only when you press Build or F5",
     ));
     let build = gtk::Button::with_label("Build · F5");
+    build.set_tooltip_text(Some(
+        "Run the visible command using files already saved on disk",
+    ));
+    let save_and_build = gtk::Button::with_label("Save all + Build");
+    save_and_build.set_tooltip_text(Some(
+        "Save every modified buffer, then build only if all saves succeed",
+    ));
     let cancel_build = command_button(
         &session,
         &editor,
@@ -673,6 +826,7 @@ pub(crate) fn open(
     build_bar.append(&label("BUILD"));
     build_bar.append(&build_command);
     build_bar.append(&build);
+    build_bar.append(&save_and_build);
     build_bar.append(&cancel_build);
     build_bar.append(&build_state);
     {
@@ -681,7 +835,9 @@ pub(crate) fn open(
         let message = message.clone();
         let editor = editor.clone();
         let output_stack = output_stack.clone();
+        let output_box = output_box.clone();
         build.connect_clicked(move |_| {
+            output_box.set_visible(true);
             output_stack.set_visible_child_name("output");
             dispatch(
                 &session,
@@ -694,6 +850,27 @@ pub(crate) fn open(
         });
     }
     {
+        let session = session.clone();
+        let command = build_command.clone();
+        let message = message.clone();
+        let editor = editor.clone();
+        let output_stack = output_stack.clone();
+        let output_box = output_box.clone();
+        save_and_build.connect_clicked(move |_| {
+            output_box.set_visible(true);
+            output_stack.set_visible_child_name("output");
+            dispatch(
+                &session,
+                Vim9Command::SaveAndBuild {
+                    command: command.text().into(),
+                },
+                &message,
+                &editor,
+            );
+        });
+    }
+    navigation::editor_escape(&build_command, &editor);
+    {
         let build = build.clone();
         build_command.connect_activate(move |_| {
             build.emit_clicked();
@@ -703,7 +880,11 @@ pub(crate) fn open(
         let session = session.clone();
         let message = message.clone();
         let editor = editor.clone();
+        let output_stack = output_stack.clone();
+        let output_box = output_box.clone();
         search.connect_activate(move |entry| {
+            output_box.set_visible(true);
+            output_stack.set_visible_child_name("problems");
             dispatch(
                 &session,
                 Vim9Command::Search {
@@ -832,15 +1013,27 @@ pub(crate) fn open(
     // Editor-specific shortcuts live only on this window. All other keys,
     // including Escape/Ctrl+[ and insert-mode input, pass directly to Vim.
     let keys = gtk::EventControllerKey::new();
+    keys.set_name(Some("vim9-workbench-shortcuts"));
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     {
         let session = session.clone();
         let message = message.clone();
         let editor = editor.clone();
-        let query = query.clone();
+        let quick_open = quick_open.clone();
+        let go_to_line = go_to_line.clone();
+        let search = search.clone();
+        let build_command = build_command.clone();
         let open_file = open_file.clone();
         let build = build.clone();
+        let close_buffer = close_buffer.clone();
+        let weak = window.downgrade();
         keys.connect_key_pressed(move |_, key, _, modifiers| {
+            // Let the active native dialog own its text and shortcut handling.
+            if weak.upgrade().is_some_and(|window| {
+                window.visible_dialog().is_some() || navigation::native_text_has_focus(&window)
+            }) {
+                return glib::Propagation::Proceed;
+            }
             let ctrl = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
             let shift = modifiers.contains(gdk::ModifierType::SHIFT_MASK);
             let alt =
@@ -852,7 +1045,31 @@ pub(crate) fn open(
                     Vim9Command::Save
                 }),
                 Some('p') if ctrl && shift && !alt => {
-                    query.grab_focus();
+                    if quick_open.is_sensitive() {
+                        quick_open.emit_clicked();
+                    }
+                    return glib::Propagation::Stop;
+                }
+                Some('g') if ctrl && shift && !alt => {
+                    if go_to_line.is_sensitive() {
+                        go_to_line.emit_clicked();
+                    }
+                    return glib::Propagation::Stop;
+                }
+                Some('f') if ctrl && shift && !alt => {
+                    search.grab_focus();
+                    search.select_region(0, -1);
+                    return glib::Propagation::Stop;
+                }
+                Some('b') if ctrl && shift && !alt => {
+                    build_command.grab_focus();
+                    build_command.select_region(0, -1);
+                    return glib::Propagation::Stop;
+                }
+                Some('w') if ctrl && shift && !alt => {
+                    if close_buffer.is_sensitive() {
+                        close_buffer.emit_clicked();
+                    }
                     return glib::Propagation::Stop;
                 }
                 Some('o') if ctrl && shift && !alt => {
@@ -870,6 +1087,12 @@ pub(crate) fn open(
                 } else {
                     Vim9Command::NextDiagnostic
                 }),
+                _ if key == gdk::Key::Page_Up && ctrl && shift && !alt => {
+                    Some(Vim9Command::PreviousBuffer)
+                }
+                _ if key == gdk::Key::Page_Down && ctrl && shift && !alt => {
+                    Some(Vim9Command::NextBuffer)
+                }
                 _ => None,
             };
             if let Some(command) = command {
@@ -975,7 +1198,21 @@ pub(crate) fn open(
     let mut old_output = Vec::new();
     let mut last_error = None;
     let mut was_connected = false;
-    let connected_controls = [new_file, open_file, save, save_all, previous, next];
+    let connected_controls = [
+        new_file,
+        open_file,
+        quick_open,
+        go_to_line,
+        save,
+        save_all,
+        previous,
+        next,
+        previous_buffer,
+        next_buffer,
+        close_buffer,
+        split_vertical,
+        split_horizontal,
+    ];
     for button in &connected_controls {
         button.set_sensitive(false);
     }
@@ -993,6 +1230,7 @@ pub(crate) fn open(
         }
         search.set_sensitive(connected);
         build.set_sensitive(connected && !snapshot.build.running);
+        save_and_build.set_sensitive(connected && !snapshot.build.running);
         cancel_build.set_sensitive(connected && snapshot.build.running);
         for (capability, button, tooltip) in &language_actions {
             let supported = snapshot
@@ -1025,15 +1263,29 @@ pub(crate) fn open(
         };
         let modified = if snapshot.modified { " ●" } else { "" };
         status.set_label(&format!(
-            "{} · {}{} · Ln {}, Col {} · {}{} buffers · {}",
+            "{} · {}{} · Ln {}/{}, Col {} · {} · {} · {} windows · {}{} buffers · {}",
             visible(&snapshot.mode).to_uppercase(),
             visible(file),
             modified,
             snapshot.line,
+            snapshot.line_count,
             snapshot.column,
+            if snapshot.filetype.is_empty() {
+                "plain text".into()
+            } else {
+                visible(&snapshot.filetype)
+            },
+            if snapshot.encoding.is_empty() {
+                "UTF-8".into()
+            } else {
+                visible(&snapshot.encoding)
+            },
+            snapshot.window_count,
             snapshot.buffers.len(),
             if snapshot.buffers_truncated { "+" } else { "" },
-            if connected {
+            if connected && snapshot.waiting_for_input {
+                "SAVE WAITING FOR VIM INPUT"
+            } else if connected {
                 "CONNECTED"
             } else {
                 "DISCONNECTED"
@@ -1084,11 +1336,18 @@ pub(crate) fn open(
         search_feedback.set_visible(!snapshot.search.query.is_empty());
         build_state.set_label(&if snapshot.build.running {
             "Running…".into()
+        } else if snapshot.build.cancelled {
+            "Cancelled".into()
         } else if let Some(code) = snapshot.build.exit_code {
             format!("Exited: {code}")
         } else {
             "Ready".into()
         });
+        output_note.set_label(&format!(
+            "Showing the latest output · {} earlier output lines omitted",
+            snapshot.build.truncated
+        ));
+        output_note.set_visible(snapshot.build.truncated > 0);
         if snapshot.build.output != old_output {
             build_output
                 .buffer()
