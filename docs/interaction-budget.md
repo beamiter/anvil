@@ -611,3 +611,38 @@ from RGB alone. Validator output records the proof method and learned pre-input
 signature. Styles without a stable supported signature remain unsupported.
 Retained failed runs stay failed; offline successor replay is diagnostic only.
 No full performance budget or physical scanout is accepted by this source change.
+
+### Native Vim buffer successor source review (2026-10-20)
+
+The next single-parent successor is reviewed against publication head
+`2fb6d7edb8310c47e47535acd496b619562b41f1`. The workflow's exact-parent pin
+advances to that immutable head after independent source review and root review
+of the resulting workflow and dependency changes. It is not derived from the
+candidate at runtime. Another parent change still fails closed and requires a
+new review; the historical baseline remains
+`88c3f4c565cb5b9f8d47d22eb3ad07f47a822ae4`.
+
+The reviewed range from `3ff8221fed5faaa84398ad1dff1dec4f63761f3e` contains
+12 commits and 58 changed files. It includes Block selection/navigation and
+shared-core updates as well as the native Vim workbench, so the range is not
+treated as behavior-neutral. All 33 interaction and associated QA files have
+identical Git blobs at the two endpoints. The observer patch applies cleanly
+to the reviewed target. The combined observer identity remains
+`eac561f4c56d15c6038ceee148c0bb2bba24280b95c7d8144f9d288c8dffd26b`.
+The PTY, watch reader/batch, session implementation and existing budget document
+were also unchanged across those endpoints.
+
+Candidate/event identity, the single-parent equality guard, byte-identical
+overlays, complete source hashes, separate fresh locked builds, actual rustc
+and binary identities, rejection of identical binaries, clean original
+checkouts and owned-process cleanup checks remain required. The accompanying
+core-pin update also synchronizes the link-recovery fixture; its extraction
+and provenance checks remain strict and its native execution remains disabled.
+
+The Block collector still starts ordinary Block mode without `--ide`, so it
+does not construct the native Vim buffer, its IM context or its frame timer.
+The added terminal-toolbar entry changes chrome, however, and actual pane and
+separator geometry still requires the hosted short gate. This review permits
+the existing short 1/8/32-total paired pixel/control scenarios only. Source
+review is not a successful native result, a Vim GUI acceptance result, a
+physical-scanout measurement or permission for the full performance matrix.

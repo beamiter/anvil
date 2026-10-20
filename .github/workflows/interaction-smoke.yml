@@ -44,8 +44,8 @@ jobs:
       CARGO_BUILD_JOBS: '1'
       RUST_BACKTRACE: '1'
       BASELINE_SHA: 88c3f4c565cb5b9f8d47d22eb3ad07f47a822ae4
-      # Reviewed migration parent; future native changes require a new source review.
-      CANDIDATE_PARENT_SHA: 3ff8221fed5faaa84398ad1dff1dec4f63761f3e
+      # Reviewed native Vim buffer parent; later changes require a new source review.
+      CANDIDATE_PARENT_SHA: 2fb6d7edb8310c47e47535acd496b619562b41f1
     steps:
       - name: Check out immutable candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
