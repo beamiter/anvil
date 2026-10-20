@@ -17,8 +17,9 @@ Vim `guifg`, `guibg` and `guisp` colors are preserved as full RGB, including
 when `termguicolors` is disabled. Bold, italic, underline, undercurl,
 strikethrough and Visual selection are drawn by the GUI. Pango shapes complete
 same-style runs, with font fallback and optional font ligatures. The mode cursor
-and IME preedit are separate native layers. Text commits still go to the actual
-Vim process, so editing, undo and mappings have a single owner.
+and IME preedit are separate native layers. Text runs and preedit share a row
+baseline, so CJK fallback fonts align with Latin text. Text commits still go to
+the actual Vim process, so editing, undo and mappings have a single owner.
 
 Use the header's **Editor rendering, font and line spacing** menu to choose a
 monospace editor font, enable or disable ligatures, adjust line spacing, or
@@ -28,14 +29,19 @@ bridge retains Vim display-cell positions for mouse and cursor alignment; this
 does not yet implement variable-width document layout or arbitrary inline
 widgets.
 
-The native surface covers the buffer viewport only. Vim's command/status area
-uses its compatibility display. The bridge explicitly falls back for display
-features it cannot yet reproduce faithfully, including multiple Vim windows,
-closed folds, wrapped continuation rows, diff, popup windows/completion,
+The native surface covers each buffer viewport independently, including
+horizontal, vertical and nested Vim splits. Vim's status lines, split dividers
+and command area remain live in the compatibility display. Every pane uses its
+own buffer text, syntax and viewport; the active Vim window alone owns the
+native cursor and IME preedit. The bridge explicitly falls back for display
+features it cannot yet reproduce faithfully, including closed folds, wrapped
+continuation rows, diff, popup windows/completion,
 complex signs or fold columns, virtual text, match decorations, concealment,
 and complex bidirectional text. The default single sign column, ordinary
-diagnostic text-property highlights and simple search matches use their GUI styles. The header gives the fallback reason. Native
-rendering resumes when the view becomes supported. Resize transitions also
+diagnostic text-property highlights and simple search matches use their GUI
+styles. If any pane needs compatibility, the whole editor shows live Vim until
+all panes can be sampled faithfully. The header gives the reason; native
+rendering then resumes automatically. Resize transitions also
 retain the compatibility view until Vim publishes matching geometry, so a stale
 frame cannot cover a differently sized input grid. Selecting terminal text
 with Shift-drag temporarily reveals the compatibility display so selection
@@ -197,7 +203,7 @@ Shared-core tests cover command encoding, authenticated transport, file path
 handling and bounded snapshots. An opt-in native GTK smoke test exercises a real
 Vim PTY, native GUI RGB with deliberately different terminal colors and
 `termguicolors` disabled, Unicode IM-context commits and real Vim undo, native
-render subscription toggling and split fallback, fuzzy opening of a nested
+render subscription toggling and native split painting, fuzzy opening of a nested
 file, typed line/column navigation and
 jump-history back/forward, native search case/regex/word/glob options, invalid
 patterns and zero matches, real editor splits, protected buffer close, explicit
@@ -207,7 +213,18 @@ graphical display (for example Xvfb) with the required Vim:
 
 ```sh
 cargo test native_vim9_edit_save_build_and_modified_close -- --ignored --test-threads=1
+cargo test native_vim9_split_unicode_visual_and_font_scaling -- --ignored --test-threads=1
 ```
+
+The split regression opens distinct real Vim buffers, checks independent GUI
+syntax colors with `termguicolors` disabled, CJK and combining-character
+geometry, Visual selection, editing and native Save, nested splits and native
+font changes. Font size changes must produce a resized Vim grid and a fresh
+painted frame; same-size font style changes also request a fresh frame. The
+test checks that unsupported display states retire the native
+overlay and supported states restore all panes. Run it separately with
+`GDK_SCALE=2` on a sufficiently large display to exercise GTK HiDPI rendering.
+Pango layout caches are retired when the window changes monitor scale factor.
 
 Set `JTERM_VIM9_TEST_REAL_KEYS=1` with `xdotool` on an isolated X11 display
 to additionally exercise actual key delivery through the native IM filter.
@@ -215,3 +232,10 @@ Set `JTERM_VIM9_TEST_SCREENSHOT=/tmp/vim9.png` with ImageMagick `import` to
 record the live RGB and Unicode editor windows. This covers GTK IM-context
 commits; platform-specific input-method engines and candidate windows still
 need testing on the target Wayland/X11 desktop.
+
+
+### Recovery validation — 2026-10-20
+
+Pinned shared core: `c387ab33caff52a0bd4f759fb20a35aae2586cd0`.
+Passed 4 focused tests and 3 separate real GTK runs (split/Unicode/font at scale 1 and 2, plus edit/save/build/close).
+These runs use Xvfb/software graphics; physical GPU, Wayland and OS IME candidate windows are not certified.

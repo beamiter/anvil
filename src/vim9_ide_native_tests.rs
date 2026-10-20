@@ -496,11 +496,17 @@ fn native_vim9_edit_save_build_and_modified_close() {
             .iter()
             .any(|label| label.text().contains("2 windows"))
     });
-    wait_for(widget, "unsupported split retires the native frame", || {
-        native_buffer.painted_frame().is_none()
-            && descendants::<gtk::Label>(widget)
-                .iter()
-                .any(|label| label.text().starts_with("Vim ·") && label.text().contains("split"))
+    wait_for(widget, "both Vim split windows remain native", || {
+        native_buffer.painted_frame().is_some_and(|frame| {
+            frame.windows.len() == 2
+                && frame.windows.iter().all(|window| {
+                    frame.runs.iter().any(|run| {
+                        run.line == 1
+                            && run.text.contains("first")
+                            && window.view.contains(run.row, run.column)
+                    })
+                })
+        })
     });
     editor.feed_child(b"gg0iSAVED \x1b");
     wait_for(widget, "modified nested buffer", || {
@@ -652,6 +658,262 @@ fn native_vim9_edit_save_build_and_modified_close() {
     });
     window.close();
     wait_for(widget, "graceful Vim exit closes the workbench", || {
+        app.windows().is_empty()
+    });
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Runs against Vim and the actual GTK snapshot path. The same test may be
+/// invoked with GDK_SCALE=2 to validate a device-scaled native editing window.
+#[test]
+#[ignore = "needs a display and Vim 9 with +channel +job +timers"]
+fn native_vim9_split_unicode_visual_and_font_scaling() {
+    if !jterm_core::child_env::inherited_environment_is_captured() {
+        jterm_core::child_env::capture_inherited_environment().unwrap();
+    }
+    adw::init().unwrap();
+    let app = adw::Application::builder()
+        .application_id("io.github.beamiter.Vim9SplitTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let root = std::env::temp_dir().join(format!("vim9-splits-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    // Anchor project discovery even when another test left a marker in /tmp.
+    std::fs::write(root.join("Makefile"), "all:\n\t@true\n").unwrap();
+    let left = root.join("left.txt");
+    let right = root.join("right.txt");
+    std::fs::write(&left, "LEFT 中文 cafe\u{301}\nsecond left\n").unwrap();
+    std::fs::write(&right, "RIGHT 日本語 e\u{301}\nsecond right\n").unwrap();
+    open(app.upcast_ref(), None, left.clone());
+    let window = app.windows().into_iter().next().expect("native IDE window");
+    window.set_default_size(1440, 980);
+    let widget: &gtk::Widget = window.upcast_ref();
+    let editor = descendants::<vte4::Terminal>(widget)
+        .into_iter()
+        .next()
+        .expect("real Vim PTY");
+    let buffer = descendants::<native_buffer::BufferSurface>(widget)
+        .into_iter()
+        .next()
+        .expect("native Pango surface");
+    wait_for(widget, "initial native Unicode buffer", || {
+        buffer.painted_frame().is_some()
+    });
+
+    // Fixture options are intentionally ordinary supported Vim views. GUI and
+    // terminal colors disagree to expose any accidental terminal-grid repaint.
+    editor.feed_child(b":set nowrap nonumber norelativenumber nocursorline notermguicolors | hi Normal guifg=#dce8f5 guibg=#17212b ctermfg=2 ctermbg=0 | hi GuiLeft guifg=#fa5ea9 gui=bold,italic ctermfg=2 | hi Visual guibg=#574b90 gui=NONE ctermbg=2 | syn match GuiLeft /LEFT/ | vsplit right.txt\r");
+    editor.feed_child(b":set nowrap nonumber norelativenumber nocursorline | hi GuiRight guifg=#4cdec1 gui=underline ctermfg=2 | syn match GuiRight /RIGHT/\r");
+    wait_for(
+        widget,
+        "independent split text and GUI syntax colors",
+        || {
+            buffer.painted_frame().is_some_and(|frame| {
+                frame.windows.len() == 2
+                    && frame
+                        .runs
+                        .iter()
+                        .any(|run| run.text == "LEFT" && run.style.foreground == Some(0xfa5ea9))
+                    && frame
+                        .runs
+                        .iter()
+                        .any(|run| run.text == "RIGHT" && run.style.foreground == Some(0x4cdec1))
+                    && frame
+                        .runs
+                        .iter()
+                        .any(|run| run.text == "中" && run.cells == 2)
+                    && frame
+                        .runs
+                        .iter()
+                        .any(|run| run.text == "e\u{301}" && run.cells == 1)
+            })
+        },
+    );
+    let first_frame = buffer.painted_frame().unwrap();
+    let mut columns: Vec<_> = first_frame.paint_views().collect();
+    columns.sort_by_key(|view| view.column);
+    let divider = columns[0].column + columns[0].columns;
+    assert!(columns[1].column > divider);
+    assert!(
+        !first_frame.covers(columns[0].row, divider),
+        "Vim's vertical divider must remain a live compatibility cell"
+    );
+    assert!(first_frame.covers(first_frame.cursor.row, first_frame.cursor.column));
+
+    editor.feed_child(b":set hlsearch | hi Search guibg=#70421f gui=NONE\r/RIGHT\r");
+    wait_for(
+        widget,
+        "Vim search highlight stays in its matching split",
+        || {
+            buffer.painted_frame().is_some_and(|frame| {
+                frame.mode == "n"
+                    && frame
+                        .runs
+                        .iter()
+                        .any(|run| run.text == "RIGHT" && run.style.background == Some(0x70421f))
+                    && frame
+                        .runs
+                        .iter()
+                        .any(|run| run.text == "LEFT" && run.style.background != Some(0x70421f))
+            })
+        },
+    );
+    editor.feed_child(b"gg0v4l");
+    wait_for(
+        widget,
+        "native Visual selection in the active split",
+        || {
+            buffer.painted_frame().is_some_and(|frame| {
+                frame.mode == "v"
+                    && frame
+                        .runs
+                        .iter()
+                        .any(|run| run.text == "RIGHT" && run.style.background == Some(0x574b90))
+                    && frame
+                        .runs
+                        .iter()
+                        .any(|run| run.text == "LEFT" && run.style.background != Some(0x574b90))
+            })
+        },
+    );
+    editor.feed_child(b"\x1bgg0iEDIT \x1b");
+    wait_for(widget, "actual Vim edit is painted in its split", || {
+        buffer.painted_frame().is_some_and(|frame| {
+            frame.mode == "n" && frame.runs.iter().any(|run| run.text.contains("EDIT "))
+        })
+    });
+    named_button(widget, "Save (Ctrl+S)").emit_clicked();
+    wait_for(
+        widget,
+        "native Save writes the active real Vim buffer",
+        || {
+            std::fs::read_to_string(&right)
+                .is_ok_and(|text| text == "EDIT RIGHT 日本語 e\u{301}\nsecond right\n")
+        },
+    );
+    assert_eq!(
+        std::fs::read_to_string(&left).unwrap(),
+        "LEFT 中文 cafe\u{301}\nsecond left\n"
+    );
+
+    // A horizontal split nested inside a vertical one must retain both status
+    // rows and the outside divider, while every editing pane stays native.
+    named_button(widget, "Split editor horizontally").emit_clicked();
+    wait_for(widget, "three native Vim windows in a mixed layout", || {
+        buffer
+            .painted_frame()
+            .is_some_and(|frame| frame.windows.len() == 3)
+    });
+    let capture = |extension: &str| {
+        if let Some(path) = std::env::var_os("JTERM_VIM9_TEST_SCREENSHOT") {
+            let clock = window
+                .frame_clock()
+                .expect("mapped split window frame clock");
+            let previous = clock.frame_counter();
+            window.queue_draw();
+            wait_for(widget, "font and split snapshot reaches the window", || {
+                clock.frame_counter() > previous && buffer.painted_frame().is_some()
+            });
+            gtk::prelude::WidgetExt::display(&window).flush();
+            assert!(std::process::Command::new("import")
+                .args(["-window", "root"])
+                .arg(PathBuf::from(path).with_extension(extension))
+                .status()
+                .unwrap()
+                .success());
+        }
+    };
+    capture("gui-splits-before.png");
+    let font_menu = descendants::<gtk::MenuButton>(widget)
+        .into_iter()
+        .find(|menu| {
+            menu.tooltip_text().as_deref() == Some("Editor rendering, font and line spacing")
+        })
+        .unwrap();
+    font_menu.popup();
+    let popover = font_menu.popover().unwrap();
+    let font = descendants::<gtk::FontDialogButton>(popover.upcast_ref())
+        .into_iter()
+        .next()
+        .unwrap();
+    let previous_metrics = (editor.char_width(), editor.char_height());
+    let previous_frame = buffer.painted_frame().unwrap();
+    font.set_font_desc(&gtk::pango::FontDescription::from_string("Monospace 18"));
+    font_menu.popdown();
+    wait_for(
+        widget,
+        "larger font resizes the actual Vim grid and all panes",
+        || {
+            editor.char_height() > previous_metrics.1
+                && buffer.painted_frame().is_some_and(|frame| {
+                    frame.windows.len() == 3
+                        && frame.revision > previous_frame.revision
+                        && frame.columns < previous_frame.columns
+                        && frame.rows == editor.row_count() as usize
+                        && frame.columns == editor.column_count() as usize
+                        && frame.covers(frame.cursor.row, frame.cursor.column)
+                })
+        },
+    );
+    let larger_frame = buffer.painted_frame().unwrap();
+    eprintln!(
+        "Native font scaling at GTK scale {}: cell {:?} -> {:?}, Vim grid {}x{} -> {}x{}, revision {} -> {}",
+        window.scale_factor(),
+        previous_metrics,
+        (editor.char_width(), editor.char_height()),
+        previous_frame.columns,
+        previous_frame.rows,
+        larger_frame.columns,
+        larger_frame.rows,
+        previous_frame.revision,
+        larger_frame.revision,
+    );
+    capture("gui-splits.png");
+
+    let before_style = buffer.painted_frame().unwrap();
+    let before_metrics = (editor.char_width(), editor.char_height());
+    let mut styled_font = font.font_desc().unwrap();
+    styled_font.set_weight(gtk::pango::Weight::Bold);
+    font.set_font_desc(&styled_font);
+    wait_for(
+        widget,
+        "font style changes receive a fresh native keyframe",
+        || {
+            buffer.painted_frame().is_some_and(|frame| {
+                frame.revision > before_style.revision
+                    && frame.rows == editor.row_count() as usize
+                    && frame.columns == editor.column_count() as usize
+            })
+        },
+    );
+    if before_metrics == (editor.char_width(), editor.char_height()) {
+        let styled = buffer.painted_frame().unwrap();
+        assert_eq!(styled.rows, before_style.rows);
+        assert_eq!(styled.columns, before_style.columns);
+    }
+
+    // An unsupported feature in any pane must retire every native overlay,
+    // never leave a stale valid pane over Vim's updated screen.
+    editor.feed_child(b":setlocal conceallevel=2\r");
+    wait_for(
+        widget,
+        "unsupported split state retires the native overlay",
+        || {
+            buffer.painted_frame().is_none()
+                && descendants::<gtk::Label>(widget)
+                    .iter()
+                    .any(|label| label.text().starts_with("Vim ·"))
+        },
+    );
+    editor.feed_child(b":setlocal conceallevel=0\r");
+    wait_for(widget, "native mixed split layout resumes", || {
+        buffer
+            .painted_frame()
+            .is_some_and(|frame| frame.windows.len() == 3)
+    });
+    window.close();
+    wait_for(widget, "clean split session closes", || {
         app.windows().is_empty()
     });
     std::fs::remove_dir_all(root).unwrap();

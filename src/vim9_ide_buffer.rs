@@ -4,7 +4,9 @@
 
 use super::gtk;
 use gtk::{gdk, glib, pango, subclass::prelude::*};
-use jterm_core::vim9::{Vim9Command, Vim9RenderFrame, Vim9RenderStyle, Vim9Session};
+use jterm_core::vim9::{
+    Vim9Command, Vim9RenderFrame, Vim9RenderRect, Vim9RenderStyle, Vim9Session,
+};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -34,6 +36,7 @@ struct PaintState {
     frame: Option<Arc<Vim9RenderFrame>>,
     metrics: Metrics,
     font: pango::FontDescription,
+    font_generation: u64,
     ligatures: bool,
     focused: bool,
     preedit: Option<Preedit>,
@@ -45,6 +48,7 @@ impl Default for PaintState {
             frame: None,
             metrics: Metrics::default(),
             font: pango::FontDescription::from_string("Monospace 12"),
+            font_generation: 0,
             ligatures: true,
             focused: false,
             preedit: None,
@@ -85,98 +89,109 @@ mod imp {
             if metrics.width <= 0.0 || metrics.height <= 0.0 {
                 return;
             }
-            let view = gtk::graphene::Rect::new(
-                metrics.x + frame.view.column as f32 * metrics.width,
-                metrics.y + frame.view.row as f32 * metrics.height,
-                frame.view.columns as f32 * metrics.width,
-                frame.view.rows as f32 * metrics.height,
-            );
-            snapshot.push_clip(&view);
-            let (_, background, _) = colors(&frame.default_style, &frame.default_style);
-            snapshot.append_color(&rgb(background), &view);
-
-            // Paint backgrounds before ink so a subsequent syntax run cannot
-            // erase italic glyphs extending beyond the previous run's box.
-            for run in &frame.runs {
-                let (_, background, _) = colors(&run.style, &frame.default_style);
-                snapshot.append_color(
-                    &rgb(background),
-                    &gtk::graphene::Rect::new(
-                        metrics.x + run.column as f32 * metrics.width,
-                        metrics.y + run.row as f32 * metrics.height,
-                        run.cells as f32 * metrics.width,
-                        metrics.height,
-                    ),
-                );
-            }
-
-            // Layouts are cached across cursor and viewport updates. Pango
-            // shapes a complete same-style run, including font fallback and
-            // supported ligatures; GTK retains device-independent text nodes.
+            // Clip and cover each Vim editing window independently. A single
+            // bounding rectangle would erase live PTY status lines, split
+            // separators and plugin-owned chrome between the native panes.
+            let baseline = row_baseline(&surface, &state);
             let mut layouts = self.layouts.borrow_mut();
             if layouts.len() > 4096 {
                 layouts.clear();
             }
-            for run in &frame.runs {
-                let x = metrics.x + run.column as f32 * metrics.width;
-                let y = metrics.y + run.row as f32 * metrics.height;
-                let width = run.cells as f32 * metrics.width;
-                let (foreground, _, special) = colors(&run.style, &frame.default_style);
-                if !run.text.is_empty() && width > 0.0 {
-                    let key = (run.text.clone(), run.style.bold, run.style.italic);
-                    let layout = layouts.entry(key).or_insert_with(|| {
-                        let layout = surface.create_pango_layout(Some(&run.text));
-                        let mut font = state.font.clone();
-                        if run.style.bold {
-                            font.set_weight(pango::Weight::Bold);
-                        }
-                        if run.style.italic {
-                            font.set_style(pango::Style::Italic);
-                        }
-                        layout.set_font_description(Some(&font));
-                        layout.set_single_paragraph_mode(true);
-                        layout.set_auto_dir(false);
-                        let attributes = pango::AttrList::new();
-                        attributes.insert(pango::AttrFontFeatures::new(if state.ligatures {
-                            "calt=1,liga=1"
-                        } else {
-                            "calt=0,liga=0"
-                        }));
-                        layout.set_attributes(Some(&attributes));
-                        layout
-                    });
-                    let (_, logical) = layout.extents();
-                    let logical_width = logical.width() as f32 / pango::SCALE as f32;
-                    let logical_height = logical.height() as f32 / pango::SCALE as f32;
-                    let text_y = y + (metrics.height - logical_height) * 0.5;
-                    snapshot.save();
-                    snapshot.translate(&gtk::graphene::Point::new(x, text_y));
-                    // VTE rounds its input grid to whole logical pixels. Match
-                    // that advance without independently slicing Unicode or
-                    // breaking a shaped run into terminal-sized glyph boxes.
-                    if logical_width > 0.0 {
-                        snapshot.scale(width / logical_width, 1.0);
-                    }
-                    snapshot.append_layout(layout, &rgb(foreground));
-                    snapshot.restore();
-                    decorations(snapshot, &run.style, special, x, y, width, metrics.height);
-                }
-            }
+            for region in frame.paint_views() {
+                let view = view_rectangle(region, metrics);
+                snapshot.push_clip(&view);
+                let (_, background, _) = colors(&frame.default_style, &frame.default_style);
+                snapshot.append_color(&rgb(background), &view);
 
-            if frame.cursor.visible {
-                let cursor = gtk::graphene::Rect::new(
-                    metrics.x + frame.cursor.column as f32 * metrics.width,
-                    metrics.y + frame.cursor.row as f32 * metrics.height,
-                    frame.cursor.width.max(1) as f32 * metrics.width,
-                    metrics.height,
-                );
-                let (foreground, _, _) = colors(&frame.default_style, &frame.default_style);
-                paint_cursor(snapshot, &cursor, foreground, &frame.mode, state.focused);
-                if let Some(preedit) = state.preedit.as_ref() {
-                    paint_preedit(&surface, snapshot, &state, preedit, &cursor, &view);
+                // Paint backgrounds before ink so a subsequent syntax run
+                // cannot erase italic glyphs from the previous run.
+                for run in frame
+                    .runs
+                    .iter()
+                    .filter(|run| region.contains(run.row, run.column))
+                {
+                    let (_, background, _) = colors(&run.style, &frame.default_style);
+                    snapshot.append_color(
+                        &rgb(background),
+                        &gtk::graphene::Rect::new(
+                            metrics.x + run.column as f32 * metrics.width,
+                            metrics.y + run.row as f32 * metrics.height,
+                            run.cells as f32 * metrics.width,
+                            metrics.height,
+                        ),
+                    );
                 }
+
+                // Layouts are cached across cursor and viewport updates. Pango
+                // shapes a complete same-style run, including font fallback and
+                // supported ligatures; GTK retains device-independent text nodes.
+                for run in frame
+                    .runs
+                    .iter()
+                    .filter(|run| region.contains(run.row, run.column))
+                {
+                    let x = metrics.x + run.column as f32 * metrics.width;
+                    let y = metrics.y + run.row as f32 * metrics.height;
+                    let width = run.cells as f32 * metrics.width;
+                    let (foreground, _, special) = colors(&run.style, &frame.default_style);
+                    if !run.text.is_empty() && width > 0.0 {
+                        let key = (run.text.clone(), run.style.bold, run.style.italic);
+                        let layout = layouts.entry(key).or_insert_with(|| {
+                            let layout = surface.create_pango_layout(Some(&run.text));
+                            let mut font = state.font.clone();
+                            if run.style.bold {
+                                font.set_weight(pango::Weight::Bold);
+                            }
+                            if run.style.italic {
+                                font.set_style(pango::Style::Italic);
+                            }
+                            layout.set_font_description(Some(&font));
+                            layout.set_single_paragraph_mode(true);
+                            layout.set_auto_dir(false);
+                            let attributes = pango::AttrList::new();
+                            attributes.insert(pango::AttrFontFeatures::new(if state.ligatures {
+                                "calt=1,liga=1"
+                            } else {
+                                "calt=0,liga=0"
+                            }));
+                            layout.set_attributes(Some(&attributes));
+                            layout
+                        });
+                        let (_, logical) = layout.extents();
+                        let logical_width = logical.width() as f32 / pango::SCALE as f32;
+                        // A fallback CJK font can have different ascent and
+                        // descent from the Latin font. Centering every run's
+                        // logical box independently makes their baselines drift.
+                        let text_y = y + baseline - layout.baseline() as f32 / pango::SCALE as f32;
+                        snapshot.save();
+                        snapshot.translate(&gtk::graphene::Point::new(x, text_y));
+                        // VTE rounds its input grid to whole logical pixels. Match
+                        // that advance without independently slicing Unicode or
+                        // breaking a shaped run into terminal-sized glyph boxes.
+                        if logical_width > 0.0 {
+                            snapshot.scale(width / logical_width, 1.0);
+                        }
+                        snapshot.append_layout(layout, &rgb(foreground));
+                        snapshot.restore();
+                        decorations(snapshot, &run.style, special, x, y, width, metrics.height);
+                    }
+                }
+
+                if frame.cursor.visible && region.contains(frame.cursor.row, frame.cursor.column) {
+                    let cursor = gtk::graphene::Rect::new(
+                        metrics.x + frame.cursor.column as f32 * metrics.width,
+                        metrics.y + frame.cursor.row as f32 * metrics.height,
+                        frame.cursor.width.max(1) as f32 * metrics.width,
+                        metrics.height,
+                    );
+                    let (foreground, _, _) = colors(&frame.default_style, &frame.default_style);
+                    paint_cursor(snapshot, &cursor, foreground, &frame.mode, state.focused);
+                    if let Some(preedit) = state.preedit.as_ref() {
+                        paint_preedit(&surface, snapshot, &state, preedit, &cursor, &view);
+                    }
+                }
+                snapshot.pop();
             }
-            snapshot.pop();
             #[cfg(test)]
             self.painted_revision.set(frame.revision);
         }
@@ -187,6 +202,15 @@ glib::wrapper! {
     pub struct BufferSurface(ObjectSubclass<imp::BufferSurface>)
         @extends gtk::Widget,
         @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+fn view_rectangle(view: &Vim9RenderRect, metrics: Metrics) -> gtk::graphene::Rect {
+    gtk::graphene::Rect::new(
+        metrics.x + view.column as f32 * metrics.width,
+        metrics.y + view.row as f32 * metrics.height,
+        view.columns as f32 * metrics.width,
+        view.rows as f32 * metrics.height,
+    )
 }
 
 fn rgb(value: u32) -> gdk::RGBA {
@@ -296,6 +320,13 @@ fn paint_cursor(
     }
 }
 
+fn row_baseline(surface: &BufferSurface, state: &PaintState) -> f32 {
+    let metrics = surface.pango_context().metrics(Some(&state.font), None);
+    let ascent = metrics.ascent() as f32 / pango::SCALE as f32;
+    let descent = metrics.descent() as f32 / pango::SCALE as f32;
+    (state.metrics.height - ascent - descent) * 0.5 + ascent
+}
+
 fn paint_preedit(
     surface: &BufferSurface,
     snapshot: &gtk::Snapshot,
@@ -311,11 +342,12 @@ fn paint_preedit(
     layout.set_font_description(Some(&state.font));
     layout.set_attributes(Some(&preedit.attributes));
     layout.set_single_paragraph_mode(true);
-    let (width, height) = layout.pixel_size();
+    let (width, _) = layout.pixel_size();
     let x = cursor
         .x()
         .min((view.x() + view.width() - width as f32 - 4.0).max(view.x()));
-    let y = cursor.y() + (state.metrics.height - height as f32) * 0.5;
+    let y =
+        cursor.y() + row_baseline(surface, state) - layout.baseline() as f32 / pango::SCALE as f32;
     let (foreground, background, _) = colors(&frame.default_style, &frame.default_style);
     snapshot.append_color(
         &rgb(background),
@@ -355,6 +387,12 @@ impl BufferSurface {
         surface.set_vexpand(true);
         surface.set_can_target(false);
         surface.set_focusable(false);
+        surface.connect_scale_factor_notify(|surface| {
+            // Cached layouts belong to the widget's Pango context. Retire
+            // them when it moves between monitors with different DPI.
+            surface.imp().layouts.borrow_mut().clear();
+            surface.queue_draw();
+        });
         surface.update_property(&[gtk::accessible::Property::Label(
             "Native Vim buffer rendering",
         )]);
@@ -362,7 +400,14 @@ impl BufferSurface {
     }
 
     fn set_font(&self, font: &pango::FontDescription) {
-        self.imp().state.borrow_mut().font = font.clone();
+        let mut state = self.imp().state.borrow_mut();
+        state.font = font.clone();
+        state.font_generation = state.font_generation.wrapping_add(1);
+        // Font metrics and VTE's PTY allocation change asynchronously. Do not
+        // paint the old geometry with the new font while a resized frame is
+        // in flight; the live Vim surface owns this short transition.
+        state.frame = None;
+        drop(state);
         self.imp().layouts.borrow_mut().clear();
         self.queue_draw();
     }
@@ -544,6 +589,8 @@ impl NativeBuffer {
         let poll_surface = surface.clone();
         let poll_badge = badge.clone();
         let mut subscribed = None;
+        let mut font_generation = 0;
+        let mut render_revision_floor = 0;
         let mut old_status = String::new();
         glib::timeout_add_local(Duration::from_millis(16), move || {
             if weak_widget.upgrade().is_none() {
@@ -553,6 +600,16 @@ impl NativeBuffer {
                 return glib::ControlFlow::Break;
             };
             let wanted = enabled.is_active();
+            let frame = session.render_snapshot();
+            let generation = poll_surface.imp().state.borrow().font_generation;
+            if generation != font_generation {
+                font_generation = generation;
+                render_revision_floor = frame.as_ref().map_or(0, |frame| frame.revision);
+                // A font-family/style change can retain the same PTY geometry.
+                // Re-subscribing explicitly requests a fresh keyframe in that
+                // case, instead of waiting forever for a Vim resize event.
+                subscribed = None;
+            }
             // send() is bounded and refuses unauthenticated sessions; retry
             // subscription after startup rather than silently losing it.
             if subscribed != Some(wanted)
@@ -562,9 +619,10 @@ impl NativeBuffer {
             {
                 subscribed = Some(wanted);
             }
-            let frame = session.render_snapshot();
             let geometry_matches = frame.as_ref().is_some_and(|frame| {
-                frame.rows == terminal.row_count().max(0) as usize
+                frame.revision > render_revision_floor
+                    && terminal_grid_is_allocated(&terminal)
+                    && frame.rows == terminal.row_count().max(0) as usize
                     && frame.columns == terminal.column_count().max(0) as usize
             });
             let terminal_selection = terminal.has_selection();
@@ -655,6 +713,21 @@ fn terminal_metrics(terminal: &vte4::Terminal) -> Metrics {
         width: terminal.char_width().max(1) as f32,
         height: terminal.char_height().max(1) as f32,
     }
+}
+
+fn terminal_grid_is_allocated(terminal: &vte4::Terminal) -> bool {
+    let border = gtk::prelude::ScrollableExt::border(terminal);
+    let (horizontal, vertical) = border.as_ref().map_or((0, 0), |border| {
+        (
+            i32::from(border.left()) + i32::from(border.right()),
+            i32::from(border.top()) + i32::from(border.bottom()),
+        )
+    });
+    let columns = (terminal.width() - horizontal).max(0) as i64 / terminal.char_width().max(1);
+    let rows = (terminal.height() - vertical).max(0) as i64 / terminal.char_height().max(1);
+    // set_font changes character metrics before GTK reallocates VTE's PTY.
+    // Geometry is ready only when the published counts fit the current size.
+    rows > 0 && columns > 0 && rows == terminal.row_count() && columns == terminal.column_count()
 }
 
 #[cfg(test)]
