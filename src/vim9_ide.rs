@@ -13,6 +13,8 @@ use vte4::prelude::*;
 
 #[path = "vim9_ide_navigation.rs"]
 mod navigation;
+#[path = "vim9_ide_search.rs"]
+mod project_search;
 
 fn visible(text: &str) -> String {
     jterm_core::review_input::safe_inline_display(text, 1024)
@@ -356,6 +358,26 @@ pub(crate) fn open(
     let header = adw::HeaderBar::new();
     let title = adw::WindowTitle::new("Vim9 IDE", &visible(&session.root().display().to_string()));
     header.set_title_widget(Some(&title));
+    let navigate_back = command_button(
+        &session,
+        &editor,
+        &message,
+        "go-previous-symbolic",
+        "Navigate back (Alt+Left)",
+        || Vim9Command::NavigateBack,
+    );
+    let navigate_forward = command_button(
+        &session,
+        &editor,
+        &message,
+        "go-next-symbolic",
+        "Navigate forward (Alt+Right)",
+        || Vim9Command::NavigateForward,
+    );
+    navigate_back.set_sensitive(false);
+    navigate_forward.set_sensitive(false);
+    header.pack_start(&navigate_back);
+    header.pack_start(&navigate_forward);
     let new_file = button("document-new-symbolic", "New file");
     header.pack_start(&new_file);
     let open_file = button("document-open-symbolic", "Open file (Ctrl+Shift+O)");
@@ -436,6 +458,27 @@ pub(crate) fn open(
     search.set_tooltip_text(Some("Search project text and populate Vim quickfix"));
     tools.append(&search);
     navigation::editor_escape(&search, &editor);
+    let search_options = project_search::SearchOptions::new();
+    tools.append(&search_options.menu);
+    let run_search = button(
+        "system-search-symbolic",
+        "Search project using the selected options",
+    );
+    tools.append(&run_search);
+    {
+        let search = search.clone();
+        run_search.connect_clicked(move |_| search.emit_activate());
+    }
+    let cancel_search = command_button(
+        &session,
+        &editor,
+        &message,
+        "process-stop-symbolic",
+        "Cancel project search",
+        || Vim9Command::CancelSearch,
+    );
+    cancel_search.set_sensitive(false);
+    tools.append(&cancel_search);
     let go_to_line = button("go-jump-symbolic", "Go to line (Ctrl+Shift+G)");
     tools.append(&go_to_line);
     {
@@ -882,13 +925,15 @@ pub(crate) fn open(
         let editor = editor.clone();
         let output_stack = output_stack.clone();
         let output_box = output_box.clone();
+        let search_options = search_options.clone();
         search.connect_activate(move |entry| {
             output_box.set_visible(true);
             output_stack.set_visible_child_name("problems");
             dispatch(
                 &session,
-                Vim9Command::Search {
+                Vim9Command::SearchWithOptions {
                     query: entry.text().into(),
+                    options: search_options.options(),
                 },
                 &message,
                 &editor,
@@ -1038,6 +1083,31 @@ pub(crate) fn open(
             let shift = modifiers.contains(gdk::ModifierType::SHIFT_MASK);
             let alt =
                 modifiers.intersects(gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK);
+            // Navigation history belongs to the Vim grid. In particular,
+            // Alt+Left in a native field or an options popover remains native.
+            if (key == gdk::Key::Left || key == gdk::Key::Right)
+                && modifiers.contains(gdk::ModifierType::ALT_MASK)
+                && !modifiers.intersects(
+                    gdk::ModifierType::CONTROL_MASK
+                        | gdk::ModifierType::SHIFT_MASK
+                        | gdk::ModifierType::SUPER_MASK
+                        | gdk::ModifierType::META_MASK
+                        | gdk::ModifierType::HYPER_MASK,
+                )
+                && editor.has_focus()
+            {
+                dispatch(
+                    &session,
+                    if key == gdk::Key::Left {
+                        Vim9Command::NavigateBack
+                    } else {
+                        Vim9Command::NavigateForward
+                    },
+                    &message,
+                    &editor,
+                );
+                return glib::Propagation::Stop;
+            }
             let command = match key.to_unicode().map(|value| value.to_ascii_lowercase()) {
                 Some('s') if ctrl && !alt => Some(if shift {
                     Vim9Command::SaveAll
@@ -1212,6 +1282,7 @@ pub(crate) fn open(
         close_buffer,
         split_vertical,
         split_horizontal,
+        run_search,
     ];
     for button in &connected_controls {
         button.set_sensitive(false);
@@ -1229,6 +1300,10 @@ pub(crate) fn open(
             button.set_sensitive(connected);
         }
         search.set_sensitive(connected);
+        search_options.menu.set_sensitive(connected);
+        cancel_search.set_sensitive(connected && snapshot.search.running);
+        navigate_back.set_sensitive(connected && snapshot.navigation.can_go_back);
+        navigate_forward.set_sensitive(connected && snapshot.navigation.can_go_forward);
         build.set_sensitive(connected && !snapshot.build.running);
         save_and_build.set_sensitive(connected && !snapshot.build.running);
         cancel_build.set_sensitive(connected && snapshot.build.running);
@@ -1308,31 +1383,7 @@ pub(crate) fn open(
             }
             last_error = snapshot.error.clone();
         }
-        search_feedback.set_label(&if snapshot.search.query.is_empty() {
-            String::new()
-        } else if snapshot.search.running {
-            format!("Searching: {}…", visible(&snapshot.search.query))
-        } else if !snapshot.search.errors.is_empty()
-            || snapshot.search.exit_code < 0
-            || snapshot.search.exit_code > 1
-        {
-            format!(
-                "Search failed ({}): {}",
-                snapshot.search.exit_code,
-                visible(&snapshot.search.errors.join(" · "))
-            )
-        } else {
-            format!(
-                "Search: {} matches{} for {}",
-                snapshot.search.count,
-                if snapshot.search.truncated > 0 {
-                    format!(" · {} omitted", snapshot.search.truncated)
-                } else {
-                    String::new()
-                },
-                visible(&snapshot.search.query)
-            )
-        });
+        search_feedback.set_label(&project_search::feedback(&snapshot.search));
         search_feedback.set_visible(!snapshot.search.query.is_empty());
         build_state.set_label(&if snapshot.build.running {
             "Running…".into()
@@ -1405,18 +1456,29 @@ pub(crate) fn open(
                 )
             })
             .collect::<Vec<_>>();
+        problems_title.set_label(&format!(
+            "PROBLEMS · {}{} · Quickfix: {}",
+            snapshot.diagnostics.len(),
+            if snapshot.diagnostics_truncated {
+                "+"
+            } else {
+                ""
+            },
+            match snapshot.quickfix.source.as_str() {
+                "search" => "Search",
+                "build" => "Build",
+                _ => "Vim",
+            }
+        ));
+        problems_title.set_tooltip_text(Some(&format!(
+            "{} · quickfix item {} of {}. Vim may also supply location-list or language-server diagnostics.",
+            visible(&snapshot.quickfix.title),
+            snapshot.quickfix.index,
+            snapshot.quickfix.count
+        )));
         if diagnostic_rows != old_diagnostics {
             problems.remove_all();
             diagnostic_targets.borrow_mut().clear();
-            problems_title.set_label(&format!(
-                "PROBLEMS · {}{}",
-                snapshot.diagnostics.len(),
-                if snapshot.diagnostics_truncated {
-                    "+"
-                } else {
-                    ""
-                }
-            ));
             for diagnostic in &snapshot.diagnostics {
                 let row = label(&format!(
                     "{}  {}:{}:{}  {}",

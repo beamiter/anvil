@@ -81,6 +81,12 @@ fn native_vim9_edit_save_build_and_modified_close() {
     std::fs::create_dir(root.join("src")).unwrap();
     let nested = root.join("src/chosen.rs");
     std::fs::write(&nested, "first\nsecond\nthird\nfourth\n").unwrap();
+    std::fs::write(
+        root.join("src/search.rs"),
+        "needle\nNeedle\nNEEDLE\nneedles\nneedle42\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("notes.txt"), "needle\n").unwrap();
     open(app.upcast_ref(), None, file.clone());
     let window = app.windows().into_iter().next().expect("native IDE window");
     let native_window = window.clone().downcast::<adw::ApplicationWindow>().unwrap();
@@ -123,6 +129,13 @@ fn native_vim9_edit_save_build_and_modified_close() {
             &[&gdk::Key::F5, &0u32, &gdk::ModifierType::empty()]
         ),
         "F5 in a native field must not start a build"
+    );
+    assert!(
+        !shortcuts.emit_by_name::<bool>(
+            "key-pressed",
+            &[&gdk::Key::Left, &0u32, &gdk::ModifierType::ALT_MASK]
+        ),
+        "Alt+Left in a native search field must not navigate Vim history"
     );
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "before\n");
     let field_escape = named_key_controller(&text_search, "vim9-native-field-escape");
@@ -200,6 +213,114 @@ fn native_vim9_edit_save_build_and_modified_close() {
             && descendants::<gtk::Label>(widget)
                 .iter()
                 .any(|label| label.text().contains("Ln 3/4, Col 2"))
+    });
+    let navigate_back = named_button(widget, "Navigate back (Alt+Left)");
+    wait_for(widget, "native back reflects Vim jump history", || {
+        navigate_back.is_sensitive()
+    });
+    navigate_back.emit_clicked();
+    wait_for(widget, "back restores the preceding Vim location", || {
+        window
+            .title()
+            .is_some_and(|title| title.contains("chosen.rs"))
+            && descendants::<gtk::Label>(widget)
+                .iter()
+                .any(|label| label.text().contains("Ln 1/4, Col 1"))
+    });
+    wait_for(widget, "native forward reflects Vim jump history", || {
+        named_button(widget, "Navigate forward (Alt+Right)").is_sensitive() && editor.has_focus()
+    });
+    assert!(shortcuts.emit_by_name::<bool>(
+        "key-pressed",
+        &[&gdk::Key::Right, &0u32, &gdk::ModifierType::ALT_MASK]
+    ));
+    wait_for(widget, "Alt+Right restores line and column", || {
+        window
+            .title()
+            .is_some_and(|title| title.contains("chosen.rs"))
+            && descendants::<gtk::Label>(widget)
+                .iter()
+                .any(|label| label.text().contains("Ln 3/4, Col 2"))
+    });
+
+    // Set actual native controls and observe real rg results through Vim.
+    // No search starts until Enter or the explicit Search button is used.
+    let options_menu = descendants::<gtk::MenuButton>(widget)
+        .into_iter()
+        .find(|menu| menu.tooltip_text().as_deref() == Some("Project search options"))
+        .expect("native search options menu");
+    options_menu.popup();
+    let options_popover = options_menu.popover().expect("search options popover");
+    let options_widget: &gtk::Widget = options_popover.upcast_ref();
+    let case = descendants::<gtk::DropDown>(options_widget)
+        .into_iter()
+        .next()
+        .expect("native case selector");
+    case.set_selected(2); // Ignore case, even for uppercase query text.
+    let regex = descendants::<gtk::CheckButton>(options_widget)
+        .into_iter()
+        .find(|check| check.label().as_deref() == Some("Regular expression"))
+        .unwrap();
+    regex.set_active(true);
+    descendants::<gtk::CheckButton>(options_widget)
+        .into_iter()
+        .find(|check| check.label().as_deref() == Some("Match whole words"))
+        .unwrap()
+        .set_active(true);
+    let glob = descendants::<gtk::Entry>(options_widget)
+        .into_iter()
+        .find(|entry| {
+            entry.placeholder_text().as_deref() == Some("File pattern, e.g. *.rs or !*.lock")
+        })
+        .expect("native file glob");
+    glob.set_text("*.rs");
+    options_menu.popdown();
+    text_search.set_text("^NEEDLE$");
+    named_button(widget, "Search project using the selected options").emit_clicked();
+    wait_for(
+        widget,
+        "native regex, case, word and file options reach rg",
+        || {
+            descendants::<gtk::Label>(widget).iter().any(|label| {
+                let text = label.text();
+                text.starts_with("Search: 3 matches for ^NEEDLE$")
+                    && text.contains("regex · ignore case · whole words · files: *.rs")
+            })
+        },
+    );
+    assert!(descendants::<gtk::Label>(widget)
+        .iter()
+        .any(|label| label.text().contains("Quickfix: Search")));
+    assert!(
+        !descendants::<gtk::Label>(widget)
+            .iter()
+            .any(|label| { label.text().contains("notes.txt:1:") }),
+        "the file glob must exclude the text-file match"
+    );
+    case.set_selected(1); // Case-sensitive regex now matches only one line.
+    text_search.emit_activate();
+    wait_for(widget, "native Match case produces one result", || {
+        descendants::<gtk::Label>(widget).iter().any(|label| {
+            label.text().starts_with("Search: 1 match for ^NEEDLE$")
+                && label.text().contains("regex · match case")
+        })
+    });
+    text_search.set_text("[");
+    text_search.emit_activate();
+    wait_for(widget, "invalid native regex is reported", || {
+        descendants::<gtk::Label>(widget)
+            .iter()
+            .any(|label| label.text().starts_with("Search failed (2):"))
+    });
+    regex.set_active(false);
+    text_search.set_text("absent_fixture_token");
+    text_search.emit_activate();
+    wait_for(widget, "no matches is a completed search", || {
+        descendants::<gtk::Label>(widget).iter().any(|label| {
+            label
+                .text()
+                .starts_with("Search: 0 matches for absent_fixture_token")
+        })
     });
     named_button(widget, "Split editor vertically").emit_clicked();
     wait_for(widget, "real Vim vertical split", || {

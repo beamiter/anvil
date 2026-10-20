@@ -45,10 +45,11 @@ project roots; select a local pane or launch a local checkout explicitly.
 | --- | --- |
 | Project | Browse one directory at a time, filter filenames, open files, refresh, and move to the parent directory. Directory reads run off the GTK thread and are bounded to 1,024 entries. |
 | Quick open | Ctrl+Shift+P opens a native fuzzy picker across the project. Type a filename or path, use ↑/↓ to select, and press Enter to open. Indexing runs in the background and reports progress, errors, and truncation. Refresh rebuilds the index. |
+| Navigation history | Back/forward buttons and Alt+Left/Alt+Right move through the active Vim window's real jump list, restoring the file and cursor position. Native Go to line records a jump as well. Buttons reflect whether a direction is available. |
 | Open buffers | Shows real Vim buffer names, current-buffer marker and modified marker. Activate a row or use previous/next controls to switch; Close current buffer preserves modified-buffer protection. Split vertically/horizontally creates real Vim windows. |
 | Editor | Real Vim in VTE; normal Vim editing, mappings, mouse and input methods remain active. |
-| Search project | Press Enter to run a project text search and publish results in Vim quickfix and the native Problems list. Requires `rg` in Vim's environment. Progress, errors, match counts and omitted-result counts are visible below the build controls. |
-| Problems | Displays filename, line, column, severity/type and message. Activate a result to open its exact location. F8/Shift+F8 navigate Vim diagnostics. |
+| Search project | Press Enter or Search to run a search with the selected case mode, literal/regex, whole-word and file-glob options. Stop cancels an active search. Requires `rg` in Vim's environment. Progress, errors, cancellations, match counts and omitted-result counts are visible below the build controls. |
+| Problems | Displays filename, line, column, severity/type and message, and identifies the current quickfix list as Search, Build or Vim. Vim may also supply location-list or language-server diagnostics. Activate a result to open its exact location. F8/Shift+F8 navigate Vim diagnostics. |
 | Build | Edit the visible shell command and press Build/F5. Builds run asynchronously in the project root. Cancel stops the active build. Exit status and a bounded output tail are shown in the native Build output tab; parsed diagnostics populate Problems. |
 | Status | Live Vim mode, filename, modified flag, cursor location and total lines, filetype, encoding, window/buffer counts, and bridge connection state. |
 
@@ -74,6 +75,7 @@ UTF-8 path. Sidebar navigation stays inside the project root, including symlink 
 | Terminal workspace | Ctrl+Alt+I | Open Vim9 IDE for the local pane |
 | IDE | Ctrl+Shift+P | Quick open a project file with fuzzy path matching |
 | IDE | Ctrl+Shift+G | Go to line or line:column |
+| Vim editing grid | Alt+Left / Alt+Right | Back / forward through Vim jump history |
 | IDE | Ctrl+Shift+F | Focus project text search |
 | IDE | Ctrl+Shift+B | Focus the build command |
 | IDE | Ctrl+Shift+O | Native file picker |
@@ -91,6 +93,30 @@ go to Vim or the focused native control. In terminal configuration,
 `[keybindings].open_vim9_ide` overrides the launch shortcut.
 
 Escape in a native search/build field returns focus to Vim. Escape in the quick picker or go-to dialog closes that dialog. The folder filter follows the selected row when Enter is pressed. Header buttons show/hide the project and output panels while preserving the editor session; starting a build or search reveals the corresponding output tab.
+
+### Search options and result ownership
+
+Open **Project search options** beside the query to choose **Smart case**
+(the default), **Match case**, or **Ignore case**. Smart case ignores case for
+a lowercase query and matches case when the query contains uppercase text.
+Search is literal unless **Regular expression** is selected; **Match whole
+words** adds ripgrep's word-boundary matching.
+
+The file field accepts one ripgrep glob, such as `*.rs`, `src/**`, or
+`!*.lock`. Spaces and commas are part of that one pattern. Empty means all
+searchable files; the project ignore rules still apply. Changing a control
+does not run a job. Press Enter in the query or click Search to apply the
+options, and use Stop to cancel. Feedback describes the options attached to
+the last search even if the controls have since changed.
+
+A cancelled or failed search retains the preceding quickfix list. The search
+feedback distinguishes cancellation, an error, and a successful search with
+zero matches; the Problems header identifies the quickfix list currently
+displayed. The quickfix count and current item are available in its tooltip.
+Back/forward follows Vim's active-window jump list, so ordinary Vim jumps and
+native navigation share history. It respects Vim's modified-buffer checks,
+and Alt+Left/Alt+Right remains with native controls when the editor grid does
+not own focus.
 
 ## Language services
 
@@ -133,7 +159,11 @@ CLI tests cover directory/file/new-file launch validation, unchanged terminal
 directory requirements, spaces in project paths, and incompatible mode flags.
 Shared-core tests cover command encoding, authenticated transport, file path
 handling and bounded snapshots. An opt-in native GTK smoke test exercises a real
-Vim PTY, fuzzy opening of a nested file, typed line/column navigation, real editor splits, protected buffer close, explicit save-all-and-build, native save/build controls, diagnostics, and modified-buffer close protection. Run it under a
+Vim PTY, fuzzy opening of a nested file, typed line/column navigation and
+jump-history back/forward, native search case/regex/word/glob options, invalid
+patterns and zero matches, real editor splits, protected buffer close, explicit
+save-all-and-build, native save/build controls, diagnostics, and modified-buffer
+close protection. Run it under a
 graphical display (for example Xvfb) with the required Vim:
 
 ```sh
