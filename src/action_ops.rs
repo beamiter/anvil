@@ -316,7 +316,9 @@ impl AppModel {
                     .active_cwd()
                     .or_else(|| std::env::current_dir().ok())
                     .unwrap_or_else(|| std::path::PathBuf::from("/"));
-                if let Err(error) = crate::vim9_ide::launch(root) {
+                if let Err(error) =
+                    crate::vim9_ide::launch(jterm_core::vim9::Vim9EntryRequest::user_action(root))
+                {
                     self.show_toast(format!("Cannot open Vim9 IDE: {error}"));
                 }
             }

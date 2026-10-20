@@ -4,7 +4,9 @@
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
-use jterm_core::vim9::{list_project_directory, ProjectEntry, Vim9Command, Vim9Session};
+use jterm_core::vim9::{
+    list_project_directory, ProjectEntry, Vim9Command, Vim9EntryRequest, Vim9Session,
+};
 use relm4::{adw, gtk};
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -284,14 +286,17 @@ fn open_error(
 /// Existing terminal windows explicitly quit their application on close. Give
 /// each editor its own process so that terminal teardown cannot kill unsaved
 /// buffers. The same binary's --ide path owns the native workbench below.
-pub(crate) fn launch(root: PathBuf) -> std::io::Result<()> {
+pub(crate) fn launch(request: Vim9EntryRequest) -> std::io::Result<()> {
     use std::process::Command;
     let env = jterm_core::child_env::vte_envv_from_captured(
         &jterm_core::child_env::ChildEnv::from_identity(),
         &[],
     )?;
     let mut command = Command::new(std::env::current_exe()?);
-    command.arg("--ide").arg("--working-directory").arg(root);
+    command
+        .arg("--ide")
+        .arg("--working-directory")
+        .arg(request.target());
     command.env_clear();
     for entry in &env {
         if let Some((name, value)) = entry.split_once('=') {
@@ -308,9 +313,9 @@ pub(crate) fn launch(root: PathBuf) -> std::io::Result<()> {
 pub(crate) fn open(
     application: &gtk::Application,
     parent: Option<&adw::ApplicationWindow>,
-    target: PathBuf,
+    request: Vim9EntryRequest,
 ) {
-    let session = match Vim9Session::start(&target) {
+    let session = match Vim9Session::start(request) {
         Ok(session) => session,
         Err(error) => {
             open_error(application, parent, &error.to_string());
@@ -1187,6 +1192,8 @@ pub(crate) fn open(
     }
     window.add_controller(keys);
 
+    let destroy_session = session.clone();
+    window.connect_destroy(move |_| destroy_session.revoke());
     let child_finished = Rc::new(Cell::new(false));
     let closing = Rc::new(Cell::new(false));
     {
@@ -1208,7 +1215,9 @@ pub(crate) fn open(
         let closing = closing.clone();
         let weak = window.downgrade();
         let message = message.clone();
+        let exited_session = session.clone();
         editor.connect_child_exited(move |_, status| {
+            exited_session.revoke();
             finished.set(true);
             if closing.get() || status == 0 {
                 if let Some(window) = weak.upgrade() {
@@ -1236,6 +1245,7 @@ pub(crate) fn open(
     ) {
         Ok(env) => env,
         Err(error) => {
+            session.revoke();
             child_finished.set(true);
             message.set_label(&format!(
                 "Cannot prepare Vim environment: {}",
@@ -1252,6 +1262,7 @@ pub(crate) fn open(
     {
         let finished = child_finished.clone();
         let message = message.clone();
+        let failed_session = session.clone();
         editor.spawn_async(
             vte4::PtyFlags::DEFAULT,
             launch.cwd.to_str(),
@@ -1263,6 +1274,7 @@ pub(crate) fn open(
             None::<&gio::Cancellable>,
             move |result| {
                 if let Err(error) = result {
+                    failed_session.revoke();
                     finished.set(true);
                     message.set_label(&format!(
                         "Cannot start Vim: {}",

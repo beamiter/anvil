@@ -87,7 +87,11 @@ fn native_vim9_edit_save_build_and_modified_close() {
     )
     .unwrap();
     std::fs::write(root.join("notes.txt"), "needle\n").unwrap();
-    open(app.upcast_ref(), None, file.clone());
+    open(
+        app.upcast_ref(),
+        None,
+        Vim9EntryRequest::user_action(file.clone()),
+    );
     let window = app.windows().into_iter().next().expect("native IDE window");
     let native_window = window.clone().downcast::<adw::ApplicationWindow>().unwrap();
     let widget: &gtk::Widget = window.upcast_ref();
@@ -685,7 +689,11 @@ fn native_vim9_split_unicode_visual_and_font_scaling() {
     let right = root.join("right.txt");
     std::fs::write(&left, "LEFT 中文 cafe\u{301}\nsecond left\n").unwrap();
     std::fs::write(&right, "RIGHT 日本語 e\u{301}\nsecond right\n").unwrap();
-    open(app.upcast_ref(), None, left.clone());
+    open(
+        app.upcast_ref(),
+        None,
+        Vim9EntryRequest::user_action(left.clone()),
+    );
     let window = app.windows().into_iter().next().expect("native IDE window");
     window.set_default_size(1440, 980);
     let widget: &gtk::Widget = window.upcast_ref();

@@ -2867,8 +2867,15 @@ fn main() {
                 let root = options.working_directory.clone().unwrap_or_else(|| {
                     std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
                 });
+                let entry = std::cell::RefCell::new(Some(
+                    jterm_core::vim9::Vim9EntryRequest::command_line(root),
+                ));
                 application.connect_activate(move |app| {
-                    vim9_ide::open(app.upcast_ref(), None, root.clone());
+                    if let Some(request) = entry.borrow_mut().take() {
+                        vim9_ide::open(app.upcast_ref(), None, request);
+                    } else if let Some(window) = app.active_window() {
+                        window.present();
+                    }
                 });
                 let _ = application.run_with_args(&["anvil"]);
                 return;
