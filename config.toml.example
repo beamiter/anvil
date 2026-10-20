@@ -64,9 +64,9 @@ command_history_max_entries = 10000
 
 # Block view behavior and optional full-output persistence.
 block_compact = false
-# Experimental native ASCII organism. Motion: "full", "calm", "static", or
+# Native ASCII organism, enabled by default. Motion: "full", "calm", "static", or
 # omit the motion key to follow the desktop animation preference.
-ascii_organism_enabled = false
+ascii_organism_enabled = true
 # ascii_organism_motion = "calm"
 max_visible_blocks = 200
 lazy_load_threshold = 1000

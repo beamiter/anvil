@@ -1327,8 +1327,9 @@ Forge's GTK4 frontend is recorded in
 
 ### ASCII organism
 
-Set `ascii_organism_enabled = true` to attach the optional local organism to
-open and new local Block/Unified panes. It reacts only to content-free command lifecycle facts,
+The local ASCII organism is enabled by default in open and new local
+Block/Unified panes. Set `ascii_organism_enabled = false` to disable it.
+It reacts only to content-free command lifecycle facts,
 focused-pane presence, elapsed time, exit status/duration, and Agent state; it
 does not run commands, use an LLM, or persist command/output text. Its bounded
 memory lives under `${XDG_STATE_HOME:-~/.local/state}/anvil/` and is flushed on

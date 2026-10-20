@@ -2112,7 +2112,7 @@ fn resolve_file_config(fc: FileConfig) -> (Config, Vec<Theme>, KeybindingMap) {
     let tab_width = fc.tab_width.unwrap_or(180).clamp(80, 480);
     let ascii_organism_enabled = env_bool("ANVIL_ASCII_ORGANISM_ENABLED")
         .or(fc.ascii_organism_enabled)
-        .unwrap_or(false);
+        .unwrap_or(true);
     let ascii_organism_motion = resolve_setting_text(
         env_string("ANVIL_ASCII_ORGANISM_MOTION"),
         fc.ascii_organism_motion,
