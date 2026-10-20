@@ -98,6 +98,174 @@ fn native_vim9_edit_save_build_and_modified_close() {
     let save = named_button(widget, "Save (Ctrl+S)");
     wait_for(widget, "authenticated Vim bridge", || save.is_sensitive());
 
+    let native_buffer = descendants::<native_buffer::BufferSurface>(widget)
+        .into_iter()
+        .next()
+        .expect("GTK/Pango buffer paint surface");
+    wait_for(widget, "a displayed native buffer frame", || {
+        native_buffer.painted_frame().is_some()
+    });
+    // Deliberately disagree with ANSI colors and disable termguicolors. A
+    // terminal repaint would be green; the GUI must receive the exact pink
+    // guifg and cyan guisp through the independent semantic render channel.
+    editor.feed_child(b":set notermguicolors | hi Normal guifg=#abcdef guibg=#101820 ctermfg=2 ctermbg=0 | hi JTermGuiProbe guifg=#fa5ea9 guibg=#101820 guisp=#2ce5d7 gui=bold,italic,undercurl ctermfg=2 ctermbg=0 cterm=NONE | syn match JTermGuiProbe /before/\r");
+    wait_for(
+        widget,
+        "GUI RGB survives a different terminal palette",
+        || {
+            native_buffer.painted_frame().is_some_and(|frame| {
+                frame.default_style.background == Some(0x101820)
+                    && frame.runs.iter().any(|run| {
+                        run.text.contains("before")
+                            && run.style.foreground == Some(0xfa5ea9)
+                            && run.style.special == Some(0x2ce5d7)
+                            && run.style.bold
+                            && run.style.italic
+                            && run.style.undercurl
+                    })
+            })
+        },
+    );
+    if let Some(path) = std::env::var_os("JTERM_VIM9_TEST_SCREENSHOT") {
+        let rgb_path = PathBuf::from(path).with_extension("gui-rgb.png");
+        assert!(std::process::Command::new("import")
+            .args(["-window", "root"])
+            .arg(rgb_path)
+            .status()
+            .expect("capture the real GUI RGB buffer")
+            .success());
+    }
+
+    editor.feed_child(b"i");
+    wait_for(widget, "native insert-mode buffer", || {
+        native_buffer
+            .painted_frame()
+            .is_some_and(|frame| frame.mode.starts_with('i'))
+    });
+    let native_im = named_key_controller(&editor, "vim9-native-input-method")
+        .im_context()
+        .expect("native composition context is active");
+    native_im.emit_by_name::<()>("commit", &[&"中文"]);
+    wait_for(
+        widget,
+        "IME commits UTF-8 once to the real Vim buffer",
+        || {
+            native_buffer.painted_frame().is_some_and(|frame| {
+                frame
+                    .runs
+                    .iter()
+                    .filter(|run| run.line == 1)
+                    .map(|run| run.text.as_str())
+                    .collect::<String>()
+                    == "中文before"
+            })
+        },
+    );
+    if let Some(path) = std::env::var_os("JTERM_VIM9_TEST_SCREENSHOT") {
+        assert!(std::process::Command::new("import")
+            .args(["-window", "root"])
+            .arg(PathBuf::from(path).with_extension("gui-ime.png"))
+            .status()
+            .expect("capture native Unicode buffer")
+            .success());
+    }
+    editor.feed_child(b"\x1bu");
+    wait_for(widget, "Vim undo reverses the native IM commit", || {
+        native_buffer.painted_frame().is_some_and(|frame| {
+            frame.mode == "n"
+                && frame.runs.iter().any(|run| run.text.contains("before"))
+                && !frame
+                    .runs
+                    .iter()
+                    .any(|run| run.text.contains('中') || run.text.contains('文'))
+        })
+    });
+
+    let native_toggle = descendants::<gtk::CheckButton>(widget)
+        .into_iter()
+        .find(|button| button.label().as_deref() == Some("Native GUI buffer"))
+        .expect("native render preference");
+    native_toggle.set_active(false);
+    wait_for(
+        widget,
+        "compatibility preference retires the native surface",
+        || native_buffer.painted_frame().is_none(),
+    );
+    native_toggle.set_active(true);
+    wait_for(widget, "native buffer subscription resumes", || {
+        native_buffer.painted_frame().is_some()
+    });
+
+    // Optional X11 integration exercises actual key-event delivery through
+    // the native IM filter, not only feed_child or a synthetic commit signal.
+    if std::env::var_os("JTERM_VIM9_TEST_REAL_KEYS").is_some() {
+        let pid = std::process::id().to_string();
+        let found = std::process::Command::new("xdotool")
+            .args([
+                "search",
+                "--all",
+                "--onlyvisible",
+                "--pid",
+                &pid,
+                "--name",
+                "sample.txt.*Vim9 IDE",
+            ])
+            .output()
+            .expect("find native test window");
+        assert!(found.status.success());
+        let id = String::from_utf8(found.stdout).unwrap();
+        let id = id.lines().next().expect("test X11 window id");
+        assert!(std::process::Command::new("xdotool")
+            .args(["windowfocus", "--sync", id])
+            .status()
+            .unwrap()
+            .success());
+        editor.grab_focus();
+        assert!(std::process::Command::new("xdotool")
+            .args(["type", "--clearmodifiers", "--delay", "4", "AKEY"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("xdotool")
+            .args(["key", "--clearmodifiers", "Escape"])
+            .status()
+            .unwrap()
+            .success());
+        wait_for(
+            widget,
+            "X11 keys cross the native IM filter exactly once",
+            || {
+                native_buffer.painted_frame().is_some_and(|frame| {
+                    frame.mode == "n"
+                        && frame
+                            .runs
+                            .iter()
+                            .filter(|run| run.line == 1)
+                            .map(|run| run.text.as_str())
+                            .collect::<String>()
+                            == "beforeKEY"
+                })
+            },
+        );
+        assert!(std::process::Command::new("xdotool")
+            .args(["key", "--clearmodifiers", "u"])
+            .status()
+            .unwrap()
+            .success());
+        wait_for(widget, "X11 undo restores the real Vim buffer", || {
+            native_buffer.painted_frame().is_some_and(|frame| {
+                frame.mode == "n"
+                    && frame
+                        .runs
+                        .iter()
+                        .filter(|run| run.line == 1)
+                        .map(|run| run.text.as_str())
+                        .collect::<String>()
+                        == "before"
+            })
+        });
+    }
+
     // PTY keystrokes mutate real Vim. The native Save button then sends a typed
     // bridge request; the test does not simulate either text editing or saving.
     editor.feed_child(b"gg0iNATIVE \x1b");
@@ -327,6 +495,12 @@ fn native_vim9_edit_save_build_and_modified_close() {
         descendants::<gtk::Label>(widget)
             .iter()
             .any(|label| label.text().contains("2 windows"))
+    });
+    wait_for(widget, "unsupported split retires the native frame", || {
+        native_buffer.painted_frame().is_none()
+            && descendants::<gtk::Label>(widget)
+                .iter()
+                .any(|label| label.text().starts_with("Vim ·") && label.text().contains("split"))
     });
     editor.feed_child(b"gg0iSAVED \x1b");
     wait_for(widget, "modified nested buffer", || {

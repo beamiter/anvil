@@ -1,5 +1,6 @@
 //! Native Vim9 workbench. Vim owns every editing operation and modified buffer;
-//! GTK owns navigation/chrome, and VTE owns the real interactive Vim PTY.
+//! GTK/Pango paints the buffer from Vim's GUI RGB frame. VTE owns the real
+//! interactive PTY/input path and displays views outside the native contract.
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -11,6 +12,8 @@ use std::rc::Rc;
 use std::time::Duration;
 use vte4::prelude::*;
 
+#[path = "vim9_ide_buffer.rs"]
+mod native_buffer;
 #[path = "vim9_ide_navigation.rs"]
 mod navigation;
 #[path = "vim9_ide_search.rs"]
@@ -340,6 +343,7 @@ pub(crate) fn open(
     let foreground = gdk::RGBA::new(0.85, 0.88, 0.93, 1.0);
     let background = gdk::RGBA::new(0.07, 0.09, 0.12, 1.0);
     editor.set_colors(Some(&foreground), Some(&background), &[]);
+    let native = native_buffer::NativeBuffer::new(&session, &editor);
 
     let message = label("Starting Vim 9 and connecting the workbench…");
     message.set_margin_start(10);
@@ -358,6 +362,8 @@ pub(crate) fn open(
     let header = adw::HeaderBar::new();
     let title = adw::WindowTitle::new("Vim9 IDE", &visible(&session.root().display().to_string()));
     header.set_title_widget(Some(&title));
+    header.pack_end(&native.menu);
+    header.pack_end(&native.badge);
     let navigate_back = command_button(
         &session,
         &editor,
@@ -777,7 +783,7 @@ pub(crate) fn open(
     output_box.append(&output_tabs);
     output_box.append(&output_stack);
     let editor_split = gtk::Paned::new(gtk::Orientation::Vertical);
-    editor_split.set_start_child(Some(&editor));
+    editor_split.set_start_child(Some(&native.widget));
     editor_split.set_end_child(Some(&output_box));
     editor_split.set_resize_start_child(true);
     editor_split.set_shrink_start_child(false);
@@ -1071,8 +1077,14 @@ pub(crate) fn open(
         let open_file = open_file.clone();
         let build = build.clone();
         let close_buffer = close_buffer.clone();
+        let native_surface = native.surface.clone();
         let weak = window.downgrade();
         keys.connect_key_pressed(move |_, key, _, modifiers| {
+            // Composition keys belong to the native input method until its
+            // preedit is committed or cancelled, including Escape and Enter.
+            if native_surface.is_preediting() {
+                return glib::Propagation::Proceed;
+            }
             // Let the active native dialog own its text and shortcut handling.
             if weak.upgrade().is_some_and(|window| {
                 window.visible_dialog().is_some() || navigation::native_text_has_focus(&window)

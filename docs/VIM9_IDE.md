@@ -2,9 +2,45 @@
 
 The Vim9 workbench gives real Vim 9 a native GTK interface. Vim owns text,
 normal/insert/visual modes, registers, macros, undo, buffers, splits, and your
-existing Vim configuration. A dedicated VTE renders its interactive PTY; native
-widgets communicate with a bundled Vim9script bridge through a private,
+existing Vim configuration. The main buffer is rendered by GTK/Pango from
+Vim's buffer text, display positions and **GUI RGB highlight attributes**.
+It does not obtain its colors from ANSI output or VTE palette entries. VTE
+continues to own the real interactive PTY and the compatibility display.
+Native widgets communicate with a bundled Vim9script bridge through a private,
 authenticated local connection.
+
+## Native buffer rendering
+
+Native rendering is enabled by default for supported ordinary buffer views.
+The header reports **GUI · RGB / Pango** while the native surface is drawing.
+Vim `guifg`, `guibg` and `guisp` colors are preserved as full RGB, including
+when `termguicolors` is disabled. Bold, italic, underline, undercurl,
+strikethrough and Visual selection are drawn by the GUI. Pango shapes complete
+same-style runs, with font fallback and optional font ligatures. The mode cursor
+and IME preedit are separate native layers. Text commits still go to the actual
+Vim process, so editing, undo and mappings have a single owner.
+
+Use the header's **Editor rendering, font and line spacing** menu to choose a
+monospace editor font, enable or disable ligatures, adjust line spacing, or
+select the compatibility display. These controls affect this editor window;
+the terminal workspace and sidebar keep their own font settings. The current
+bridge retains Vim display-cell positions for mouse and cursor alignment; this
+does not yet implement variable-width document layout or arbitrary inline
+widgets.
+
+The native surface covers the buffer viewport only. Vim's command/status area
+uses its compatibility display. The bridge explicitly falls back for display
+features it cannot yet reproduce faithfully, including multiple Vim windows,
+closed folds, wrapped continuation rows, diff, popup windows/completion,
+complex signs or fold columns, virtual text, match decorations, concealment,
+and complex bidirectional text. The default single sign column, ordinary
+diagnostic text-property highlights and simple search matches use their GUI styles. The header gives the fallback reason. Native
+rendering resumes when the view becomes supported. Resize transitions also
+retain the compatibility view until Vim publishes matching geometry, so a stale
+frame cannot cover a differently sized input grid. Selecting terminal text
+with Shift-drag temporarily reveals the compatibility display so selection
+feedback remains visible. No options in the user's
+Vim configuration are disabled to force the native path.
 
 ## Start a project
 
@@ -47,7 +83,7 @@ project roots; select a local pane or launch a local checkout explicitly.
 | Quick open | Ctrl+Shift+P opens a native fuzzy picker across the project. Type a filename or path, use ↑/↓ to select, and press Enter to open. Indexing runs in the background and reports progress, errors, and truncation. Refresh rebuilds the index. |
 | Navigation history | Back/forward buttons and Alt+Left/Alt+Right move through the active Vim window's real jump list, restoring the file and cursor position. Native Go to line records a jump as well. Buttons reflect whether a direction is available. |
 | Open buffers | Shows real Vim buffer names, current-buffer marker and modified marker. Activate a row or use previous/next controls to switch; Close current buffer preserves modified-buffer protection. Split vertically/horizontally creates real Vim windows. |
-| Editor | Real Vim in VTE; normal Vim editing, mappings, mouse and input methods remain active. |
+| Editor | GTK/Pango draws supported buffer views with Vim GUI RGB styles, native cursor and IME preedit; real Vim owns editing, mappings and undo. VTE remains the PTY/input adapter and compatibility view. |
 | Search project | Press Enter or Search to run a search with the selected case mode, literal/regex, whole-word and file-glob options. Stop cancels an active search. Requires `rg` in Vim's environment. Progress, errors, cancellations, match counts and omitted-result counts are visible below the build controls. |
 | Problems | Displays filename, line, column, severity/type and message, and identifies the current quickfix list as Search, Build or Vim. Vim may also supply location-list or language-server diagnostics. Activate a result to open its exact location. F8/Shift+F8 navigate Vim diagnostics. |
 | Build | Edit the visible shell command and press Build/F5. Builds run asynchronously in the project root. Cancel stops the active build. Exit status and a bounded output tail are shown in the native Build output tab; parsed diagnostics populate Problems. |
@@ -159,7 +195,10 @@ CLI tests cover directory/file/new-file launch validation, unchanged terminal
 directory requirements, spaces in project paths, and incompatible mode flags.
 Shared-core tests cover command encoding, authenticated transport, file path
 handling and bounded snapshots. An opt-in native GTK smoke test exercises a real
-Vim PTY, fuzzy opening of a nested file, typed line/column navigation and
+Vim PTY, native GUI RGB with deliberately different terminal colors and
+`termguicolors` disabled, Unicode IM-context commits and real Vim undo, native
+render subscription toggling and split fallback, fuzzy opening of a nested
+file, typed line/column navigation and
 jump-history back/forward, native search case/regex/word/glob options, invalid
 patterns and zero matches, real editor splits, protected buffer close, explicit
 save-all-and-build, native save/build controls, diagnostics, and modified-buffer
@@ -169,3 +208,10 @@ graphical display (for example Xvfb) with the required Vim:
 ```sh
 cargo test native_vim9_edit_save_build_and_modified_close -- --ignored --test-threads=1
 ```
+
+Set `JTERM_VIM9_TEST_REAL_KEYS=1` with `xdotool` on an isolated X11 display
+to additionally exercise actual key delivery through the native IM filter.
+Set `JTERM_VIM9_TEST_SCREENSHOT=/tmp/vim9.png` with ImageMagick `import` to
+record the live RGB and Unicode editor windows. This covers GTK IM-context
+commits; platform-specific input-method engines and candidate windows still
+need testing on the target Wayland/X11 desktop.
