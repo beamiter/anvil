@@ -1344,7 +1344,7 @@ pub(crate) fn open(
             "Ready".into()
         });
         output_note.set_label(&format!(
-            "Showing the latest output · {} earlier output lines omitted",
+            "Showing the latest output · {} output lines omitted",
             snapshot.build.truncated
         ));
         output_note.set_visible(snapshot.build.truncated > 0);

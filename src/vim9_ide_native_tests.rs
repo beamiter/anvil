@@ -250,7 +250,7 @@ fn native_vim9_edit_save_build_and_modified_close() {
     assert!(
         descendants::<gtk::Label>(widget)
             .iter()
-            .any(|label| label.text().contains("20 earlier output lines omitted")),
+            .any(|label| label.text().contains("20 output lines omitted")),
         "the native output panel must disclose its retained tail"
     );
     assert!(
