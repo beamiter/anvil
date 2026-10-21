@@ -1317,6 +1317,13 @@ impl BufferSurface {
         let frame = self.imp().state.borrow().frame.clone()?;
         (self.imp().painted_revision.get() == frame.revision).then_some(frame)
     }
+
+    #[cfg(test)]
+    pub(super) fn painted_geometry(&self) -> Option<(Metrics, Vim9PixelRect)> {
+        let presented = self.imp().presented.borrow();
+        let presented = presented.as_ref()?;
+        Some((presented.metrics, presented.cursor?))
+    }
 }
 
 fn zoom_font(font_button: &gtk::FontDialogButton, step: Option<f64>) {
@@ -1757,7 +1764,11 @@ impl NativeBuffer {
             }
             // send() is bounded and refuses unauthenticated sessions; retry
             // subscription after startup rather than silently losing it.
+            // Wait for VTE's new grid before requesting a keyframe: racing
+            // that request with allocation can leave Vim 9.1 on the old grid.
+            // Disabling rendering does not need to wait for allocation.
             if *subscribed != Some(wanted)
+                && (!wanted || terminal_grid_is_allocated(&terminal))
                 && session
                     .send(Vim9Command::SetRender { enabled: wanted })
                     .is_ok()

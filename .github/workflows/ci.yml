@@ -138,6 +138,9 @@ jobs:
           GTK_A11Y: none
         run: |
           set -Eeuo pipefail
+          vim_bin="$(command -v "${JTERM_VIM9_BIN:-${VIM9_TEST_VIM:-vim}}")"
+          export JTERM_VIM9_BIN="$vim_bin" VIM9_TEST_VIM="$vim_bin"
+          "$vim_bin" --version
           cargo_test=(cargo test --locked)
           listed_tests="$("${cargo_test[@]}" vim9_ide -- --include-ignored --list)"
           mapfile -t tests < <(printf '%s\n' "$listed_tests" | sed -n 's/: test$//p')

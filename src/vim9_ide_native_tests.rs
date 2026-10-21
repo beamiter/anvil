@@ -953,6 +953,15 @@ fn native_vim9_split_unicode_visual_and_font_scaling() {
         assert_eq!(styled.columns, before_style.columns);
     }
 
+    let geometry_matches = |frame: &jterm_core::vim9::Vim9RenderFrame| {
+        frame.rows == editor.row_count() as usize
+            && frame.columns == editor.column_count() as usize
+            && buffer.painted_geometry().is_some_and(|(metrics, caret)| {
+                metrics.cell_width == editor.char_width() as f32
+                    && metrics.line_height == editor.char_height() as f32
+                    && Some(caret) == metrics.cursor_rect(&frame.cursor)
+            })
+    };
     let zoom = named_key_controller(&editor, "vim9-buffer-zoom");
     let before_zoom = buffer.painted_frame().unwrap().revision;
     assert!(zoom.emit_by_name::<bool>(
@@ -966,7 +975,7 @@ fn native_vim9_split_unicode_visual_and_font_scaling() {
         || {
             buffer
                 .painted_frame()
-                .is_some_and(|frame| frame.revision > before_zoom)
+                .is_some_and(|frame| frame.revision > before_zoom && geometry_matches(&frame))
         },
     );
     let before_reset = buffer.painted_frame().unwrap().revision;
@@ -981,7 +990,7 @@ fn native_vim9_split_unicode_visual_and_font_scaling() {
         || {
             buffer
                 .painted_frame()
-                .is_some_and(|frame| frame.revision > before_reset)
+                .is_some_and(|frame| frame.revision > before_reset && geometry_matches(&frame))
         },
     );
 
