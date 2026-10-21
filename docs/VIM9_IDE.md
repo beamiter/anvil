@@ -89,7 +89,7 @@ own buffer text, syntax and viewport; the active Vim window alone owns the
 native cursor and IME preedit. The bridge explicitly falls back for display
 features it cannot yet reproduce faithfully, including closed folds, wrapped
 continuation rows, diff, popup windows/completion,
-complex signs or fold columns, virtual text, match decorations, concealment,
+complex signs or fold columns, virtual text, complex match patterns, concealment,
 and complex bidirectional text. The default single sign column, ordinary
 diagnostic text-property highlights and simple search matches use their GUI
 styles. If any pane needs compatibility, the whole editor shows live Vim until
@@ -338,3 +338,31 @@ need testing on the target Wayland/X11 desktop.
 Pinned shared core: `c387ab33caff52a0bd4f759fb20a35aae2586cd0`.
 Passed 4 focused tests and 3 separate real GTK runs (split/Unicode/font at scale 1 and 2, plus edit/save/build/close).
 These runs use Xvfb/software graphics; physical GPU, Wayland and OS IME candidate windows are not certified.
+
+
+## Native plugin highlights
+
+Single-line `matchadd()` / `:match` patterns and byte-based `matchaddpos()`
+positions now use native GUI RGB paint, including the built-in `matchparen`
+plugin. Match priorities, equal-priority insertion order, search precedence,
+Visual selection and independent split-window ownership follow Vim. Plugin
+matches update and disappear without editing the buffer or emitting a special
+invalidation hook. Syntax, properties, text, undo and input remain Vim-owned.
+
+Multiline/context-dependent/zero-width regexes and conceal matches retain an
+explicit compatibility reason. Native paint is bounded to 64 matches and 2048
+positions per window and 512 match/search ranges per source line; exceeding a
+budget shows the real Vim compatibility view instead of partial decoration.
+
+### Plugin validation — 2026-10-21
+
+Pinned shared core: `feae27f7cd965332253a81723095f75850241e81`.
+The locked Nix native test build and the complete GTK/VTE
+`native_vim9_edit_save_build_and_modified_close` workflow pass under Xvfb with
+an isolated Vim startup configuration. Both regex and positional plugin paint
+reach the native Pango surface, disappear without editing, and retain the GUI
+RGB values while terminal truecolor is disabled. The workflow additionally
+checks IM commit, undo, native save/search/build/navigation and modified-close
+protection. The optional `JTERM_VIM9_TEST_REAL_KEYS=1` variant failed at later
+save/jump steps with Vim busy-state refusals on this Vim 9.2 host; that optional
+variant is not reported as passing. Plugin-paint screenshots were inspected.

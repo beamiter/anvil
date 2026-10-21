@@ -148,6 +148,55 @@ fn native_vim9_edit_save_build_and_modified_close() {
             .success());
     }
 
+    // Plugin APIs share the native RGB path while termguicolors remains off.
+    editor.feed_child(b":hi JTermPluginProbe guifg=#f1a234 guibg=#304050 guisp=#ee3344 gui=undercurl ctermfg=2 ctermbg=0 | let g:gui_plugin = matchadd('JTermPluginProbe', 'before')\r");
+    wait_for(
+        widget,
+        "plugin regex highlight reaches native GUI paint",
+        || {
+            native_buffer.painted_frame().is_some_and(|frame| {
+                frame.runs.iter().any(|run| {
+                    run.text == "before"
+                        && run.style.foreground == Some(0xf1a234)
+                        && run.style.background == Some(0x304050)
+                        && run.style.special == Some(0xee3344)
+                        && run.style.undercurl
+                })
+            })
+        },
+    );
+    editor.feed_child(b":call matchdelete(g:gui_plugin) | let g:gui_plugin = matchaddpos('JTermPluginProbe', [[1,2,3]])\r");
+    wait_for(widget, "plugin positional highlight stays native", || {
+        native_buffer.painted_frame().is_some_and(|frame| {
+            frame
+                .runs
+                .iter()
+                .any(|run| run.text == "efo" && run.style.foreground == Some(0xf1a234))
+        })
+    });
+    if let Some(path) = std::env::var_os("JTERM_VIM9_TEST_SCREENSHOT") {
+        assert!(std::process::Command::new("import")
+            .args(["-window", "root"])
+            .arg(PathBuf::from(path).with_extension("gui-plugin.png"))
+            .status()
+            .expect("capture native plugin highlight")
+            .success());
+    }
+    editor.feed_child(b":call matchdelete(g:gui_plugin)\r");
+    wait_for(
+        widget,
+        "plugin removal restores syntax without editing text",
+        || {
+            native_buffer.painted_frame().is_some_and(|frame| {
+                frame
+                    .runs
+                    .iter()
+                    .any(|run| run.text == "before" && run.style.foreground == Some(0xfa5ea9))
+            })
+        },
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "before\n");
+
     editor.feed_child(b"i");
     wait_for(widget, "native insert-mode buffer", || {
         native_buffer
