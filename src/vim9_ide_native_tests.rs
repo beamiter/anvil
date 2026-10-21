@@ -87,10 +87,18 @@ fn native_vim9_edit_save_build_and_modified_close() {
     )
     .unwrap();
     std::fs::write(root.join("notes.txt"), "needle\n").unwrap();
-    open(
+    open_with_config(
         app.upcast_ref(),
         None,
         Vim9EntryRequest::user_action(file.clone()),
+        Vim9UiConfig {
+            toolbar: true,
+            buffer_tabs: true,
+            status_bar: true,
+            project_panel: true,
+            tool_panel: true,
+            ..Default::default()
+        },
     );
     let window = app.windows().into_iter().next().expect("native IDE window");
     let native_window = window.clone().downcast::<adw::ApplicationWindow>().unwrap();
@@ -689,10 +697,11 @@ fn native_vim9_split_unicode_visual_and_font_scaling() {
     let right = root.join("right.txt");
     std::fs::write(&left, "LEFT 中文 cafe\u{301}\nsecond left\n").unwrap();
     std::fs::write(&right, "RIGHT 日本語 e\u{301}\nsecond right\n").unwrap();
-    open(
+    open_with_config(
         app.upcast_ref(),
         None,
         Vim9EntryRequest::user_action(left.clone()),
+        Vim9UiConfig::default(),
     );
     let window = app.windows().into_iter().next().expect("native IDE window");
     window.set_default_size(1440, 980);
@@ -708,6 +717,31 @@ fn native_vim9_split_unicode_visual_and_font_scaling() {
     wait_for(widget, "initial native Unicode buffer", || {
         buffer.painted_frame().is_some()
     });
+
+    // Minimal defaults retain the native editor while every legacy workbench
+    // action is hidden. Hidden tools must not consume user Vim mappings.
+    assert!(!named_button(widget, "Save (Ctrl+S)").is_visible());
+    assert!(!named_button(widget, "Quick open project file (Ctrl+Shift+P)").is_visible());
+    assert!(descendants::<gtk::Paned>(widget).iter().all(|split| {
+        split
+            .start_child()
+            .is_none_or(|child| !child.is_visible() || child.is::<gtk::Overlay>())
+    }));
+    let shortcuts = named_key_controller(&window, "vim9-workbench-shortcuts");
+    for (key, modifiers) in [
+        (gdk::Key::F5, gdk::ModifierType::empty()),
+        (gdk::Key::F8, gdk::ModifierType::empty()),
+        (
+            gdk::Key::F,
+            gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK,
+        ),
+        (
+            gdk::Key::B,
+            gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK,
+        ),
+    ] {
+        assert!(!shortcuts.emit_by_name::<bool>("key-pressed", &[&key, &0u32, &modifiers]));
+    }
 
     // Fixture options are intentionally ordinary supported Vim views. GUI and
     // terminal colors disagree to expose any accidental terminal-grid repaint.
@@ -748,6 +782,24 @@ fn native_vim9_split_unicode_visual_and_font_scaling() {
         "Vim's vertical divider must remain a live compatibility cell"
     );
     assert!(first_frame.covers(first_frame.cursor.row, first_frame.cursor.column));
+
+    let scene_builds = buffer.scene_build_count();
+    editor.feed_child(b"l");
+    wait_for(
+        widget,
+        "cursor-only frame reuses the native text scene",
+        || {
+            buffer.painted_frame().is_some_and(|frame| {
+                frame.revision > first_frame.revision
+                    && frame.cursor.column != first_frame.cursor.column
+            })
+        },
+    );
+    assert_eq!(
+        buffer.scene_build_count(),
+        scene_builds,
+        "cursor-only updates must not rebuild GTK text and background nodes"
+    );
 
     editor.feed_child(b":set hlsearch | hi Search guibg=#70421f gui=NONE\r/RIGHT\r");
     wait_for(
@@ -900,6 +952,38 @@ fn native_vim9_split_unicode_visual_and_font_scaling() {
         assert_eq!(styled.rows, before_style.rows);
         assert_eq!(styled.columns, before_style.columns);
     }
+
+    let zoom = named_key_controller(&editor, "vim9-buffer-zoom");
+    let before_zoom = buffer.painted_frame().unwrap().revision;
+    assert!(zoom.emit_by_name::<bool>(
+        "key-pressed",
+        &[&gdk::Key::equal, &0u32, &gdk::ModifierType::CONTROL_MASK,]
+    ));
+    assert_eq!(font.font_desc().unwrap().size(), 19 * gtk::pango::SCALE);
+    wait_for(
+        widget,
+        "keyboard zoom refreshes native buffer geometry",
+        || {
+            buffer
+                .painted_frame()
+                .is_some_and(|frame| frame.revision > before_zoom)
+        },
+    );
+    let before_reset = buffer.painted_frame().unwrap().revision;
+    assert!(zoom.emit_by_name::<bool>(
+        "key-pressed",
+        &[&gdk::Key::_0, &0u32, &gdk::ModifierType::CONTROL_MASK,]
+    ));
+    assert_eq!(font.font_desc().unwrap().size(), 12 * gtk::pango::SCALE);
+    wait_for(
+        widget,
+        "keyboard zoom reset refreshes native buffer geometry",
+        || {
+            buffer
+                .painted_frame()
+                .is_some_and(|frame| frame.revision > before_reset)
+        },
+    );
 
     // An unsupported feature in any pane must retire every native overlay,
     // never leave a stale valid pane over Vim's updated screen.

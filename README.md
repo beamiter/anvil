@@ -11,7 +11,7 @@ restoration as the only copy of work in progress.
 
 ## Highlights
 
-- Native [Vim9 IDE workbench](docs/VIM9_IDE.md): real Vim 9 editing with
+- Native [Vim9 GUI buffer](docs/VIM9_IDE.md): optional IDE panels default off; real Vim 9 editing with
   GTK/Pango buffer rendering from GUI RGB highlights, editor font/line spacing,
   ligatures and native IME preedit; explicit compatibility display for complex
   Vim views. Includes GTK project

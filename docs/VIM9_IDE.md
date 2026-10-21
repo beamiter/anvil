@@ -9,10 +9,61 @@ continues to own the real interactive PTY and the compatibility display.
 Native widgets communicate with a bundled Vim9script bridge through a private,
 authenticated local connection.
 
+
+## Buffer-first defaults and optional workbench
+
+The default editor opens with a native buffer and a small title/font header.
+Project browsing, open-buffer controls, tool rows, diagnostics/output and the
+extra status bar are opt-in. Put this section in the terminal's `config.toml`;
+the same keys apply to Anvil, Forge, Ember and Frost:
+
+```toml
+[vim9]
+native_buffer = true
+# Optional Vim IDE chrome: all default to false.
+toolbar = false
+buffer_tabs = false
+status_bar = false
+project_panel = false
+tool_panel = false
+```
+
+Set individual options to `true` before opening a new editor window to restore
+those controls. `toolbar` restores header actions; `buffer_tabs` shows the open
+buffers and split controls; `project_panel` shows the directory browser;
+`tool_panel` shows project search, build and Problems/output; `status_bar` shows
+editor state and the render badge. The project directory is not scanned while
+its panel stays closed. Existing configs without `[vim9]` get these minimal
+defaults. Ordinary terminal settings saves preserve the section.
+
+Workbench shortcuts only intercept keys when their corresponding optional
+surface is enabled. Hidden Search/Build fields cannot capture keyboard focus,
+and a hidden build panel does not take over F5/F8 from Vim. **Ctrl+S** and
+**Ctrl+Shift+S** remain buffer save actions. The editor font menu remains
+available, as do **Ctrl+=**, **Ctrl+-**, **Ctrl+0** and **Ctrl+wheel** for buffer
+font zoom; these do not change terminal or sidebar font settings. Rendering
+status and compatibility reasons are available inside the font menu even when
+the status bar is hidden. Real errors and unsaved-close feedback still appear.
+
+The GTK renderer retains one immutable text/background scene, separately from
+cursor and IME overlays. Cursor-only, focus and composition changes reuse the
+native render nodes; changed text, syntax, selection, viewport, font, spacing
+or DPI rebuild the scene. Shared `Vim9RenderMetrics` supplies the same logical
+pixel geometry for viewport clips, cursor painting and IME positioning.
+
+For future native hover cards, Markdown preview, images and color pickers,
+`jterm_core::vim9` provides source anchors tied to a Vim window, buffer,
+changedtick and UTF-8 byte location. The existing GTK overlay can host native
+widgets at those pixel anchors. An asynchronous result must re-resolve its
+source anchor after scroll/zoom and be discarded after a source edit or window
+closure. This release establishes the attachment contract; it does not claim
+those advanced content renderers are already implemented.
+
 ## Native buffer rendering
 
 Native rendering is enabled by default for supported ordinary buffer views.
-The header reports **GUI · RGB / Pango** while the native surface is drawing.
+The rendering menu reports **GUI · RGB / Pango** while the native surface is drawing;
+`status_bar = true` also enables the header badge.
 Vim `guifg`, `guibg` and `guisp` colors are preserved as full RGB, including
 when `termguicolors` is disabled. Bold, italic, underline, undercurl,
 strikethrough and Visual selection are drawn by the GUI. Pango shapes complete
@@ -40,7 +91,7 @@ complex signs or fold columns, virtual text, match decorations, concealment,
 and complex bidirectional text. The default single sign column, ordinary
 diagnostic text-property highlights and simple search matches use their GUI
 styles. If any pane needs compatibility, the whole editor shows live Vim until
-all panes can be sampled faithfully. The header gives the reason; native
+all panes can be sampled faithfully. The rendering menu gives the reason; native
 rendering then resumes automatically. Resize transitions also
 retain the compatibility view until Vim publishes matching geometry, so a stale
 frame cannot cover a differently sized input grid. Selecting terminal text
@@ -81,7 +132,7 @@ only when saved. Normal terminal launches still require a directory. `--ide` can
 `--execute`, `--mode`, or `--safe-mode`. Managed SSH panes are not local IDE
 project roots; select a local pane or launch a local checkout explicitly.
 
-## Workbench layout
+## Workbench layout (opt-in)
 
 | Area | Behavior |
 | --- | --- |

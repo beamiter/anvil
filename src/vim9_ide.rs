@@ -5,7 +5,7 @@
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use jterm_core::vim9::{
-    list_project_directory, ProjectEntry, Vim9Command, Vim9EntryRequest, Vim9Session,
+    list_project_directory, ProjectEntry, Vim9Command, Vim9EntryRequest, Vim9Session, Vim9UiConfig,
 };
 use relm4::{adw, gtk};
 use std::cell::{Cell, RefCell};
@@ -295,6 +295,11 @@ pub(crate) fn launch(request: Vim9EntryRequest) -> std::io::Result<()> {
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("--ide")
+        // The editor is another window of this application, so carry the
+        // selected config explicitly. The frozen PTY environment intentionally
+        // omits process-local --config overrides for ordinary shell children.
+        .arg("--config")
+        .arg(crate::config::config_file_path())
         .arg("--working-directory")
         .arg(request.target());
     command.env_clear();
@@ -314,6 +319,16 @@ pub(crate) fn open(
     application: &gtk::Application,
     parent: Option<&adw::ApplicationWindow>,
     request: Vim9EntryRequest,
+) {
+    let config = crate::config::load_config().0.vim9;
+    open_with_config(application, parent, request, config);
+}
+
+fn open_with_config(
+    application: &gtk::Application,
+    parent: Option<&adw::ApplicationWindow>,
+    request: Vim9EntryRequest,
+    config: Vim9UiConfig,
 ) {
     let session = match Vim9Session::start(request) {
         Ok(session) => session,
@@ -348,9 +363,17 @@ pub(crate) fn open(
     let foreground = gdk::RGBA::new(0.85, 0.88, 0.93, 1.0);
     let background = gdk::RGBA::new(0.07, 0.09, 0.12, 1.0);
     editor.set_colors(Some(&foreground), Some(&background), &[]);
-    let native = native_buffer::NativeBuffer::new(&session, &editor);
+    let native = native_buffer::NativeBuffer::new(&session, &editor, config.native_buffer);
 
-    let message = label("Starting Vim 9 and connecting the workbench…");
+    let message = label(if config.status_bar {
+        "Starting Vim 9 and connecting the workbench…"
+    } else {
+        ""
+    });
+    // Connection errors and unsaved-close feedback must remain visible even
+    // in the minimal editor. Empty informational chrome takes no space.
+    message.set_visible(!message.text().is_empty());
+    message.connect_label_notify(|message| message.set_visible(!message.text().is_empty()));
     message.set_margin_start(10);
     message.set_margin_end(10);
     message.set_margin_top(4);
@@ -363,12 +386,14 @@ pub(crate) fn open(
     status.set_margin_top(6);
     status.set_margin_bottom(6);
     status.add_css_class("caption");
+    status.set_visible(config.status_bar);
 
     let header = adw::HeaderBar::new();
     let title = adw::WindowTitle::new("Vim9 IDE", &visible(&session.root().display().to_string()));
     header.set_title_widget(Some(&title));
     header.pack_end(&native.menu);
     header.pack_end(&native.badge);
+    native.badge.set_visible(config.status_bar);
     let navigate_back = command_button(
         &session,
         &editor,
@@ -608,10 +633,14 @@ pub(crate) fn open(
     files.add_css_class("navigation-sidebar");
     navigation::list_navigation(&query, &files);
     navigation::editor_escape(&query, &editor);
-    project.append(&project_heading);
-    project.append(&location);
-    project.append(&query);
-    project.append(&scroll(&files));
+    let files_section = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    files_section.set_vexpand(true);
+    files_section.set_visible(config.project_panel);
+    files_section.append(&project_heading);
+    files_section.append(&location);
+    files_section.append(&query);
+    files_section.append(&scroll(&files));
+    project.append(&files_section);
     let browser = Rc::new(Browser {
         root: session.root().into(),
         directory: RefCell::new(session.root().into()),
@@ -674,8 +703,11 @@ pub(crate) fn open(
     buffers_heading.add_css_class("heading");
     buffers_heading.set_margin_start(8);
     buffers_heading.set_margin_top(8);
-    project.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    project.append(&buffers_heading);
+    let buffers_section = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    buffers_section.set_visible(config.buffer_tabs);
+    buffers_section.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    buffers_section.append(&buffers_heading);
+    project.append(&buffers_section);
     let buffer_controls = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     buffer_controls.set_margin_start(4);
     let previous_buffer = command_button(
@@ -727,8 +759,9 @@ pub(crate) fn open(
     ] {
         buffer_controls.append(button);
     }
-    project.append(&buffer_controls);
-    project.append(&buffer_scroll);
+    buffers_section.append(&buffer_controls);
+    buffers_section.append(&buffer_scroll);
+    project.set_visible(config.project_panel || config.buffer_tabs);
     {
         let session = session.clone();
         let ids = buffer_ids.clone();
@@ -787,6 +820,7 @@ pub(crate) fn open(
     let output_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     output_box.append(&output_tabs);
     output_box.append(&output_stack);
+    output_box.set_visible(config.tool_panel);
     let editor_split = gtk::Paned::new(gtk::Orientation::Vertical);
     editor_split.set_start_child(Some(&native.widget));
     editor_split.set_end_child(Some(&output_box));
@@ -807,9 +841,18 @@ pub(crate) fn open(
     let toggle_project = button("view-sidebar-symbolic", "Show or hide project panel");
     {
         let project = project.clone();
+        let files_section = files_section.clone();
+        let buffers_section = buffers_section.clone();
+        let browser = browser.clone();
         let editor = editor.clone();
         toggle_project.connect_clicked(move |_| {
-            project.set_visible(!project.is_visible());
+            let show = !files_section.is_visible();
+            files_section.set_visible(show);
+            project.set_visible(show || buffers_section.is_visible());
+            if show && browser.entries.borrow().is_empty() {
+                let directory = browser.directory.borrow().clone();
+                Browser::navigate(&browser, directory);
+            }
             editor.grab_focus();
         });
     }
@@ -954,16 +997,38 @@ pub(crate) fn open(
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&header);
+    tools.set_visible(config.tool_panel);
+    build_bar.set_visible(config.tool_panel);
+    for button in [
+        &navigate_back,
+        &navigate_forward,
+        &new_file,
+        &open_file,
+        &quick_open,
+        &save,
+        &save_all,
+        &previous,
+        &next,
+        &toggle_project,
+        &toggle_output,
+    ] {
+        button.set_visible(config.toolbar);
+    }
+    let tools_separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+    tools_separator.set_visible(config.tool_panel);
+    let build_separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+    build_separator.set_visible(config.tool_panel);
     content.append(&tools);
-    content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    content.append(&tools_separator);
     content.append(&main_split);
-    content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    content.append(&build_separator);
     content.append(&build_bar);
     let search_feedback = label("");
     search_feedback.set_margin_start(10);
     search_feedback.set_margin_end(10);
     search_feedback.set_wrap(true);
     search_feedback.add_css_class("caption");
+    search_feedback.set_visible(false);
     content.append(&search_feedback);
     content.append(&message);
     content.append(&status);
@@ -1112,6 +1177,7 @@ pub(crate) fn open(
                         | gdk::ModifierType::HYPER_MASK,
                 )
                 && editor.has_focus()
+                && config.toolbar
             {
                 dispatch(
                     &session,
@@ -1125,59 +1191,61 @@ pub(crate) fn open(
                 );
                 return glib::Propagation::Stop;
             }
+            // Hidden workbench controls never intercept Vim mappings or
+            // focus an invisible field. Saving remains an editor action.
             let command = match key.to_unicode().map(|value| value.to_ascii_lowercase()) {
                 Some('s') if ctrl && !alt => Some(if shift {
                     Vim9Command::SaveAll
                 } else {
                     Vim9Command::Save
                 }),
-                Some('p') if ctrl && shift && !alt => {
+                Some('p') if ctrl && shift && !alt && config.toolbar => {
                     if quick_open.is_sensitive() {
                         quick_open.emit_clicked();
                     }
                     return glib::Propagation::Stop;
                 }
-                Some('g') if ctrl && shift && !alt => {
+                Some('g') if ctrl && shift && !alt && (config.toolbar || config.tool_panel) => {
                     if go_to_line.is_sensitive() {
                         go_to_line.emit_clicked();
                     }
                     return glib::Propagation::Stop;
                 }
-                Some('f') if ctrl && shift && !alt => {
+                Some('f') if ctrl && shift && !alt && config.tool_panel => {
                     search.grab_focus();
                     search.select_region(0, -1);
                     return glib::Propagation::Stop;
                 }
-                Some('b') if ctrl && shift && !alt => {
+                Some('b') if ctrl && shift && !alt && config.tool_panel => {
                     build_command.grab_focus();
                     build_command.select_region(0, -1);
                     return glib::Propagation::Stop;
                 }
-                Some('w') if ctrl && shift && !alt => {
+                Some('w') if ctrl && shift && !alt && config.buffer_tabs => {
                     if close_buffer.is_sensitive() {
                         close_buffer.emit_clicked();
                     }
                     return glib::Propagation::Stop;
                 }
-                Some('o') if ctrl && shift && !alt => {
+                Some('o') if ctrl && shift && !alt && config.toolbar => {
                     open_file.emit_clicked();
                     return glib::Propagation::Stop;
                 }
-                _ if key == gdk::Key::F5 && !ctrl && !alt && !shift => {
+                _ if key == gdk::Key::F5 && !ctrl && !alt && !shift && config.tool_panel => {
                     if build.is_sensitive() {
                         build.emit_clicked();
                     }
                     return glib::Propagation::Stop;
                 }
-                _ if key == gdk::Key::F8 && !ctrl && !alt => Some(if shift {
+                _ if key == gdk::Key::F8 && !ctrl && !alt && config.tool_panel => Some(if shift {
                     Vim9Command::PreviousDiagnostic
                 } else {
                     Vim9Command::NextDiagnostic
                 }),
-                _ if key == gdk::Key::Page_Up && ctrl && shift && !alt => {
+                _ if key == gdk::Key::Page_Up && ctrl && shift && !alt && config.buffer_tabs => {
                     Some(Vim9Command::PreviousBuffer)
                 }
-                _ if key == gdk::Key::Page_Down && ctrl && shift && !alt => {
+                _ if key == gdk::Key::Page_Down && ctrl && shift && !alt && config.buffer_tabs => {
                     Some(Vim9Command::NextBuffer)
                 }
                 _ => None,
@@ -1285,7 +1353,9 @@ pub(crate) fn open(
         );
     }
 
-    Browser::navigate(&browser, session.root().into());
+    if config.project_panel {
+        Browser::navigate(&browser, session.root().into());
+    }
     let weak_window = window.downgrade();
     let mut old_buffers = Vec::new();
     let mut old_diagnostics = Vec::new();
@@ -1349,9 +1419,11 @@ pub(crate) fn open(
             if closing.get() {
                 dispatch(&session, Vim9Command::Quit, &message, &poll_editor);
             } else {
-                message.set_label(
-                    "Vim9 connected · your Vim configuration and native keybindings are active.",
-                );
+                message.set_label(if config.status_bar {
+                    "Vim9 connected · your Vim configuration and native keybindings are active."
+                } else {
+                    ""
+                });
             }
         }
         was_connected = connected;
@@ -1408,7 +1480,7 @@ pub(crate) fn open(
             last_error = snapshot.error.clone();
         }
         search_feedback.set_label(&project_search::feedback(&snapshot.search));
-        search_feedback.set_visible(!snapshot.search.query.is_empty());
+        search_feedback.set_visible(config.tool_panel && !snapshot.search.query.is_empty());
         build_state.set_label(&if snapshot.build.running {
             "Running…".into()
         } else if snapshot.build.cancelled {

@@ -267,3 +267,14 @@ remote_hosts = []
 # Neither mode edits the destination's .bashrc, .profile, or login shell, and
 # neither needs root. `remote_shell` is ignored when deploy is on.
 # deploy = "persist"
+
+
+# Vim buffer-first GUI. These settings apply to newly opened --ide windows.
+# Turn individual workbench surfaces on explicitly; missing keys use these defaults.
+[vim9]
+native_buffer = true
+toolbar = false
+buffer_tabs = false
+status_bar = false
+project_panel = false
+tool_panel = false

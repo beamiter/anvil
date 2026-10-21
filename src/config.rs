@@ -703,6 +703,8 @@ fn build_plain_ssh_argv_with_control_dir(
 
 #[derive(Clone)]
 pub struct Config {
+    /// Native buffer rendering is independent of optional Vim workbench chrome.
+    pub(crate) vim9: jterm_core::vim9::Vim9UiConfig,
     pub(crate) window_opacity: f64,
     pub(crate) terminal_scrollback_lines: u32,
     pub(crate) font_desc: String,
@@ -844,6 +846,7 @@ impl Config {
         let themes = builtin_themes();
         let theme = &themes[0];
         Self {
+            vim9: jterm_core::vim9::Vim9UiConfig::default(),
             window_opacity: 0.95,
             terminal_scrollback_lines: 5_000,
             font_desc: DEFAULT_FONT_DESC.to_string(),
@@ -1290,9 +1293,24 @@ pub(crate) fn config_file_error() -> Option<String> {
     }
 }
 
+/// Missing Vim settings preserve the buffer-first defaults. This section is
+/// file-owned and survives ordinary terminal settings saves unchanged.
+fn parse_vim9_config(table: &toml::Table) -> jterm_core::vim9::Vim9UiConfig {
+    table
+        .get("vim9")
+        .map(|value| {
+            value.clone().try_into().unwrap_or_else(|error| {
+                log::warn!("Invalid [vim9] configuration: {error}");
+                jterm_core::vim9::Vim9UiConfig::default()
+            })
+        })
+        .unwrap_or_default()
+}
+
 /// Parsed TOML config file structure.
 #[derive(Default)]
 struct FileConfig {
+    vim9: jterm_core::vim9::Vim9UiConfig,
     opacity: Option<f64>,
     scrollback: Option<u32>,
     font: Option<String>,
@@ -1401,6 +1419,7 @@ fn file_config_from_table(table: &toml::Table) -> FileConfig {
     };
 
     FileConfig {
+        vim9: parse_vim9_config(table),
         opacity: config_number(table, "opacity"),
         scrollback: table
             .get("scrollback")
@@ -2158,6 +2177,7 @@ fn resolve_file_config(fc: FileConfig) -> (Config, Vec<Theme>, KeybindingMap) {
     }
 
     let config = Config {
+        vim9: fc.vim9,
         window_opacity,
         terminal_scrollback_lines,
         font_desc,
@@ -2370,6 +2390,23 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vim9_settings_load_independently_from_terminal_and_workbench_defaults() {
+        let empty = toml::Table::new();
+        assert_eq!(
+            parse_vim9_config(&empty),
+            jterm_core::vim9::Vim9UiConfig::default()
+        );
+        let table: toml::Table = "[vim9]\nproject_panel = true\ntool_panel = true\n"
+            .parse()
+            .unwrap();
+        let settings = parse_vim9_config(&table);
+        assert!(settings.native_buffer && settings.project_panel && settings.tool_panel);
+        assert!(!settings.toolbar && !settings.buffer_tabs && !settings.status_bar);
+        let disabled: toml::Table = "[vim9]\nnative_buffer = false\n".parse().unwrap();
+        assert!(!parse_vim9_config(&disabled).native_buffer);
+    }
 
     #[test]
     fn credential_file_selection_preserves_nonempty_paths_for_core_validation() {

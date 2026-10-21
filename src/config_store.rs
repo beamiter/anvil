@@ -1601,7 +1601,13 @@ fn validate_remote_hosts(report: &mut ConfigValidationReport, table: &toml::Tabl
 
 fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
     let mut report = ConfigValidationReport::new(path, true);
+    if let Some(value) = table.get("vim9") {
+        if let Err(error) = value.clone().try_into::<jterm_core::vim9::Vim9UiConfig>() {
+            report.error("vim9", error.to_string());
+        }
+    }
     let known: HashSet<&str> = [
+        "vim9",
         "opacity",
         "scrollback",
         "font",
