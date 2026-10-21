@@ -9,7 +9,7 @@ on:
       core_revision:
         description: Full jterm_core commit SHA
         required: true
-        default: b8e340c3f47b37367a3c2fe56efcd6fbd641f701
+        default: d0e27eac29eaec790c00a63d7b0065f21d14fd1f
 
 permissions:
   contents: write
@@ -20,6 +20,6 @@ concurrency:
 
 jobs:
   prepare:
-    uses: beamiter/jterm_core/.github/workflows/prepare-vim9-core.yml@b8e340c3f47b37367a3c2fe56efcd6fbd641f701
+    uses: beamiter/jterm_core/.github/workflows/prepare-vim9-core.yml@d0e27eac29eaec790c00a63d7b0065f21d14fd1f
     with:
-      core_revision: ${{ inputs.core_revision || 'b8e340c3f47b37367a3c2fe56efcd6fbd641f701' }}
+      core_revision: ${{ inputs.core_revision || 'd0e27eac29eaec790c00a63d7b0065f21d14fd1f' }}
