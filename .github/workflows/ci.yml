@@ -137,8 +137,24 @@ jobs:
           GSK_RENDERER: cairo
           GTK_A11Y: none
         run: |
-          dbus-run-session -- xvfb-run --auto-servernum \
-            cargo test --locked vim9_ide -- --include-ignored --test-threads=1
+          set -Eeuo pipefail
+          cargo_test=(cargo test --locked)
+          listed_tests="$("${cargo_test[@]}" vim9_ide -- --include-ignored --list)"
+          mapfile -t tests < <(printf '%s\n' "$listed_tests" | sed -n 's/: test$//p')
+          if ((${#tests[@]} == 0)); then
+            printf 'No Vim9 IDE tests were discovered.\n' >&2
+            exit 1
+          fi
+          # GTK initialization belongs to one OS thread for the whole process.
+          # Rust uses a new thread per test even with --test-threads=1.
+          failed=0
+          for test_name in "${tests[@]}"; do
+            if ! dbus-run-session -- xvfb-run --auto-servernum \
+              "${cargo_test[@]}" "$test_name" -- --exact --include-ignored --test-threads=1; then
+              failed=1
+            fi
+          done
+          exit "$failed"
 
       - name: Check task accessibility observer failure controls
         run: |
