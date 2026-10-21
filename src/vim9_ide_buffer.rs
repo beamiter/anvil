@@ -5,9 +5,9 @@
 use super::gtk;
 use gtk::{gdk, glib, pango, subclass::prelude::*};
 use jterm_core::vim9::{
-    Vim9BufferPosition, Vim9Command, Vim9PixelRect, Vim9PixelScroll, Vim9PointerPhase,
-    Vim9RenderFrame, Vim9RenderMetrics, Vim9RenderRect, Vim9RenderStyle, Vim9ScrollAccumulator,
-    Vim9ScrollAnimation, Vim9Session, Vim9Viewport,
+    Vim9BufferPosition, Vim9Command, Vim9InputSnapshot, Vim9PixelRect, Vim9PixelScroll,
+    Vim9PointerPhase, Vim9RenderFrame, Vim9RenderMetrics, Vim9RenderRect, Vim9RenderStyle,
+    Vim9ScrollAccumulator, Vim9ScrollAnimation, Vim9Session, Vim9Viewport,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -31,6 +31,8 @@ struct PresentedFrame {
     frame: Arc<Vim9RenderFrame>,
     metrics: Metrics,
     offsets: HashMap<i64, f32>,
+    precision_windows: Vec<i64>,
+    cursor: Option<Vim9PixelRect>,
 }
 
 struct SourceGesture {
@@ -186,10 +188,12 @@ mod imp {
             let surface = self.obj();
             let state = self.state.borrow();
             let Some(frame) = state.frame.as_ref() else {
+                self.presented.borrow_mut().take();
                 return;
             };
             let metrics = state.metrics;
             if !metrics.is_valid() {
+                self.presented.borrow_mut().take();
                 return;
             }
             if !self.pixels.borrow().is_empty() {
@@ -255,6 +259,7 @@ mod imp {
                 }
                 drop(scene);
             }
+            let cursor = surface.projected_cursor();
             *self.presented.borrow_mut() = Some(PresentedFrame {
                 frame: frame.clone(),
                 metrics,
@@ -268,6 +273,8 @@ mod imp {
                         )
                     })
                     .collect(),
+                precision_windows: self.pixels.borrow().keys().copied().collect(),
+                cursor,
             });
             // Cursor and composition are transient layers over the retained
             // buffer scene, and never invalidate unchanged shaped text.
@@ -275,7 +282,7 @@ mod imp {
                 let view = view_rectangle(region, metrics);
                 snapshot.push_clip(&view);
                 if frame.cursor.visible && region.contains(frame.cursor.row, frame.cursor.column) {
-                    let Some(cursor) = surface.presented_cursor().map(graphene_rect) else {
+                    let Some(cursor) = cursor.map(graphene_rect) else {
                         snapshot.pop();
                         continue;
                     };
@@ -677,6 +684,11 @@ impl BufferSurface {
         surface.set_can_target(false);
         surface.set_focusable(false);
         surface.pango_context().set_round_glyph_positions(false);
+        surface.connect_unmap(|surface| {
+            surface.cancel_scroll();
+            surface.imp().pointer.set(None);
+            surface.imp().presented.borrow_mut().take();
+        });
         surface.connect_scale_factor_notify(|surface| {
             // Cached layouts belong to the widget's Pango context. Retire
             // them when it moves between monitors with different DPI.
@@ -766,15 +778,51 @@ impl BufferSurface {
         if Arc::ptr_eq(previous, next) {
             return;
         }
-        let scene = self.imp().text_scene.borrow();
+        let input = self.imp().scroll_input.borrow();
+        let mut scene = self.imp().text_scene.borrow_mut();
+        if !scene
+            .as_ref()
+            .is_some_and(|scene| scene.matches(&state, previous, self.scale_factor()))
+        {
+            let requested_movement = next.windows.iter().any(|window| {
+                input
+                    .requested
+                    .get(&window.window)
+                    .is_some_and(|time| now - time < 0.25)
+                    && previous
+                        .windows
+                        .iter()
+                        .any(|old| old.window == window.window && old.topline != window.topline)
+            });
+            if requested_movement {
+                // Precision snapshots paint directly and do not update the
+                // retained integer scene. Rebuild it lazily when a real wheel
+                // acknowledgement needs that outgoing viewport; otherwise the
+                // first wheel after a touchpad gesture would snap instead of
+                // animating. Cached Pango layouts remain reusable.
+                #[cfg(test)]
+                self.imp()
+                    .scene_builds
+                    .set(self.imp().scene_builds.get() + 1);
+                *scene =
+                    build_text_scene(self, &state, previous, &mut self.imp().layouts.borrow_mut())
+                        .map(|node| TextScene {
+                            frame: previous.clone(),
+                            metrics,
+                            font_generation: state.font_generation,
+                            ligatures: state.ligatures,
+                            scale_factor: self.scale_factor(),
+                            node,
+                        });
+            }
+        }
         let Some(scene) = scene
             .as_ref()
-            .filter(|scene| same_text_content(&scene.frame, previous))
+            .filter(|scene| scene.matches(&state, previous, self.scale_factor()))
         else {
             motions.clear();
             return;
         };
-        let input = self.imp().scroll_input.borrow();
         for window in &next.windows {
             let old = previous
                 .windows
@@ -824,10 +872,10 @@ impl BufferSurface {
                     distance <= offset && distance >= -height
                 }
             });
-            if offset.abs() >= height || outgoing.is_none() {
-                motions.remove(&window.window);
+            if let Some(outgoing) = outgoing.filter(|_| offset.abs() < height) {
+                motion.history.drain(..outgoing);
             } else {
-                motion.history.drain(..outgoing.unwrap());
+                motions.remove(&window.window);
             }
         }
         if was_animating || !motions.is_empty() {
@@ -836,6 +884,12 @@ impl BufferSurface {
     }
 
     pub(super) fn enqueue_scroll(&self, x: f64, y: f64, dy: f64, unit: gdk::ScrollUnit) -> bool {
+        if self.stale_scroll_source_at(x, y) {
+            // The event belongs to the image still on screen. Do not send it
+            // to a replacement buffer before GTK has presented that buffer.
+            self.cancel_scroll();
+            return true;
+        }
         let state = self.imp().state.borrow();
         let Some(frame) = &state.frame else {
             return false;
@@ -902,7 +956,7 @@ impl BufferSurface {
             .map_or(0.0, |motion| motion.animation.offset(state.time) as f32)
     }
 
-    fn presented_cursor(&self) -> Option<Vim9PixelRect> {
+    fn projected_cursor(&self) -> Option<Vim9PixelRect> {
         let state = self.imp().state.borrow();
         let frame = state.frame.as_ref()?;
         let offset = self.presentation_offset(&state, frame, frame.window);
@@ -912,6 +966,23 @@ impl BufferSurface {
         let mut cursor = state.metrics.cursor_rect(&frame.cursor)?;
         cursor.y += offset;
         Some(cursor)
+    }
+
+    /// The IM candidate rectangle must follow the caret already submitted to
+    /// GTK, even when the polling loop has received a newer cursor/scroll frame.
+    /// Geometry and buffer switches retire it until a replacement is painted.
+    fn presented_cursor(&self) -> Option<Vim9PixelRect> {
+        let state = self.imp().state.borrow();
+        let current = state.frame.as_ref()?;
+        let presented = self.imp().presented.borrow();
+        let presented = presented.as_ref()?;
+        if state.metrics != presented.metrics
+            || current.window != presented.frame.window
+            || current.buffer != presented.frame.buffer
+        {
+            return None;
+        }
+        presented.cursor
     }
 
     /// Hit the last submitted native image, not a newer frame received between
@@ -977,16 +1048,81 @@ impl BufferSurface {
         }
     }
 
+    fn precision_image_at(&self, x: f64, y: f64) -> bool {
+        if !x.is_finite() || !y.is_finite() {
+            return false;
+        }
+        self.imp().presented.borrow().as_ref().is_some_and(|shown| {
+            shown.frame.windows.iter().any(|window| {
+                shown.precision_windows.contains(&window.window)
+                    && shown
+                        .offsets
+                        .get(&window.window)
+                        .is_some_and(|offset| *offset != 0.0)
+                    && shown
+                        .metrics
+                        .rect(&window.view)
+                        .is_some_and(|rect| rect.contains(x as f32, y as f32))
+            })
+        })
+    }
+
+    fn stale_precision_at(&self, x: f64, y: f64) -> bool {
+        self.precision_image_at(x, y) && self.source_at(x, y).is_none()
+    }
+
+    fn should_settle_press(&self, x: f64, y: f64, button: u32, count: i32, modified: bool) -> bool {
+        self.stale_precision_at(x, y)
+            || (self.precision_image_at(x, y) && (button != 1 || count != 1 || modified))
+    }
+
+    fn stale_scroll_source_at(&self, x: f64, y: f64) -> bool {
+        if !x.is_finite() || !y.is_finite() {
+            return false;
+        }
+        let presented = self.imp().presented.borrow();
+        let Some(shown) = presented.as_ref() else {
+            return false;
+        };
+        let Some(window) = shown.frame.windows.iter().find(|window| {
+            shown
+                .metrics
+                .rect(&window.view)
+                .is_some_and(|rect| rect.contains(x as f32, y as f32))
+        }) else {
+            return false;
+        };
+        let state = self.imp().state.borrow();
+        state.metrics != shown.metrics
+            || state.frame.as_ref().is_none_or(|current| {
+                current
+                    .windows
+                    .iter()
+                    .find(|live| live.window == window.window)
+                    .is_none_or(|live| {
+                        live.buffer != window.buffer
+                            || live.changedtick != window.changedtick
+                            || live.view != window.view
+                            || live.leftcol != window.leftcol
+                            || live.textoff != window.textoff
+                    })
+            })
+    }
+
     fn direct_source_at(&self, x: f64, y: f64) -> Option<Vim9BufferPosition> {
         let position = self.source_at(x, y)?;
         // Do not replace stationary Vim mouse behavior. Source transactions
         // are necessary only while precision presentation differs from its
         // integer grid; plain clicks/multi-clicks otherwise remain Vim-owned.
-        if !self.imp().pixels.borrow().contains_key(&position.window) {
+        let presented = self.imp().presented.borrow();
+        let presented = presented.as_ref()?;
+        // Cancellation/acknowledgement may retire the live pixel controller
+        // before GTK paints its replacement. Ownership follows the submitted
+        // image until that image is replaced, just like its hit coordinates.
+        if !presented.precision_windows.contains(&position.window) {
             return None;
         }
-        let presented = self.imp().presented.borrow();
-        let offset = presented.as_ref()?.offsets.get(&position.window).copied()?;
+        let offset = presented.offsets.get(&position.window).copied()?;
         (offset != 0.0).then_some(position)
     }
 
@@ -1000,7 +1136,10 @@ impl BufferSurface {
             gesture,
             Vim9PointerPhase::Press,
         )) else {
-            return false;
+            // This press targets a visible fractional image. Failed transport
+            // must settle it, not fall through to different terminal cells.
+            self.cancel_scroll();
+            return true;
         };
         self.imp().gesture_sequence.set(gesture);
         *self.imp().source_gesture.borrow_mut() = Some(SourceGesture {
@@ -1048,9 +1187,24 @@ impl BufferSurface {
         true
     }
 
+    fn source_motion(&self, x: f64, y: f64, primary_down: bool) {
+        if primary_down {
+            self.queue_source_pointer(x, y, Vim9PointerPhase::Drag);
+        } else if let Some(gesture) = self.imp().source_gesture.borrow_mut().as_mut() {
+            // Some compositors/widget grabs lose the release event. A later
+            // hover must finish at the last admitted target, never extend the
+            // selection to the unpressed pointer's new location.
+            if !gesture.released {
+                gesture.pending = Some((gesture.last, Vim9PointerPhase::Release));
+                gesture.released = true;
+            }
+        }
+    }
+
     fn advance_native_input(
         &self,
         session: &Vim9Session,
+        input: &Vim9InputSnapshot,
         next: &Option<Arc<Vim9RenderFrame>>,
         metrics: Metrics,
         enabled: bool,
@@ -1059,7 +1213,8 @@ impl BufferSurface {
         let Some(frame) = next.as_ref() else {
             self.imp().pixels.borrow_mut().clear();
             self.imp().source_gesture.borrow_mut().take();
-            self.imp().presented.borrow_mut().take();
+            // Keep last-image ownership until GTK actually clears/replaces
+            // the surface; an intervening click must not hit a different grid.
             return;
         };
         let changed_geometry = {
@@ -1077,7 +1232,8 @@ impl BufferSurface {
                 })
         };
         let mut pointer = self.imp().source_gesture.borrow_mut();
-        if changed_geometry
+        if !enabled
+            || changed_geometry
             || !matches!(frame.mode.as_str(), "n" | "v")
             || pointer.as_ref().is_some_and(|gesture| {
                 !frame.windows.iter().any(|w| {
@@ -1103,7 +1259,7 @@ impl BufferSurface {
                     .is_some_and(|w| {
                         let pending = scroll
                             .request_id()
-                            .is_some_and(|id| session.command_pending(id));
+                            .is_some_and(|id| input.command_pending(id));
                         scroll.reconcile(w, metrics, pending)
                     })
             });
@@ -1121,7 +1277,7 @@ impl BufferSurface {
             }
         }
         if let Some(gesture) = pointer.as_mut() {
-            if !session.command_pending(gesture.request) {
+            if !input.command_pending(gesture.request) {
                 if let Some((position, phase)) = gesture.pending.take() {
                     match session.send(Self::pointer_command(position, gesture.gesture, phase)) {
                         Ok(id) => {
@@ -1340,10 +1496,16 @@ impl NativeBuffer {
         motion.set_propagation_phase(gtk::PropagationPhase::Capture);
         {
             let surface = surface.downgrade();
-            motion.connect_motion(move |_, x, y| {
+            motion.connect_motion(move |controller, x, y| {
                 if let Some(surface) = surface.upgrade() {
                     surface.imp().pointer.set(Some((x, y)));
-                    surface.queue_source_pointer(x, y, Vim9PointerPhase::Drag);
+                    surface.source_motion(
+                        x,
+                        y,
+                        controller
+                            .current_event_state()
+                            .contains(gdk::ModifierType::BUTTON1_MASK),
+                    );
                 }
             });
         }
@@ -1362,6 +1524,16 @@ impl NativeBuffer {
         {
             let surface = surface.downgrade();
             scroll.connect_scroll(move |controller, dx, dy| {
+                let Some(surface) = surface.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                let Some((x, y)) = surface.imp().pointer.get() else {
+                    return glib::Propagation::Proceed;
+                };
+                if surface.stale_scroll_source_at(x, y) {
+                    surface.cancel_scroll();
+                    return glib::Propagation::Stop;
+                }
                 if controller.current_event_state().intersects(
                     gdk::ModifierType::CONTROL_MASK
                         | gdk::ModifierType::ALT_MASK
@@ -1370,14 +1542,12 @@ impl NativeBuffer {
                 ) || dy == 0.0
                     || dx.abs() > dy.abs()
                 {
+                    if surface.precision_image_at(x, y) {
+                        surface.cancel_scroll();
+                        return glib::Propagation::Stop;
+                    }
                     return glib::Propagation::Proceed;
                 }
-                let Some(surface) = surface.upgrade() else {
-                    return glib::Propagation::Proceed;
-                };
-                let Some((x, y)) = surface.imp().pointer.get() else {
-                    return glib::Propagation::Proceed;
-                };
                 if surface.enqueue_scroll(x, y, dy, controller.unit()) {
                     glib::Propagation::Stop
                 } else {
@@ -1417,6 +1587,14 @@ impl NativeBuffer {
                         | gdk::ModifierType::ALT_MASK
                         | gdk::ModifierType::SUPER_MASK,
                 );
+                if surface.should_settle_press(x, y, gesture.current_button(), count, modified) {
+                    // Consume unsupported clicks and stale images until the
+                    // fractional view settles. Their integer terminal cells
+                    // would not address the source currently on screen.
+                    surface.cancel_scroll();
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                    return;
+                }
                 if gesture.current_button() == 1
                     && count == 1
                     && !modified
@@ -1434,10 +1612,31 @@ impl NativeBuffer {
         {
             let surface = surface.downgrade();
             clicking.connect_released(move |gesture, _, x, y| {
+                if gesture.current_button() != 1 {
+                    return;
+                }
                 if let Some(surface) = surface.upgrade() {
                     if surface.queue_source_pointer(x, y, Vim9PointerPhase::Release) {
                         gesture.set_state(gtk::EventSequenceState::Claimed);
                     }
+                }
+            });
+        }
+        {
+            let surface = surface.downgrade();
+            clicking.connect_unpaired_release(move |_, x, y, button, _| {
+                if button == 1 {
+                    if let Some(surface) = surface.upgrade() {
+                        surface.queue_source_pointer(x, y, Vim9PointerPhase::Release);
+                    }
+                }
+            });
+        }
+        {
+            let surface = surface.downgrade();
+            clicking.connect_cancel(move |_, _| {
+                if let Some(surface) = surface.upgrade() {
+                    surface.cancel_scroll();
                 }
             });
         }
@@ -1545,7 +1744,8 @@ impl NativeBuffer {
                 return glib::ControlFlow::Break;
             };
             let wanted = enabled.is_active();
-            let frame = session.render_snapshot();
+            let input = session.input_snapshot();
+            let frame = input.frame.clone();
             let generation = poll_surface.imp().state.borrow().font_generation;
             if generation != *font_generation {
                 *font_generation = generation;
@@ -1579,7 +1779,13 @@ impl NativeBuffer {
             let next = if active { frame.clone() } else { None };
             let animations =
                 smooth.is_active() && poll_surface.settings().is_gtk_enable_animations();
-            poll_surface.advance_native_input(&session, &next, metrics, active && animations);
+            poll_surface.advance_native_input(
+                &session,
+                &input,
+                &next,
+                metrics,
+                active && animations,
+            );
             poll_surface.retarget_scroll(&next, metrics, now, animations);
             {
                 let mut input = poll_surface.imp().scroll_input.borrow_mut();
@@ -1886,12 +2092,14 @@ mod tests {
             surface.presentation_offset(&surface.imp().state.borrow(), &frame, 10),
             -6.25
         );
-        assert_eq!(surface.presented_cursor().unwrap().y, 13.75);
+        assert_eq!(surface.projected_cursor().unwrap().y, 13.75);
+        assert!(surface.presented_cursor().is_none());
         // Execute the actual GTK snapshot/Pango path, including a partly
         // exposed semantic margin. No GPU/hardware latency is asserted here.
         let snapshot = gtk::Snapshot::new();
         surface.imp().snapshot(&snapshot);
         assert!(snapshot.to_node().is_some());
+        assert_eq!(surface.presented_cursor().unwrap().y, 13.75);
         assert_eq!(surface.source_at(9.0, 75.0).unwrap().line, 14);
         assert_eq!(surface.source_at(9.0, 75.0).unwrap().byte_column, 1);
         assert_eq!(
@@ -1900,18 +2108,60 @@ mod tests {
         );
         assert_eq!(surface.source_at(45.0, 65.0).unwrap().line, 13);
         assert!(surface.source_at(65.0, 75.0).is_none());
+        assert!(!surface.should_settle_press(9.0, 75.0, 1, 1, false));
+        for (button, count, modified) in [(3, 1, false), (1, 2, false), (1, 1, true)] {
+            assert!(surface.should_settle_press(9.0, 75.0, button, count, modified));
+        }
         // Input must still hit the submitted image when a new frame is
         // received before GTK has submitted its replacement snapshot.
         let mut received = (*frame).clone();
         received.revision += 1;
         received.windows[0].topline += 1;
         received.windows[0].botline += 1;
+        received.cursor.row += 1;
+        received.windows[0].cursor.row += 1;
         surface.imp().state.borrow_mut().frame = Some(Arc::new(received));
         assert_eq!(surface.source_at(9.0, 75.0).unwrap().line, 14);
+        assert_eq!(surface.presented_cursor().unwrap().y, 13.75);
+        assert_ne!(surface.projected_cursor(), surface.presented_cursor());
+        assert!(
+            !surface.stale_scroll_source_at(9.0, 75.0),
+            "a valid viewport acknowledgement may change topline before paint"
+        );
         surface.imp().state.borrow_mut().frame = Some(frame.clone());
+
+        // A lost release must not turn later hover movement into a drag. End
+        // at the last accepted source position even when hovering elsewhere.
+        let last = surface.source_at(9.0, 75.0).unwrap();
+        *surface.imp().source_gesture.borrow_mut() = Some(SourceGesture {
+            gesture: 1,
+            request: 1,
+            last,
+            pending: None,
+            released: false,
+        });
+        surface.source_motion(9.0, 10.0, false);
+        {
+            let gesture = surface.imp().source_gesture.borrow();
+            let gesture = gesture.as_ref().unwrap();
+            assert!(gesture.released);
+            assert_eq!(gesture.last, last);
+            assert_eq!(gesture.pending, Some((last, Vim9PointerPhase::Release)));
+        }
+        surface.source_motion(9.0, 30.0, true);
+        assert_eq!(
+            surface.imp().source_gesture.borrow().as_ref().unwrap().last,
+            last
+        );
         surface.cancel_scroll();
         assert!(surface.imp().pixels.borrow().is_empty());
         assert!(surface.imp().source_gesture.borrow().is_none());
+        assert_eq!(surface.presented_cursor().unwrap().y, 13.75);
+        assert_eq!(
+            surface.direct_source_at(9.0, 75.0),
+            Some(last),
+            "retiring input state must not remap an image GTK still displays"
+        );
         let snapshot = gtk::Snapshot::new();
         surface.imp().snapshot(&snapshot);
         assert!(snapshot.to_node().is_some());
@@ -1921,9 +2171,45 @@ mod tests {
             surface.direct_source_at(9.0, 75.0).is_none(),
             "stationary input remains Vim-owned"
         );
+        assert!(!surface.stale_precision_at(9.0, 75.0));
+        for (button, count, modified) in [(3, 1, false), (1, 2, false), (1, 1, true)] {
+            assert!(!surface.should_settle_press(9.0, 75.0, button, count, modified));
+        }
+        assert!(surface.enqueue_scroll(8.0, 10.0, 6.25, gdk::ScrollUnit::Surface));
+        let snapshot = gtk::Snapshot::new();
+        surface.imp().snapshot(&snapshot);
+        assert!(snapshot.to_node().is_some());
         let mut edited = (*frame).clone();
         edited.windows[0].changedtick += 1;
         surface.imp().state.borrow_mut().frame = Some(Arc::new(edited));
         assert!(surface.source_at(9.0, 75.0).is_none());
+        assert!(surface.stale_precision_at(9.0, 75.0));
+        assert!(surface.should_settle_press(9.0, 75.0, 1, 1, false));
+        for unit in [gdk::ScrollUnit::Surface, gdk::ScrollUnit::Wheel] {
+            assert!(surface.enqueue_scroll(9.0, 75.0, 1.0, unit));
+            assert!(surface.imp().pixels.borrow().is_empty());
+            assert!(surface.imp().scroll_input.borrow().pending.is_empty());
+        }
+        let mut replaced = (*frame).clone();
+        replaced.windows[0].buffer += 1;
+        surface.imp().state.borrow_mut().frame = Some(Arc::new(replaced));
+        assert!(surface.stale_scroll_source_at(9.0, 75.0));
+        let mut resized = (*frame).clone();
+        resized.windows[0].view.columns -= 1;
+        surface.imp().state.borrow_mut().frame = Some(Arc::new(resized));
+        assert!(surface.stale_scroll_source_at(9.0, 75.0));
+        assert!(
+            surface.stale_precision_at(9.0, 75.0),
+            "cancel has not replaced the visible image"
+        );
+        surface.imp().state.borrow_mut().frame = None;
+        assert!(
+            surface.stale_precision_at(9.0, 75.0),
+            "an inactive pending frame still has an old visible image"
+        );
+        let snapshot = gtk::Snapshot::new();
+        surface.imp().snapshot(&snapshot);
+        assert!(snapshot.to_node().is_none());
+        assert!(!surface.stale_precision_at(9.0, 75.0));
     }
 }

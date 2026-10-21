@@ -11,7 +11,7 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 # Pin the shared shell GUI entry and precise scrolling contract.
-jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "338011a4d0bb889df6e4116ac5221b50efca0620" }
+jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "9dc44d8bb521b4d8ad9435e2bd6e09aecdf090b0" }
 relm4 = { version = "0.11", features = ["libadwaita", "gnome_46"] }
 vte4 = { version = "0.10.0", features = ["v0_76"] }
 log = { version = "0.4", features = ["std"] }
@@ -41,7 +41,7 @@ io-lifetimes = "3"
 env_logger = "0.11"
 
 [dev-dependencies]
-jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "338011a4d0bb889df6e4116ac5221b50efca0620", features = ["session-parity-tests"] }
+jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "9dc44d8bb521b4d8ad9435e2bd6e09aecdf090b0", features = ["session-parity-tests"] }
 
 [profile.dev]
 opt-level = 1
