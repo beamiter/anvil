@@ -5,8 +5,9 @@
 use super::gtk;
 use gtk::{gdk, glib, pango, subclass::prelude::*};
 use jterm_core::vim9::{
-    Vim9Command, Vim9PixelRect, Vim9RenderFrame, Vim9RenderMetrics, Vim9RenderRect,
-    Vim9RenderStyle, Vim9ScrollAccumulator, Vim9ScrollAnimation, Vim9Session,
+    Vim9BufferPosition, Vim9Command, Vim9PixelRect, Vim9PixelScroll, Vim9PointerPhase,
+    Vim9RenderFrame, Vim9RenderMetrics, Vim9RenderRect, Vim9RenderStyle, Vim9ScrollAccumulator,
+    Vim9ScrollAnimation, Vim9Session, Vim9Viewport,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -24,6 +25,20 @@ struct Preedit {
     text: String,
     attributes: pango::AttrList,
     cursor: i32,
+}
+
+struct PresentedFrame {
+    frame: Arc<Vim9RenderFrame>,
+    metrics: Metrics,
+    offsets: HashMap<i64, f32>,
+}
+
+struct SourceGesture {
+    gesture: u64,
+    request: u64,
+    last: Vim9BufferPosition,
+    pending: Option<(Vim9BufferPosition, Vim9PointerPhase)>,
+    released: bool,
 }
 
 struct PaintState {
@@ -146,6 +161,11 @@ mod imp {
         pub(super) motions: RefCell<HashMap<i64, WindowMotion>>,
         pub(super) scroll_input: RefCell<ScrollInput>,
         pub(super) pointer: Cell<Option<(f64, f64)>>,
+        pub(super) pixels: RefCell<HashMap<i64, Vim9PixelScroll>>,
+        pub(super) pixel_enabled: Cell<bool>,
+        pub(super) source_gesture: RefCell<Option<SourceGesture>>,
+        pub(super) gesture_sequence: Cell<u64>,
+        pub(super) presented: RefCell<Option<PresentedFrame>>,
         #[cfg(test)]
         pub(super) painted_revision: Cell<u64>,
         #[cfg(test)]
@@ -172,80 +192,98 @@ mod imp {
             if !metrics.is_valid() {
                 return;
             }
-            let mut scene = self.text_scene.borrow_mut();
-            if !scene
-                .as_ref()
-                .is_some_and(|cached| cached.matches(&state, frame, surface.scale_factor()))
-            {
-                #[cfg(test)]
-                self.scene_builds.set(self.scene_builds.get() + 1);
-                let mut layouts = self.layouts.borrow_mut();
-                *scene =
-                    build_text_scene(&surface, &state, frame, &mut layouts).map(|node| TextScene {
-                        frame: frame.clone(),
-                        metrics,
-                        font_generation: state.font_generation,
-                        ligatures: state.ligatures,
-                        scale_factor: surface.scale_factor(),
-                        node,
-                    });
-            }
-            if let Some(scene) = scene.as_mut() {
-                // Advance the frame identity after reusing the same scene, so
-                // another focus/preedit snapshot is an O(1) pointer check.
-                scene.frame = frame.clone();
-                let motions = self.motions.borrow();
-                if motions.is_empty() {
-                    snapshot.append_node(&scene.node);
-                } else {
-                    for window in &frame.windows {
-                        let view = view_rectangle(&window.view, metrics);
-                        snapshot.push_clip(&view);
-                        let (_, background, _) = colors(&frame.default_style, &frame.default_style);
-                        snapshot.append_color(&rgb(background), &view);
-                        if let Some(motion) = motions.get(&window.window) {
-                            let offset = motion.animation.offset(state.time) as f32;
-                            if let Some(outgoing) = motion.history.first() {
-                                let delta = window.topline as f64 - outgoing.topline as f64;
-                                paint_shifted_scene(
-                                    snapshot,
-                                    &outgoing.node,
-                                    &view,
-                                    offset - (delta * f64::from(metrics.line_height)) as f32,
-                                );
-                            }
-                            paint_shifted_scene(snapshot, &scene.node, &view, offset);
-                        } else {
-                            snapshot.append_node(&scene.node);
+            if !self.pixels.borrow().is_empty() {
+                paint_pixel_scene(
+                    &surface,
+                    snapshot,
+                    &state,
+                    frame,
+                    &mut self.layouts.borrow_mut(),
+                );
+            } else {
+                let mut scene = self.text_scene.borrow_mut();
+                if !scene
+                    .as_ref()
+                    .is_some_and(|cached| cached.matches(&state, frame, surface.scale_factor()))
+                {
+                    #[cfg(test)]
+                    self.scene_builds.set(self.scene_builds.get() + 1);
+                    let mut layouts = self.layouts.borrow_mut();
+                    *scene = build_text_scene(&surface, &state, frame, &mut layouts).map(|node| {
+                        TextScene {
+                            frame: frame.clone(),
+                            metrics,
+                            font_generation: state.font_generation,
+                            ligatures: state.ligatures,
+                            scale_factor: surface.scale_factor(),
+                            node,
                         }
-                        snapshot.pop();
+                    });
+                }
+                if let Some(scene) = scene.as_mut() {
+                    // Advance the frame identity after reusing the same scene, so
+                    // another focus/preedit snapshot is an O(1) pointer check.
+                    scene.frame = frame.clone();
+                    let motions = self.motions.borrow();
+                    if motions.is_empty() {
+                        snapshot.append_node(&scene.node);
+                    } else {
+                        for window in &frame.windows {
+                            let view = view_rectangle(&window.view, metrics);
+                            snapshot.push_clip(&view);
+                            let (_, background, _) =
+                                colors(&frame.default_style, &frame.default_style);
+                            snapshot.append_color(&rgb(background), &view);
+                            if let Some(motion) = motions.get(&window.window) {
+                                let offset = motion.animation.offset(state.time) as f32;
+                                if let Some(outgoing) = motion.history.first() {
+                                    let delta = window.topline as f64 - outgoing.topline as f64;
+                                    paint_shifted_scene(
+                                        snapshot,
+                                        &outgoing.node,
+                                        &view,
+                                        offset - (delta * f64::from(metrics.line_height)) as f32,
+                                    );
+                                }
+                                paint_shifted_scene(snapshot, &scene.node, &view, offset);
+                            } else {
+                                snapshot.append_node(&scene.node);
+                            }
+                            snapshot.pop();
+                        }
                     }
                 }
+                drop(scene);
             }
-            drop(scene);
+            *self.presented.borrow_mut() = Some(PresentedFrame {
+                frame: frame.clone(),
+                metrics,
+                offsets: frame
+                    .windows
+                    .iter()
+                    .map(|w| {
+                        (
+                            w.window,
+                            surface.presentation_offset(&state, frame, w.window),
+                        )
+                    })
+                    .collect(),
+            });
             // Cursor and composition are transient layers over the retained
             // buffer scene, and never invalidate unchanged shaped text.
             for region in frame.paint_views() {
                 let view = view_rectangle(region, metrics);
                 snapshot.push_clip(&view);
                 if frame.cursor.visible && region.contains(frame.cursor.row, frame.cursor.column) {
-                    let Some(cursor) = metrics.cursor_rect(&frame.cursor).map(graphene_rect) else {
+                    let Some(cursor) = surface.presented_cursor().map(graphene_rect) else {
                         snapshot.pop();
                         continue;
                     };
                     let (foreground, _, _) = colors(&frame.default_style, &frame.default_style);
-                    let offset = self
-                        .motions
-                        .borrow()
-                        .get(&frame.window)
-                        .map_or(0.0, |motion| motion.animation.offset(state.time) as f32);
-                    snapshot.save();
-                    snapshot.translate(&gtk::graphene::Point::new(0.0, offset));
                     paint_cursor(snapshot, &cursor, foreground, &frame.mode, state.focused);
                     if let Some(preedit) = state.preedit.as_ref() {
                         paint_preedit(&surface, snapshot, &state, preedit, &cursor, &view);
                     }
-                    snapshot.restore();
                 }
                 snapshot.pop();
             }
@@ -367,6 +405,90 @@ fn build_text_scene(
         snapshot.pop();
     }
     snapshot.to_node()
+}
+
+fn paint_pixel_scene(
+    surface: &BufferSurface,
+    snapshot: &gtk::Snapshot,
+    state: &PaintState,
+    frame: &Vim9RenderFrame,
+    layouts: &mut HashMap<LayoutKey, pango::Layout>,
+) {
+    let metrics = state.metrics;
+    let baseline = row_baseline(surface, state);
+    if layouts.len() > 4096 {
+        layouts.clear();
+    }
+    for window in &frame.windows {
+        let offset = surface.presentation_offset(state, frame, window.window);
+        let Some(view) = Vim9Viewport::new(frame, window.window, metrics, offset) else {
+            continue;
+        };
+        snapshot.push_clip(&graphene_rect(view.clip()));
+        let (_, background, _) = colors(&frame.default_style, &frame.default_style);
+        snapshot.append_color(&rgb(background), &graphene_rect(view.clip()));
+        for projected in view.runs() {
+            let (_, background, _) = colors(&projected.run.style, &frame.default_style);
+            snapshot.append_color(&rgb(background), &graphene_rect(projected.clip));
+        }
+        for projected in view.runs() {
+            let run = projected.run;
+            let x = projected.rect.x;
+            let y = projected.rect.y;
+            let width = projected.rect.width;
+            let (foreground, _, special) = colors(&run.style, &frame.default_style);
+            if !run.text.is_empty() && width > 0.0 {
+                let key = (run.text.clone(), run.style.bold, run.style.italic);
+                let layout = layouts.entry(key).or_insert_with(|| {
+                    let layout = surface.create_pango_layout(Some(&run.text));
+                    let mut font = state.font.clone();
+                    if run.style.bold {
+                        font.set_weight(pango::Weight::Bold);
+                    }
+                    if run.style.italic {
+                        font.set_style(pango::Style::Italic);
+                    }
+                    layout.set_font_description(Some(&font));
+                    layout.set_single_paragraph_mode(true);
+                    layout.set_auto_dir(false);
+                    let attributes = pango::AttrList::new();
+                    attributes.insert(pango::AttrFontFeatures::new(if state.ligatures {
+                        "calt=1,liga=1"
+                    } else {
+                        "calt=0,liga=0"
+                    }));
+                    layout.set_attributes(Some(&attributes));
+                    layout
+                });
+                let (_, logical) = layout.extents();
+                let logical_width = logical.width() as f32 / pango::SCALE as f32;
+                // A fallback CJK font can have different ascent and
+                // descent from the Latin font. Centering every run's
+                // logical box independently makes their baselines drift.
+                let text_y = y + baseline - layout.baseline() as f32 / pango::SCALE as f32;
+                snapshot.save();
+                snapshot.translate(&gtk::graphene::Point::new(x, text_y));
+                // VTE rounds its input grid to whole logical pixels. Match
+                // that advance without independently slicing Unicode or
+                // breaking a shaped run into terminal-sized glyph boxes.
+                if logical_width > 0.0 {
+                    snapshot.scale(width / logical_width, 1.0);
+                }
+                snapshot.append_layout(layout, &rgb(foreground));
+                snapshot.restore();
+                decorations(
+                    snapshot,
+                    &run.style,
+                    special,
+                    x,
+                    y,
+                    width,
+                    metrics.line_height,
+                );
+            }
+        }
+        snapshot.pop();
+    }
 }
 
 fn graphene_rect(rect: Vim9PixelRect) -> gtk::graphene::Rect {
@@ -597,6 +719,8 @@ impl BufferSurface {
     }
 
     pub(super) fn cancel_scroll(&self) {
+        self.imp().pixels.borrow_mut().clear();
+        self.imp().source_gesture.borrow_mut().take();
         self.imp().motions.borrow_mut().clear();
         let mut input = self.imp().scroll_input.borrow_mut();
         input.fractions.clear();
@@ -616,6 +740,10 @@ impl BufferSurface {
     ) {
         let state = self.imp().state.borrow();
         let mut motions = self.imp().motions.borrow_mut();
+        if !self.imp().pixels.borrow().is_empty() {
+            motions.clear();
+            return;
+        }
         let was_animating = !motions.is_empty();
         if was_animating {
             self.queue_draw();
@@ -730,12 +858,287 @@ impl BufferSurface {
             _ => dy * 3.0,
         };
         let mut input = self.imp().scroll_input.borrow_mut();
+        if self.imp().source_gesture.borrow().is_some() {
+            return true;
+        }
+        if unit == gdk::ScrollUnit::Surface
+            && self.imp().pixel_enabled.get()
+            && frame.mode == "n"
+            && window.native_pointer
+            && !input.pending.contains_key(&window.window)
+        {
+            let mut pixels = self.imp().pixels.borrow_mut();
+            if let Some(scroll) = pixels.get_mut(&window.window) {
+                scroll.push(lines);
+            } else if let Some(mut scroll) = Vim9PixelScroll::new(window, state.metrics) {
+                scroll.push(lines);
+                pixels.insert(window.window, scroll);
+            } else {
+                return false;
+            }
+            input.fractions.discard(window.window);
+            self.imp().motions.borrow_mut().clear();
+            self.queue_draw();
+            return true;
+        }
+        // Discrete wheels keep their established acknowledged-row animation.
+        self.imp().pixels.borrow_mut().clear();
         let count = input.fractions.add(window.window, lines);
         if count != 0 {
             let pending = input.pending.entry(window.window).or_default();
             *pending = (*pending + count).clamp(-120, 120);
         }
         true
+    }
+
+    fn presentation_offset(&self, state: &PaintState, frame: &Vim9RenderFrame, window: i64) -> f32 {
+        if let Some(scroll) = self.imp().pixels.borrow().get(&window) {
+            return scroll.offset(frame, state.metrics);
+        }
+        self.imp()
+            .motions
+            .borrow()
+            .get(&window)
+            .map_or(0.0, |motion| motion.animation.offset(state.time) as f32)
+    }
+
+    fn presented_cursor(&self) -> Option<Vim9PixelRect> {
+        let state = self.imp().state.borrow();
+        let frame = state.frame.as_ref()?;
+        let offset = self.presentation_offset(&state, frame, frame.window);
+        if self.imp().pixels.borrow().contains_key(&frame.window) {
+            return Vim9Viewport::new(frame, frame.window, state.metrics, offset)?.cursor_rect();
+        }
+        let mut cursor = state.metrics.cursor_rect(&frame.cursor)?;
+        cursor.y += offset;
+        Some(cursor)
+    }
+
+    /// Hit the last submitted native image, not a newer frame received between
+    /// presentation ticks. Source generation is checked again before dispatch.
+    fn source_at(&self, x: f64, y: f64) -> Option<Vim9BufferPosition> {
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        let state = self.imp().state.borrow();
+        if state.preedit.is_some() {
+            return None;
+        }
+        let current = state.frame.as_ref()?;
+        if !matches!(current.mode.as_str(), "n" | "v") {
+            return None;
+        }
+        let presented = self.imp().presented.borrow();
+        let presented = presented.as_ref()?;
+        if presented.metrics != state.metrics {
+            return None;
+        }
+        for window in &presented.frame.windows {
+            let live = current.windows.iter().find(|w| w.window == window.window)?;
+            if !window.native_pointer
+                || !live.native_pointer
+                || live.buffer != window.buffer
+                || live.changedtick != window.changedtick
+                || live.view != window.view
+                || live.leftcol != window.leftcol
+                || live.textoff != window.textoff
+            {
+                continue;
+            }
+            let offset = presented
+                .offsets
+                .get(&window.window)
+                .copied()
+                .unwrap_or(0.0);
+            if let Some(view) =
+                Vim9Viewport::new(&presented.frame, window.window, presented.metrics, offset)
+            {
+                if let Some(anchor) = view.anchor_at(x as f32, y as f32) {
+                    return Some(anchor.position);
+                }
+            }
+        }
+        None
+    }
+
+    fn pointer_command(
+        position: Vim9BufferPosition,
+        gesture: u64,
+        phase: Vim9PointerPhase,
+    ) -> Vim9Command {
+        Vim9Command::Pointer {
+            window: position.window,
+            buffer: position.buffer,
+            changedtick: position.changedtick,
+            line: position.line,
+            byte_column: position.byte_column,
+            gesture,
+            phase,
+        }
+    }
+
+    fn direct_source_at(&self, x: f64, y: f64) -> Option<Vim9BufferPosition> {
+        let position = self.source_at(x, y)?;
+        // Do not replace stationary Vim mouse behavior. Source transactions
+        // are necessary only while precision presentation differs from its
+        // integer grid; plain clicks/multi-clicks otherwise remain Vim-owned.
+        if !self.imp().pixels.borrow().contains_key(&position.window) {
+            return None;
+        }
+        let presented = self.imp().presented.borrow();
+        let offset = presented.as_ref()?.offsets.get(&position.window).copied()?;
+        (offset != 0.0).then_some(position)
+    }
+
+    fn press_source(&self, session: &Vim9Session, x: f64, y: f64) -> bool {
+        let Some(position) = self.direct_source_at(x, y) else {
+            return false;
+        };
+        let gesture = self.imp().gesture_sequence.get() % i32::MAX as u64 + 1;
+        let Ok(request) = session.send(Self::pointer_command(
+            position,
+            gesture,
+            Vim9PointerPhase::Press,
+        )) else {
+            return false;
+        };
+        self.imp().gesture_sequence.set(gesture);
+        *self.imp().source_gesture.borrow_mut() = Some(SourceGesture {
+            gesture,
+            request,
+            last: position,
+            pending: None,
+            released: false,
+        });
+        // Drop unsent legacy wheel impulses; an already accepted source-bound
+        // scroll stays ordered ahead of the click on the same bridge channel.
+        let mut input = self.imp().scroll_input.borrow_mut();
+        input.pending.clear();
+        input.fractions.clear();
+        input.requested.clear();
+        self.imp().motions.borrow_mut().clear();
+        true
+    }
+
+    fn queue_source_pointer(&self, x: f64, y: f64, phase: Vim9PointerPhase) -> bool {
+        let target = self.source_at(x, y);
+        let mut gesture = self.imp().source_gesture.borrow_mut();
+        let Some(gesture) = gesture.as_mut() else {
+            return false;
+        };
+        if gesture.released {
+            return true;
+        }
+        let position = target.filter(|p| {
+            p.window == gesture.last.window
+                && p.buffer == gesture.last.buffer
+                && p.changedtick == gesture.last.changedtick
+        });
+        if phase == Vim9PointerPhase::Release {
+            // Releasing outside the split completes at the last admitted
+            // source target, never at another split or fabricated source row.
+            gesture.pending = Some((position.unwrap_or(gesture.last), phase));
+            gesture.released = true;
+        } else if let Some(position) = position {
+            if position != gesture.last {
+                gesture.pending = Some((position, phase));
+                gesture.last = position;
+            }
+        }
+        true
+    }
+
+    fn advance_native_input(
+        &self,
+        session: &Vim9Session,
+        next: &Option<Arc<Vim9RenderFrame>>,
+        metrics: Metrics,
+        enabled: bool,
+    ) {
+        self.imp().pixel_enabled.set(enabled);
+        let Some(frame) = next.as_ref() else {
+            self.imp().pixels.borrow_mut().clear();
+            self.imp().source_gesture.borrow_mut().take();
+            self.imp().presented.borrow_mut().take();
+            return;
+        };
+        let changed_geometry = {
+            let state = self.imp().state.borrow();
+            state.metrics != metrics
+                || state.frame.as_ref().is_some_and(|old| {
+                    old.rows != frame.rows
+                        || old.columns != frame.columns
+                        || old.windows.len() != frame.windows.len()
+                        || old
+                            .windows
+                            .iter()
+                            .zip(&frame.windows)
+                            .any(|(a, b)| a.window != b.window || a.view != b.view)
+                })
+        };
+        let mut pointer = self.imp().source_gesture.borrow_mut();
+        if changed_geometry
+            || !matches!(frame.mode.as_str(), "n" | "v")
+            || pointer.as_ref().is_some_and(|gesture| {
+                !frame.windows.iter().any(|w| {
+                    w.window == gesture.last.window
+                        && w.buffer == gesture.last.buffer
+                        && w.changedtick == gesture.last.changedtick
+                        && w.native_pointer
+                })
+            })
+        {
+            *pointer = None;
+        }
+        let mut pixels = self.imp().pixels.borrow_mut();
+        let before = pixels.len();
+        if !enabled || changed_geometry || (frame.mode != "n" && pointer.is_none()) {
+            pixels.clear();
+        } else {
+            pixels.retain(|window, scroll| {
+                frame
+                    .windows
+                    .iter()
+                    .find(|w| w.window == *window)
+                    .is_some_and(|w| {
+                        let pending = scroll
+                            .request_id()
+                            .is_some_and(|id| session.command_pending(id));
+                        scroll.reconcile(w, metrics, pending)
+                    })
+            });
+        }
+        if pixels.len() != before {
+            self.queue_draw();
+        }
+        if pointer.is_none() && frame.mode == "n" {
+            for scroll in pixels.values_mut() {
+                if let Some(command) = scroll.command() {
+                    if let Ok(id) = session.send(command) {
+                        scroll.submitted(id);
+                    }
+                }
+            }
+        }
+        if let Some(gesture) = pointer.as_mut() {
+            if !session.command_pending(gesture.request) {
+                if let Some((position, phase)) = gesture.pending.take() {
+                    match session.send(Self::pointer_command(position, gesture.gesture, phase)) {
+                        Ok(id) => {
+                            gesture.request = id;
+                            gesture.last = position;
+                        }
+                        // Fail closed on transport saturation/disconnect. Do
+                        // not replay an old drag after unrelated keyboard input.
+                        Err(_) => {
+                            *pointer = None;
+                        }
+                    }
+                } else if gesture.released {
+                    *pointer = None;
+                }
+            }
+        }
     }
 
     #[cfg(test)]
@@ -823,7 +1226,7 @@ impl NativeBuffer {
         let smooth = gtk::CheckButton::with_label("Smooth scrolling");
         smooth.set_active(smooth_enabled);
         smooth.set_tooltip_text(Some(
-            "Animate acknowledged Vim viewport movement; obeys system reduced-motion settings.",
+            "Direct precision-device pixels with source-checked clicks; discrete wheels use bounded easing. Obeys reduced-motion settings.",
         ));
         settings.append(&smooth);
         {
@@ -934,11 +1337,13 @@ impl NativeBuffer {
 
         let motion = gtk::EventControllerMotion::new();
         motion.set_name(Some("vim9-buffer-pointer"));
+        motion.set_propagation_phase(gtk::PropagationPhase::Capture);
         {
             let surface = surface.downgrade();
             motion.connect_motion(move |_, x, y| {
                 if let Some(surface) = surface.upgrade() {
                     surface.imp().pointer.set(Some((x, y)));
+                    surface.queue_source_pointer(x, y, Vim9PointerPhase::Drag);
                 }
             });
         }
@@ -981,8 +1386,7 @@ impl NativeBuffer {
             });
         }
         terminal.add_controller(scroll);
-        // Finish the short visual easing tail before Vim processes a click or
-        // editing key, so input always targets the exact displayed source row.
+        // Keyboard/preedit cancels unsent native gestures before PTY input.
         let editing = gtk::EventControllerKey::new();
         editing.set_name(Some("vim9-buffer-scroll-stop"));
         editing.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -1001,9 +1405,39 @@ impl NativeBuffer {
         clicking.set_propagation_phase(gtk::PropagationPhase::Capture);
         {
             let surface = surface.downgrade();
-            clicking.connect_pressed(move |_, _, _, _| {
-                if let Some(surface) = surface.upgrade() {
+            let terminal = terminal.downgrade();
+            let session = session.clone();
+            clicking.connect_pressed(move |gesture, count, x, y| {
+                let Some(surface) = surface.upgrade() else {
+                    return;
+                };
+                let modified = gesture.current_event_state().intersects(
+                    gdk::ModifierType::CONTROL_MASK
+                        | gdk::ModifierType::SHIFT_MASK
+                        | gdk::ModifierType::ALT_MASK
+                        | gdk::ModifierType::SUPER_MASK,
+                );
+                if gesture.current_button() == 1
+                    && count == 1
+                    && !modified
+                    && surface.press_source(&session, x, y)
+                {
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                    if let Some(terminal) = terminal.upgrade() {
+                        terminal.grab_focus();
+                    }
+                } else {
                     surface.cancel_scroll();
+                }
+            });
+        }
+        {
+            let surface = surface.downgrade();
+            clicking.connect_released(move |gesture, _, x, y| {
+                if let Some(surface) = surface.upgrade() {
+                    if surface.queue_source_pointer(x, y, Vim9PointerPhase::Release) {
+                        gesture.set_state(gtk::EventSequenceState::Claimed);
+                    }
                 }
             });
         }
@@ -1089,6 +1523,9 @@ impl NativeBuffer {
                         im.focus_out();
                     }
                 }
+                if !terminal.has_focus() {
+                    surface.cancel_scroll();
+                }
                 surface.imp().state.borrow_mut().focused = terminal.has_focus();
                 surface.queue_draw();
             });
@@ -1142,6 +1579,7 @@ impl NativeBuffer {
             let next = if active { frame.clone() } else { None };
             let animations =
                 smooth.is_active() && poll_surface.settings().is_gtk_enable_animations();
+            poll_surface.advance_native_input(&session, &next, metrics, active && animations);
             poll_surface.retarget_scroll(&next, metrics, now, animations);
             {
                 let mut input = poll_surface.imp().scroll_input.borrow_mut();
@@ -1199,10 +1637,7 @@ impl NativeBuffer {
                 }
             }
             if active {
-                if let Some(cursor) = frame
-                    .as_ref()
-                    .and_then(|frame| metrics.cursor_rect(&frame.cursor))
-                {
+                if let Some(cursor) = poll_surface.presented_cursor() {
                     im.set_cursor_location(&gdk::Rectangle::new(
                         cursor.x.round() as i32,
                         cursor.y.round() as i32,
@@ -1358,5 +1793,137 @@ mod tests {
             colors(&Vim9RenderStyle::default(), &normal),
             (0x123456, 0x789abc, 0x123456)
         );
+    }
+
+    #[test]
+    #[ignore = "requires GTK display; exercised by the native pixel integration CI"]
+    fn native_pixel_snapshot_and_source_hit_round_trip() {
+        gtk::init().expect("GTK display required");
+        use jterm_core::vim9::{
+            Vim9RenderCursor, Vim9RenderMarginRow, Vim9RenderRun, Vim9RenderWindow,
+        };
+        let surface = BufferSurface::new();
+        let metrics = Metrics {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            cell_width: 8.0,
+            line_height: 20.0,
+        };
+        let cursor = Vim9RenderCursor {
+            row: 1,
+            column: 0,
+            width: 1,
+            visible: true,
+            line: 11,
+            byte_column: 0,
+        };
+        let region = Vim9RenderRect {
+            row: 0,
+            column: 0,
+            rows: 4,
+            columns: 8,
+        };
+        let run = |row, line, text: &str| Vim9RenderRun {
+            window: 10,
+            row,
+            column: 0,
+            cells: text.len(),
+            text: text.into(),
+            line,
+            byte_start: 0,
+            byte_end: text.len(),
+            ..Default::default()
+        };
+        let frame = Arc::new(Vim9RenderFrame {
+            revision: 1,
+            supported: true,
+            rows: 6,
+            columns: 8,
+            window: 10,
+            buffer: 1,
+            changedtick: 3,
+            mode: "n".into(),
+            view: region.clone(),
+            cursor: cursor.clone(),
+            windows: vec![Vim9RenderWindow {
+                window: 10,
+                buffer: 1,
+                changedtick: 3,
+                view: region,
+                cursor,
+                topline: 10,
+                botline: 13,
+                line_count: 100,
+                native_pointer: true,
+                line_lengths: vec![2, 2, 2, 0],
+                overscan: vec![
+                    Vim9RenderMarginRow {
+                        row: -1,
+                        line: 9,
+                        byte_length: 3,
+                        runs: vec![run(0, 9, "pre")],
+                    },
+                    Vim9RenderMarginRow {
+                        row: 4,
+                        line: 14,
+                        byte_length: 4,
+                        runs: vec![run(0, 14, "post")],
+                    },
+                ],
+                ..Default::default()
+            }],
+            runs: vec![run(0, 10, "AB"), run(1, 11, "CD"), run(2, 12, "EF")],
+            ..Default::default()
+        });
+        {
+            let mut state = surface.imp().state.borrow_mut();
+            state.metrics = metrics;
+            state.frame = Some(frame.clone());
+        }
+        surface.imp().pixel_enabled.set(true);
+        assert!(surface.enqueue_scroll(8.0, 10.0, 6.25, gdk::ScrollUnit::Surface));
+        assert_eq!(
+            surface.presentation_offset(&surface.imp().state.borrow(), &frame, 10),
+            -6.25
+        );
+        assert_eq!(surface.presented_cursor().unwrap().y, 13.75);
+        // Execute the actual GTK snapshot/Pango path, including a partly
+        // exposed semantic margin. No GPU/hardware latency is asserted here.
+        let snapshot = gtk::Snapshot::new();
+        surface.imp().snapshot(&snapshot);
+        assert!(snapshot.to_node().is_some());
+        assert_eq!(surface.source_at(9.0, 75.0).unwrap().line, 14);
+        assert_eq!(surface.source_at(9.0, 75.0).unwrap().byte_column, 1);
+        assert_eq!(
+            surface.direct_source_at(9.0, 75.0),
+            surface.source_at(9.0, 75.0)
+        );
+        assert_eq!(surface.source_at(45.0, 65.0).unwrap().line, 13);
+        assert!(surface.source_at(65.0, 75.0).is_none());
+        // Input must still hit the submitted image when a new frame is
+        // received before GTK has submitted its replacement snapshot.
+        let mut received = (*frame).clone();
+        received.revision += 1;
+        received.windows[0].topline += 1;
+        received.windows[0].botline += 1;
+        surface.imp().state.borrow_mut().frame = Some(Arc::new(received));
+        assert_eq!(surface.source_at(9.0, 75.0).unwrap().line, 14);
+        surface.imp().state.borrow_mut().frame = Some(frame.clone());
+        surface.cancel_scroll();
+        assert!(surface.imp().pixels.borrow().is_empty());
+        assert!(surface.imp().source_gesture.borrow().is_none());
+        let snapshot = gtk::Snapshot::new();
+        surface.imp().snapshot(&snapshot);
+        assert!(snapshot.to_node().is_some());
+        assert_eq!(surface.source_at(9.0, 75.0).unwrap().line, 13);
+        assert_eq!(surface.presented_cursor().unwrap().y, 20.0);
+        assert!(
+            surface.direct_source_at(9.0, 75.0).is_none(),
+            "stationary input remains Vim-owned"
+        );
+        let mut edited = (*frame).clone();
+        edited.windows[0].changedtick += 1;
+        surface.imp().state.borrow_mut().frame = Some(Arc::new(edited));
+        assert!(surface.source_at(9.0, 75.0).is_none());
     }
 }
