@@ -1486,7 +1486,10 @@ impl SimpleComponent for AppModel {
         {
             let close_sender = sender.clone();
             let quit_allowed = model.quit_allowed.clone();
-            root.connect_close_request(move |_| {
+            root.connect_close_request(move |window| {
+                if crate::vim9_ide::request_embedded_close(window) {
+                    return glib::Propagation::Stop;
+                }
                 if quit_allowed.get() {
                     glib::Propagation::Proceed
                 } else {
@@ -1820,6 +1823,7 @@ impl SimpleComponent for AppModel {
             }
         }
 
+        crate::vim9_ide::install_shell_host(&root);
         model.init_file_tree();
         {
             let ttl_sender = sender.clone();
@@ -2797,6 +2801,15 @@ fn main() {
     // of ours. Every `main` exit path below shares this line, including the
     // subcommands that never open a window, so no route can lose the lane.
     jterm_core::organism_memory::init_scheduler(Box::new(OrganismLane));
+    if let Some(result) =
+        jterm_core::vim9::forward_shell_vim(&std::env::args_os().skip(1).collect::<Vec<_>>())
+    {
+        let status = result.unwrap_or_else(|error| {
+            eprintln!("anvil: {error}");
+            1
+        });
+        std::process::exit(status);
+    }
     let shell_request =
         match jterm_core::vim9::shell_vim_request(&std::env::args_os().skip(1).collect::<Vec<_>>())
         {

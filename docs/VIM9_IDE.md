@@ -107,8 +107,9 @@ In newly opened local interactive panes, `vim`, `vim file.txt`,
 `vim +37 "name with spaces.txt"` and multi-file/split arguments automatically
 open the native GUI editor. The shell expands and quotes arguments normally;
 the frontend receives the exact argument vector and working directory. This
-uses a separate native window in Anvil and Forge. The originating shell waits
-until Vim exits and receives its actual exit status, including `:cquit`.
+uses the originating tab/pane inside the existing GUI. The original terminal
+view is restored when Vim exits, and its shell receives the actual exit status,
+including `:cquit`. No second GUI window is created for shell entry.
 Unsaved-buffer close protection still belongs to Vim.
 
 `auto_gui = false` keeps the ordinary command-line entry in the terminal.

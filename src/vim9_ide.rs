@@ -9,6 +9,7 @@ use jterm_core::vim9::{
 };
 use relm4::{adw, gtk};
 use std::cell::{Cell, RefCell};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -346,8 +347,207 @@ pub(crate) fn shell_environment(argv: &[String], enabled: bool) -> Vec<(String, 
     }
 }
 
-/// The originating shell waits for this window and receives Vim's actual exit
-/// code, including :cquit. Failed children cannot hold the prompt open forever.
+/// The managed shell keeps its original PTY while this pane hosts Vim.
+struct EmbeddedLaunch {
+    container: gtk::Box,
+    source: gtk::Widget,
+    completion: jterm_core::vim9::Vim9ShellCompletion,
+}
+
+struct EmbeddedHost {
+    container: gtk::Box,
+    source: gtk::Widget,
+    children: Vec<(gtk::Widget, bool)>,
+    controllers: Vec<(gtk::EventController, gtk::PropagationPhase)>,
+    content: RefCell<Option<glib::WeakRef<gtk::Box>>>,
+    completion: RefCell<Option<jterm_core::vim9::Vim9ShellCompletion>>,
+    finished: Cell<bool>,
+}
+
+thread_local! {
+    static EMBEDDED_EDITORS: RefCell<Vec<(glib::WeakRef<gtk::Box>, Vim9Session)>> = const { RefCell::new(Vec::new()) };
+}
+
+impl EmbeddedHost {
+    fn new(launch: EmbeddedLaunch) -> Rc<Self> {
+        let mut children = Vec::new();
+        let mut child = launch.container.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            children.push((widget.clone(), widget.is_visible()));
+        }
+        let list = launch.container.observe_controllers();
+        let controllers = (0..list.n_items())
+            .filter_map(|index| list.item(index)?.downcast::<gtk::EventController>().ok())
+            .map(|controller| {
+                let phase = controller.propagation_phase();
+                (controller, phase)
+            })
+            .collect();
+        Rc::new(Self {
+            container: launch.container,
+            source: launch.source,
+            children,
+            controllers,
+            content: RefCell::new(None),
+            completion: RefCell::new(Some(launch.completion)),
+            finished: Cell::new(false),
+        })
+    }
+    fn attach(&self, content: &gtk::Box, session: &Vim9Session) {
+        // Block-mode root key handlers belong to the waiting shell. They must
+        // not turn Vim editing keys into input for that hidden shell.
+        for (controller, _) in &self.controllers {
+            controller.set_propagation_phase(gtk::PropagationPhase::None);
+        }
+        for (child, _) in &self.children {
+            child.set_visible(false);
+        }
+        content.set_hexpand(true);
+        content.set_vexpand(true);
+        self.container.append(content);
+        *self.content.borrow_mut() = Some(content.downgrade());
+        EMBEDDED_EDITORS
+            .with_borrow_mut(|editors| editors.push((self.container.downgrade(), session.clone())));
+    }
+    fn finish(&self, status: i32) {
+        if self.finished.replace(true) {
+            return;
+        }
+        EMBEDDED_EDITORS.with_borrow_mut(|editors| {
+            editors.retain(|(container, _)| container.upgrade().as_ref() != Some(&self.container))
+        });
+        if let Some(content) = self
+            .content
+            .borrow_mut()
+            .take()
+            .and_then(|weak| weak.upgrade())
+        {
+            self.container.remove(&content);
+        }
+        for (controller, phase) in &self.controllers {
+            controller.set_propagation_phase(*phase);
+        }
+        for (child, visible) in &self.children {
+            child.set_visible(*visible);
+        }
+        self.source.grab_focus();
+        if let Some(completion) = self.completion.borrow_mut().take() {
+            completion.finish(status);
+        }
+    }
+}
+
+fn has_embedded_editor(root: &impl IsA<gtk::Widget>) -> bool {
+    EMBEDDED_EDITORS.with_borrow(|editors| {
+        editors.iter().any(|(container, _)| {
+            container.upgrade().is_some_and(|container| {
+                let widget: &gtk::Widget = container.upcast_ref();
+                let root = root.as_ref();
+                widget == root || widget.is_ancestor(root) || root.is_ancestor(widget)
+            })
+        })
+    })
+}
+
+/// Tab/pane/window close first asks the actual Vim to quit. A modified buffer
+/// can refuse without losing either the editor or its waiting shell.
+pub(crate) fn request_embedded_close(root: &impl IsA<gtk::Widget>) -> bool {
+    EMBEDDED_EDITORS.with_borrow(|editors| {
+        let mut handled = false;
+        for (container, session) in editors {
+            if let Some(container) = container.upgrade() {
+                let widget: &gtk::Widget = container.upcast_ref();
+                let root = root.as_ref();
+                if widget == root || widget.is_ancestor(root) || root.is_ancestor(widget) {
+                    let _ = session.send(Vim9Command::Quit);
+                    handled = true;
+                }
+            }
+        }
+        handled
+    })
+}
+
+fn shell_source(
+    root: &gtk::Widget,
+    request: &jterm_core::vim9::Vim9ShellInvocation,
+) -> Option<(gtk::Box, gtk::Widget)> {
+    if let Some(terminal) = root.downcast_ref::<vte4::Terminal>() {
+        let shell_pid = unsafe { terminal.data::<i32>("child-pid").map(|pid| *pid.as_ref()) };
+        if terminal
+            .pty()
+            .is_some_and(|pty| request.matches_pty(pty.fd().as_raw_fd()))
+            || shell_pid.is_some_and(|pid| request.matches_pid(pid))
+        {
+            let mut block_root = root.parent();
+            while let Some(parent) = block_root {
+                if parent.has_css_class("term-view-root") {
+                    if let Some(container) = parent.downcast_ref::<gtk::Box>() {
+                        return Some((container.clone(), root.clone()));
+                    }
+                }
+                block_root = parent.parent();
+            }
+            let mut ancestor = root.parent();
+            while let Some(parent) = ancestor {
+                if let Some(container) = parent.downcast_ref::<gtk::Box>() {
+                    return Some((container.clone(), root.clone()));
+                }
+                ancestor = parent.parent();
+            }
+        }
+    }
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        if let Some(found) = shell_source(&widget, request) {
+            return Some(found);
+        }
+        child = widget.next_sibling();
+    }
+    None
+}
+
+pub(crate) fn install_shell_host(window: &adw::ApplicationWindow) {
+    let weak = window.downgrade();
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        let Some(window) = weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        let Some(application) = window.application() else {
+            return glib::ControlFlow::Break;
+        };
+        for invocation in jterm_core::vim9::take_shell_vim_requests() {
+            let destination = application.windows().into_iter().find_map(|window| {
+                let window = window.downcast::<adw::ApplicationWindow>().ok()?;
+                let (container, source) = shell_source(window.upcast_ref(), &invocation)?;
+                Some((window, container, source))
+            });
+            let Some((window, container, source)) = destination else {
+                continue;
+            };
+            if has_embedded_editor(&container) {
+                continue;
+            }
+            let config = crate::config::load_config().0.vim9;
+            open_with_config_and_exit(
+                &application,
+                Some(&window),
+                invocation.request,
+                config,
+                None,
+                Some(EmbeddedLaunch {
+                    container,
+                    source,
+                    completion: invocation.completion,
+                }),
+            );
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Standalone fallback for an explicit shell CLI without a managed host.
 pub(crate) fn run_shell(request: Vim9EntryRequest, application_id: &str) -> i32 {
     let application = adw::Application::builder()
         .application_id(application_id)
@@ -365,6 +565,7 @@ pub(crate) fn run_shell(request: Vim9EntryRequest, application_id: &str) -> i32 
                 request,
                 config,
                 Some(result.clone()),
+                None,
             );
         } else if let Some(window) = application.active_window() {
             window.present();
@@ -389,7 +590,7 @@ fn open_with_config(
     request: Vim9EntryRequest,
     config: Vim9UiConfig,
 ) {
-    open_with_config_and_exit(application, parent, request, config, None);
+    open_with_config_and_exit(application, parent, request, config, None, None);
 }
 
 fn open_with_config_and_exit(
@@ -398,10 +599,17 @@ fn open_with_config_and_exit(
     request: Vim9EntryRequest,
     config: Vim9UiConfig,
     shell_exit: Option<Rc<Cell<Option<i32>>>>,
+    embedded: Option<EmbeddedLaunch>,
 ) {
+    let embedded = embedded.map(EmbeddedHost::new);
     let session = match Vim9Session::start(request) {
         Ok(session) => session,
         Err(error) => {
+            if let Some(host) = &embedded {
+                eprintln!("anvil: cannot start Vim in this tab: {error}");
+                host.finish(1);
+                return;
+            }
             if let Some(result) = &shell_exit {
                 result.set(Some(1));
                 eprintln!("anvil: cannot start GUI Vim: {error}");
@@ -412,18 +620,27 @@ fn open_with_config_and_exit(
             return;
         }
     };
-    let window = adw::ApplicationWindow::builder()
-        .application(application)
-        .title("Vim9 IDE")
-        .default_width(1240)
-        .default_height(820)
-        .build();
-    if let Some(parent) = parent {
-        window.set_transient_for(Some(parent));
-    }
+    let window = if embedded.is_some() {
+        parent
+            .expect("embedded Vim belongs to an existing window")
+            .clone()
+    } else {
+        let window = adw::ApplicationWindow::builder()
+            .application(application)
+            .title("Vim9 IDE")
+            .default_width(1240)
+            .default_height(820)
+            .build();
+        if let Some(parent) = parent {
+            window.set_transient_for(Some(parent));
+        }
+        window
+    };
     // Toolbar entry points launch a separate --ide process. This window's
     // lifetime therefore cannot be cut short by terminal-workspace shutdown.
-    window.set_destroy_with_parent(false);
+    if embedded.is_none() {
+        window.set_destroy_with_parent(false);
+    }
 
     let editor = vte4::Terminal::new();
     editor.set_hexpand(true);
@@ -465,7 +682,6 @@ fn open_with_config_and_exit(
             glib::Propagation::Proceed
         });
     }
-    window.add_controller(interaction);
 
     let message = label(if config.status_bar {
         "Starting Vim 9 and connecting the workbench…"
@@ -1098,6 +1314,11 @@ fn open_with_config_and_exit(
     }
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content.add_controller(interaction);
+    if embedded.is_some() {
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+    }
     content.append(&header);
     tools.set_visible(config.tool_panel);
     build_bar.set_visible(config.tool_panel);
@@ -1134,7 +1355,11 @@ fn open_with_config_and_exit(
     content.append(&search_feedback);
     content.append(&message);
     content.append(&status);
-    window.set_content(Some(&content));
+    if let Some(host) = &embedded {
+        host.attach(&content, &session);
+    } else {
+        window.set_content(Some(&content));
+    }
 
     {
         let weak = window.downgrade();
@@ -1360,10 +1585,18 @@ fn open_with_config_and_exit(
             }
         });
     }
-    window.add_controller(keys);
+    if embedded.is_some() {
+        content.add_controller(keys);
+    } else {
+        window.add_controller(keys);
+    }
 
     let destroy_session = session.clone();
-    window.connect_destroy(move |_| destroy_session.revoke());
+    if embedded.is_some() {
+        content.connect_destroy(move |_| destroy_session.revoke());
+    } else {
+        window.connect_destroy(move |_| destroy_session.revoke());
+    }
     let child_finished = Rc::new(Cell::new(false));
     let closing = Rc::new(Cell::new(false));
     {
@@ -1372,13 +1605,15 @@ fn open_with_config_and_exit(
         let session = session.clone();
         let editor = editor.clone();
         let message = message.clone();
-        window.connect_close_request(move |_| {
+        if embedded.is_none() {
+            window.connect_close_request(move |_| {
             if finished.get() { return glib::Propagation::Proceed; }
             closing.set(true);
             dispatch(&session, Vim9Command::Quit, &message, &editor);
             message.set_label("Close requested. Vim keeps modified buffers open: save them, or use :qa! in Vim to discard them explicitly.");
             glib::Propagation::Stop
         });
+        }
     }
     {
         let finished = child_finished.clone();
@@ -1387,12 +1622,17 @@ fn open_with_config_and_exit(
         let message = message.clone();
         let exited_session = session.clone();
         let shell_exit = shell_exit.clone();
+        let embedded = embedded.clone();
         editor.connect_child_exited(move |_, status| {
             let Some(code) = jterm_core::process::exit_code_from_wait_status(status) else {
                 return;
             };
             exited_session.revoke();
             finished.set(true);
+            if let Some(host) = &embedded {
+                host.finish(code);
+                return;
+            }
             if let Some(result) = &shell_exit {
                 result.set(Some(code));
             }
@@ -1424,6 +1664,10 @@ fn open_with_config_and_exit(
         Err(error) => {
             session.revoke();
             child_finished.set(true);
+            if let Some(host) = &embedded {
+                host.finish(1);
+                return;
+            }
             if let Some(result) = &shell_exit {
                 result.set(Some(1));
                 eprintln!("anvil: cannot prepare Vim environment: {error}");
@@ -1448,6 +1692,7 @@ fn open_with_config_and_exit(
         let failed_session = session.clone();
         let shell_exit = shell_exit.clone();
         let weak_window = window.downgrade();
+        let embedded = embedded.clone();
         editor.spawn_async(
             vte4::PtyFlags::DEFAULT,
             launch.cwd.to_str(),
@@ -1461,6 +1706,10 @@ fn open_with_config_and_exit(
                 if let Err(error) = result {
                     failed_session.revoke();
                     finished.set(true);
+                    if let Some(host) = &embedded {
+                        host.finish(1);
+                        return;
+                    }
                     if let Some(result) = &shell_exit {
                         result.set(Some(1));
                         eprintln!("anvil: cannot start Vim: {error}");
@@ -1507,7 +1756,14 @@ fn open_with_config_and_exit(
         button.set_sensitive(false);
     }
     let poll_editor = editor.clone();
+    let embedded_poll = embedded.clone();
     glib::timeout_add_local(Duration::from_millis(100), move || {
+        if embedded_poll
+            .as_ref()
+            .is_some_and(|host| host.finished.get())
+        {
+            return glib::ControlFlow::Break;
+        }
         let Some(window) = weak_window.upgrade() else {
             return glib::ControlFlow::Break;
         };
@@ -1597,7 +1853,9 @@ fn open_with_config_and_exit(
             ),
             modified
         ));
-        window.set_title(Some(&format!("{}{} — Vim9 IDE", visible(file), modified)));
+        if embedded_poll.is_none() {
+            window.set_title(Some(&format!("{}{} — Vim9 IDE", visible(file), modified)));
+        }
         if snapshot.error != last_error {
             if let Some(error) = &snapshot.error {
                 message.set_label(&visible(error));

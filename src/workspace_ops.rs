@@ -1370,6 +1370,9 @@ impl AppModel {
     }
 
     pub(crate) fn request_quit(&self, sender: &ComponentSender<AppModel>) {
+        if crate::vim9_ide::request_embedded_close(&self.window) {
+            return;
+        }
         if let Some(running) = self.running_process_summary() {
             dialogs::confirm_close(&self.window, &running, AppMsg::ForceQuit, sender);
         } else {
@@ -1378,6 +1381,9 @@ impl AppModel {
     }
 
     pub(crate) fn force_quit(&self) {
+        if crate::vim9_ide::request_embedded_close(&self.window) {
+            return;
+        }
         if !self.safe_mode {
             let width = self.content_paned.position().clamp(120, 800) as u32;
             let ai_width = self
@@ -1890,6 +1896,9 @@ impl AppModel {
 
     pub(crate) fn close_tab(&mut self, id: u64, sender: &ComponentSender<AppModel>) {
         let Some(idx) = self.index_of(id) else { return };
+        if crate::vim9_ide::request_embedded_close(&self.tabs[idx].holder) {
+            return;
+        }
         let active_id = self.tabs.get(self.active).map(|tab| tab.id);
         let previous_pane_id = self.active_pane_id();
         if active_id == Some(id) {
@@ -2371,6 +2380,13 @@ impl AppModel {
             return;
         }
         let selected: std::collections::HashSet<u64> = ids.into_iter().collect();
+        let mut editor_open = false;
+        for tab in self.tabs.iter().filter(|tab| selected.contains(&tab.id)) {
+            editor_open |= crate::vim9_ide::request_embedded_close(&tab.holder);
+        }
+        if editor_open {
+            return;
+        }
         let previous_pane_id = self.active_pane_id();
         if self
             .tabs
@@ -2630,6 +2646,9 @@ impl AppModel {
             self.pending_split_spawns.remove(&pane_id);
             return;
         };
+        if crate::vim9_ide::request_embedded_close(&self.tabs[ti].panes[pi].widget()) {
+            return;
+        }
         let pending_in_tab = self.tabs[ti].panes.iter().find_map(|pane| {
             self.pending_split_spawns
                 .get(&pane.id)
