@@ -915,17 +915,24 @@ impl BufferSurface {
         if self.imp().source_gesture.borrow().is_some() {
             return true;
         }
-        if unit == gdk::ScrollUnit::Surface
-            && self.imp().pixel_enabled.get()
+        if self.imp().pixel_enabled.get()
             && frame.mode == "n"
             && window.native_pointer
             && !input.pending.contains_key(&window.window)
         {
             let mut pixels = self.imp().pixels.borrow_mut();
             if let Some(scroll) = pixels.get_mut(&window.window) {
-                scroll.push(lines);
+                if unit == gdk::ScrollUnit::Surface {
+                    scroll.push(lines);
+                } else {
+                    scroll.push_wheel(lines);
+                }
             } else if let Some(mut scroll) = Vim9PixelScroll::new(window, state.metrics) {
-                scroll.push(lines);
+                if unit == gdk::ScrollUnit::Surface {
+                    scroll.push(lines);
+                } else {
+                    scroll.push_wheel(lines);
+                }
                 pixels.insert(window.window, scroll);
             } else {
                 return false;
@@ -935,7 +942,8 @@ impl BufferSurface {
             self.queue_draw();
             return true;
         }
-        // Discrete wheels keep their established acknowledged-row animation.
+        // Unsupported native pointer/input semantics keep Vim's compatibility
+        // route and its acknowledged-row presentation.
         self.imp().pixels.borrow_mut().clear();
         let count = input.fractions.add(window.window, lines);
         if count != 0 {
@@ -1142,6 +1150,9 @@ impl BufferSurface {
             return true;
         };
         self.imp().gesture_sequence.set(gesture);
+        for scroll in self.imp().pixels.borrow_mut().values_mut() {
+            scroll.stop_animation();
+        }
         *self.imp().source_gesture.borrow_mut() = Some(SourceGesture {
             gesture,
             request,
@@ -1248,6 +1259,7 @@ impl BufferSurface {
         }
         let mut pixels = self.imp().pixels.borrow_mut();
         let before = pixels.len();
+        let was_animating = pixels.values().any(Vim9PixelScroll::is_animating);
         if !enabled || changed_geometry || (frame.mode != "n" && pointer.is_none()) {
             pixels.clear();
         } else {
@@ -1264,7 +1276,7 @@ impl BufferSurface {
                     })
             });
         }
-        if pixels.len() != before {
+        if pixels.len() != before || was_animating {
             self.queue_draw();
         }
         if pointer.is_none() && frame.mode == "n" {
@@ -1299,12 +1311,10 @@ impl BufferSurface {
 
     #[cfg(test)]
     pub(super) fn scroll_offset(&self, window: i64) -> f64 {
-        let time = self.imp().state.borrow().time;
-        self.imp()
-            .motions
-            .borrow()
-            .get(&window)
-            .map_or(0.0, |motion| motion.animation.offset(time))
+        let state = self.imp().state.borrow();
+        state.frame.as_ref().map_or(0.0, |frame| {
+            f64::from(self.presentation_offset(&state, frame, window))
+        })
     }
 
     #[cfg(test)]

@@ -1111,7 +1111,7 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
     wait_for(widget, "native scroll fixture", || {
         buffer.painted_frame().is_some()
     });
-    editor.feed_child(b":set nowrap nonumber norelativenumber scrolloff=0 | vsplit\r");
+    editor.feed_child(b":set nowrap mouse=a nonumber norelativenumber scrolloff=0 | vsplit\r");
     wait_for(widget, "two independent scroll viewports", || {
         buffer
             .painted_frame()
@@ -1178,22 +1178,38 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
     for _ in 0..3 {
         assert!(buffer.enqueue_scroll(x, y, 1.0, gdk::ScrollUnit::Wheel));
     }
+    let wheel_positions = RefCell::new(Vec::new());
     wait_for(
         widget,
         "wheel burst is coalesced without losing distance",
         || {
             buffer.painted_frame().is_some_and(|frame| {
-                frame
+                let view = frame
                     .windows
                     .iter()
-                    .any(|view| view.window == inactive_id && view.topline == 11)
+                    .find(|view| view.window == inactive_id)
+                    .unwrap();
+                wheel_positions
+                    .borrow_mut()
+                    .push(view.topline as f64 - buffer.scroll_offset(inactive_id) / line_height);
+                view.topline == 11
             })
         },
     );
     if buffer.settings().is_gtk_enable_animations() {
         assert!(
-            buffer.scroll_offset(inactive_id) > 0.0,
-            "acknowledged viewport uses a fractional animation offset"
+            wheel_positions
+                .borrow()
+                .iter()
+                .any(|position| *position > 2.25 && *position < 10.95),
+            "the GUI frame clock must paint intermediate source positions: {:?}",
+            wheel_positions.borrow()
+        );
+    }
+    if buffer.settings().is_gtk_enable_animations() {
+        assert!(
+            buffer.scroll_offset(inactive_id).abs() > 0.0,
+            "native viewport retains its exact fractional pixel offset"
         );
     }
     // A sustained gesture must keep its easing tail instead of periodically
@@ -1210,7 +1226,7 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
             })
         });
         if buffer.settings().is_gtk_enable_animations() {
-            assert!(buffer.scroll_offset(inactive_id) > 0.0);
+            assert!(buffer.scroll_offset(inactive_id).abs() > 0.0);
         }
     }
     if let Some(path) = std::env::var_os("JTERM_VIM9_TEST_SCREENSHOT") {

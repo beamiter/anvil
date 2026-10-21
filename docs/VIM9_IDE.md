@@ -366,3 +366,35 @@ checks IM commit, undo, native save/search/build/navigation and modified-close
 protection. The optional `JTERM_VIM9_TEST_REAL_KEYS=1` variant failed at later
 save/jump steps with Vim busy-state refusals on this Vim 9.2 host; that optional
 variant is not reported as passing. Plugin-paint screenshots were inspected.
+
+
+## Continuous wheel scrolling — 2026-10-21
+
+Pinned shared core: `2b00c1d3d92f4f5555969d6b62a410866d4acb34`.
+Supported Normal-mode buffer views now turn each three-line wheel notch into
+a 100 ms continuous input transition. New notches retain their own completion
+deadlines; reversing cancels the old direction's unplayed tail. The GUI frame
+clock advances motion even without new Vim render messages. Trackpad pixels
+continue following OS input directly. Source-checked acknowledgements rebase
+paint, hit testing and caret/IME together; a captured press freezes future
+wheel animation. Editing, preedit, focus changes, zoom and changed layout
+retain their cancellation rules. Turning smooth scrolling off keeps the
+existing compatibility behavior.
+
+Render protocol 4 prefetches eight real source rows on each edge (protocol 3
+hosts retain two). This gives ordinary notches and short bursts text to expose
+while Vim handles the request. File boundaries, unsupported views and missing
+margin coverage remain bounded by the actual Vim source.
+
+The shared runtime passes 93 real-Vim regressions. The core Rust Vim9 suite
+passes 77 regular checks plus its explicit real-PTY round trip; deterministic
+wheel tests cover 60/120/240 Hz timelines, exact distance, acknowledgement
+continuity, reversal, file edges and pointer capture.
+
+The locked Nix test build and the real GTK/VTE
+`native_vim9_fractional_scroll_and_split_isolation` test pass under Xvfb.
+The test samples intermediate source/pixel positions during a nine-line wheel
+burst, then checks 32 further notches without losing distance or moving the
+other split. It also checks fractional trackpad input, focus ownership and
+cancellation before editing. Reduced-motion settings retain their existing
+behavior. These checks do not establish a physical-display frame-rate result.
