@@ -32,7 +32,9 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq pkg-config libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev libpcre2-dev xvfb dbus-x11 vim-nox ripgrep > /tmp/deps.log 2>&1 || { tail -60 /tmp/deps.log; exit 1; }
-      - run: python3 .maintenance/apply-pixel-gtk.py
+      - run: |
+          python3 .maintenance/apply-pixel-gtk.py
+          python3 .maintenance/refine-pixel-gtk.py
       - run: cargo fmt --all && git diff --check
       - run: cargo check --quiet --locked --all-targets
       - run: cargo test --quiet --locked vim9 -- --test-threads=1
