@@ -7,7 +7,8 @@ use gtk::{gdk, glib, pango, subclass::prelude::*};
 use jterm_core::vim9::{
     Vim9BufferPosition, Vim9Command, Vim9CursorBlink, Vim9InputSnapshot, Vim9PixelRect,
     Vim9PixelScroll, Vim9PointerPhase, Vim9RenderFrame, Vim9RenderMetrics, Vim9RenderRect,
-    Vim9RenderStyle, Vim9ScrollAccumulator, Vim9ScrollAnimation, Vim9Session, Vim9Viewport,
+    Vim9RenderRun, Vim9RenderStyle, Vim9ScrollAccumulator, Vim9ScrollAnimation, Vim9Session,
+    Vim9Viewport,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -311,6 +312,13 @@ mod imp {
                 }
                 snapshot.pop();
             }
+            paint_completion(
+                &surface,
+                snapshot,
+                &state,
+                frame,
+                &mut self.layouts.borrow_mut(),
+            );
             #[cfg(test)]
             self.painted_revision.set(frame.revision);
         }
@@ -331,10 +339,10 @@ fn build_text_scene(
 ) -> Option<gtk::gsk::RenderNode> {
     let snapshot = gtk::Snapshot::new();
     let metrics = state.metrics;
+    let baseline = row_baseline(surface, state);
     // Clip and cover each Vim editing window independently. A single
     // bounding rectangle would erase live PTY status lines, split
     // separators and plugin-owned chrome between the native panes.
-    let baseline = row_baseline(surface, state);
     if layouts.len() > 4096 {
         layouts.clear();
     }
@@ -374,56 +382,21 @@ fn build_text_scene(
             let x = metrics.origin_x + run.column as f32 * metrics.cell_width;
             let y = metrics.origin_y + run.row as f32 * metrics.line_height;
             let width = run.cells as f32 * metrics.cell_width;
-            let (foreground, _, special) = colors(&run.style, &frame.default_style);
-            if !run.text.is_empty() && width > 0.0 {
-                let key = (run.text.clone(), run.style.bold, run.style.italic);
-                let layout = layouts.entry(key).or_insert_with(|| {
-                    let layout = surface.create_pango_layout(Some(&run.text));
-                    let mut font = state.font.clone();
-                    if run.style.bold {
-                        font.set_weight(pango::Weight::Bold);
-                    }
-                    if run.style.italic {
-                        font.set_style(pango::Style::Italic);
-                    }
-                    layout.set_font_description(Some(&font));
-                    layout.set_single_paragraph_mode(true);
-                    layout.set_auto_dir(false);
-                    let attributes = pango::AttrList::new();
-                    attributes.insert(pango::AttrFontFeatures::new(if state.ligatures {
-                        "calt=1,liga=1"
-                    } else {
-                        "calt=0,liga=0"
-                    }));
-                    layout.set_attributes(Some(&attributes));
-                    layout
-                });
-                let (_, logical) = layout.extents();
-                let logical_width = logical.width() as f32 / pango::SCALE as f32;
-                // A fallback CJK font can have different ascent and
-                // descent from the Latin font. Centering every run's
-                // logical box independently makes their baselines drift.
-                let text_y = y + baseline - layout.baseline() as f32 / pango::SCALE as f32;
-                snapshot.save();
-                snapshot.translate(&gtk::graphene::Point::new(x, text_y));
-                // VTE rounds its input grid to whole logical pixels. Match
-                // that advance without independently slicing Unicode or
-                // breaking a shaped run into terminal-sized glyph boxes.
-                if logical_width > 0.0 {
-                    snapshot.scale(width / logical_width, 1.0);
-                }
-                snapshot.append_layout(layout, &rgb(foreground));
-                snapshot.restore();
-                decorations(
-                    &snapshot,
-                    &run.style,
-                    special,
+            paint_text_run(
+                surface,
+                &snapshot,
+                state,
+                run,
+                &frame.default_style,
+                Vim9PixelRect {
                     x,
                     y,
                     width,
-                    metrics.line_height,
-                );
-            }
+                    height: metrics.line_height,
+                },
+                baseline,
+                layouts,
+            );
         }
 
         snapshot.pop();
@@ -456,63 +429,130 @@ fn paint_pixel_scene(
             snapshot.append_color(&rgb(background), &graphene_rect(projected.clip));
         }
         for projected in view.runs() {
-            let run = projected.run;
-            let x = projected.rect.x;
-            let y = projected.rect.y;
-            let width = projected.rect.width;
-            let (foreground, _, special) = colors(&run.style, &frame.default_style);
-            if !run.text.is_empty() && width > 0.0 {
-                let key = (run.text.clone(), run.style.bold, run.style.italic);
-                let layout = layouts.entry(key).or_insert_with(|| {
-                    let layout = surface.create_pango_layout(Some(&run.text));
-                    let mut font = state.font.clone();
-                    if run.style.bold {
-                        font.set_weight(pango::Weight::Bold);
-                    }
-                    if run.style.italic {
-                        font.set_style(pango::Style::Italic);
-                    }
-                    layout.set_font_description(Some(&font));
-                    layout.set_single_paragraph_mode(true);
-                    layout.set_auto_dir(false);
-                    let attributes = pango::AttrList::new();
-                    attributes.insert(pango::AttrFontFeatures::new(if state.ligatures {
-                        "calt=1,liga=1"
-                    } else {
-                        "calt=0,liga=0"
-                    }));
-                    layout.set_attributes(Some(&attributes));
-                    layout
-                });
-                let (_, logical) = layout.extents();
-                let logical_width = logical.width() as f32 / pango::SCALE as f32;
-                // A fallback CJK font can have different ascent and
-                // descent from the Latin font. Centering every run's
-                // logical box independently makes their baselines drift.
-                let text_y = y + baseline - layout.baseline() as f32 / pango::SCALE as f32;
-                snapshot.save();
-                snapshot.translate(&gtk::graphene::Point::new(x, text_y));
-                // VTE rounds its input grid to whole logical pixels. Match
-                // that advance without independently slicing Unicode or
-                // breaking a shaped run into terminal-sized glyph boxes.
-                if logical_width > 0.0 {
-                    snapshot.scale(width / logical_width, 1.0);
-                }
-                snapshot.append_layout(layout, &rgb(foreground));
-                snapshot.restore();
-                decorations(
-                    snapshot,
-                    &run.style,
-                    special,
-                    x,
-                    y,
-                    width,
-                    metrics.line_height,
-                );
-            }
+            paint_text_run(
+                surface,
+                snapshot,
+                state,
+                projected.run,
+                &frame.default_style,
+                projected.rect,
+                baseline,
+                layouts,
+            );
         }
         snapshot.pop();
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_text_run(
+    surface: &BufferSurface,
+    snapshot: &gtk::Snapshot,
+    state: &PaintState,
+    run: &Vim9RenderRun,
+    normal: &Vim9RenderStyle,
+    rect: Vim9PixelRect,
+    baseline: f32,
+    layouts: &mut HashMap<LayoutKey, pango::Layout>,
+) {
+    let x = rect.x;
+    let y = rect.y;
+    let width = rect.width;
+    let (foreground, _, special) = colors(&run.style, normal);
+    if !run.text.is_empty() && width > 0.0 {
+        let key = (run.text.clone(), run.style.bold, run.style.italic);
+        let layout = layouts.entry(key).or_insert_with(|| {
+            let layout = surface.create_pango_layout(Some(&run.text));
+            let mut font = state.font.clone();
+            if run.style.bold {
+                font.set_weight(pango::Weight::Bold);
+            }
+            if run.style.italic {
+                font.set_style(pango::Style::Italic);
+            }
+            layout.set_font_description(Some(&font));
+            layout.set_single_paragraph_mode(true);
+            layout.set_auto_dir(false);
+            let attributes = pango::AttrList::new();
+            attributes.insert(pango::AttrFontFeatures::new(if state.ligatures {
+                "calt=1,liga=1"
+            } else {
+                "calt=0,liga=0"
+            }));
+            layout.set_attributes(Some(&attributes));
+            layout
+        });
+        let (_, logical) = layout.extents();
+        let logical_width = logical.width() as f32 / pango::SCALE as f32;
+        // A fallback CJK font can have different ascent and
+        // descent from the Latin font. Centering every run's
+        // logical box independently makes their baselines drift.
+        let text_y = y + baseline - layout.baseline() as f32 / pango::SCALE as f32;
+        snapshot.save();
+        snapshot.translate(&gtk::graphene::Point::new(x, text_y));
+        // VTE rounds its input grid to whole logical pixels. Match
+        // that advance without independently slicing Unicode or
+        // breaking a shaped run into terminal-sized glyph boxes.
+        if logical_width > 0.0 {
+            snapshot.scale(width / logical_width, 1.0);
+        }
+        snapshot.append_layout(layout, &rgb(foreground));
+        snapshot.restore();
+        decorations(snapshot, &run.style, special, x, y, width, rect.height);
+    }
+}
+
+fn paint_completion(
+    surface: &BufferSurface,
+    snapshot: &gtk::Snapshot,
+    state: &PaintState,
+    frame: &Vim9RenderFrame,
+    layouts: &mut HashMap<LayoutKey, pango::Layout>,
+) {
+    let Some(completion) = &frame.completion else {
+        return;
+    };
+    let metrics = state.metrics;
+    let baseline = row_baseline(surface, state);
+    let view = view_rectangle(&completion.view, metrics);
+    // The popup uses Vim's exact grid geometry. It may cross editing panes
+    // and status lines, so this layer sits outside every per-window clip.
+    snapshot.push_clip(&view);
+    let (_, background, _) = colors(&completion.default_style, &frame.default_style);
+    snapshot.append_color(&rgb(background), &view);
+    for run in &completion.runs {
+        let (_, background, _) = colors(&run.style, &completion.default_style);
+        snapshot.append_color(
+            &rgb(background),
+            &gtk::graphene::Rect::new(
+                metrics.origin_x + run.column as f32 * metrics.cell_width,
+                metrics.origin_y + run.row as f32 * metrics.line_height,
+                run.cells as f32 * metrics.cell_width,
+                metrics.line_height,
+            ),
+        );
+    }
+    if layouts.len() > 4096 {
+        layouts.clear();
+    }
+    for run in &completion.runs {
+        paint_text_run(
+            surface,
+            snapshot,
+            state,
+            run,
+            &completion.default_style,
+            Vim9PixelRect {
+                x: metrics.origin_x + run.column as f32 * metrics.cell_width,
+                y: metrics.origin_y + run.row as f32 * metrics.line_height,
+                width: run.cells as f32 * metrics.cell_width,
+                height: metrics.line_height,
+            },
+            baseline,
+            layouts,
+        );
+    }
+    snapshot.pop();
 }
 
 fn graphene_rect(rect: Vim9PixelRect) -> gtk::graphene::Rect {
@@ -853,6 +893,8 @@ impl BufferSurface {
             return;
         };
         if !enabled
+            || previous.completion.is_some()
+            || next.completion.is_some()
             || state.metrics != metrics
             || previous.default_style != next.default_style
             || previous.windows.len() != next.windows.len()
@@ -971,6 +1013,10 @@ impl BufferSurface {
     }
 
     pub(super) fn enqueue_scroll(&self, x: f64, y: f64, dy: f64, unit: gdk::ScrollUnit) -> bool {
+        if self.completion_visible() {
+            self.cancel_scroll();
+            return false;
+        }
         if self.stale_scroll_source_at(x, y) {
             // The event belongs to the image still on screen. Do not send it
             // to a replacement buffer before GTK has presented that buffer.
@@ -1080,9 +1126,27 @@ impl BufferSurface {
         presented.cursor
     }
 
+    fn completion_visible(&self) -> bool {
+        self.imp()
+            .state
+            .borrow()
+            .frame
+            .as_ref()
+            .is_some_and(|frame| frame.completion.is_some())
+            || self
+                .imp()
+                .presented
+                .borrow()
+                .as_ref()
+                .is_some_and(|shown| shown.frame.completion.is_some())
+    }
+
     /// Hit the last submitted native image, not a newer frame received between
     /// presentation ticks. Source generation is checked again before dispatch.
     fn source_at(&self, x: f64, y: f64) -> Option<Vim9BufferPosition> {
+        if self.completion_visible() {
+            return None;
+        }
         if !x.is_finite() || !y.is_finite() {
             return None;
         }
@@ -1258,6 +1322,10 @@ impl BufferSurface {
     }
 
     fn queue_source_pointer(&self, x: f64, y: f64, phase: Vim9PointerPhase) -> bool {
+        if self.completion_visible() {
+            self.cancel_scroll();
+            return false;
+        }
         let target = self.source_at(x, y);
         let mut gesture = self.imp().source_gesture.borrow_mut();
         let Some(gesture) = gesture.as_mut() else {
@@ -1286,6 +1354,10 @@ impl BufferSurface {
     }
 
     fn source_motion(&self, x: f64, y: f64, primary_down: bool) {
+        if self.completion_visible() {
+            self.cancel_scroll();
+            return;
+        }
         if primary_down {
             self.queue_source_pointer(x, y, Vim9PointerPhase::Drag);
         } else if let Some(gesture) = self.imp().source_gesture.borrow_mut().as_mut() {
@@ -1315,6 +1387,22 @@ impl BufferSurface {
             // the surface; an intervening click must not hit a different grid.
             return;
         };
+        if frame.completion.is_some() {
+            // Keep completion navigation entirely on Vim's original input
+            // path, with no queued source-bound wheel or pointer transaction.
+            self.imp().pixel_enabled.set(false);
+            if self
+                .imp()
+                .state
+                .borrow()
+                .frame
+                .as_ref()
+                .is_none_or(|old| old.completion.is_none())
+            {
+                self.cancel_scroll();
+            }
+            return;
+        }
         let changed_geometry = {
             let state = self.imp().state.borrow();
             state.metrics != metrics
@@ -1631,6 +1719,10 @@ impl NativeBuffer {
                 let Some(surface) = surface.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
+                if surface.completion_visible() {
+                    surface.cancel_scroll();
+                    return glib::Propagation::Proceed;
+                }
                 let Some((x, y)) = surface.imp().pointer.get() else {
                     return glib::Propagation::Proceed;
                 };
@@ -1686,6 +1778,10 @@ impl NativeBuffer {
                 let Some(surface) = surface.upgrade() else {
                     return;
                 };
+                if surface.completion_visible() {
+                    surface.cancel_scroll();
+                    return;
+                }
                 let modified = gesture.current_event_state().intersects(
                     gdk::ModifierType::CONTROL_MASK
                         | gdk::ModifierType::SHIFT_MASK
@@ -2061,6 +2157,11 @@ mod tests {
         moved.cursor.column = 2;
         moved.mode = "i".into();
         assert!(same_text_content(&frame, &moved));
+        moved.completion = Some(jterm_core::vim9::Vim9RenderCompletion::default());
+        assert!(
+            same_text_content(&frame, &moved),
+            "completion is a transient overlay"
+        );
         moved.runs[0].style.foreground = Some(0x123456);
         assert!(!same_text_content(&frame, &moved));
         moved = frame.clone();

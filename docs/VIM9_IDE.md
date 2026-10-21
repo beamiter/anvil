@@ -88,7 +88,7 @@ and command area remain live in the compatibility display. Every pane uses its
 own buffer text, syntax and viewport; the active Vim window alone owns the
 native cursor and IME preedit. The bridge explicitly falls back for display
 features it cannot yet reproduce faithfully, including closed folds, wrapped
-continuation rows, diff, popup windows/completion,
+continuation rows, diff, general popup windows and complex/scrolling completion menus,
 complex signs or fold columns, virtual text, complex match patterns, concealment,
 and complex bidirectional text. The default single sign column, ordinary
 diagnostic text-property highlights and simple search matches use their GUI
@@ -441,3 +441,44 @@ frontend test package; dependency profiles and shipped settings were unchanged.
 The shared core passes 80 Rust Vim9 checks plus the explicit real-PTY round
 trip and 99 real-Vim runtime regressions. These are headless X11 checks and
 do not establish a physical-display or Wayland performance result.
+
+
+## Native Insert completion — 2026-10-21
+
+Pinned core: `20a1c694792f5737c8b92b32ef02e40f6e2c08d9` (render protocol 5).
+Ordinary Insert completion menus now paint above the native GUI buffer, with
+Vim's GUI `Pmenu`/`PmenuSel`, kind and extra-column colors. Word/abbreviation,
+kind/menu labels, CJK and combining characters use the existing native glyph
+path. The menu keeps Vim's screen geometry and padding and can cross split
+separators without being clipped to one editing pane.
+
+Vim still owns candidate generation and keyboard/mouse behavior. Ctrl-N/P
+select, Ctrl-Y accepts and Ctrl-E cancels through the original PTY; the menu
+never takes keyboard or IME focus. Its appearance cancels old buffer scroll
+transforms, and completion mouse/wheel input bypasses semantic buffer actions.
+Previously captured native gestures retain their cancelled physical tails.
+Closing the menu clears the overlay and restores the same source buffer.
+
+The list must fit fully without a scrollbar, use default column order and
+contain unclipped ordinary labels. Long/filtered/fuzzy menus, separate info
+popups, borders, opacity, custom `pumopt` and distinct `PmenuMatch[Sel]` styles
+retain explicit compatibility reasons. Available per-item highlight metadata
+is applied, but older Vim builds (including this host's 9.2.0858) omit those
+fields from `complete_info()` and expose only standard menu highlight groups.
+Hosts using render protocols 1–4 always retain their live compatibility menu.
+
+Shared validation: 82 focused core Rust checks and the explicit real-PTY round
+trip pass. The real-Vim runtime suite runs 106 checks: 105 pass, with one
+per-item highlight test skipped because this Vim omits that optional metadata.
+Menu GUI RGB, Unicode, selection, acceptance/cancellation, cross-split geometry,
+row-delta closing and old-protocol/scrolled-menu compatibility are covered.
+
+The real GTK/VTE Xvfb test `native_vim9_fractional_scroll_and_split_isolation`
+passes with the final core, including Pmenu/PmenuSel snapshot RGB, real CJK
+candidates, Ctrl-N/P/Y/E, unchanged focus, menu close/recovery and raw wheel
+bypass, followed by the existing cursor/continuous-scroll/split checks. The
+frontend test package used `profile.test.package.anvil.opt-level=0`; shipped
+settings and dependency profiles were unchanged. Screenshot:
+`/tmp/anvil-vim9-completion-20a1c69.png`. GTK paint and pixel-scroll paths each
+compute the Pango baseline once per scene. Headless X11 validation does not
+establish physical-display or Wayland performance.

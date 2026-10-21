@@ -1195,6 +1195,148 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
         "blinking must retain shaped text"
     );
     editor.feed_child(b":let &guicursor = g:native_saved_cursor | normal! gg0\r");
+    // Real insert-mode completion remains native, preserves Vim's input
+    // ownership, and paints GUI menu colors above the retained buffer scene.
+    let original_buffer = buffer.painted_frame().unwrap().buffer;
+    editor.feed_child(b":enew | set completeopt=menuone,noinsert,noselect pumheight=8 | call setline(1, ['', 'PUM_underlay sentinel']) | normal! gg0\r");
+    editor.feed_child(b":hi Pmenu guifg=#9fe1f3 guibg=#25374b ctermfg=1 ctermbg=2 gui=NONE | hi PmenuSel guifg=#102030 guibg=#c479a1 ctermfg=2 ctermbg=1 gui=NONE | hi! link PmenuMatch Pmenu | hi! link PmenuMatchSel PmenuSel\r");
+    editor.grab_focus();
+    editor.feed_child("i\x12=[complete(1, ['现代alpha', '现代beta']), ''][1]\r".as_bytes());
+    wait_for(widget, "native Unicode completion menu", || {
+        buffer.painted_frame().is_some_and(|frame| {
+            frame.completion.as_ref().is_some_and(|menu| {
+                menu.runs
+                    .iter()
+                    .map(|run| run.text.as_str())
+                    .collect::<String>()
+                    .contains("现代alpha")
+                    && menu
+                        .runs
+                        .iter()
+                        .any(|run| run.cells == 2 && run.text == "现")
+            })
+        }) && cursor_pixels(0x25374b).is_some()
+            && cursor_pixels(0x9fe1f3).is_some()
+    });
+    assert!(
+        editor.has_focus(),
+        "completion must retain the editor's input focus"
+    );
+    let menu_frame = buffer.painted_frame().unwrap();
+    let menu = menu_frame.completion.as_ref().unwrap();
+    let menu_x = (menu.view.column + 1) as f64 * editor.char_width() as f64;
+    let menu_y = (menu.view.row + 1) as f64 * editor.char_height() as f64;
+    assert!(
+        !buffer.enqueue_scroll(menu_x, menu_y, 1.0, gdk::ScrollUnit::Wheel),
+        "completion wheel input must pass through to Vim, never become a semantic buffer scroll"
+    );
+    editor.feed_child(b"\x0e");
+    let selected_row = |frame: &jterm_core::vim9::Vim9RenderFrame| {
+        frame
+            .completion
+            .as_ref()?
+            .runs
+            .iter()
+            .filter(|run| run.style.background == Some(0xc479a1))
+            .map(|run| run.row)
+            .min()
+    };
+    wait_for(widget, "Vim selects first native completion", || {
+        buffer
+            .painted_frame()
+            .as_ref()
+            .and_then(|frame| selected_row(frame))
+            .is_some()
+            && cursor_pixels(0xc479a1).is_some()
+    });
+    let first_selected = selected_row(&buffer.painted_frame().unwrap()).unwrap();
+    if let Some(path) = std::env::var_os("JTERM_VIM9_TEST_SCREENSHOT") {
+        gtk::prelude::WidgetExt::display(&window).flush();
+        assert!(std::process::Command::new("import")
+            .args(["-window", "root"])
+            .arg(PathBuf::from(path).with_extension("completion.png"))
+            .status()
+            .unwrap()
+            .success());
+    }
+    editor.feed_child(b"\x0e");
+    wait_for(widget, "Vim selects next native completion", || {
+        buffer
+            .painted_frame()
+            .as_ref()
+            .and_then(|frame| selected_row(frame))
+            .is_some_and(|row| row != first_selected)
+    });
+    editor.feed_child(b"\x10");
+    wait_for(widget, "Vim selects previous native completion", || {
+        buffer
+            .painted_frame()
+            .as_ref()
+            .and_then(|frame| selected_row(frame))
+            == Some(first_selected)
+    });
+    editor.feed_child(b"\x19\x1b");
+    wait_for(
+        widget,
+        "accepted completion restores the native body",
+        || {
+            buffer.painted_frame().is_some_and(|frame| {
+                frame.mode == "n"
+                    && frame.completion.is_none()
+                    && frame
+                        .runs
+                        .iter()
+                        .map(|run| run.text.as_str())
+                        .collect::<String>()
+                        .contains("现代alpha")
+                    && frame
+                        .runs
+                        .iter()
+                        .any(|run| run.text.contains("PUM_underlay sentinel"))
+            }) && cursor_pixels(0x25374b).is_none()
+                && cursor_pixels(0xc479a1).is_none()
+        },
+    );
+    assert!(
+        editor.has_focus(),
+        "accepting completion must retain editor focus"
+    );
+    editor.feed_child(b":call setline(1, '') | normal! gg0\r");
+    editor.feed_child("i\x12=[complete(1, ['现代alpha', '现代beta']), ''][1]\r".as_bytes());
+    wait_for(widget, "completion reopens", || {
+        buffer
+            .painted_frame()
+            .is_some_and(|frame| frame.completion.is_some())
+    });
+    editor.feed_child(b"\x0e\x05\x1b");
+    wait_for(
+        widget,
+        "cancelled completion restores the original line",
+        || {
+            buffer.painted_frame().is_some_and(|frame| {
+                frame.mode == "n"
+                    && frame.completion.is_none()
+                    && !frame
+                        .runs
+                        .iter()
+                        .any(|run| run.text.contains("alpha") || run.text.contains("beta"))
+                    && frame
+                        .runs
+                        .iter()
+                        .any(|run| run.text.contains("PUM_underlay sentinel"))
+            })
+        },
+    );
+    editor.feed_child(b":bwipeout!\r");
+    wait_for(
+        widget,
+        "completion test returns to the original scroll buffer",
+        || {
+            buffer
+                .painted_frame()
+                .is_some_and(|frame| frame.buffer == original_buffer && frame.mode == "n")
+        },
+    );
     editor.feed_child(b":set nowrap mouse=a nonumber norelativenumber scrolloff=0 | vsplit\r");
     wait_for(widget, "two independent scroll viewports", || {
         buffer
