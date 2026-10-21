@@ -1,0 +1,25 @@
+name: Prepare Vim9 core upgrade
+
+on:
+  push:
+    branches: [master]
+    paths: [.github/workflows/vim9-core-upgrade.yml]
+  workflow_dispatch:
+    inputs:
+      core_revision:
+        description: Full jterm_core commit SHA
+        required: true
+        default: b8e340c3f47b37367a3c2fe56efcd6fbd641f701
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vim9-core-upgrade-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    uses: beamiter/jterm_core/.github/workflows/prepare-vim9-core.yml@b8e340c3f47b37367a3c2fe56efcd6fbd641f701
+    with:
+      core_revision: ${{ inputs.core_revision || 'b8e340c3f47b37367a3c2fe56efcd6fbd641f701' }}
