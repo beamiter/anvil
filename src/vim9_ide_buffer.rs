@@ -5,9 +5,9 @@
 use super::gtk;
 use gtk::{gdk, glib, pango, subclass::prelude::*};
 use jterm_core::vim9::{
-    Vim9BufferPosition, Vim9Command, Vim9InputSnapshot, Vim9PixelRect, Vim9PixelScroll,
-    Vim9PointerPhase, Vim9RenderFrame, Vim9RenderMetrics, Vim9RenderRect, Vim9RenderStyle,
-    Vim9ScrollAccumulator, Vim9ScrollAnimation, Vim9Session, Vim9Viewport,
+    Vim9BufferPosition, Vim9Command, Vim9CursorBlink, Vim9InputSnapshot, Vim9PixelRect,
+    Vim9PixelScroll, Vim9PointerPhase, Vim9RenderFrame, Vim9RenderMetrics, Vim9RenderRect,
+    Vim9RenderStyle, Vim9ScrollAccumulator, Vim9ScrollAnimation, Vim9Session, Vim9Viewport,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -44,6 +44,8 @@ struct SourceGesture {
 }
 
 struct PaintState {
+    cursor_blink: Vim9CursorBlink,
+    cursor_on: bool,
     frame: Option<Arc<Vim9RenderFrame>>,
     metrics: Metrics,
     font: pango::FontDescription,
@@ -57,6 +59,8 @@ struct PaintState {
 impl Default for PaintState {
     fn default() -> Self {
         Self {
+            cursor_blink: Vim9CursorBlink::default(),
+            cursor_on: true,
             frame: None,
             metrics: Metrics {
                 origin_x: 0.0,
@@ -287,7 +291,20 @@ mod imp {
                         continue;
                     };
                     let (foreground, _, _) = colors(&frame.default_style, &frame.default_style);
-                    paint_cursor(snapshot, &cursor, foreground, &frame.mode, state.focused);
+                    if state.cursor_on {
+                        if frame.cursor.appearance.is_some() {
+                            paint_native_cursor(
+                                &surface,
+                                snapshot,
+                                &state,
+                                frame,
+                                &cursor,
+                                &self.layouts.borrow(),
+                            );
+                        } else {
+                            paint_cursor(snapshot, &cursor, foreground, &frame.mode, state.focused);
+                        }
+                    }
                     if let Some(preedit) = state.preedit.as_ref() {
                         paint_preedit(&surface, snapshot, &state, preedit, &cursor, &view);
                     }
@@ -583,6 +600,73 @@ fn decorations(
     }
 }
 
+fn paint_native_cursor(
+    surface: &BufferSurface,
+    snapshot: &gtk::Snapshot,
+    state: &PaintState,
+    frame: &Vim9RenderFrame,
+    cell: &gtk::graphene::Rect,
+    layouts: &HashMap<LayoutKey, pango::Layout>,
+) {
+    let Some(appearance) = &frame.cursor.appearance else {
+        return;
+    };
+    let runs: Vec<_> = frame
+        .runs
+        .iter()
+        .filter(|r| {
+            r.row == frame.cursor.row
+                && r.column <= frame.cursor.column
+                && frame.cursor.column < r.column + r.cells
+        })
+        .collect();
+    let under = runs.last().map_or(&frame.default_style, |run| &run.style);
+    let (fg, bg) = appearance.colors(under, &frame.default_style);
+    if !state.focused {
+        paint_cursor(snapshot, cell, bg, &frame.mode, false);
+        return;
+    }
+    let caret = graphene_rect(appearance.paint_rect(
+        Vim9PixelRect {
+            x: cell.x(),
+            y: cell.y(),
+            width: cell.width(),
+            height: cell.height(),
+        },
+        state.metrics.cell_width,
+        surface.scale_factor() as f32,
+    ));
+    snapshot.append_color(&rgb(bg), &caret);
+    snapshot.push_clip(&caret);
+    let baseline = row_baseline(surface, state);
+    for run in runs {
+        if let Some(layout) = layouts.get(&(run.text.clone(), run.style.bold, run.style.italic)) {
+            let width = run.cells as f32 * state.metrics.cell_width;
+            let (_, logical) = layout.extents();
+            let logical_width = logical.width() as f32 / pango::SCALE as f32;
+            let x = state.metrics.origin_x + run.column as f32 * state.metrics.cell_width;
+            let y = cell.y() + baseline - layout.baseline() as f32 / pango::SCALE as f32;
+            snapshot.save();
+            snapshot.translate(&gtk::graphene::Point::new(x, y));
+            if logical_width > 0.0 {
+                snapshot.scale(width / logical_width, 1.0);
+            }
+            snapshot.append_layout(layout, &rgb(fg));
+            snapshot.restore();
+            decorations(
+                snapshot,
+                &run.style,
+                fg,
+                x,
+                cell.y(),
+                width,
+                state.metrics.line_height,
+            );
+        }
+    }
+    snapshot.pop();
+}
+
 fn paint_cursor(
     snapshot: &gtk::Snapshot,
     rect: &gtk::graphene::Rect,
@@ -722,7 +806,10 @@ impl BufferSurface {
         if preedit.is_some() {
             self.cancel_scroll();
         }
-        self.imp().state.borrow_mut().preedit = preedit;
+        let mut state = self.imp().state.borrow_mut();
+        state.cursor_blink.reset();
+        state.preedit = preedit;
+        drop(state);
         self.queue_draw();
     }
 
@@ -1582,6 +1669,7 @@ impl NativeBuffer {
             editing.connect_key_pressed(move |_, _, _, _| {
                 if let Some(surface) = surface.upgrade() {
                     surface.cancel_scroll();
+                    surface.imp().state.borrow_mut().cursor_blink.reset();
                 }
                 glib::Propagation::Proceed
             });
@@ -1834,11 +1922,24 @@ impl NativeBuffer {
                 }
             }
             let mut state = poll_surface.imp().state.borrow_mut();
-            let changed = match (&state.frame, &next) {
+            let mut changed = match (&state.frame, &next) {
                 (Some(previous), Some(next)) => !Arc::ptr_eq(previous, next),
                 (None, None) => false,
                 _ => true,
             } || state.metrics != metrics;
+            let focused = terminal.has_focus();
+            let cursor_on =
+                if let Some(frame) = next.as_ref().filter(|f| f.cursor.appearance.is_some()) {
+                    state
+                        .cursor_blink
+                        .sample(frame, focused, std::time::Instant::now())
+                        .0
+                } else {
+                    state.cursor_blink.reset();
+                    true
+                };
+            changed |= state.cursor_on != cursor_on;
+            state.cursor_on = cursor_on;
             state.metrics = metrics;
             state.time = now;
             state.frame = next;
@@ -2037,6 +2138,7 @@ mod tests {
             line_height: 20.0,
         };
         let cursor = Vim9RenderCursor {
+            appearance: None,
             row: 1,
             column: 0,
             width: 1,

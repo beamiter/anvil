@@ -1111,6 +1111,90 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
     wait_for(widget, "native scroll fixture", || {
         buffer.painted_frame().is_some()
     });
+    // Inspect the real GTK snapshot for mode-aware GUI cursor RGB and shape.
+    // Cursor changes reuse shaped text; none of this examines VTE's cells.
+    let cursor_pixels = |target: u32| -> Option<(usize, usize)> {
+        let paintable = gtk::WidgetPaintable::new(Some(&buffer));
+        let snapshot = gtk::Snapshot::new();
+        paintable.snapshot(
+            &snapshot,
+            f64::from(buffer.width()),
+            f64::from(buffer.height()),
+        );
+        let node = snapshot.to_node()?;
+        let texture = window.renderer()?.render_texture(&node, None);
+        let stride = texture.width() as usize * 4;
+        let mut pixels = vec![0; stride * texture.height() as usize];
+        texture.download(&mut pixels, stride);
+        let positions: Vec<_> = pixels
+            .chunks_exact(4)
+            .enumerate()
+            .filter(|(_, p)| {
+                (u32::from(p[2]) << 16 | u32::from(p[1]) << 8 | u32::from(p[0])) == target
+            })
+            .map(|(i, _)| (i % texture.width() as usize, i / texture.width() as usize))
+            .collect();
+        Some((
+            positions.iter().map(|p| p.0).max()? - positions.iter().map(|p| p.0).min()? + 1,
+            positions.iter().map(|p| p.1).max()? - positions.iter().map(|p| p.1).min()? + 1,
+        ))
+    };
+    editor.feed_child(b":let g:native_saved_cursor = &guicursor | highlight GuiCursorProbe guifg=#102030 guibg=#e1a273 gui=NONE | set guicursor=n-v:block-GuiCursorProbe,i:ver25-GuiCursorProbe,r:hor30-GuiCursorProbe,a:blinkon0\r");
+    wait_for(widget, "native solid cursor highlight", || {
+        buffer.painted_frame().is_some_and(|f| {
+            f.mode == "n"
+                && f.cursor
+                    .appearance
+                    .as_ref()
+                    .is_some_and(|a| a.style.background == Some(0xe1a273))
+        }) && cursor_pixels(0xe1a273).is_some()
+    });
+    let block_cursor = cursor_pixels(0xe1a273).unwrap();
+    assert!(
+        cursor_pixels(0x102030).is_some(),
+        "solid cursor must repaint readable foreground ink"
+    );
+    editor.feed_child(b"i");
+    wait_for(widget, "native insertion cursor shape", || {
+        buffer.painted_frame().is_some_and(|f| f.mode == "i")
+            && cursor_pixels(0xe1a273)
+                .is_some_and(|r| r.0 * 2 < block_cursor.0 && r.1 == block_cursor.1)
+    });
+    editor.feed_child(b"\x1bR");
+    wait_for(widget, "native replacement cursor shape", || {
+        buffer
+            .painted_frame()
+            .is_some_and(|f| f.mode.starts_with('R'))
+            && cursor_pixels(0xe1a273).is_some_and(|r| r.1 * 2 < block_cursor.1)
+    });
+    editor.feed_child("\x1b:normal! gg0f中\r".as_bytes());
+    wait_for(widget, "wide cursor retains both source cells", || {
+        buffer
+            .painted_frame()
+            .is_some_and(|f| f.mode == "n" && f.cursor.width == 2)
+            && cursor_pixels(0xe1a273).is_some_and(|r| r.0 >= block_cursor.0 * 2)
+    });
+    editor
+        .feed_child(b":set guicursor=a:block-GuiCursorProbe-blinkwait250-blinkoff150-blinkon150\r");
+    wait_for(widget, "native cursor blink off", || {
+        buffer.painted_frame().is_some_and(|f| {
+            f.mode == "n"
+                && f.cursor
+                    .appearance
+                    .as_ref()
+                    .is_some_and(|a| a.blinkwait == 250)
+        }) && cursor_pixels(0xe1a273).is_none()
+    });
+    let scene_builds = buffer.scene_build_count();
+    wait_for(widget, "native cursor blink on", || {
+        cursor_pixels(0xe1a273).is_some()
+    });
+    assert_eq!(
+        buffer.scene_build_count(),
+        scene_builds,
+        "blinking must retain shaped text"
+    );
+    editor.feed_child(b":let &guicursor = g:native_saved_cursor | normal! gg0\r");
     editor.feed_child(b":set nowrap mouse=a nonumber norelativenumber scrolloff=0 | vsplit\r");
     wait_for(widget, "two independent scroll viewports", || {
         buffer
