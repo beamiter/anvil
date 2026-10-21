@@ -18,7 +18,9 @@ restoration as the only copy of work in progress.
   and buffer navigation, project-wide fuzzy quick open, line/column jumps, native
   Vim split controls, protected buffer close, save-all-and-build, project search,
   Problems, asynchronous builds with output, and capability-aware language actions. Start with
-  `anvil --ide ~/project` or `Ctrl+Alt+I`.
+  typing `vim` in a local interactive pane; `anvil --ide ~/project` and
+  `Ctrl+Alt+I` remain available. Native scrolling preserves trackpad fractions,
+  targets individual Vim splits and follows the monitor frame clock.
 - VTE and block-aware terminal modes
 - Tabs, backend-inheriting nested split panes, pane zoom, directional focus,
   and session restore

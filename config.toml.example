@@ -269,10 +269,13 @@ remote_hosts = []
 # deploy = "persist"
 
 
-# Vim buffer-first GUI. These settings apply to newly opened --ide windows.
+# Vim buffer-first GUI. Applies to `vim` from local interactive shells and --ide.
 # Turn individual workbench surfaces on explicitly; missing keys use these defaults.
 [vim9]
+# Automatically open `vim` in a GUI window; the originating shell waits for :q.
+auto_gui = true
 native_buffer = true
+smooth_scroll = true
 toolbar = false
 buffer_tabs = false
 status_bar = false

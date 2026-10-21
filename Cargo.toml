@@ -10,8 +10,8 @@ keywords = ["terminal", "gtk", "rust", "shell", "productivity"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
-# Pin the shared explicit IDE entry contract to its published revision.
-jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "40c2e0a482bd5334b2607e9426de7617af9fc680" }
+# Pin the shared shell GUI entry and precise scrolling contract.
+jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "f53528e553bd95de10e1650ca4c77eedda48d397" }
 relm4 = { version = "0.11", features = ["libadwaita", "gnome_46"] }
 vte4 = { version = "0.10.0", features = ["v0_76"] }
 log = { version = "0.4", features = ["std"] }
@@ -41,7 +41,7 @@ io-lifetimes = "3"
 env_logger = "0.11"
 
 [dev-dependencies]
-jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "40c2e0a482bd5334b2607e9426de7617af9fc680", features = ["session-parity-tests"] }
+jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "f53528e553bd95de10e1650ca4c77eedda48d397", features = ["session-parity-tests"] }
 
 [profile.dev]
 opt-level = 1

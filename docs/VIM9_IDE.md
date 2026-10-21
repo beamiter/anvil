@@ -19,7 +19,9 @@ the same keys apply to Anvil, Forge, Ember and Frost:
 
 ```toml
 [vim9]
+auto_gui = true
 native_buffer = true
+smooth_scroll = true
 # Optional Vim IDE chrome: all default to false.
 toolbar = false
 buffer_tabs = false
@@ -98,6 +100,51 @@ frame cannot cover a differently sized input grid. Selecting terminal text
 with Shift-drag temporarily reveals the compatibility display so selection
 feedback remains visible. No options in the user's
 Vim configuration are disabled to force the native path.
+
+## Open Vim from the command prompt
+
+In newly opened local interactive panes, `vim`, `vim file.txt`,
+`vim +37 "name with spaces.txt"` and multi-file/split arguments automatically
+open the native GUI editor. The shell expands and quotes arguments normally;
+the frontend receives the exact argument vector and working directory. This
+uses a separate native window in Anvil and Forge. The originating shell waits
+until Vim exits and receives its actual exit status, including `:cquit`.
+Unsaved-buffer close protection still belongs to Vim.
+
+`auto_gui = false` keeps the ordinary command-line entry in the terminal.
+For one invocation, use `JTERM_VIM9_AUTO_GUI=0 vim file.txt`, or call an explicit
+Vim executable path. Redirections/pipes, Ex/script invocations, version/help
+queries and headless sessions keep ordinary Vim behavior. Managed SSH panes,
+validation workers and Flatpak host shells do not receive this local launcher.
+An explicitly configured alias or function remains the shell's responsibility.
+The integration is confined to the child shell environment; no shell startup
+file or user Vim configuration is rewritten. Bash login shells retain the
+launcher after a startup file resets PATH, and the owned Bash-to-jsh wrapper
+restores its child-local PATH prefix after sourcing the user's rc.
+
+## Scrolling and presentation
+
+Native scroll events target the buffer split under the pointer, including an
+inactive split, without moving editing focus. Trackpad pixel deltas accumulate
+at the actual line height; three wheel lines are used per discrete notch.
+Events are coalesced once per GTK frame, bounded and sent as typed viewport
+requests. Vim remains the source of truth for which rows became visible.
+
+After Vim acknowledges a viewport movement, the GTK renderer eases the
+per-window text and cursor over 100 ms. Retained outgoing scenes fill exposed
+edge rows, and clips preserve split dividers and status lines. Text/layout
+changes, zoom, input-method composition and editing/click input stop the short
+presentation tail before the next interaction. `smooth_scroll = false` or the
+system reduced-motion setting disables this easing; the precise fractional
+input path remains available. The font menu also has a per-window toggle.
+
+The renderer now follows GTK's frame clock instead of a fixed 16 ms timer, so
+high-refresh monitors determine presentation timing and unmapped surfaces do
+no polling. Pango keeps fractional glyph positions; text shaping and shared
+baselines continue to preserve Unicode, font fallback, GUI RGB colors and
+buffer-only font zoom. This implementation has not established a performance
+lead over VS Code, and physical high-refresh/Wayland/IME device validation is
+still required.
 
 ## Start a project
 

@@ -1010,3 +1010,226 @@ fn native_vim9_split_unicode_visual_and_font_scaling() {
     });
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+#[ignore = "needs a display and Vim 9 with +channel +job +timers"]
+fn native_vim9_fractional_scroll_and_split_isolation() {
+    if !jterm_core::child_env::inherited_environment_is_captured() {
+        jterm_core::child_env::capture_inherited_environment().unwrap();
+    }
+    adw::init().unwrap();
+    let app = adw::Application::builder()
+        .application_id("io.github.beamiter.Vim9ScrollTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let root = std::env::temp_dir().join(format!("vim9-scroll-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("Makefile"), "all:\n\t@true\n").unwrap();
+    let file = root.join("long.txt");
+    std::fs::write(
+        &file,
+        (1..=400)
+            .map(|line| format!("row {line:04} 中文 cafe\u{301}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    open_with_config(
+        app.upcast_ref(),
+        None,
+        Vim9EntryRequest::user_action(file),
+        Vim9UiConfig::default(),
+    );
+    let window = app.windows().into_iter().next().unwrap();
+    let widget: &gtk::Widget = window.upcast_ref();
+    let editor = descendants::<vte4::Terminal>(widget)
+        .into_iter()
+        .next()
+        .unwrap();
+    let buffer = descendants::<native_buffer::BufferSurface>(widget)
+        .into_iter()
+        .next()
+        .unwrap();
+    wait_for(widget, "native scroll fixture", || {
+        buffer.painted_frame().is_some()
+    });
+    editor.feed_child(b":set nowrap nonumber norelativenumber scrolloff=0 | vsplit\r");
+    wait_for(widget, "two independent scroll viewports", || {
+        buffer
+            .painted_frame()
+            .is_some_and(|frame| frame.windows.len() == 2 && frame.mode == "n")
+    });
+    let frame = buffer.painted_frame().unwrap();
+    let active = frame.window;
+    let inactive = frame
+        .windows
+        .iter()
+        .find(|view| view.window != active)
+        .unwrap();
+    let inactive_id = inactive.window;
+    let view = &inactive.view;
+    let cell_width = editor.char_width() as f64;
+    let line_height = editor.char_height() as f64;
+    let x = (view.column + 3) as f64 * cell_width;
+    let y = (view.row + 3) as f64 * line_height;
+    assert!(buffer.enqueue_scroll(x, y, line_height * 0.4, gdk::ScrollUnit::Surface));
+    assert!(buffer.enqueue_scroll(x, y, line_height * 0.4, gdk::ScrollUnit::Surface));
+    // Fine deltas stay below one source row until their fractional sum crosses
+    // the threshold; the host must never round every trackpad event up.
+    let context = glib::MainContext::default();
+    let until = Instant::now() + Duration::from_millis(80);
+    while Instant::now() < until {
+        while context.pending() {
+            context.iteration(false);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(buffer
+        .painted_frame()
+        .unwrap()
+        .windows
+        .iter()
+        .all(|view| view.topline == 1));
+    assert!(buffer.enqueue_scroll(x, y, line_height * 0.4, gdk::ScrollUnit::Surface));
+    wait_for(
+        widget,
+        "fractional input scrolls only the hovered split",
+        || {
+            buffer.painted_frame().is_some_and(|frame| {
+                frame
+                    .windows
+                    .iter()
+                    .any(|view| view.window == inactive_id && view.topline == 2)
+            })
+        },
+    );
+    let frame = buffer.painted_frame().unwrap();
+    assert_eq!(
+        frame.window, active,
+        "scrolling an inactive pane must not steal editing focus"
+    );
+    assert_eq!(
+        frame
+            .windows
+            .iter()
+            .find(|view| view.window == active)
+            .unwrap()
+            .topline,
+        1
+    );
+    for _ in 0..3 {
+        assert!(buffer.enqueue_scroll(x, y, 1.0, gdk::ScrollUnit::Wheel));
+    }
+    wait_for(
+        widget,
+        "wheel burst is coalesced without losing distance",
+        || {
+            buffer.painted_frame().is_some_and(|frame| {
+                frame
+                    .windows
+                    .iter()
+                    .any(|view| view.window == inactive_id && view.topline == 11)
+            })
+        },
+    );
+    if buffer.settings().is_gtk_enable_animations() {
+        assert!(
+            buffer.scroll_offset(inactive_id) > 0.0,
+            "acknowledged viewport uses a fractional animation offset"
+        );
+    }
+    // A sustained gesture must keep its easing tail instead of periodically
+    // snapping when an outgoing-frame cache fills up.
+    for step in 1..=32 {
+        assert!(buffer.enqueue_scroll(x, y, 1.0, gdk::ScrollUnit::Wheel));
+        let expected = 11 + step * 3;
+        wait_for(widget, "sustained smooth scroll", || {
+            buffer.painted_frame().is_some_and(|frame| {
+                frame
+                    .windows
+                    .iter()
+                    .any(|view| view.window == inactive_id && view.topline == expected)
+            })
+        });
+        if buffer.settings().is_gtk_enable_animations() {
+            assert!(buffer.scroll_offset(inactive_id) > 0.0);
+        }
+    }
+    if let Some(path) = std::env::var_os("JTERM_VIM9_TEST_SCREENSHOT") {
+        let paintable = gtk::WidgetPaintable::new(Some(&window));
+        let snapshot = gtk::Snapshot::new();
+        paintable.snapshot(
+            &snapshot,
+            f64::from(window.width()),
+            f64::from(window.height()),
+        );
+        let node = snapshot.to_node().expect("scrolling native scene");
+        window
+            .renderer()
+            .unwrap()
+            .render_texture(&node, None)
+            .save_to_png(PathBuf::from(path).with_extension("scroll.png"))
+            .unwrap();
+    }
+    let stop = named_key_controller(&editor, "vim9-buffer-scroll-stop");
+    assert!(!stop.emit_by_name::<bool>(
+        "key-pressed",
+        &[&gdk::Key::i, &0u32, &gdk::ModifierType::empty()]
+    ));
+    assert_eq!(
+        buffer.scroll_offset(inactive_id),
+        0.0,
+        "editing cancels visual interpolation before hit testing"
+    );
+    editor.feed_child(b":qa!\r");
+    wait_for(widget, "scroll fixture exits", || app.windows().is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "needs a display and Vim 9 with +channel +job +timers"]
+fn native_vim9_shell_argv_and_exit_status() {
+    if !jterm_core::child_env::inherited_environment_is_captured() {
+        jterm_core::child_env::capture_inherited_environment().unwrap();
+    }
+    adw::init().unwrap();
+    let root = std::env::temp_dir().join(format!("vim9-shell-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let file = root.join("name with spaces.txt");
+    let report = root.join("result.txt");
+    std::fs::write(
+        &file,
+        (1..=50)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let program = std::env::var_os("JTERM_VIM9_BIN")
+        .or_else(|| std::env::var_os("VIM9_TEST_VIM"))
+        .expect("explicit Vim executable for shell fixture");
+    let command = format!(
+        "call writefile([expand('%:p'), string(line('.'))], '{}')",
+        report.to_string_lossy().replace('\'', "''")
+    );
+    let args = vec![
+        "--vim-shell".into(),
+        program,
+        "--".into(),
+        "-Nu".into(),
+        "NONE".into(),
+        "-n".into(),
+        "+37".into(),
+        "-c".into(),
+        command.into(),
+        "-c".into(),
+        "cq 7".into(),
+        file.clone().into_os_string(),
+    ];
+    let request = jterm_core::vim9::shell_vim_request(&args).unwrap().unwrap();
+    assert_eq!(run_shell(request, "io.github.beamiter.Vim9ShellTest"), 7);
+    assert_eq!(
+        std::fs::read_to_string(report).unwrap(),
+        format!("{}\n37\n", file.display())
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}

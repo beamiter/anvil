@@ -472,7 +472,7 @@ fn wrap_jsh_argv_in_interactive_bash(jsh_path: &str) -> Option<Vec<String>> {
         // Keep the executable and any later session arguments as structured
         // argv. `bash -c` assigns the first post-command argument to $0 and
         // the rest to $@; no shell reconstruction of either value is needed.
-        "exec \"$0\" \"$@\"".to_string(),
+        jterm_core::vim9::VIM9_SHELL_EXEC.to_string(),
         jsh_path.to_string(),
     ])
 }
@@ -535,7 +535,8 @@ pub(crate) fn shell_argv_with_session(
             .and_then(|name| name.to_str())
             == Some("bash")
         && shell_argv[1] == "-ic"
-        && shell_argv[2] == "exec \"$0\" \"$@\""
+        && (shell_argv[2] == "exec \"$0\" \"$@\""
+            || shell_argv[2] == jterm_core::vim9::VIM9_SHELL_EXEC)
         && Path::new(&shell_argv[3])
             .file_name()
             .and_then(|name| name.to_str())
@@ -2309,11 +2310,9 @@ fn resolve_file_config(fc: FileConfig) -> (Config, Vec<Theme>, KeybindingMap) {
 /// after `load_config`, this cannot block on or inherit a user-selected config
 /// path, and it also resets custom keybindings.
 pub(crate) fn load_safe_config() -> (Config, Vec<Theme>, KeybindingMap) {
-    (
-        Config::safe_defaults(),
-        builtin_themes(),
-        KeybindingMap::from_defaults(),
-    )
+    let mut config = Config::safe_defaults();
+    config.vim9.auto_gui = false;
+    (config, builtin_themes(), KeybindingMap::from_defaults())
 }
 
 // ---------------------------------------------------------------------------
@@ -2777,7 +2776,10 @@ mod tests {
         assert_eq!(argv[1], "-ic");
         assert_eq!(
             &argv[2..],
-            ["exec \"$0\" \"$@\"", "/home/tester/.local/bin/jsh"]
+            [
+                jterm_core::vim9::VIM9_SHELL_EXEC,
+                "/home/tester/.local/bin/jsh"
+            ]
         );
     }
 

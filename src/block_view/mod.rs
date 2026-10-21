@@ -12174,7 +12174,17 @@ impl TermView {
         // `child_env::ChildEnv::less_default` in `crate::pty` — one place that
         // also gets it right for the Flatpak bridge, where "the parent has no
         // LESS" is the wrong question to ask about the host session.
+        let vim_environment = if env_overrides.is_empty() {
+            crate::vim9_ide::shell_environment(shell_argv, config.vim9.auto_gui)
+        } else {
+            Vec::new()
+        };
         let mut env_extra = Vec::from(crate::terminal::cwd_token_environment(cwd_token));
+        env_extra.extend(
+            vim_environment
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        );
         env_extra.extend(
             env_overrides
                 .iter()

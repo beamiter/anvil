@@ -315,6 +315,65 @@ pub(crate) fn launch(request: Vim9EntryRequest) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Prepare automatic Vim entry only for local interactive shell panes. The
+/// shim preserves shell cwd/arguments and is independent of buffer rendering.
+pub(crate) fn shell_environment(argv: &[String], enabled: bool) -> Vec<(String, String)> {
+    if !enabled {
+        // A nested terminal may inherit another terminal's shim or Bash
+        // function. Explicit opt-out must also disable that inherited route.
+        return vec![("JTERM_VIM9_AUTO_GUI".into(), "0".into())];
+    }
+    if crate::host::is_flatpak() || !jterm_core::vim9::shell_argv_eligible(argv) {
+        return Vec::new();
+    }
+    let prepared = std::env::current_exe()
+        .and_then(|program| jterm_core::vim9::Vim9ShellIntegration::prepare(&program));
+    match prepared {
+        Ok(integration) => {
+            let mut env = integration.env();
+            env.push((
+                "JTERM_VIM9_CONFIG".into(),
+                crate::config::config_file_path()
+                    .to_string_lossy()
+                    .into_owned(),
+            ));
+            env
+        }
+        Err(error) => {
+            log::warn!("Cannot prepare automatic GUI Vim entry: {error}");
+            Vec::new()
+        }
+    }
+}
+
+/// The originating shell waits for this window and receives Vim's actual exit
+/// code, including :cquit. Failed children cannot hold the prompt open forever.
+pub(crate) fn run_shell(request: Vim9EntryRequest, application_id: &str) -> i32 {
+    let application = adw::Application::builder()
+        .application_id(application_id)
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    let outcome = Rc::new(Cell::new(None));
+    let request = RefCell::new(Some(request));
+    let result = outcome.clone();
+    application.connect_activate(move |application| {
+        if let Some(request) = request.borrow_mut().take() {
+            let config = crate::config::load_config().0.vim9;
+            open_with_config_and_exit(
+                application.upcast_ref(),
+                None,
+                request,
+                config,
+                Some(result.clone()),
+            );
+        } else if let Some(window) = application.active_window() {
+            window.present();
+        }
+    });
+    let _ = application.run_with_args(&["anvil"]);
+    outcome.get().unwrap_or(1)
+}
+
 pub(crate) fn open(
     application: &gtk::Application,
     parent: Option<&adw::ApplicationWindow>,
@@ -330,10 +389,26 @@ fn open_with_config(
     request: Vim9EntryRequest,
     config: Vim9UiConfig,
 ) {
+    open_with_config_and_exit(application, parent, request, config, None);
+}
+
+fn open_with_config_and_exit(
+    application: &gtk::Application,
+    parent: Option<&adw::ApplicationWindow>,
+    request: Vim9EntryRequest,
+    config: Vim9UiConfig,
+    shell_exit: Option<Rc<Cell<Option<i32>>>>,
+) {
     let session = match Vim9Session::start(request) {
         Ok(session) => session,
         Err(error) => {
-            open_error(application, parent, &error.to_string());
+            if let Some(result) = &shell_exit {
+                result.set(Some(1));
+                eprintln!("anvil: cannot start GUI Vim: {error}");
+                application.quit();
+            } else {
+                open_error(application, parent, &error.to_string());
+            }
             return;
         }
     };
@@ -363,7 +438,34 @@ fn open_with_config(
     let foreground = gdk::RGBA::new(0.85, 0.88, 0.93, 1.0);
     let background = gdk::RGBA::new(0.07, 0.09, 0.12, 1.0);
     editor.set_colors(Some(&foreground), Some(&background), &[]);
-    let native = native_buffer::NativeBuffer::new(&session, &editor, config.native_buffer);
+    let native = native_buffer::NativeBuffer::new(
+        &session,
+        &editor,
+        config.native_buffer,
+        config.smooth_scroll,
+    );
+
+    // A wheel burst is coalesced until the next display frame. Stop that
+    // pending burst before a toolbar/tab action or editing key can change the
+    // buffer it belongs to; the widget must not overtake queued scroll input.
+    let interaction = gtk::EventControllerLegacy::new();
+    interaction.set_name(Some("vim9-window-scroll-stop"));
+    interaction.set_propagation_phase(gtk::PropagationPhase::Capture);
+    {
+        let surface = native.surface.downgrade();
+        interaction.connect_event(move |_, event| {
+            if matches!(
+                event.event_type(),
+                gdk::EventType::KeyPress | gdk::EventType::ButtonPress | gdk::EventType::TouchBegin
+            ) {
+                if let Some(surface) = surface.upgrade() {
+                    surface.cancel_scroll();
+                }
+            }
+            glib::Propagation::Proceed
+        });
+    }
+    window.add_controller(interaction);
 
     let message = label(if config.status_bar {
         "Starting Vim 9 and connecting the workbench…"
@@ -1284,10 +1386,17 @@ fn open_with_config(
         let weak = window.downgrade();
         let message = message.clone();
         let exited_session = session.clone();
+        let shell_exit = shell_exit.clone();
         editor.connect_child_exited(move |_, status| {
+            let Some(code) = jterm_core::process::exit_code_from_wait_status(status) else {
+                return;
+            };
             exited_session.revoke();
             finished.set(true);
-            if closing.get() || status == 0 {
+            if let Some(result) = &shell_exit {
+                result.set(Some(code));
+            }
+            if shell_exit.is_some() || closing.get() || status == 0 {
                 if let Some(window) = weak.upgrade() {
                     window.close();
                 }
@@ -1315,6 +1424,12 @@ fn open_with_config(
         Err(error) => {
             session.revoke();
             child_finished.set(true);
+            if let Some(result) = &shell_exit {
+                result.set(Some(1));
+                eprintln!("anvil: cannot prepare Vim environment: {error}");
+                window.close();
+                return;
+            }
             message.set_label(&format!(
                 "Cannot prepare Vim environment: {}",
                 visible(&error.to_string())
@@ -1331,6 +1446,8 @@ fn open_with_config(
         let finished = child_finished.clone();
         let message = message.clone();
         let failed_session = session.clone();
+        let shell_exit = shell_exit.clone();
+        let weak_window = window.downgrade();
         editor.spawn_async(
             vte4::PtyFlags::DEFAULT,
             launch.cwd.to_str(),
@@ -1344,6 +1461,14 @@ fn open_with_config(
                 if let Err(error) = result {
                     failed_session.revoke();
                     finished.set(true);
+                    if let Some(result) = &shell_exit {
+                        result.set(Some(1));
+                        eprintln!("anvil: cannot start Vim: {error}");
+                        if let Some(window) = weak_window.upgrade() {
+                            window.close();
+                        }
+                        return;
+                    }
                     message.set_label(&format!(
                         "Cannot start Vim: {}",
                         visible(&error.to_string())

@@ -257,6 +257,7 @@ pub(crate) fn spawn_shell(
     cwd_token: &str,
     initial_commands: &[String],
     env_extra: &[(String, String)],
+    auto_gui: bool,
     probe: PaneProbe,
     sender: ComponentSender<VteTerminal>,
     on_launch_failed: impl Fn() + 'static,
@@ -274,7 +275,17 @@ pub(crate) fn spawn_shell(
     // The integration marker and cwd-authentication token must be encoded in
     // the host wrapper as well as VTE's environment. The shell integration
     // immediately removes the token from its exported environment.
+    let vim_environment = if env_extra.is_empty() {
+        crate::vim9_ide::shell_environment(argv_owned, auto_gui)
+    } else {
+        Vec::new()
+    };
     let mut host_environment = Vec::from(crate::terminal::cwd_token_environment(cwd_token));
+    host_environment.extend(
+        vim_environment
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    );
     host_environment.extend(
         env_extra
             .iter()
@@ -723,6 +734,7 @@ impl Component for VteTerminal {
             &init.cwd_token,
             init.initial_commands.as_slice(),
             &init.env_extra,
+            init.config.borrow().vim9.auto_gui,
             init.probe.clone(),
             sender.clone(),
             {

@@ -2797,6 +2797,24 @@ fn main() {
     // of ours. Every `main` exit path below shares this line, including the
     // subcommands that never open a window, so no route can lose the lane.
     jterm_core::organism_memory::init_scheduler(Box::new(OrganismLane));
+    let shell_request =
+        match jterm_core::vim9::shell_vim_request(&std::env::args_os().skip(1).collect::<Vec<_>>())
+        {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("anvil: {error}");
+                std::process::exit(2);
+            }
+        };
+    if let Some(request) = shell_request {
+        if let Some(path) = std::env::var_os("JTERM_VIM9_CONFIG") {
+            std::env::set_var("ANVIL_CONFIG", path);
+        }
+        init_logging();
+        init_input_method_env();
+        let status = crate::vim9_ide::run_shell(request, crate::host::APP_ID);
+        std::process::exit(status);
+    }
     let parsed = match cli::parse(std::env::args_os().skip(1)) {
         Ok(parsed) => parsed,
         Err(error) => {
