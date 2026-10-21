@@ -517,8 +517,32 @@ fn paint_completion(
     let view = view_rectangle(&completion.view, metrics);
     // The popup uses Vim's exact grid geometry. It may cross editing panes
     // and status lines, so this layer sits outside every per-window clip.
+    snapshot.push_clip(&gtk::graphene::Rect::new(
+        0.0,
+        0.0,
+        surface.width() as f32,
+        surface.height() as f32,
+    ));
+    // Keep elevation outside Vim's rectangle; menu rows and input targets
+    // retain their original geometry, including at the widget edges.
+    for (extent, alpha) in [
+        (4.0, 4.0 / 255.0),
+        (3.0, 5.0 / 255.0),
+        (2.0, 7.0 / 255.0),
+        (1.0, 10.0 / 255.0),
+    ] {
+        snapshot.append_color(
+            &gdk::RGBA::new(0.0, 0.0, 0.0, alpha),
+            &gtk::graphene::Rect::new(
+                view.x() - extent,
+                view.y() - extent,
+                view.width() + extent * 2.0,
+                view.height() + extent * 2.0,
+            ),
+        );
+    }
     snapshot.push_clip(&view);
-    let (_, background, _) = colors(&completion.default_style, &frame.default_style);
+    let (foreground, background, _) = colors(&completion.default_style, &frame.default_style);
     snapshot.append_color(&rgb(background), &view);
     for run in &completion.runs {
         let (_, background, _) = colors(&run.style, &completion.default_style);
@@ -552,6 +576,30 @@ fn paint_completion(
             layouts,
         );
     }
+    let edge = (1.0 / surface.scale_factor().max(1) as f32)
+        .min(view.width() * 0.5)
+        .min(view.height() * 0.5);
+    let mut border = rgb(foreground);
+    border.set_alpha(0.20);
+    for rect in [
+        gtk::graphene::Rect::new(view.x(), view.y(), view.width(), edge),
+        gtk::graphene::Rect::new(
+            view.x(),
+            view.y() + view.height() - edge,
+            view.width(),
+            edge,
+        ),
+        gtk::graphene::Rect::new(view.x(), view.y() + edge, edge, view.height() - edge * 2.0),
+        gtk::graphene::Rect::new(
+            view.x() + view.width() - edge,
+            view.y() + edge,
+            edge,
+            view.height() - edge * 2.0,
+        ),
+    ] {
+        snapshot.append_color(&border, &rect);
+    }
+    snapshot.pop();
     snapshot.pop();
 }
 
@@ -2222,6 +2270,102 @@ mod tests {
             colors(&Vim9RenderStyle::default(), &normal),
             (0x123456, 0x789abc, 0x123456)
         );
+    }
+
+    #[test]
+    #[ignore = "requires GTK display; checks actual completion render pixels"]
+    fn native_completion_elevation_preserves_rows_and_clips_to_widget() {
+        gtk::init().expect("GTK display required");
+        use jterm_core::vim9::Vim9RenderCompletion;
+
+        let surface = BufferSurface::new();
+        surface.measure(gtk::Orientation::Horizontal, -1);
+        surface.measure(gtk::Orientation::Vertical, 96);
+        surface.allocate(96, 72, -1, None);
+        let state = PaintState {
+            metrics: Metrics {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                cell_width: 8.0,
+                line_height: 12.0,
+            },
+            ..Default::default()
+        };
+        let normal = Vim9RenderStyle {
+            foreground: Some(0xe0e0e0),
+            background: Some(0x406080),
+            ..Default::default()
+        };
+        let selected = Vim9RenderStyle {
+            background: Some(0x80a0c0),
+            ..normal.clone()
+        };
+        let mut frame = Vim9RenderFrame {
+            completion: Some(Vim9RenderCompletion {
+                view: Vim9RenderRect {
+                    row: 1,
+                    column: 2,
+                    rows: 2,
+                    columns: 4,
+                },
+                default_style: normal,
+                runs: vec![Vim9RenderRun {
+                    row: 2,
+                    column: 2,
+                    cells: 4,
+                    style: selected,
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        };
+        // Use a larger image than the widget so out-of-widget shadow paint
+        // is observable, and a bright underlying surface to measure blending.
+        let render = |frame: &Vim9RenderFrame| {
+            let snapshot = gtk::Snapshot::new();
+            snapshot.append_color(
+                &rgb(0xc0c0c0),
+                &gtk::graphene::Rect::new(0.0, 0.0, 104.0, 80.0),
+            );
+            paint_completion(&surface, &snapshot, &state, frame, &mut HashMap::new());
+            let mut image =
+                gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 104, 80).unwrap();
+            let cr = gtk::cairo::Context::new(&image).unwrap();
+            snapshot.to_node().unwrap().draw(&cr);
+            drop(cr);
+            let stride = image.stride() as usize;
+            let bytes = image.data().unwrap().to_vec();
+            (stride, bytes)
+        };
+        let pixel = |image: &(usize, Vec<u8>), x: usize, y: usize| {
+            let index = y * image.0 + x * 4;
+            u32::from_ne_bytes(image.1[index..index + 4].try_into().unwrap()) & 0xffffff
+        };
+        let image = render(&frame);
+        assert_eq!(pixel(&image, 24, 18), 0x406080);
+        assert_eq!(pixel(&image, 24, 30), 0x80a0c0);
+        // The inside edge is one pixel; the next pixel retains Vim's color.
+        assert_ne!(pixel(&image, 24, 12), 0x406080);
+        assert_eq!(pixel(&image, 24, 13), 0x406080);
+        assert!(pixel(&image, 14, 18) < 0xc0c0c0);
+        assert_eq!(pixel(&image, 11, 18), 0xc0c0c0);
+        assert_eq!(pixel(&image, 24, 6), 0xc0c0c0);
+
+        // A menu flush with the lower right edge still fills the exact Vim
+        // rectangle, while the elevation cannot paint outside the widget.
+        frame.completion.as_mut().unwrap().view.row = 4;
+        frame.completion.as_mut().unwrap().view.column = 8;
+        frame.completion.as_mut().unwrap().runs.clear();
+        let edge_image = render(&frame);
+        assert_eq!(pixel(&edge_image, 72, 60), 0x406080);
+        assert_eq!(pixel(&edge_image, 97, 60), 0xc0c0c0);
+        assert_eq!(pixel(&edge_image, 72, 73), 0xc0c0c0);
+
+        frame.completion = None;
+        let closed = render(&frame);
+        for (x, y) in [(14, 18), (24, 12), (24, 18), (72, 60)] {
+            assert_eq!(pixel(&closed, x, y), 0xc0c0c0);
+        }
     }
 
     #[test]

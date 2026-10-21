@@ -42,3 +42,5 @@ jobs:
       - run: cargo test --quiet --locked vim9 -- --test-threads=1
       - name: Exercise real GTK snapshot and source coordinates
         run: dbus-run-session -- xvfb-run -a cargo test --quiet --locked native_pixel_snapshot_and_source_hit_round_trip -- --ignored --test-threads=1
+      - name: Exercise native completion elevation and clipping
+        run: dbus-run-session -- xvfb-run -a cargo test --quiet --locked native_completion_elevation_preserves_rows_and_clips_to_widget -- --ignored --test-threads=1

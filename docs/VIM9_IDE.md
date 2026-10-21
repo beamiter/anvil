@@ -467,6 +467,14 @@ is applied, but older Vim builds (including this host's 9.2.0858) omit those
 fields from `complete_info()` and expose only standard menu highlight groups.
 Hosts using render protocols 1–4 always retain their live compatibility menu.
 
+The native menu now has a restrained four-pixel shadow and a one-device-pixel
+inside border derived from its foreground color. The shadow clips to the editor
+surface; Vim's menu rectangle, row colors, text and input geometry are retained,
+including menus crossing split separators or touching the window edges.
+`native_completion_elevation_preserves_rows_and_clips_to_widget` checks actual
+GTK/Cairo pixels for row colors, border placement, shadow bounds and menu removal.
+The native pixel workflow runs this display test explicitly under DBus/Xvfb.
+
 Shared validation: 82 focused core Rust checks and the explicit real-PTY round
 trip pass. The real-Vim runtime suite runs 106 checks: 105 pass, with one
 per-item highlight test skipped because this Vim omits that optional metadata.
