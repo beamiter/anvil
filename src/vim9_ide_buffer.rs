@@ -7,8 +7,8 @@ use gtk::{gdk, glib, pango, subclass::prelude::*};
 use jterm_core::vim9::{
     Vim9BufferPosition, Vim9Command, Vim9CursorBlink, Vim9InputSnapshot, Vim9PixelRect,
     Vim9PixelScroll, Vim9PointerPhase, Vim9RenderCursor, Vim9RenderFrame, Vim9RenderMetrics,
-    Vim9RenderRect, Vim9RenderRun, Vim9RenderStyle, Vim9RenderWindow, Vim9ScrollAccumulator,
-    Vim9ScrollAnimation, Vim9Session, Vim9Viewport,
+    Vim9RenderPopup, Vim9RenderRect, Vim9RenderRun, Vim9RenderStyle, Vim9RenderWindow,
+    Vim9ScrollAccumulator, Vim9ScrollAnimation, Vim9Session, Vim9Viewport,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -159,6 +159,7 @@ fn trim_layout_cache<T>(frame: &Vim9RenderFrame, layouts: &mut StyledCache<T>) {
                 .flat_map(|row| &row.runs),
         )
         .chain(frame.completion.iter().flat_map(|menu| &menu.runs))
+        .chain(frame.popups.iter().flat_map(|popup| &popup.runs))
         .map(|run| {
             (
                 StyledCache::<T>::bucket(run.style.bold, run.style.italic),
@@ -453,7 +454,7 @@ mod imp {
                 snapshot.pop();
             }
             paint_active_split(&surface, snapshot, &state, frame);
-            paint_completion(
+            paint_overlays(
                 &surface,
                 snapshot,
                 &state,
@@ -711,6 +712,89 @@ fn paint_text_run(
         snapshot.restore();
         decorations(snapshot, &run.style, special, rect, decoration_phase);
     }
+}
+
+/// Popup windows and the completion menu share Vim's screen coordinates, not
+/// a buffer's scroll transform. Vim reserves z-index 100 for the menu.
+fn paint_overlays(
+    surface: &BufferSurface,
+    snapshot: &gtk::Snapshot,
+    state: &PaintState,
+    frame: &Vim9RenderFrame,
+    layouts: &mut LayoutCache,
+) {
+    let mut popups: Vec<_> = frame.popups.iter().collect();
+    // At the same z-index, Vim paints the older (lower-id) popup on top.
+    popups.sort_by_key(|popup| (popup.zindex, std::cmp::Reverse(popup.id)));
+    for popup in popups.iter().filter(|popup| popup.zindex < 100) {
+        paint_popup(surface, snapshot, state, frame, popup, layouts);
+    }
+    paint_completion(surface, snapshot, state, frame, layouts);
+    for popup in popups.iter().filter(|popup| popup.zindex >= 100) {
+        paint_popup(surface, snapshot, state, frame, popup, layouts);
+    }
+}
+
+fn paint_popup(
+    surface: &BufferSurface,
+    snapshot: &gtk::Snapshot,
+    state: &PaintState,
+    frame: &Vim9RenderFrame,
+    popup: &Vim9RenderPopup,
+    layouts: &mut LayoutCache,
+) {
+    let metrics = state.metrics;
+    let baseline = row_baseline(surface, state);
+    let view = view_rectangle(&popup.view, metrics);
+    // A popup is opaque across its entire rectangle, including padding,
+    // border cells, empty lines and any Vim status/split rows beneath it.
+    // Its border and padding are supplied by Vim as runs; adding a second
+    // host border would alter the published geometry and GUI colors.
+    snapshot.push_clip(&gtk::graphene::Rect::new(
+        0.0,
+        0.0,
+        surface.width() as f32,
+        surface.height() as f32,
+    ));
+    snapshot.push_clip(&view);
+    let (_, background, _) = colors(&popup.default_style, &frame.default_style);
+    snapshot.append_color(&rgb(background), &view);
+    for run in &popup.runs {
+        let (_, background, _) = colors(&run.style, &popup.default_style);
+        snapshot.append_color(
+            &rgb(background),
+            &view_rectangle(
+                &Vim9RenderRect {
+                    row: run.row,
+                    column: run.column,
+                    rows: 1,
+                    columns: run.cells,
+                },
+                metrics,
+            ),
+        );
+    }
+    trim_layout_cache(frame, layouts);
+    for run in &popup.runs {
+        paint_text_run(
+            surface,
+            snapshot,
+            state,
+            run,
+            &popup.default_style,
+            Vim9PixelRect {
+                x: metrics.origin_x + run.column as f32 * metrics.cell_width,
+                y: metrics.origin_y + run.row as f32 * metrics.line_height,
+                width: run.cells as f32 * metrics.cell_width,
+                height: metrics.line_height,
+            },
+            baseline,
+            run.column.saturating_sub(popup.view.column) as f32 * metrics.cell_width,
+            layouts,
+        );
+    }
+    snapshot.pop();
+    snapshot.pop();
 }
 
 fn paint_completion(
@@ -1278,8 +1362,8 @@ impl BufferSurface {
             return;
         };
         if !enabled
-            || previous.completion.is_some()
-            || next.completion.is_some()
+            || previous.has_overlays()
+            || next.has_overlays()
             || state.metrics != metrics
             || previous.default_style != next.default_style
             || previous.windows.len() != next.windows.len()
@@ -1404,7 +1488,7 @@ impl BufferSurface {
         unit: gdk::ScrollUnit,
         smooth_event: bool,
     ) -> bool {
-        if self.completion_visible() {
+        if self.overlays_visible() {
             self.cancel_scroll();
             return false;
         }
@@ -1532,25 +1616,25 @@ impl BufferSurface {
         presented.cursor
     }
 
-    fn completion_visible(&self) -> bool {
+    fn overlays_visible(&self) -> bool {
         self.imp()
             .state
             .borrow()
             .frame
             .as_ref()
-            .is_some_and(|frame| frame.completion.is_some())
+            .is_some_and(|frame| frame.has_overlays())
             || self
                 .imp()
                 .presented
                 .borrow()
                 .as_ref()
-                .is_some_and(|shown| shown.frame.completion.is_some())
+                .is_some_and(|shown| shown.frame.has_overlays())
     }
 
     /// Hit the last submitted native image, not a newer frame received between
     /// presentation ticks. Source generation is checked again before dispatch.
     fn source_at(&self, x: f64, y: f64) -> Option<Vim9BufferPosition> {
-        if self.completion_visible() {
+        if self.overlays_visible() {
             return None;
         }
         if !x.is_finite() || !y.is_finite() {
@@ -1728,7 +1812,7 @@ impl BufferSurface {
     }
 
     fn queue_source_pointer(&self, x: f64, y: f64, phase: Vim9PointerPhase) -> bool {
-        if self.completion_visible() {
+        if self.overlays_visible() {
             self.cancel_scroll();
             return false;
         }
@@ -1760,7 +1844,7 @@ impl BufferSurface {
     }
 
     fn source_motion(&self, x: f64, y: f64, primary_down: bool) {
-        if self.completion_visible() {
+        if self.overlays_visible() {
             self.cancel_scroll();
             return;
         }
@@ -1793,8 +1877,8 @@ impl BufferSurface {
             // the surface; an intervening click must not hit a different grid.
             return;
         };
-        if frame.completion.is_some() {
-            // Keep completion navigation entirely on Vim's original input
+        if frame.has_overlays() {
+            // Keep popup and completion navigation on Vim's original input
             // path, with no queued source-bound wheel or pointer transaction.
             self.imp().pixel_enabled.set(false);
             if self
@@ -1803,7 +1887,7 @@ impl BufferSurface {
                 .borrow()
                 .frame
                 .as_ref()
-                .is_none_or(|old| old.completion.is_none())
+                .is_none_or(|old| !old.has_overlays())
             {
                 self.cancel_scroll();
             }
@@ -2201,7 +2285,7 @@ impl NativeBuffer {
                 let Some(surface) = surface.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                if surface.completion_visible() {
+                if surface.overlays_visible() {
                     surface.cancel_scroll();
                     return glib::Propagation::Proceed;
                 }
@@ -2285,7 +2369,7 @@ impl NativeBuffer {
                     // the clock. Show it now and retain Vim's next wait period.
                     surface.restart_cursor_blink();
                 }
-                if surface.completion_visible() {
+                if surface.overlays_visible() {
                     surface.cancel_scroll();
                     return;
                 }
@@ -2628,7 +2712,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn layout_pressure_keeps_visible_margin_and_completion_shapes_warm() {
+    fn layout_pressure_keeps_visible_margin_and_overlay_shapes_warm() {
         use jterm_core::vim9::{Vim9RenderCompletion, Vim9RenderMarginRow, Vim9RenderWindow};
         let run = |text: &str| Vim9RenderRun {
             text: text.into(),
@@ -2647,17 +2731,21 @@ mod tests {
                 runs: vec![run("completion")],
                 ..Default::default()
             }),
+            popups: vec![Vim9RenderPopup {
+                runs: vec![run("popup")],
+                ..Default::default()
+            }],
             ..Default::default()
         };
         let mut layouts = StyledCache::default();
         for index in 0..4096 {
             layouts.get_or_insert_with(&format!("cold-{index}"), false, false, || index);
         }
-        for text in ["visible", "margin", "completion"] {
+        for text in ["visible", "margin", "completion", "popup"] {
             layouts.get_or_insert_with(text, false, false, || usize::MAX);
         }
         trim_layout_cache(&frame, &mut layouts);
-        assert_eq!(layouts.len(), 3);
+        assert_eq!(layouts.len(), 4);
         assert!(layouts
             .buckets
             .iter()
@@ -2669,7 +2757,7 @@ mod tests {
         }
         layouts.get_or_insert_with("visible", true, false, || 0);
         trim_layout_cache(&frame, &mut layouts);
-        assert_eq!(layouts.len(), 3);
+        assert_eq!(layouts.len(), 4);
         assert!(layouts.get("visible", true, false).is_none());
         assert_eq!(layouts.get("visible", false, false), Some(&usize::MAX));
     }
@@ -3738,6 +3826,11 @@ mod tests {
             same_text_content(&frame, &moved),
             "completion is a transient overlay"
         );
+        moved.popups.push(Vim9RenderPopup::default());
+        assert!(
+            same_text_content(&frame, &moved),
+            "popup changes must not rebuild the underlying buffer scene"
+        );
         moved.runs[0].style.foreground = Some(0x123456);
         assert!(!same_text_content(&frame, &moved));
         moved = frame.clone();
@@ -3900,6 +3993,273 @@ mod tests {
         for (x, y) in [(14, 18), (24, 12), (24, 18), (72, 60)] {
             assert_eq!(pixel(&closed, x, y), 0xc0c0c0);
         }
+    }
+
+    #[test]
+    #[ignore = "requires GTK display; checks popup layering and opaque render pixels"]
+    fn native_popups_cover_split_gaps_and_obey_vim_zindex() {
+        gtk::init().expect("GTK display required");
+        use jterm_core::vim9::Vim9RenderCompletion;
+
+        let surface = BufferSurface::new();
+        surface.measure(gtk::Orientation::Horizontal, -1);
+        surface.measure(gtk::Orientation::Vertical, 96);
+        surface.allocate(96, 72, -1, None);
+        let state = PaintState {
+            metrics: Metrics {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                cell_width: 8.0,
+                line_height: 12.0,
+            },
+            ..Default::default()
+        };
+        let style = |background| Vim9RenderStyle {
+            foreground: Some(0xe0e0e0),
+            background: Some(background),
+            ..Default::default()
+        };
+        let upper = Vim9RenderPopup {
+            id: 20,
+            zindex: 100,
+            view: Vim9RenderRect {
+                row: 2,
+                column: 4,
+                rows: 3,
+                columns: 5,
+            },
+            default_style: style(0xa060c0),
+            runs: vec![Vim9RenderRun {
+                row: 2,
+                column: 4,
+                cells: 5,
+                style: style(0xd03040),
+                ..Default::default()
+            }],
+        };
+        let mut newer = upper.clone();
+        newer.id = 21;
+        newer.default_style = style(0x602080);
+        newer.runs.clear();
+        let mut frame = Vim9RenderFrame {
+            // Two splits leave column 4 and row 3 Vim-owned. The popup must
+            // still fill both gaps; clipping to buffer views would leak PTY.
+            windows: vec![
+                Vim9RenderWindow {
+                    view: Vim9RenderRect {
+                        row: 0,
+                        column: 0,
+                        rows: 3,
+                        columns: 4,
+                    },
+                    ..Default::default()
+                },
+                Vim9RenderWindow {
+                    view: Vim9RenderRect {
+                        row: 0,
+                        column: 5,
+                        rows: 3,
+                        columns: 7,
+                    },
+                    ..Default::default()
+                },
+            ],
+            completion: Some(Vim9RenderCompletion {
+                view: Vim9RenderRect {
+                    row: 1,
+                    column: 2,
+                    rows: 3,
+                    columns: 5,
+                },
+                default_style: style(0x204080),
+                ..Default::default()
+            }),
+            // Deliberately unsorted so host ordering is independently tested.
+            popups: vec![
+                upper,
+                Vim9RenderPopup {
+                    id: 10,
+                    zindex: 50,
+                    view: Vim9RenderRect {
+                        row: 0,
+                        column: 1,
+                        rows: 4,
+                        columns: 9,
+                    },
+                    default_style: style(0x246824),
+                    ..Default::default()
+                },
+                newer,
+            ],
+            ..Default::default()
+        };
+        let render = |frame: &Vim9RenderFrame| {
+            let snapshot = gtk::Snapshot::new();
+            snapshot.append_color(
+                &rgb(0xc0c0c0),
+                &gtk::graphene::Rect::new(0.0, 0.0, 104.0, 80.0),
+            );
+            paint_overlays(
+                &surface,
+                &snapshot,
+                &state,
+                frame,
+                &mut LayoutCache::default(),
+            );
+            let mut image =
+                gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 104, 80).unwrap();
+            let cr = gtk::cairo::Context::new(&image).unwrap();
+            snapshot.to_node().unwrap().draw(&cr);
+            drop(cr);
+            let stride = image.stride() as usize;
+            let bytes = image.data().unwrap().to_vec();
+            (stride, bytes)
+        };
+        let pixel = |image: &(usize, Vec<u8>), x: usize, y: usize| {
+            let index = y * image.0 + x * 4;
+            u32::from_ne_bytes(image.1[index..index + 4].try_into().unwrap()) & 0xffffff
+        };
+        let image = render(&frame);
+        assert_eq!(pixel(&image, 12, 6), 0x246824, "low popup is opaque");
+        assert_eq!(pixel(&image, 24, 18), 0x204080, "menu covers z-index 50");
+        assert_eq!(
+            pixel(&image, 40, 30),
+            0xd03040,
+            "popup border run keeps GUI color"
+        );
+        assert_eq!(
+            pixel(&image, 36, 42),
+            0xa060c0,
+            "popup covers split/status gaps"
+        );
+        assert_eq!(
+            pixel(&image, 40, 42),
+            0xa060c0,
+            "z-index 100 and older id cover menu and equal-zindex popup"
+        );
+        assert_eq!(
+            pixel(&image, 4, 6),
+            0xc0c0c0,
+            "popup does not invent a host border"
+        );
+
+        frame.completion = None;
+        frame.popups.truncate(1);
+        frame.popups[0].view = Vim9RenderRect {
+            row: 4,
+            column: 9,
+            rows: 2,
+            columns: 3,
+        };
+        frame.popups[0].runs.clear();
+        let edge = render(&frame);
+        assert_eq!(pixel(&edge, 80, 60), 0xa060c0);
+        assert_eq!(
+            pixel(&edge, 97, 60),
+            0xc0c0c0,
+            "widget clipping is preserved"
+        );
+        assert_eq!(pixel(&edge, 80, 73), 0xc0c0c0);
+        frame.popups.clear();
+        let closed = render(&frame);
+        assert_eq!(
+            pixel(&closed, 80, 60),
+            0xc0c0c0,
+            "closed popup leaves no stale paint"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires GTK display; checks popup input remains Vim-owned"]
+    fn native_popup_input_never_targets_underlying_source() {
+        gtk::init().expect("GTK display required");
+        let surface = BufferSurface::new();
+        let metrics = Metrics {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            cell_width: 8.0,
+            line_height: 12.0,
+        };
+        let mut frame = Vim9RenderFrame {
+            supported: true,
+            window: 10,
+            buffer: 1,
+            mode: "n".into(),
+            windows: vec![Vim9RenderWindow {
+                window: 10,
+                buffer: 1,
+                native_pointer: true,
+                native_scroll: true,
+                view: Vim9RenderRect {
+                    row: 0,
+                    column: 0,
+                    rows: 4,
+                    columns: 8,
+                },
+                ..Default::default()
+            }],
+            runs: vec![Vim9RenderRun {
+                window: 10,
+                row: 0,
+                column: 0,
+                line: 1,
+                byte_start: 0,
+                byte_end: 4,
+                text: "text".into(),
+                cells: 4,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let shown = Arc::new(frame.clone());
+        surface.imp().state.borrow_mut().frame = Some(shown.clone());
+        surface.imp().state.borrow_mut().metrics = metrics;
+        *surface.imp().presented.borrow_mut() = Some(PresentedFrame {
+            frame: shown,
+            metrics,
+            offsets: HashMap::new(),
+            precision_windows: Vec::new(),
+            cursor: None,
+        });
+        let source = surface.source_at(4.0, 6.0).unwrap();
+        *surface.imp().source_gesture.borrow_mut() = Some(SourceGesture {
+            gesture: 1,
+            request: 1,
+            last: source,
+            pending: Some((source, Vim9PointerPhase::Drag)),
+            released: false,
+        });
+        surface
+            .imp()
+            .scroll_input
+            .borrow_mut()
+            .pending
+            .insert(10, 3);
+        frame.popups.push(Vim9RenderPopup {
+            id: 12,
+            zindex: 50,
+            view: Vim9RenderRect {
+                row: 0,
+                column: 0,
+                rows: 2,
+                columns: 4,
+            },
+            ..Default::default()
+        });
+        let popup_frame = Arc::new(frame);
+        surface.imp().state.borrow_mut().frame = Some(popup_frame.clone());
+        assert!(surface.overlays_visible());
+        assert!(surface.source_at(4.0, 6.0).is_none());
+        assert!(!surface.enqueue_scroll(4.0, 6.0, 0.5, gdk::ScrollUnit::Surface));
+        assert!(surface.imp().source_gesture.borrow().is_none());
+        assert!(surface.imp().scroll_input.borrow().pending.is_empty());
+        assert!(!surface.queue_source_pointer(4.0, 6.0, Vim9PointerPhase::Press));
+        // The already-presented popup retains input ownership until GTK has
+        // painted its disappearance, even if a newer frame has no popups.
+        surface.imp().presented.borrow_mut().as_mut().unwrap().frame = popup_frame;
+        surface.imp().state.borrow_mut().frame = Some(Arc::new(Vim9RenderFrame::default()));
+        assert!(surface.overlays_visible());
+        assert!(!surface.enqueue_scroll(4.0, 6.0, 1.0, gdk::ScrollUnit::Wheel));
     }
 
     #[test]

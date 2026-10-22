@@ -44,3 +44,7 @@ jobs:
         run: dbus-run-session -- xvfb-run -a cargo test --quiet --locked native_pixel_snapshot_and_source_hit_round_trip -- --ignored --test-threads=1
       - name: Exercise native completion elevation and clipping
         run: dbus-run-session -- xvfb-run -a cargo test --quiet --locked native_completion_elevation_preserves_rows_and_clips_to_widget -- --ignored --test-threads=1
+      - name: Exercise native popup layering and split gaps
+        run: dbus-run-session -- xvfb-run -a cargo test --quiet --locked native_popups_cover_split_gaps_and_obey_vim_zindex -- --ignored --test-threads=1
+      - name: Exercise native popup input ownership
+        run: dbus-run-session -- xvfb-run -a cargo test --quiet --locked native_popup_input_never_targets_underlying_source -- --ignored --test-threads=1
