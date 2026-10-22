@@ -11,7 +11,7 @@ use jterm_core::vim9::{
     Vim9Viewport,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use vte4::prelude::*;
@@ -80,6 +80,29 @@ impl Default for PaintState {
 }
 
 type LayoutKey = (String, bool, bool);
+
+/// Trim cold layouts at the cache limit while keeping every shape used by
+/// this frame warm. Clearing the entire cache made long scrolls periodically
+/// reshape all visible text, including unchanged rows in sibling splits.
+fn trim_layout_cache<T>(frame: &Vim9RenderFrame, layouts: &mut HashMap<LayoutKey, T>) {
+    if layouts.len() <= 4096 {
+        return;
+    }
+    let live: HashSet<_> = frame
+        .runs
+        .iter()
+        .chain(
+            frame
+                .windows
+                .iter()
+                .flat_map(|window| &window.overscan)
+                .flat_map(|row| &row.runs),
+        )
+        .chain(frame.completion.iter().flat_map(|menu| &menu.runs))
+        .map(|run| (run.text.as_str(), run.style.bold, run.style.italic))
+        .collect();
+    layouts.retain(|(text, bold, italic), _| live.contains(&(text.as_str(), *bold, *italic)));
+}
 
 /// Retain the immutable text/background scene independently of cursor, focus
 /// and input-method overlays. A cursor-only frame reuses GTK render nodes.
@@ -403,9 +426,7 @@ fn build_text_scene(
     // Clip and cover each Vim editing window independently. A single
     // bounding rectangle would erase live PTY status lines, split
     // separators and plugin-owned chrome between the native panes.
-    if layouts.len() > 4096 {
-        layouts.clear();
-    }
+    trim_layout_cache(frame, layouts);
     for region in frame.paint_views() {
         let view = view_rectangle(region, metrics);
         snapshot.push_clip(&view);
@@ -473,9 +494,7 @@ fn paint_pixel_scene(
 ) {
     let metrics = state.metrics;
     let baseline = row_baseline(surface, state);
-    if layouts.len() > 4096 {
-        layouts.clear();
-    }
+    trim_layout_cache(frame, layouts);
     for window in &frame.windows {
         let offset = surface.presentation_offset(state, frame, window.window);
         let Some(view) = Vim9Viewport::new(frame, window.window, metrics, offset) else {
@@ -616,9 +635,7 @@ fn paint_completion(
             ),
         );
     }
-    if layouts.len() > 4096 {
-        layouts.clear();
-    }
+    trim_layout_cache(frame, layouts);
     for run in &completion.runs {
         paint_text_run(
             surface,
@@ -2279,6 +2296,46 @@ fn terminal_grid_is_allocated(terminal: &vte4::Terminal) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layout_pressure_keeps_visible_margin_and_completion_shapes_warm() {
+        use jterm_core::vim9::{Vim9RenderCompletion, Vim9RenderMarginRow, Vim9RenderWindow};
+        let run = |text: &str| Vim9RenderRun {
+            text: text.into(),
+            ..Default::default()
+        };
+        let frame = Vim9RenderFrame {
+            runs: vec![run("visible")],
+            windows: vec![Vim9RenderWindow {
+                overscan: vec![Vim9RenderMarginRow {
+                    runs: vec![run("margin")],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            completion: Some(Vim9RenderCompletion {
+                runs: vec![run("completion")],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut layouts: HashMap<_, _> = (0..4096)
+            .map(|index| ((format!("cold-{index}"), false, false), index))
+            .collect();
+        for text in ["visible", "margin", "completion"] {
+            layouts.insert((text.into(), false, false), usize::MAX);
+        }
+        trim_layout_cache(&frame, &mut layouts);
+        assert_eq!(layouts.len(), 3);
+        assert!(layouts.values().all(|value| *value == usize::MAX));
+        // Font style is part of shape identity; an old bold/italic variant
+        // cannot count as the visible regular shape under pressure.
+        layouts.extend((0..4096).map(|index| ((format!("cold-{index}"), true, false), index)));
+        layouts.insert(("visible".into(), true, false), 0);
+        trim_layout_cache(&frame, &mut layouts);
+        assert_eq!(layouts.len(), 3);
+        assert!(!layouts.contains_key(&("visible".into(), true, false)));
+    }
 
     #[test]
     #[ignore = "requires GTK display; verifies actual active-split edge pixels"]
