@@ -1511,10 +1511,26 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
     let line_height = editor.char_height() as f64;
     let x = (view.column + 3) as f64 * cell_width;
     let y = (view.row + 3) as f64 * line_height;
-    if buffer.settings().is_gtk_enable_animations() {
-        // Precision movement is in logical pixels, not rounded source rows.
-        // The reversal also restores this fixture's original position before
-        // the line-crossing and discrete-wheel checks below.
+    let settings = buffer.settings();
+    let saved_animations = settings.is_gtk_enable_animations();
+    let smooth = descendants::<gtk::CheckButton>(widget)
+        .into_iter()
+        .find(|button| button.label().as_deref() == Some("Smooth scrolling"))
+        .unwrap();
+    let saved_smooth = smooth.is_active();
+    // Each setting combination must retain exact direct manipulation. Wait
+    // for the frontend frame callback so this also exercises its admission
+    // gates rather than merely a controller left over from the previous tick.
+    for (animate, interpolate_wheel) in [(true, true), (false, true), (true, false)] {
+        settings.set_gtk_enable_animations(animate);
+        smooth.set_active(interpolate_wheel);
+        let ticked = Rc::new(Cell::new(false));
+        let observed = ticked.clone();
+        buffer.add_tick_callback(move |_, _| {
+            observed.set(true);
+            glib::ControlFlow::Break
+        });
+        wait_for(widget, "precision scroll animation policy", || ticked.get());
         for (delta, expected) in [(1.0, -1.0), (0.25, -1.25), (-1.25, 0.0)] {
             assert!(buffer.enqueue_scroll(x, y, delta, gdk::ScrollUnit::Surface));
             assert!(
@@ -1530,6 +1546,56 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
                 .all(|view| view.topline == 1));
         }
     }
+    settings.set_gtk_enable_animations(saved_animations);
+    smooth.set_active(saved_smooth);
+    // A mouse mapping/virtualedit governs pointer gestures, not scrolling.
+    // Insert-mode scrolling must commit its source viewport without leaving
+    // Insert mode or moving focus into the hovered inactive split.
+    editor.feed_child(b":set virtualedit=all\r");
+    editor.feed_child(b"i");
+    wait_for(
+        widget,
+        "Insert scroll without native mouse ownership",
+        || {
+            buffer.painted_frame().is_some_and(|frame| {
+                frame.mode == "i"
+                    && frame
+                        .windows
+                        .iter()
+                        .all(|view| view.native_scroll && !view.native_pointer)
+            })
+        },
+    );
+    assert!(buffer.enqueue_scroll(x, y, line_height * 1.25, gdk::ScrollUnit::Surface));
+    wait_for(
+        widget,
+        "Insert-mode precision viewport acknowledgement",
+        || {
+            buffer.painted_frame().is_some_and(|frame| {
+                frame.mode == "i"
+                    && frame.window == active
+                    && frame
+                        .windows
+                        .iter()
+                        .any(|view| view.window == inactive_id && view.topline == 2)
+            })
+        },
+    );
+    assert!((buffer.scroll_offset(inactive_id) + line_height * 0.25).abs() < 0.001);
+    assert_eq!(buffer.scroll_offset(active), 0.0);
+    assert!(buffer.enqueue_scroll(x, y, -line_height * 1.25, gdk::ScrollUnit::Surface));
+    wait_for(widget, "Insert-mode precision reversal", || {
+        buffer.painted_frame().is_some_and(|frame| {
+            frame.mode == "i" && frame.windows.iter().all(|view| view.topline == 1)
+        })
+    });
+    assert!(buffer.scroll_offset(inactive_id).abs() < 0.001);
+    editor.feed_child(b"\x1b:set virtualedit=\r");
+    wait_for(widget, "Normal-mode scroll fixture restored", || {
+        buffer
+            .painted_frame()
+            .is_some_and(|frame| frame.mode == "n")
+    });
     assert!(buffer.enqueue_scroll(x, y, line_height * 0.4, gdk::ScrollUnit::Surface));
     assert!(buffer.enqueue_scroll(x, y, line_height * 0.4, gdk::ScrollUnit::Surface));
     // Fine deltas stay below one source row until their fractional sum crosses

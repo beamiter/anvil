@@ -3,11 +3,12 @@
 ## Implemented GTK path
 
 The native Vim buffer surface uses shared core's `Vim9PixelScroll` for GDK
-surface-unit precision input in supported idle Normal-mode views. Sub-line input immediately updates
+surface-unit precision input in supported idle Normal- and Insert-mode views. Sub-line input immediately updates
 logical-pixel presentation; it is not held until Vim acknowledges a whole row.
 The residual fraction persists across acknowledgements. Each split has at most
 one source/view-checked scroll command in flight. Platform momentum is consumed
-once rather than receiving a second synthetic easing curve.
+once rather than receiving a second synthetic easing curve. This includes X11
+smooth wheel-unit events as well as surface-pixel events.
 
 During this gesture, the GTK snapshot paints real semantic overscan rows through
 `Vim9Viewport`, including partly exposed text at split edges. Pango shaping,
@@ -16,7 +17,8 @@ The split clipping rectangle stays fixed. Idle text retains its cached scene;
 discrete wheel input retains the bounded acknowledged-row animation.
 
 A snapshot records its immutable source frame, geometry and applied offsets.
-A primary click during a nonzero precision offset resolves against that
+When Vim permits native pointer handling, a primary click during a nonzero
+precision offset resolves against that
 submitted image, not a newer frame merely received by the polling loop. The
 current source generation and geometry are checked again before dispatch.
 Plain primary dragging sends coalesced source-byte targets into real Vim
@@ -26,11 +28,14 @@ preedit, zoom, focus loss and incompatible geometry/source changes cancel old
 unsent gestures. Caret paint and the native IM candidate rectangle share the
 same projection offset.
 
+Scroll eligibility is independent of mouse mappings, `mouse`, and `virtualedit`.
+When Vim retains pointer ownership, a click on a fractional image settles that
+image and is consumed before subsequent clicks use the stationary Vim grid.
 Stationary mouse events are not taken over. Custom mouse mappings, Select-mode,
 virtual columns, modifier clicks and multi-click handling remain on the Vim
 compatibility path. Complete multi-click equivalence during a fractional
 scroll gesture and drag-edge auto-scrolling remain future acceptance items.
-Precision mode obeys the existing smooth-scrolling and system animation gates.
+Raw precision-device pixels remain direct when smooth scrolling or system animations are disabled. Those settings control discrete-wheel interpolation; disabled wheel animation applies its distance directly.
 Unsupported native states keep the compatibility renderer and input path.
 No optional IDE chrome is enabled by this change.
 

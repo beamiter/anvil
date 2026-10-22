@@ -170,6 +170,7 @@ mod imp {
         pub(super) pointer: Cell<Option<(f64, f64)>>,
         pub(super) pixels: RefCell<HashMap<i64, Vim9PixelScroll>>,
         pub(super) pixel_enabled: Cell<bool>,
+        pub(super) wheel_animation: Cell<bool>,
         pub(super) source_gesture: RefCell<Option<SourceGesture>>,
         pub(super) gesture_sequence: Cell<u64>,
         pub(super) presented: RefCell<Option<PresentedFrame>>,
@@ -1061,6 +1062,17 @@ impl BufferSurface {
     }
 
     pub(super) fn enqueue_scroll(&self, x: f64, y: f64, dy: f64, unit: gdk::ScrollUnit) -> bool {
+        self.enqueue_scroll_input(x, y, dy, unit, false)
+    }
+
+    fn enqueue_scroll_input(
+        &self,
+        x: f64,
+        y: f64,
+        dy: f64,
+        unit: gdk::ScrollUnit,
+        smooth_event: bool,
+    ) -> bool {
         if self.completion_visible() {
             self.cancel_scroll();
             return false;
@@ -1092,24 +1104,27 @@ impl BufferSurface {
             gdk::ScrollUnit::Surface => dy / f64::from(state.metrics.line_height),
             _ => dy * 3.0,
         };
+        // X11 touchpad valuators use smooth wheel units. Preserve their
+        // supplied fractional distance and momentum just like surface pixels.
+        let precision = smooth_event || unit == gdk::ScrollUnit::Surface || dy.fract() != 0.0;
         let mut input = self.imp().scroll_input.borrow_mut();
         if self.imp().source_gesture.borrow().is_some() {
             return true;
         }
         if self.imp().pixel_enabled.get()
-            && frame.mode == "n"
-            && window.native_pointer
+            && matches!(frame.mode.as_str(), "n" | "i")
+            && window.native_scroll
             && !input.pending.contains_key(&window.window)
         {
             let mut pixels = self.imp().pixels.borrow_mut();
             if let Some(scroll) = pixels.get_mut(&window.window) {
-                if unit == gdk::ScrollUnit::Surface {
+                if precision || !self.imp().wheel_animation.get() {
                     scroll.push(lines);
                 } else {
                     scroll.push_wheel(lines);
                 }
             } else if let Some(mut scroll) = Vim9PixelScroll::new(window, state.metrics) {
-                if unit == gdk::ScrollUnit::Surface {
+                if precision || !self.imp().wheel_animation.get() {
                     scroll.push(lines);
                 } else {
                     scroll.push_wheel(lines);
@@ -1483,7 +1498,10 @@ impl BufferSurface {
         let mut pixels = self.imp().pixels.borrow_mut();
         let before = pixels.len();
         let was_animating = pixels.values().any(Vim9PixelScroll::is_animating);
-        if !enabled || changed_geometry || (frame.mode != "n" && pointer.is_none()) {
+        // Releasing a source-bound drag ends its transaction, but Visual
+        // selection still refers to the same frozen fractional image. Keep
+        // that image until actual input or an incompatible frame retires it.
+        if !enabled || changed_geometry || !matches!(frame.mode.as_str(), "n" | "i" | "v") {
             pixels.clear();
         } else {
             pixels.retain(|window, scroll| {
@@ -1502,7 +1520,7 @@ impl BufferSurface {
         if pixels.len() != before || was_animating {
             self.queue_draw();
         }
-        if pointer.is_none() && frame.mode == "n" {
+        if pointer.is_none() && matches!(frame.mode.as_str(), "n" | "i") {
             for scroll in pixels.values_mut() {
                 if let Some(command) = scroll.command() {
                     if let Ok(id) = session.send(command) {
@@ -1622,7 +1640,7 @@ impl NativeBuffer {
         let smooth = gtk::CheckButton::with_label("Smooth scrolling");
         smooth.set_active(smooth_enabled);
         smooth.set_tooltip_text(Some(
-            "Direct precision-device pixels with source-checked clicks; discrete wheels use bounded easing. Obeys reduced-motion settings.",
+            "Animate discrete wheel movement. Precision devices always follow their supplied pixels; wheel animation obeys reduced-motion settings.",
         ));
         settings.append(&smooth);
         {
@@ -1736,6 +1754,16 @@ impl NativeBuffer {
         motion.set_propagation_phase(gtk::PropagationPhase::Capture);
         {
             let surface = surface.downgrade();
+            motion.connect_enter(move |_, x, y| {
+                if let Some(surface) = surface.upgrade() {
+                    // A stationary pointer can enter a newly mapped editor
+                    // without a motion event before its first wheel gesture.
+                    surface.imp().pointer.set(Some((x, y)));
+                }
+            });
+        }
+        {
+            let surface = surface.downgrade();
             motion.connect_motion(move |controller, x, y| {
                 if let Some(surface) = surface.upgrade() {
                     surface.imp().pointer.set(Some((x, y)));
@@ -1792,7 +1820,17 @@ impl NativeBuffer {
                     }
                     return glib::Propagation::Proceed;
                 }
-                if surface.enqueue_scroll(x, y, dy, controller.unit()) {
+                let smooth_event = controller.current_event().is_some_and(|event| {
+                    event
+                        .downcast_ref::<gdk::ScrollEvent>()
+                        .is_some_and(|event| event.direction() == gdk::ScrollDirection::Smooth)
+                });
+                let accepted = if smooth_event {
+                    surface.enqueue_scroll_input(x, y, dy, controller.unit(), true)
+                } else {
+                    surface.enqueue_scroll(x, y, dy, controller.unit())
+                };
+                if accepted {
                     glib::Propagation::Stop
                 } else {
                     glib::Propagation::Proceed
@@ -2032,13 +2070,14 @@ impl NativeBuffer {
             let next = if active { frame.clone() } else { None };
             let animations =
                 smooth.is_active() && poll_surface.settings().is_gtk_enable_animations();
-            poll_surface.advance_native_input(
-                &session,
-                &input,
-                &next,
-                metrics,
-                active && animations,
-            );
+            if poll_surface.imp().wheel_animation.replace(animations) && !animations {
+                for scroll in poll_surface.imp().pixels.borrow_mut().values_mut() {
+                    scroll.stop_animation();
+                }
+            }
+            // Raw surface pixels describe direct manipulation, independent
+            // of the optional animation used to interpolate wheel notches.
+            poll_surface.advance_native_input(&session, &input, &next, metrics, active);
             poll_surface.retarget_scroll(&next, metrics, now, animations);
             {
                 let mut input = poll_surface.imp().scroll_input.borrow_mut();
@@ -2369,7 +2408,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires GTK display; exercised by the native pixel integration CI"]
+    #[ignore = "requires GTK display and Vim; exercised by the native pixel integration CI"]
     fn native_pixel_snapshot_and_source_hit_round_trip() {
         gtk::init().expect("GTK display required");
         use jterm_core::vim9::{
@@ -2429,6 +2468,7 @@ mod tests {
                 botline: 13,
                 line_count: 100,
                 native_pointer: true,
+                native_scroll: true,
                 line_lengths: vec![2, 2, 2, 0],
                 overscan: vec![
                     Vim9RenderMarginRow {
@@ -2489,6 +2529,40 @@ mod tests {
         );
         assert_eq!(surface.source_at(45.0, 65.0).unwrap().line, 13);
         assert!(surface.source_at(65.0, 75.0).is_none());
+        let mut visual = (*frame).clone();
+        visual.mode = "v".into();
+        visual.windows[0].native_scroll = false;
+        {
+            let mut pixels = surface.imp().pixels.borrow_mut();
+            let scroll = pixels.get_mut(&10).unwrap();
+            scroll.stop_animation();
+            assert!(scroll.reconcile(&visual.windows[0], metrics, false));
+        }
+        if !jterm_core::child_env::inherited_environment_is_captured() {
+            jterm_core::child_env::capture_inherited_environment().unwrap();
+        }
+        let session = Vim9Session::start(jterm_core::vim9::Vim9EntryRequest::user_action(
+            std::env::temp_dir(),
+        ))
+        .unwrap();
+        let visual = Some(Arc::new(visual));
+        assert!(surface.imp().source_gesture.borrow().is_none());
+        // Exercise a polling tick after the release transaction has retired.
+        // Visual selection must keep its fractional image and hit mapping.
+        surface.advance_native_input(
+            &session,
+            &Vim9InputSnapshot::default(),
+            &visual,
+            metrics,
+            true,
+        );
+        surface.imp().state.borrow_mut().frame = visual;
+        let snapshot = gtk::Snapshot::new();
+        surface.imp().snapshot(&snapshot);
+        assert!(snapshot.to_node().is_some());
+        assert_eq!(surface.scroll_offset(10), -6.25);
+        assert_eq!(surface.source_at(9.0, 75.0).unwrap().line, 14);
+        surface.imp().state.borrow_mut().frame = Some(frame.clone());
         assert!(!surface.should_settle_press(9.0, 75.0, 1, 1, false));
         for (button, count, modified) in [(3, 1, false), (1, 2, false), (1, 1, true)] {
             assert!(surface.should_settle_press(9.0, 75.0, button, count, modified));
@@ -2653,5 +2727,44 @@ mod tests {
         assert!(snapshot.to_node().is_some());
         assert_eq!(surface.source_at(9.0, 10.0), Some(before_hit));
         assert_eq!(surface.presented_cursor(), Some(before_caret));
+
+        // Scroll eligibility is independent of Vim's mouse ownership. A
+        // custom mapping/virtualedit or Insert mode must not quantize raw
+        // device pixels, including when wheel animations are disabled.
+        surface.imp().wheel_animation.set(false);
+        for mode in ["n", "i"] {
+            surface.cancel_scroll();
+            let mut scroll_only = (*frame).clone();
+            scroll_only.mode = mode.into();
+            scroll_only.windows[0].native_pointer = false;
+            surface.imp().state.borrow_mut().frame = Some(Arc::new(scroll_only));
+            assert!(surface.enqueue_scroll(8.0, 10.0, 1.25, gdk::ScrollUnit::Surface));
+            let snapshot = gtk::Snapshot::new();
+            surface.imp().snapshot(&snapshot);
+            assert!(snapshot.to_node().is_some());
+            assert_eq!(
+                surface.imp().presented.borrow().as_ref().unwrap().offsets[&10],
+                -1.25
+            );
+            assert!(surface.direct_source_at(9.0, 10.0).is_none());
+            assert!(surface.should_settle_press(9.0, 10.0, 1, 1, false));
+            assert!(surface.enqueue_scroll(8.0, 10.0, 0.25, gdk::ScrollUnit::Wheel));
+            assert_eq!(surface.scroll_offset(10), -16.25);
+            assert!(!surface.imp().pixels.borrow()[&10].is_animating());
+        }
+        surface.imp().wheel_animation.set(true);
+        for (delta, smooth_event) in [(0.125, false), (1.0, true)] {
+            surface.cancel_scroll();
+            surface.imp().state.borrow_mut().frame = Some(frame.clone());
+            assert!(surface.enqueue_scroll_input(
+                8.0,
+                10.0,
+                delta,
+                gdk::ScrollUnit::Wheel,
+                smooth_event
+            ));
+            assert_eq!(surface.scroll_offset(10), -(delta * 3.0 * 20.0).min(20.0));
+            assert!(!surface.imp().pixels.borrow()[&10].is_animating());
+        }
     }
 }
