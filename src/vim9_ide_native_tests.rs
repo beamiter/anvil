@@ -724,6 +724,161 @@ fn native_vim9_edit_save_build_and_modified_close() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+#[ignore = "needs a display and Vim 9 with +channel +job +timers"]
+fn native_vim9_quick_open_locations() {
+    if !jterm_core::child_env::inherited_environment_is_captured() {
+        jterm_core::child_env::capture_inherited_environment().unwrap();
+    }
+    adw::init().unwrap();
+    let app = adw::Application::builder()
+        .application_id("io.github.beamiter.Vim9QuickOpenTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let root = std::env::temp_dir().join(format!("vim9-quick-open-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("Makefile"), "all:\n\t@true\n").unwrap();
+    let sample = root.join("sample.txt");
+    std::fs::write(&sample, "before\n").unwrap();
+    std::fs::write(root.join("src/chosen.rs"), "first\nsecond\nthird\nfourth\n").unwrap();
+    std::fs::write(root.join("src/notes:12"), "literal colon filename\n").unwrap();
+    open_with_config(
+        app.upcast_ref(),
+        None,
+        Vim9EntryRequest::user_action(sample.clone()),
+        Vim9UiConfig {
+            toolbar: true,
+            status_bar: true,
+            ..Default::default()
+        },
+    );
+    let window = app.windows().into_iter().next().expect("native IDE window");
+    let native_window = window.clone().downcast::<adw::ApplicationWindow>().unwrap();
+    let widget: &gtk::Widget = window.upcast_ref();
+    let editor = descendants::<vte4::Terminal>(widget)
+        .into_iter()
+        .next()
+        .expect("real VTE editor");
+    wait_for(widget, "authenticated Vim bridge", || {
+        named_button(widget, "Save (Ctrl+S)").is_sensitive()
+    });
+    let open_picker = || {
+        named_button(widget, "Quick open project file (Ctrl+Shift+P)").emit_clicked();
+        wait_for(widget, "quick-open dialog", || {
+            native_window.visible_dialog().is_some()
+        });
+        let dialog = native_window.visible_dialog().unwrap();
+        let query = descendants::<gtk::SearchEntry>(dialog.upcast_ref())
+            .into_iter()
+            .next()
+            .unwrap();
+        (dialog, query)
+    };
+    let at_position = |position: &str| {
+        descendants::<gtk::Label>(widget)
+            .iter()
+            .any(|label| label.text().contains(position))
+    };
+
+    let (picker, query) = open_picker();
+    query.set_text("sample");
+    wait_for(widget, "initial file match", || {
+        descendants::<gtk::Label>(picker.upcast_ref())
+            .iter()
+            .any(|label| label.text() == "sample.txt")
+    });
+    // The location and path must both come from the newly typed query even
+    // when Enter arrives before SearchEntry's debounce signal.
+    query.set_text("chsrs:3:2");
+    query.emit_activate();
+    wait_for(widget, "quick open file and byte location", || {
+        native_window.visible_dialog().is_none()
+            && window
+                .title()
+                .is_some_and(|title| title.contains("chosen.rs"))
+            && at_position("Ln 3/4, Col 2")
+    });
+
+    let (picker, query) = open_picker();
+    query.set_text("sample");
+    wait_for(widget, "file row before a changed query", || {
+        descendants::<gtk::Label>(picker.upcast_ref())
+            .iter()
+            .any(|label| label.text() == "sample.txt")
+    });
+    let list = descendants::<gtk::ListBox>(picker.upcast_ref())
+        .into_iter()
+        .next()
+        .unwrap();
+    let stale_row = list.row_at_index(0).unwrap();
+    query.set_text(":2:3");
+    list.emit_by_name::<()>("row-activated", &[&stale_row]);
+    assert!(native_window.visible_dialog().is_some());
+    assert!(at_position("Ln 3/4, Col 2"));
+    assert_eq!(list.row_at_index(1), None);
+    assert!(descendants::<gtk::Label>(picker.upcast_ref())
+        .iter()
+        .any(|label| label.text() == "Go to line 2, byte column 3 · Current buffer"));
+    query.emit_activate();
+    wait_for(widget, "current buffer location", || {
+        native_window.visible_dialog().is_none()
+            && window
+                .title()
+                .is_some_and(|title| title.contains("chosen.rs"))
+            && at_position("Ln 2/4, Col 3")
+    });
+
+    let (picker, query) = open_picker();
+    query.set_text("chsrs:0");
+    query.emit_activate();
+    assert!(native_window.visible_dialog().is_some());
+    assert!(descendants::<gtk::Label>(picker.upcast_ref())
+        .iter()
+        .any(|label| label.has_css_class("error")));
+    assert!(descendants::<gtk::ListBoxRow>(picker.upcast_ref()).is_empty());
+    query.set_text("src/notes:12");
+    query.emit_activate();
+    wait_for(widget, "literal indexed colon filename", || {
+        native_window.visible_dialog().is_none()
+            && window
+                .title()
+                .is_some_and(|title| title.contains("notes:12"))
+            && at_position("Ln 1/1, Col 1")
+    });
+
+    // Current-buffer navigation is a Goto action, so it must not reopen a
+    // named file, reject an unnamed buffer, or overwrite its unsaved text.
+    editor.feed_child(b":enew\rione\ntwo\nthree\x1b");
+    wait_for(widget, "modified unnamed buffer", || {
+        window
+            .title()
+            .is_some_and(|title| title.contains("[No Name] ●"))
+            && at_position("Ln 3/3")
+            && descendants::<gtk::Label>(widget)
+                .iter()
+                .any(|label| label.text().starts_with("N · [No Name]"))
+    });
+    let (_, query) = open_picker();
+    query.set_text(":2:2");
+    query.emit_activate();
+    wait_for(
+        widget,
+        "navigation preserves modified unnamed buffer",
+        || {
+            native_window.visible_dialog().is_none()
+                && window
+                    .title()
+                    .is_some_and(|title| title.contains("[No Name] ●"))
+                && at_position("Ln 2/3, Col 2")
+        },
+    );
+    assert_eq!(std::fs::read_to_string(sample).unwrap(), "before\n");
+    editor.feed_child(b":qa!\r");
+    wait_for(widget, "Vim fixture exits", || app.windows().is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// Runs against Vim and the actual GTK snapshot path. The same test may be
 /// invoked with GDK_SCALE=2 to validate a device-scaled native editing window.
 #[test]
@@ -1356,6 +1511,25 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
     let line_height = editor.char_height() as f64;
     let x = (view.column + 3) as f64 * cell_width;
     let y = (view.row + 3) as f64 * line_height;
+    if buffer.settings().is_gtk_enable_animations() {
+        // Precision movement is in logical pixels, not rounded source rows.
+        // The reversal also restores this fixture's original position before
+        // the line-crossing and discrete-wheel checks below.
+        for (delta, expected) in [(1.0, -1.0), (0.25, -1.25), (-1.25, 0.0)] {
+            assert!(buffer.enqueue_scroll(x, y, delta, gdk::ScrollUnit::Surface));
+            assert!(
+                (buffer.scroll_offset(inactive_id) - expected).abs() < 0.001,
+                "precision input must retain the exact sub-line pixel distance"
+            );
+            assert_eq!(buffer.scroll_offset(active), 0.0);
+            assert!(buffer
+                .painted_frame()
+                .unwrap()
+                .windows
+                .iter()
+                .all(|view| view.topline == 1));
+        }
+    }
     assert!(buffer.enqueue_scroll(x, y, line_height * 0.4, gdk::ScrollUnit::Surface));
     assert!(buffer.enqueue_scroll(x, y, line_height * 0.4, gdk::ScrollUnit::Surface));
     // Fine deltas stay below one source row until their fractional sum crosses

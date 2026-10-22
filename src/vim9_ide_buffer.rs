@@ -2455,13 +2455,26 @@ mod tests {
             state.frame = Some(frame.clone());
         }
         surface.imp().pixel_enabled.set(true);
-        assert!(surface.enqueue_scroll(8.0, 10.0, 6.25, gdk::ScrollUnit::Surface));
+        // A real GTK snapshot must submit each supplied logical pixel, even
+        // while Vim's source viewport has not moved by a whole line.
+        for (delta, expected) in [(1.0, -1.0), (0.25, -1.25)] {
+            assert!(surface.enqueue_scroll(8.0, 10.0, delta, gdk::ScrollUnit::Surface));
+            let snapshot = gtk::Snapshot::new();
+            surface.imp().snapshot(&snapshot);
+            assert!(snapshot.to_node().is_some());
+            let presented = surface.imp().presented.borrow();
+            let presented = presented.as_ref().unwrap();
+            assert_eq!(presented.offsets[&10], expected);
+            assert_eq!(presented.frame.windows[0].topline, 10);
+            assert_eq!(presented.cursor.unwrap().y, 20.0 + expected);
+        }
+        assert!(surface.enqueue_scroll(8.0, 10.0, 5.0, gdk::ScrollUnit::Surface));
         assert_eq!(
             surface.presentation_offset(&surface.imp().state.borrow(), &frame, 10),
             -6.25
         );
         assert_eq!(surface.projected_cursor().unwrap().y, 13.75);
-        assert!(surface.presented_cursor().is_none());
+        assert_eq!(surface.presented_cursor().unwrap().y, 18.75);
         // Execute the actual GTK snapshot/Pango path, including a partly
         // exposed semantic margin. No GPU/hardware latency is asserted here.
         let snapshot = gtk::Snapshot::new();
@@ -2579,5 +2592,66 @@ mod tests {
         surface.imp().snapshot(&snapshot);
         assert!(snapshot.to_node().is_none());
         assert!(!surface.stale_precision_at(9.0, 75.0));
+
+        // A reversal while a bounded scroll request is in flight must fit
+        // both source images. This fixture has only one real margin row:
+        // receiving the acknowledgement may not snap its visible text/caret.
+        surface.cancel_scroll();
+        surface.imp().state.borrow_mut().frame = Some(frame.clone());
+        assert!(surface.enqueue_scroll(8.0, 10.0, 200.0, gdk::ScrollUnit::Surface));
+        {
+            let mut pixels = surface.imp().pixels.borrow_mut();
+            let scroll = pixels.get_mut(&10).unwrap();
+            assert!(matches!(
+                scroll.command(),
+                Some(Vim9Command::ScrollView { lines: 1, .. })
+            ));
+            scroll.submitted(88);
+        }
+        assert!(surface.enqueue_scroll(8.0, 10.0, -200.0, gdk::ScrollUnit::Surface));
+        let snapshot = gtk::Snapshot::new();
+        surface.imp().snapshot(&snapshot);
+        assert!(snapshot.to_node().is_some());
+        let before_hit = surface.source_at(9.0, 10.0).unwrap();
+        let before_caret = surface.presented_cursor().unwrap();
+        assert_eq!(before_hit.line, 10);
+
+        let mut acknowledged = (*frame).clone();
+        acknowledged.revision += 1;
+        acknowledged.cursor.row = 0;
+        let window = &mut acknowledged.windows[0];
+        window.topline = 11;
+        window.botline = 14;
+        window.scroll_ack = 88;
+        window.cursor.row = 0;
+        window.line_lengths = vec![2, 2, 0, 4];
+        window.overscan = vec![
+            Vim9RenderMarginRow {
+                row: -1,
+                line: 10,
+                byte_length: 2,
+                runs: vec![run(0, 10, "AB")],
+            },
+            Vim9RenderMarginRow {
+                row: 4,
+                line: 15,
+                byte_length: 4,
+                runs: vec![run(0, 15, "next")],
+            },
+        ];
+        acknowledged.runs = vec![run(0, 11, "CD"), run(1, 12, "EF"), run(3, 14, "post")];
+        assert!(surface
+            .imp()
+            .pixels
+            .borrow_mut()
+            .get_mut(&10)
+            .unwrap()
+            .reconcile(window, metrics, false));
+        surface.imp().state.borrow_mut().frame = Some(Arc::new(acknowledged));
+        let snapshot = gtk::Snapshot::new();
+        surface.imp().snapshot(&snapshot);
+        assert!(snapshot.to_node().is_some());
+        assert_eq!(surface.source_at(9.0, 10.0), Some(before_hit));
+        assert_eq!(surface.presented_cursor(), Some(before_caret));
     }
 }

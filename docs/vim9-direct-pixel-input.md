@@ -34,6 +34,21 @@ Precision mode obeys the existing smooth-scrolling and system animation gates.
 Unsupported native states keep the compatibility renderer and input path.
 No optional IDE chrome is enabled by this change.
 
+## Fractional input and delayed acknowledgements
+
+Precision events retain their logical-pixel distance, including one-pixel and
+quarter-pixel deltas. Neither input accumulation nor the submitted GTK snapshot
+rounds that movement to a source row. Whole-line commands only synchronize
+Vim's source viewport; they do not determine the native presentation step.
+
+If a fast gesture exhausts the available semantic margin rows, the shared
+controller keeps the requested distance separate from the distance already
+shown. It commits only sampled rows to Vim. An exact acknowledgement preserves
+the visible source position; newly available rows let the remaining distance
+catch up through the GUI frame clock. A reversal responds from the visible
+position instead of requiring repayment of motion that was never displayed.
+Unsupported margins retain their compatibility path.
+
 ## Pointer lifetime and submitted caret follow-up
 
 The GTK gesture now retires when its event sequence is cancelled or the native

@@ -2,7 +2,9 @@
 //! buffer changes, cursor movement and modified-buffer decisions belong to Vim.
 
 use super::*;
-use jterm_core::vim9::{Vim9ProjectFile, Vim9ProjectIndex};
+use jterm_core::vim9::{
+    parse_vim9_location as parse_position, Vim9ProjectFile, Vim9ProjectIndex, Vim9QuickOpenQuery,
+};
 use std::sync::Arc;
 
 fn plain_key(modifiers: gdk::ModifierType) -> bool {
@@ -51,31 +53,6 @@ fn close_dialog(dialog: &impl IsA<adw::Dialog>) {
             glib::ControlFlow::Continue
         }
     });
-}
-
-/// An explicit line[:column] input never becomes an Ex command or shell text.
-fn parse_position(value: &str) -> Result<(u64, Option<u64>), &'static str> {
-    let mut parts = value.trim().split(':');
-    let line = parts
-        .next()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|value| (1..=i32::MAX as u64).contains(value))
-        .ok_or("Enter a line from 1 to 2147483647, optionally followed by :column.")?;
-    let column = parts
-        .next()
-        .map(|value| {
-            value
-                .trim()
-                .parse::<u64>()
-                .ok()
-                .filter(|value| (1..=i32::MAX as u64).contains(value))
-                .ok_or("The column must be from 1 to 2147483647.")
-        })
-        .transpose()?;
-    if parts.next().is_some() {
-        return Err("Use line or line:column, for example 42:8.");
-    }
-    Ok((line, column))
 }
 
 pub(super) fn go_to_line(
@@ -192,6 +169,7 @@ pub(super) struct QuickOpen {
     list: gtk::ListBox,
     feedback: gtk::Label,
     matches: RefCell<Vec<Vim9ProjectFile>>,
+    parsed_query: RefCell<Result<Vim9QuickOpenQuery, &'static str>>,
     last_files: RefCell<Option<Arc<Vec<Vim9ProjectFile>>>>,
     last_query: RefCell<String>,
     dismissing: Cell<bool>,
@@ -220,7 +198,7 @@ impl QuickOpen {
         header.pack_start(&refresh);
         content.append(&header);
         let query = gtk::SearchEntry::new();
-        query.set_placeholder_text(Some("Type a filename or path…"));
+        query.set_placeholder_text(Some("File[:line[:column]] or :line[:column]…"));
         query.set_search_delay(60);
         query.set_margin_start(12);
         query.set_margin_end(12);
@@ -249,6 +227,7 @@ impl QuickOpen {
             list,
             feedback,
             matches: RefCell::new(Vec::new()),
+            parsed_query: RefCell::new(Err("Enter a file or :line[:column].")),
             last_files: RefCell::new(None),
             last_query: RefCell::new(String::new()),
             dismissing: Cell::new(false),
@@ -282,7 +261,12 @@ impl QuickOpen {
         let weak = Rc::downgrade(&this);
         this.list.connect_row_activated(move |_, row| {
             if let Some(this) = weak.upgrade() {
-                this.activate(row.index());
+                // A query edit or index completion can invalidate the row
+                // before SearchEntry's delayed signal reaches this callback.
+                this.sync();
+                if this.list.row_at_index(row.index()).as_ref() == Some(row) {
+                    this.activate(row.index());
+                }
             }
         });
         let weak = Rc::downgrade(&this);
@@ -327,15 +311,30 @@ impl QuickOpen {
             .is_none_or(|old| !Arc::ptr_eq(old, &snapshot.files))
             || *self.last_query.borrow() != query;
         if changed {
+            let parsed = snapshot.quick_open_query(&query);
             let selected = self.list.selected_row().and_then(|row| {
                 self.matches
                     .borrow()
                     .get(row.index() as usize)
                     .map(|file| file.path.clone())
             });
-            let matches = snapshot.matches(&query, 100);
+            let matches = parsed
+                .as_ref()
+                .ok()
+                .filter(|query| !query.current_buffer)
+                .map_or_else(Vec::new, |query| snapshot.matches(&query.file_query, 100));
             self.list.remove_all();
             let mut selected_index = 0;
+            if let Ok(query) = &parsed {
+                if query.current_buffer {
+                    let row = label(&format!("Go to {} · Current buffer", destination(query)));
+                    row.set_margin_start(12);
+                    row.set_margin_end(12);
+                    row.set_margin_top(7);
+                    row.set_margin_bottom(7);
+                    self.list.append(&row);
+                }
+            }
             for (i, file) in matches.iter().enumerate() {
                 let row = label(&visible(&file.relative));
                 row.set_margin_start(12);
@@ -353,9 +352,20 @@ impl QuickOpen {
             *self.matches.borrow_mut() = matches;
             *self.last_files.borrow_mut() = Some(snapshot.files.clone());
             *self.last_query.borrow_mut() = query;
+            *self.parsed_query.borrow_mut() = parsed;
+        }
+        let parsed = self.parsed_query.borrow();
+        if parsed.is_err() {
+            self.feedback.add_css_class("error");
+        } else {
+            self.feedback.remove_css_class("error");
         }
         self.feedback
-            .set_label(&if let Some(error) = &snapshot.error {
+            .set_label(&if let Err(error) = parsed.as_ref() {
+                (*error).into()
+            } else if let Some(query) = parsed.as_ref().ok().filter(|query| query.current_buffer) {
+                format!("Current buffer · {} · Enter to go", destination(query))
+            } else if let Some(error) = &snapshot.error {
                 format!("Index error: {} · Refresh to retry.", visible(error))
             } else if snapshot.scanning {
                 "Indexing project files…".into()
@@ -363,7 +373,7 @@ impl QuickOpen {
                 format!("No matching files · {} indexed", snapshot.files.len())
             } else {
                 format!(
-                    "{} shown · {} indexed{}",
+                    "{} shown · {} indexed{}{}",
                     self.matches.borrow().len(),
                     snapshot.files.len(),
                     if snapshot.truncated {
@@ -371,6 +381,11 @@ impl QuickOpen {
                     } else {
                         ""
                     },
+                    parsed
+                        .as_ref()
+                        .ok()
+                        .filter(|query| query.location.is_some())
+                        .map_or_else(String::new, |query| format!(" · {}", destination(query))),
                 )
             });
     }
@@ -385,25 +400,33 @@ impl QuickOpen {
         if self.dismissing.get() {
             return;
         }
-        let Some(file) = self.matches.borrow().get(index as usize).cloned() else {
+        let query = self.parsed_query.borrow();
+        let Ok(query) = query.as_ref() else {
             return;
         };
-        let Some(path) = file.path.to_str() else {
-            self.feedback
-                .set_label("Vim9 IDE currently requires UTF-8 file paths.");
-            return;
+        let matches = self.matches.borrow();
+        let command = match query.command(matches.get(index as usize)) {
+            Ok(command) => command,
+            Err(error) => {
+                self.feedback.set_label(error);
+                return;
+            }
         };
-        match self.session.send(Vim9Command::Open {
-            path: path.into(),
-            line: None,
-            column: None,
-        }) {
+        match self.session.send(command) {
             Ok(_) => {
                 self.message.set_label("");
                 self.dismiss();
             }
             Err(error) => self.feedback.set_label(&visible(&error.to_string())),
         }
+    }
+}
+
+fn destination(query: &Vim9QuickOpenQuery) -> String {
+    match query.location {
+        Some((line, Some(column))) => format!("line {line}, byte column {column}"),
+        Some((line, None)) => format!("line {line}"),
+        None => String::new(),
     }
 }
 

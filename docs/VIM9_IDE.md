@@ -209,12 +209,22 @@ The New file button opens a native filename chooser and creates a named Vim
 buffer; the file is written when you save it. The file picker can open any local
 UTF-8 path. Sidebar navigation stays inside the project root, including symlink targets. The directory browser stays separate from Quick open: it reads one folder at a time. Quick open invokes `rg --files --hidden -0` in the project root, respects ignore rules, and does not follow directory symlinks. It retains at most 20,000 files and shows the best 100 matches. Reopening the picker reuses its index; use Refresh after adding, renaming, or removing files. Missing `rg` and indexing errors are shown in the picker.
 
+Quick open also accepts `src/main.rs:42` and fuzzy queries such as `smrs:42:8`.
+The destination is shown before opening; columns are one-based UTF-8 byte
+columns, matching Vim. Type `:42` or `:42:8` to move within the current buffer,
+including an unnamed or modified buffer, without opening another file or
+waiting for the project index. Invalid or incomplete locations keep the picker
+open and show a validation error. An exact indexed filename containing a colon
+(such as `src/notes:12`) remains a literal file. Enter uses the latest query even
+before the typing debounce finishes; a stale clicked row cannot open another
+file after the query changes.
+
 ## Shortcuts
 
 | Scope | Shortcut | Action |
 | --- | --- | --- |
 | Terminal workspace | Ctrl+Alt+I | Open Vim9 IDE for the local pane |
-| IDE | Ctrl+Shift+P | Quick open a project file with fuzzy path matching |
+| IDE | Ctrl+Shift+P | Quick open `file[:line[:column]]`, or `:line[:column]` in the current buffer |
 | IDE | Ctrl+Shift+G | Go to line or line:column |
 | Vim editing grid | Alt+Left / Alt+Right | Back / forward through Vim jump history |
 | IDE | Ctrl+Shift+F | Focus project text search |
