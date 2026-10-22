@@ -1581,6 +1581,11 @@ impl SimpleComponent for AppModel {
             let file_tree_config = model.config.clone();
             let cross_block_search_key_latch = cross_block_search_key_latch.clone();
             key_controller.connect_key_pressed(move |_c, keyval, keycode, state| {
+                // Embedded Vim owns Quick Open before the shell's global
+                // command-palette binding can consume this capture event.
+                if crate::vim9_ide::embedded_owns_quick_open_key(&window, keyval, state) {
+                    return glib::Propagation::Proceed;
+                }
                 let focused = gtk::prelude::RootExt::focus(&window);
                 let ai_panel_focused = focused
                     .clone()

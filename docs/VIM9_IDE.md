@@ -185,12 +185,12 @@ project roots; select a local pane or launch a local checkout explicitly.
 | Area | Behavior |
 | --- | --- |
 | Project | Browse one directory at a time, filter filenames, open files, refresh, and move to the parent directory. Directory reads run off the GTK thread and are bounded to 1,024 entries. |
-| Quick open | Ctrl+Shift+P opens a native fuzzy picker across the project. Type a filename or path, use ↑/↓ to select, and press Enter to open. Indexing runs in the background and reports progress, errors, and truncation. Refresh rebuilds the index. |
+| Quick open | Ctrl+Shift+P opens a native fuzzy picker across the project. Type a filename or path, use ↑/↓ to select, and press Enter to open. Indexing runs in the background and reports progress, errors, and truncation. Refresh rebuilds the index. Prefix the query with `>` to find and run IDE commands. |
 | Navigation history | Back/forward buttons and Alt+Left/Alt+Right move through the active Vim window's real jump list, restoring the file and cursor position. Native Go to line records a jump as well. Buttons reflect whether a direction is available. |
 | Open buffers | Shows real Vim buffer names, current-buffer marker and modified marker. Activate a row or use previous/next controls to switch; Close current buffer preserves modified-buffer protection. Split vertically/horizontally creates real Vim windows. |
-| Editor | GTK/Pango draws supported buffer views with Vim GUI RGB styles, native cursor and IME preedit; real Vim owns editing, mappings and undo. VTE remains the PTY/input adapter and compatibility view. |
+| Editor | GTK/Pango draws supported buffer views with Vim GUI RGB styles, native cursor and IME preedit; real Vim owns editing, mappings and undo. VTE remains the PTY/input adapter and compatibility view. With multiple splits, a subtle inner outline identifies the active Vim window and dims when the editor loses focus. |
 | Search project | Press Enter or Search to run a search with the selected case mode, literal/regex, whole-word and file-glob options. Stop cancels an active search. Requires `rg` in Vim's environment. Progress, errors, cancellations, match counts and omitted-result counts are visible below the build controls. |
-| Problems | Displays filename, line, column, severity/type and message, and identifies the current quickfix list as Search, Build or Vim. Vim may also supply location-list or language-server diagnostics. Activate a result to open its exact location. F8/Shift+F8 navigate Vim diagnostics. |
+| Problems | Displays an E/W/I severity label, project-relative filename when valid, line, column and a wrapping message. Hover a row for the full path and message. It identifies the current quickfix list as Search, Build or Vim. Vim may also supply location-list or language-server diagnostics. Activate a result to open its exact location. F8/Shift+F8 navigate Vim diagnostics. |
 | Build | Edit the visible shell command and press Build/F5. Builds run asynchronously in the project root. Cancel stops the active build. Exit status and a bounded output tail are shown in the native Build output tab; parsed diagnostics populate Problems. |
 | Status | Live Vim mode, filename, modified flag, cursor location and total lines, filetype, encoding, window/buffer counts, and bridge connection state. |
 
@@ -219,12 +219,26 @@ open and show a validation error. An exact indexed filename containing a colon
 before the typing debounce finishes; a stale clicked row cannot open another
 file after the query changes.
 
+Prefix Quick open with `>` to search the built-in IDE command catalog by name or
+alias. The list shows existing shortcuts and explains commands that are currently
+unavailable. Enter runs the selected command after rechecking the current Vim
+state; an unavailable command keeps the picker open with its reason. Command
+results update while the picker is open and do not wait for project indexing.
+Use `./>notes` to open a literal filename beginning with `>`. Ctrl+Shift+P still
+opens the file picker even when toolbar chrome is hidden, and Escape returns
+focus to Vim. Plain Ctrl+P remains available to Vim.
+
+A completed project search with no matches shows a clear Problems empty state
+only while that search owns the current quickfix list and no location-list or
+language-server diagnostics remain. Failed or cancelled searches keep their
+existing error and cancellation feedback.
+
 ## Shortcuts
 
 | Scope | Shortcut | Action |
 | --- | --- | --- |
 | Terminal workspace | Ctrl+Alt+I | Open Vim9 IDE for the local pane |
-| IDE | Ctrl+Shift+P | Quick open `file[:line[:column]]`, or `:line[:column]` in the current buffer |
+| IDE | Ctrl+Shift+P | Quick open `file[:line[:column]]`, `:line[:column]` in the current buffer, or `>command` |
 | IDE | Ctrl+Shift+G | Go to line or line:column |
 | Vim editing grid | Alt+Left / Alt+Right | Back / forward through Vim jump history |
 | IDE | Ctrl+Shift+F | Focus project text search |
@@ -321,6 +335,7 @@ close protection. Run it under a
 graphical display (for example Xvfb) with the required Vim:
 
 ```sh
+cargo test native_vim9_command_palette_modes_and_live_availability -- --ignored --test-threads=1
 cargo test native_vim9_edit_save_build_and_modified_close -- --ignored --test-threads=1
 cargo test native_vim9_split_unicode_visual_and_font_scaling -- --ignored --test-threads=1
 ```

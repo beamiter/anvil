@@ -1,8 +1,10 @@
-//! Native project-search options. Reading controls never launches a search;
+//! Native project-search options and Problems feedback. Reading controls never launches a search;
 //! Enter or the Search button sends one immutable set of options to Vim.
 
 use super::*;
-use jterm_core::vim9::{Vim9Search, Vim9SearchCase, Vim9SearchOptions};
+use jterm_core::vim9::{
+    Vim9Diagnostic, Vim9Search, Vim9SearchCase, Vim9SearchOptions, Vim9Snapshot,
+};
 
 #[derive(Clone)]
 pub(super) struct SearchOptions {
@@ -134,9 +136,157 @@ pub(super) fn feedback(search: &Vim9Search) -> String {
     }
 }
 
+fn diagnostic_kind(kind: &str) -> (&'static str, &'static str) {
+    match kind.to_ascii_lowercase().as_str() {
+        "e" | "error" => ("E · Error", "error"),
+        "w" | "warning" => ("W · Warning", "warning"),
+        "i" | "info" | "information" => ("I · Info", "accent"),
+        "h" | "hint" => ("H · Hint", "dim-label"),
+        _ => ("• · Problem", "dim-label"),
+    }
+}
+
+fn diagnostic_path<'a>(root: &str, filename: &'a str) -> &'a str {
+    use std::path::Component;
+    let file = Path::new(filename);
+    let root = Path::new(root);
+    if file.is_absolute()
+        && root.is_absolute()
+        && !file.components().any(|part| part == Component::ParentDir)
+        && !root.components().any(|part| part == Component::ParentDir)
+    {
+        if let Ok(relative) = file.strip_prefix(root) {
+            if let Some(relative) = relative.to_str().filter(|name| !name.is_empty()) {
+                return relative;
+            }
+        }
+    }
+    filename
+}
+
+pub(super) fn diagnostic_row(root: &str, diagnostic: &Vim9Diagnostic) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    row.set_margin_start(8);
+    row.set_margin_end(8);
+    row.set_margin_top(6);
+    row.set_margin_bottom(6);
+    let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let (kind, class) = diagnostic_kind(&diagnostic.kind);
+    let badge = label(kind);
+    badge.add_css_class(class);
+    heading.append(&badge);
+    let path = diagnostic_path(root, &diagnostic.filename);
+    let location = label(&format!(
+        "{}:{}:{}",
+        if path.is_empty() {
+            "[No file]".into()
+        } else {
+            visible(path)
+        },
+        diagnostic.line,
+        diagnostic.column,
+    ));
+    location.set_hexpand(true);
+    location.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    location.add_css_class("dim-label");
+    heading.append(&location);
+    row.append(&heading);
+    let message = label(&visible(&diagnostic.text));
+    message.set_wrap(true);
+    message.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    message.set_lines(2);
+    message.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    row.append(&message);
+    row.set_tooltip_text(Some(&jterm_core::review_input::safe_multiline_display(
+        &format!(
+            "{kind}\n{}:{}:{}\n{}",
+            diagnostic.filename, diagnostic.line, diagnostic.column, diagnostic.text
+        ),
+        32 * 1024,
+    )));
+    row
+}
+
+/// A zero-result search is distinct from the merged quickfix/location/LSP
+/// diagnostics, and from a failed or cancelled job retaining an older list.
+pub(super) fn empty_results(snapshot: &Vim9Snapshot) -> Option<String> {
+    let search = &snapshot.search;
+    (snapshot.quickfix.source == "search"
+        && snapshot.quickfix.title == format!("Search: {}", search.query)
+        && snapshot.quickfix.count == 0
+        && snapshot.diagnostics.is_empty()
+        && !search.query.is_empty()
+        && !search.running
+        && !search.cancelled
+        && search.exit_code == 1
+        && search.errors.is_empty()
+        && search.count == 0)
+        .then(|| {
+            format!(
+                "No project matches for “{}”. Change the query or search options and search again.",
+                visible(&search.query)
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_paths_only_relativize_a_valid_project_descendant() {
+        assert_eq!(
+            diagnostic_path("/project", "/project/src/main.rs"),
+            "src/main.rs"
+        );
+        for path in [
+            "/project-other/src/main.rs",
+            "/project/../outside.rs",
+            "/outside.rs",
+            "/project",
+            "src/relative.rs",
+        ] {
+            assert_eq!(diagnostic_path("/project", path), path);
+        }
+        assert_eq!(
+            diagnostic_path("project", "/project/src/main.rs"),
+            "/project/src/main.rs"
+        );
+        assert_eq!(
+            diagnostic_path("/project/../outside", "/project/src/main.rs"),
+            "/project/src/main.rs"
+        );
+    }
+
+    #[test]
+    fn empty_search_feedback_requires_the_same_successful_owned_list() {
+        let mut snapshot = Vim9Snapshot::default();
+        snapshot.search.query = "needle".into();
+        snapshot.search.exit_code = 1;
+        snapshot.quickfix.source = "search".into();
+        snapshot.quickfix.title = "Search: needle".into();
+        assert!(empty_results(&snapshot).is_some());
+        snapshot.quickfix.title = "Search: older query".into();
+        assert!(empty_results(&snapshot).is_none());
+        snapshot.quickfix.title = "Search: needle".into();
+        snapshot.quickfix.source = "build".into();
+        assert!(empty_results(&snapshot).is_none());
+        snapshot.quickfix.source = "search".into();
+        snapshot.diagnostics.push(Vim9Diagnostic::default());
+        assert!(
+            empty_results(&snapshot).is_none(),
+            "location/LSP diagnostics are not an empty Problems list"
+        );
+        snapshot.diagnostics.clear();
+        snapshot.search.cancelled = true;
+        assert!(empty_results(&snapshot).is_none());
+        snapshot.search.cancelled = false;
+        snapshot.search.running = true;
+        assert!(empty_results(&snapshot).is_none());
+        snapshot.search.running = false;
+        snapshot.search.exit_code = 2;
+        assert!(empty_results(&snapshot).is_none());
+    }
 
     #[test]
     fn search_feedback_distinguishes_cancel_failure_and_no_matches() {

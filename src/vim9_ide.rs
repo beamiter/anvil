@@ -450,6 +450,43 @@ fn has_embedded_editor(root: &impl IsA<gtk::Widget>) -> bool {
     })
 }
 
+/// The shell window captures shortcuts before the embedded content. Defer
+/// only this editor dialog chord when its registered pane owns focus. Native
+/// modal dialogs own their keys even when GTK reparents their focus outside
+/// that pane; a sibling terminal pane retains its normal palette binding.
+pub(crate) fn embedded_owns_quick_open_key(
+    window: &adw::ApplicationWindow,
+    key: gdk::Key,
+    modifiers: gdk::ModifierType,
+) -> bool {
+    if key.to_unicode().map(|key| key.to_ascii_lowercase()) != Some('p')
+        || !modifiers.contains(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK)
+        || modifiers.intersects(gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK)
+    {
+        return false;
+    }
+    let dialog_owned = window
+        .visible_dialog()
+        .map(|dialog| navigation::owns_dialog(&dialog));
+    if dialog_owned == Some(false) {
+        return false;
+    }
+    let focus = gtk::prelude::RootExt::focus(window);
+    EMBEDDED_EDITORS.with_borrow(|editors| {
+        editors.iter().any(|(container, _)| {
+            container.upgrade().is_some_and(|container| {
+                container.is_mapped()
+                    && container.is_ancestor(window)
+                    && (dialog_owned == Some(true)
+                        || focus.as_ref().is_some_and(|focus| {
+                            focus == container.upcast_ref::<gtk::Widget>()
+                                || focus.is_ancestor(&container)
+                        }))
+            })
+        })
+    })
+}
+
 /// Tab/pane/window close first asks the actual Vim to quit. A modified buffer
 /// can refuse without losing either the editor or its waiting shell.
 pub(crate) fn request_embedded_close(root: &impl IsA<gtk::Widget>) -> bool {
@@ -1107,6 +1144,15 @@ fn open_with_config_and_exit(
     problems_title.set_margin_bottom(4);
     let problem_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     problem_box.append(&problems_title);
+    let problems_empty = label("");
+    problems_empty.set_margin_start(12);
+    problems_empty.set_margin_end(12);
+    problems_empty.set_margin_top(12);
+    problems_empty.set_margin_bottom(12);
+    problems_empty.set_wrap(true);
+    problems_empty.add_css_class("dim-label");
+    problems_empty.set_visible(false);
+    problem_box.append(&problems_empty);
     problem_box.append(&scroll(&problems));
     let build_output = gtk::TextView::new();
     build_output.set_editable(false);
@@ -1518,15 +1564,16 @@ fn open_with_config_and_exit(
                 );
                 return glib::Propagation::Stop;
             }
-            // Hidden workbench controls never intercept Vim mappings or
-            // focus an invisible field. Saving remains an editor action.
+            // Quick open presents a dialog even without toolbar chrome.
+            // Other hidden controls never focus an invisible native field;
+            // saving remains an editor action.
             let command = match key.to_unicode().map(|value| value.to_ascii_lowercase()) {
                 Some('s') if ctrl && !alt => Some(if shift {
                     Vim9Command::SaveAll
                 } else {
                     Vim9Command::Save
                 }),
-                Some('p') if ctrl && shift && !alt && config.toolbar => {
+                Some('p') if ctrl && shift && !alt => {
                     if quick_open.is_sensitive() {
                         quick_open.emit_clicked();
                     }
@@ -1955,23 +2002,16 @@ fn open_with_config_and_exit(
             snapshot.quickfix.index,
             snapshot.quickfix.count
         )));
+        let empty = project_search::empty_results(&snapshot);
+        problems_empty.set_visible(empty.is_some());
+        if let Some(empty) = empty {
+            problems_empty.set_label(&empty);
+        }
         if diagnostic_rows != old_diagnostics {
             problems.remove_all();
             diagnostic_targets.borrow_mut().clear();
             for diagnostic in &snapshot.diagnostics {
-                let row = label(&format!(
-                    "{}  {}:{}:{}  {}",
-                    visible(&diagnostic.kind),
-                    visible(&diagnostic.filename),
-                    diagnostic.line,
-                    diagnostic.column,
-                    visible(&diagnostic.text)
-                ));
-                row.set_margin_start(8);
-                row.set_margin_end(8);
-                row.set_margin_top(4);
-                row.set_margin_bottom(4);
-                row.set_tooltip_text(Some(&visible(&diagnostic.text)));
+                let row = project_search::diagnostic_row(&snapshot.root, diagnostic);
                 problems.append(&row);
                 diagnostic_targets.borrow_mut().push((
                     diagnostic.filename.clone(),

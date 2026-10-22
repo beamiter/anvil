@@ -313,6 +313,7 @@ mod imp {
                 }
                 snapshot.pop();
             }
+            paint_active_split(&surface, snapshot, &state, frame);
             paint_completion(
                 &surface,
                 snapshot,
@@ -330,6 +331,64 @@ glib::wrapper! {
     pub struct BufferSurface(ObjectSubclass<imp::BufferSurface>)
         @extends gtk::Widget,
         @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+fn paint_active_split(
+    surface: &BufferSurface,
+    snapshot: &gtk::Snapshot,
+    state: &PaintState,
+    frame: &Vim9RenderFrame,
+) {
+    if frame.windows.len() < 2 {
+        return;
+    }
+    let Some(window) = frame
+        .windows
+        .iter()
+        .find(|window| window.window == frame.window)
+    else {
+        return;
+    };
+    let view = view_rectangle(&window.view, state.metrics);
+    let (foreground, background, _) = colors(&frame.default_style, &frame.default_style);
+    let accent = frame
+        .cursor
+        .appearance
+        .as_ref()
+        .map_or(foreground, |cursor| {
+            let (_, caret) = cursor.colors(&frame.default_style, &frame.default_style);
+            if caret == background {
+                foreground
+            } else {
+                caret
+            }
+        });
+    let mut color = rgb(accent);
+    color.set_alpha(if state.focused { 0.60 } else { 0.24 });
+    let edge = (1.0 / surface.scale_factor().max(1) as f32)
+        .min(view.width() * 0.5)
+        .min(view.height() * 0.5);
+    // Overlay only the inside edge of the active text viewport. Its position
+    // is fixed during pixel scrolling and cannot cover a Vim separator or
+    // status row. Completion paints afterward, above this transient layer.
+    for rect in [
+        gtk::graphene::Rect::new(view.x(), view.y(), view.width(), edge),
+        gtk::graphene::Rect::new(
+            view.x(),
+            view.y() + view.height() - edge,
+            view.width(),
+            edge,
+        ),
+        gtk::graphene::Rect::new(view.x(), view.y() + edge, edge, view.height() - edge * 2.0),
+        gtk::graphene::Rect::new(
+            view.x() + view.width() - edge,
+            view.y() + edge,
+            edge,
+            view.height() - edge * 2.0,
+        ),
+    ] {
+        snapshot.append_color(&color, &rect);
+    }
 }
 
 fn build_text_scene(
@@ -2220,6 +2279,94 @@ fn terminal_grid_is_allocated(terminal: &vte4::Terminal) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires GTK display; verifies actual active-split edge pixels"]
+    fn native_active_split_outline_stays_inside_its_viewport() {
+        gtk::init().expect("GTK display required");
+        use jterm_core::vim9::Vim9RenderWindow;
+        let surface = BufferSurface::new();
+        let mut state = PaintState {
+            focused: true,
+            metrics: Metrics {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                cell_width: 8.0,
+                line_height: 10.0,
+            },
+            ..Default::default()
+        };
+        let mut frame = Vim9RenderFrame {
+            window: 10,
+            default_style: Vim9RenderStyle {
+                foreground: Some(0xa0c0f0),
+                background: Some(0x102030),
+                ..Default::default()
+            },
+            windows: vec![
+                Vim9RenderWindow {
+                    window: 10,
+                    view: Vim9RenderRect {
+                        row: 1,
+                        column: 1,
+                        rows: 3,
+                        columns: 3,
+                    },
+                    ..Default::default()
+                },
+                Vim9RenderWindow {
+                    window: 20,
+                    view: Vim9RenderRect {
+                        row: 1,
+                        column: 5,
+                        rows: 3,
+                        columns: 3,
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let render = |frame: &Vim9RenderFrame, state: &PaintState| {
+            let snapshot = gtk::Snapshot::new();
+            snapshot.append_color(
+                &rgb(0x102030),
+                &gtk::graphene::Rect::new(0.0, 0.0, 80.0, 50.0),
+            );
+            paint_active_split(&surface, &snapshot, state, frame);
+            let mut image =
+                gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 80, 50).unwrap();
+            let cr = gtk::cairo::Context::new(&image).unwrap();
+            snapshot.to_node().unwrap().draw(&cr);
+            drop(cr);
+            let stride = image.stride() as usize;
+            let bytes = image.data().unwrap().to_vec();
+            (stride, bytes)
+        };
+        let pixel = |image: &(usize, Vec<u8>), x: usize, y: usize| {
+            let index = y * image.0 + x * 4;
+            u32::from_ne_bytes(image.1[index..index + 4].try_into().unwrap()) & 0xffffff
+        };
+        let focused = render(&frame, &state);
+        assert_ne!(pixel(&focused, 8, 10), 0x102030);
+        for (x, y) in [(8, 9), (7, 10), (9, 11), (32, 20), (40, 10), (8, 40)] {
+            assert_eq!(
+                pixel(&focused, x, y),
+                0x102030,
+                "edge crossed the viewport at {x},{y}"
+            );
+        }
+        state.focused = false;
+        let unfocused = render(&frame, &state);
+        assert!(pixel(&unfocused, 8, 10) < pixel(&focused, 8, 10));
+        frame.window = 20;
+        let switched = render(&frame, &state);
+        assert_eq!(pixel(&switched, 8, 10), 0x102030);
+        assert_ne!(pixel(&switched, 40, 10), 0x102030);
+        frame.windows.remove(0);
+        let single = render(&frame, &state);
+        assert_eq!(pixel(&single, 40, 10), 0x102030);
+    }
 
     #[test]
     fn retained_text_scene_ignores_cursor_but_invalidates_real_paint_changes() {

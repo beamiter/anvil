@@ -551,6 +551,14 @@ fn native_vim9_edit_save_build_and_modified_close() {
                 .starts_with("Search: 0 matches for absent_fixture_token")
         })
     });
+    wait_for(widget, "Problems explains a completed empty search", || {
+        descendants::<gtk::Label>(widget).iter().any(|label| {
+            label.is_visible()
+                && label
+                    .text()
+                    .starts_with("No project matches for “absent_fixture_token”")
+        })
+    });
     named_button(widget, "Split editor vertically").emit_clicked();
     wait_for(widget, "real Vim vertical split", || {
         descendants::<gtk::Label>(widget)
@@ -666,10 +674,14 @@ fn native_vim9_edit_save_build_and_modified_close() {
         "build output must appear in a native text view"
     );
     assert!(
-        descendants::<gtk::Label>(widget).iter().any(|label| {
-            label.text().contains("sample.txt:1:1") && label.text().contains("native fixture")
+        descendants::<gtk::Box>(widget).iter().any(|row| {
+            row.tooltip_text().is_some_and(|text| {
+                text.contains("sample.txt:1:1") && text.contains("native fixture")
+            }) && descendants::<gtk::Label>(row.upcast_ref())
+                .iter()
+                .any(|label| label.text() == "sample.txt:1:1")
         }),
-        "compiler output must populate native diagnostics"
+        "diagnostics show a relative location and retain full tooltip text"
     );
 
     if let Some(path) = std::env::var_os("JTERM_VIM9_TEST_SCREENSHOT") {
@@ -876,6 +888,498 @@ fn native_vim9_quick_open_locations() {
     assert_eq!(std::fs::read_to_string(sample).unwrap(), "before\n");
     editor.feed_child(b":qa!\r");
     wait_for(widget, "Vim fixture exits", || app.windows().is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "needs a display and Vim 9 with +channel +job +timers"]
+fn native_vim9_command_palette_modes_and_live_availability() {
+    if !jterm_core::child_env::inherited_environment_is_captured() {
+        jterm_core::child_env::capture_inherited_environment().unwrap();
+    }
+    adw::init().unwrap();
+    let app = adw::Application::builder()
+        .application_id("io.github.beamiter.Vim9PaletteTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let root = std::env::temp_dir().join(format!("vim9-palette-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("Makefile"), "all:\n\t@true\n").unwrap();
+    let file = root.join("sample.txt");
+    std::fs::write(&file, "before\n").unwrap();
+    std::fs::write(root.join(">notes"), "literal prefix filename\n").unwrap();
+    open_with_config(
+        app.upcast_ref(),
+        None,
+        Vim9EntryRequest::user_action(file.clone()),
+        Vim9UiConfig::default(),
+    );
+    let window = app.windows().into_iter().next().unwrap();
+    let native_window = window.clone().downcast::<adw::ApplicationWindow>().unwrap();
+    let widget: &gtk::Widget = window.upcast_ref();
+    let editor = descendants::<vte4::Terminal>(widget)
+        .into_iter()
+        .next()
+        .unwrap();
+    let buffer = descendants::<native_buffer::BufferSurface>(widget)
+        .into_iter()
+        .next()
+        .unwrap();
+    wait_for(widget, "palette bridge", || {
+        named_button(widget, "Save (Ctrl+S)").is_sensitive()
+    });
+    assert!(!named_button(widget, "Quick open project file (Ctrl+Shift+P)").is_visible());
+    let shortcuts = named_key_controller(&window, "vim9-workbench-shortcuts");
+    let open_picker = || {
+        assert!(
+            !shortcuts.emit_by_name::<bool>(
+                "key-pressed",
+                &[&gdk::Key::p, &0u32, &gdk::ModifierType::CONTROL_MASK]
+            ),
+            "plain Ctrl+P remains Vim input"
+        );
+        assert!(
+            shortcuts.emit_by_name::<bool>(
+                "key-pressed",
+                &[
+                    &gdk::Key::p,
+                    &0u32,
+                    &(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK)
+                ]
+            ),
+            "Ctrl+Shift+P opens a dialog without toolbar chrome"
+        );
+        wait_for(widget, "palette dialog", || {
+            native_window.visible_dialog().is_some()
+        });
+        let dialog = native_window.visible_dialog().unwrap();
+        let query = descendants::<gtk::SearchEntry>(dialog.upcast_ref())
+            .into_iter()
+            .next()
+            .unwrap();
+        let list = descendants::<gtk::ListBox>(dialog.upcast_ref())
+            .into_iter()
+            .next()
+            .unwrap();
+        (dialog, query, list)
+    };
+    let contains = |dialog: &adw::Dialog, text: &str| {
+        descendants::<gtk::Label>(dialog.upcast_ref())
+            .iter()
+            .any(|label| label.text().contains(text))
+    };
+    let (picker, query, _) = open_picker();
+    assert_eq!(picker.title(), "Quick open project file");
+    query.set_text(">");
+    query.emit_activate();
+    // Immediate Enter uses command mode without waiting for the file index
+    // or SearchEntry debounce. Save on this unchanged fixture is harmless.
+    wait_for(widget, "palette save returns focus", || {
+        native_window.visible_dialog().is_none() && editor.has_focus()
+    });
+    let (picker, query, list) = open_picker();
+    query.set_text(">");
+    wait_for(widget, "command catalog", || {
+        contains(&picker, "Save all buffers") && contains(&picker, "Ctrl+Shift+S")
+    });
+    assert!(!named_button(picker.upcast_ref(), "Refresh project file index").is_visible());
+    assert_eq!(picker.title(), "Quick open command");
+    assert!(navigation::native_text_has_focus(&native_window));
+    assert!(!shortcuts.emit_by_name::<bool>(
+        "key-pressed",
+        &[&gdk::Key::s, &0u32, &gdk::ModifierType::CONTROL_MASK]
+    ));
+    query.set_text(">cancel build");
+    query.emit_activate();
+    assert!(native_window.visible_dialog().is_some());
+    assert!(contains(&picker, "No build is running"));
+    let settled = Rc::new(Cell::new(false));
+    let observed = settled.clone();
+    glib::timeout_add_local_once(Duration::from_millis(160), move || observed.set(true));
+    wait_for(
+        widget,
+        "unavailable command survives picker polling",
+        || settled.get(),
+    );
+    assert!(descendants::<gtk::Label>(picker.upcast_ref())
+        .iter()
+        .any(|label| label.has_css_class("error") && label.text() == "No build is running"));
+    query.set_text(">no_command_fixture_token");
+    query.emit_activate();
+    assert!(native_window.visible_dialog().is_some());
+    assert!(list.row_at_index(0).is_none());
+    assert!(contains(&picker, "No matching commands"));
+    query.set_text(">next diagnostic");
+    query.emit_activate();
+    assert!(contains(&picker, "The quickfix list has no problems"));
+    editor.feed_child(b":call setqflist([{'filename':'sample.txt','lnum':1,'col':1,'text':'palette problem','type':'W'}])\r");
+    wait_for(
+        widget,
+        "live command availability with unchanged query",
+        || {
+            contains(&picker, "Go to next quickfix problem")
+                && !contains(&picker, "The quickfix list has no problems")
+        },
+    );
+    assert_eq!(query.text(), ">next diagnostic");
+    query.emit_by_name::<()>("stop-search", &[]);
+    wait_for(widget, "Escape returns palette focus", || {
+        native_window.visible_dialog().is_none() && editor.has_focus()
+    });
+    // Prepare a modified buffer without an ambiguous standalone Escape,
+    // which can leave Vim waiting for a terminal key sequence after the
+    // modified-buffer title has already arrived.
+    editor.feed_child(b":call setqflist([]) | call setline(1, 'PALETTE before')\r");
+    wait_for(widget, "unsaved palette fixture", || {
+        window.title().is_some_and(|title| title.contains('●'))
+    });
+    let (picker, query, list) = open_picker();
+    query.set_text(">save current buffer");
+    wait_for(widget, "save row before a file query", || {
+        contains(&picker, "Save current buffer")
+    });
+    let stale_command = list.row_at_index(0).unwrap();
+    query.set_text("sample");
+    list.emit_by_name::<()>("row-activated", &[&stale_command]);
+    assert!(native_window.visible_dialog().is_some());
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "before\n");
+    wait_for(widget, "file results after switching modes", || {
+        contains(&picker, "sample.txt")
+    });
+    let stale_file = list.row_at_index(0).unwrap();
+    query.set_text(">vertical split");
+    list.emit_by_name::<()>("row-activated", &[&stale_file]);
+    assert!(native_window.visible_dialog().is_some());
+    assert!(buffer
+        .painted_frame()
+        .is_some_and(|frame| frame.windows.len() == 1));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "before\n");
+    // A detached stale row has index -1 and may not resolve as GTK's last row.
+    list.emit_by_name::<()>("row-activated", &[&stale_file]);
+    assert!(native_window.visible_dialog().is_some());
+    query.emit_activate();
+    wait_for(widget, "typed palette split", || {
+        native_window.visible_dialog().is_none()
+            && buffer
+                .painted_frame()
+                .is_some_and(|frame| frame.windows.len() == 2)
+    });
+    editor.feed_child(b"u");
+    wait_for(widget, "fixture undo retains disk contents", || {
+        window.title().is_some_and(|title| !title.contains('●'))
+    });
+    let (picker, query, _) = open_picker();
+    query.set_text(">");
+    wait_for(widget, "palette screenshot catalog", || {
+        contains(&picker, "Save all buffers")
+    });
+    if let Some(path) = std::env::var_os("JTERM_VIM9_TEST_SCREENSHOT") {
+        let clock = window.frame_clock().unwrap();
+        let previous = clock.frame_counter();
+        window.queue_draw();
+        wait_for(widget, "palette reaches a painted window frame", || {
+            clock.frame_counter() > previous
+        });
+        let paintable = gtk::WidgetPaintable::new(Some(&window));
+        let snapshot = gtk::Snapshot::new();
+        paintable.snapshot(
+            &snapshot,
+            f64::from(window.width()),
+            f64::from(window.height()),
+        );
+        window
+            .renderer()
+            .unwrap()
+            .render_texture(&snapshot.to_node().unwrap(), None)
+            .save_to_png(PathBuf::from(path).with_extension("palette.png"))
+            .unwrap();
+    }
+    query.emit_by_name::<()>("stop-search", &[]);
+    wait_for(widget, "catalog dismissal", || {
+        native_window.visible_dialog().is_none()
+    });
+    let (_, query, _) = open_picker();
+    query.set_text("./>notes");
+    query.emit_activate();
+    wait_for(
+        widget,
+        "literal greater-than filename remains reachable",
+        || {
+            native_window.visible_dialog().is_none()
+                && window.title().is_some_and(|title| title.contains(">notes"))
+        },
+    );
+    editor.feed_child(b":qa!\r");
+    wait_for(widget, "palette fixture exit", || app.windows().is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "needs an X11 display, xdotool and Vim 9 with +channel +job +timers"]
+fn native_embedded_vim9_palette_precedes_parent_and_preserves_sibling_keys() {
+    use std::io::Write;
+    if !jterm_core::child_env::inherited_environment_is_captured() {
+        jterm_core::child_env::capture_inherited_environment().unwrap();
+    }
+    adw::init().unwrap();
+    let app = adw::Application::builder()
+        .application_id("io.github.beamiter.Vim9EmbeddedPaletteTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(None::<&gio::Cancellable>).unwrap();
+    let root = std::env::temp_dir().join(format!("vim9-embedded-palette-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("Makefile"), "all:\n\t@true\n").unwrap();
+    std::fs::write(root.join("sample.txt"), "embedded before\n").unwrap();
+    let window = adw::ApplicationWindow::builder()
+        .application(&app)
+        .title("Embedded Vim9 palette test")
+        .default_width(1000)
+        .default_height(700)
+        .build();
+    let layout = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    let pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    pane.set_hexpand(true);
+    let source = gtk::Entry::new();
+    pane.append(&source);
+    let sibling = gtk::Entry::new();
+    sibling.set_placeholder_text(Some("Sibling terminal input"));
+    layout.append(&pane);
+    layout.append(&sibling);
+    window.set_content(Some(&layout));
+    let terminal_palette_count = Rc::new(Cell::new(0));
+    let parent_keys = gtk::EventControllerKey::new();
+    parent_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let parent_window = window.downgrade();
+    let parent_count = terminal_palette_count.clone();
+    parent_keys.connect_key_pressed(move |_, key, _, modifiers| {
+        let window = parent_window.upgrade().unwrap();
+        // Same boundary as the real terminal window's Capture callback. Real
+        // X11 events below must pass it before reaching embedded content.
+        if embedded_owns_quick_open_key(&window, key, modifiers) {
+            return glib::Propagation::Proceed;
+        }
+        if key.to_unicode().map(|key| key.to_ascii_lowercase()) == Some('p')
+            && modifiers.contains(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK)
+        {
+            parent_count.set(parent_count.get() + 1);
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    window.add_controller(parent_keys);
+    window.present();
+    // Obtain an ordinary authenticated shell completion so the real
+    // EmbeddedHost attach/finish path is exercised without a second GUI.
+    let integration =
+        jterm_core::vim9::Vim9ShellIntegration::prepare(&std::env::current_exe().unwrap()).unwrap();
+    let environment = integration
+        .env()
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut connection =
+        std::os::unix::net::UnixStream::connect(&environment["JTERM_VIM9_HOST_SOCKET"]).unwrap();
+    let argv = [
+        "--vim-shell".into(),
+        std::env::var_os("JTERM_VIM9_BIN").unwrap_or_else(|| "vim".into()),
+        "--".into(),
+        "sample.txt".into(),
+    ];
+    serde_json::to_writer(
+        &mut connection,
+        &serde_json::json!({
+            "token": environment["JTERM_VIM9_HOST_TOKEN"],
+            "cwd": root,
+            "argv": argv,
+            "tty": "/dev/pts/1"
+        }),
+    )
+    .unwrap();
+    connection.write_all(b"\n").unwrap();
+    let invocation = RefCell::new(None);
+    wait_for(
+        window.upcast_ref(),
+        "authenticated embedded invocation",
+        || {
+            if invocation.borrow().is_none() {
+                *invocation.borrow_mut() = jterm_core::vim9::take_shell_vim_requests()
+                    .into_iter()
+                    .next();
+            }
+            invocation.borrow().is_some()
+        },
+    );
+    let invocation = invocation.into_inner().unwrap();
+    open_with_config_and_exit(
+        app.upcast_ref(),
+        Some(&window),
+        invocation.request,
+        Vim9UiConfig::default(),
+        None,
+        Some(EmbeddedLaunch {
+            container: pane.clone(),
+            source: source.clone().upcast(),
+            completion: invocation.completion,
+        }),
+    );
+    let widget: &gtk::Widget = window.upcast_ref();
+    let editor = descendants::<vte4::Terminal>(widget)
+        .into_iter()
+        .next()
+        .unwrap();
+    wait_for(widget, "embedded Vim bridge and focus", || {
+        named_button(widget, "Save (Ctrl+S)").is_sensitive() && editor.has_focus()
+    });
+    let ctrl_shift = gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK;
+    assert!(embedded_owns_quick_open_key(
+        &window,
+        gdk::Key::P,
+        ctrl_shift
+    ));
+    assert!(!embedded_owns_quick_open_key(
+        &window,
+        gdk::Key::p,
+        gdk::ModifierType::CONTROL_MASK
+    ));
+    assert!(!embedded_owns_quick_open_key(
+        &window,
+        gdk::Key::P,
+        ctrl_shift | gdk::ModifierType::ALT_MASK
+    ));
+    let found = std::process::Command::new("xdotool")
+        .args([
+            "search",
+            "--all",
+            "--onlyvisible",
+            "--pid",
+            &std::process::id().to_string(),
+            "--name",
+            "^Embedded Vim9 palette test$",
+        ])
+        .output()
+        .unwrap();
+    assert!(found.status.success());
+    let ids = String::from_utf8(found.stdout).unwrap();
+    let id = ids.lines().next().unwrap();
+    assert!(std::process::Command::new("xdotool")
+        .args(["windowfocus", "--sync", id])
+        .status()
+        .unwrap()
+        .success());
+    let send = |key: &str| {
+        assert!(std::process::Command::new("xdotool")
+            .args(["key", "--clearmodifiers", key])
+            .status()
+            .unwrap()
+            .success());
+    };
+    send("ctrl+shift+p");
+    wait_for(widget, "parent capture defers to embedded picker", || {
+        window.visible_dialog().is_some()
+    });
+    assert_eq!(terminal_palette_count.get(), 0);
+    let picker = window.visible_dialog().unwrap();
+    let query = descendants::<gtk::SearchEntry>(picker.upcast_ref())
+        .into_iter()
+        .next()
+        .unwrap();
+    query.set_text(">hover");
+    send("ctrl+shift+p");
+    let settled = Rc::new(Cell::new(false));
+    let observed = settled.clone();
+    glib::timeout_add_local_once(Duration::from_millis(120), move || observed.set(true));
+    wait_for(widget, "native dialog keeps parent palette key", || {
+        settled.get()
+    });
+    assert_eq!(terminal_palette_count.get(), 0);
+    assert!(window.visible_dialog().as_ref() == Some(&picker));
+    assert_eq!(query.text(), ">hover");
+    query.emit_stop_search();
+    wait_for(widget, "embedded dialog returns focus", || {
+        window.visible_dialog().is_none() && editor.has_focus()
+    });
+    sibling.grab_focus();
+    assert!(!embedded_owns_quick_open_key(
+        &window,
+        gdk::Key::P,
+        ctrl_shift
+    ));
+    send("ctrl+shift+p");
+    wait_for(
+        widget,
+        "sibling terminal retains its palette shortcut",
+        || terminal_palette_count.get() == 1,
+    );
+    assert!(window.visible_dialog().is_none());
+    let sibling_dialog = adw::Dialog::new();
+    let sibling_query = gtk::Entry::new();
+    let native_modal_count = Rc::new(Cell::new(0));
+    let observed_modal_count = native_modal_count.clone();
+    let native_modal_keys = gtk::EventControllerKey::new();
+    native_modal_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    native_modal_keys.connect_key_pressed(move |_, key, _, modifiers| {
+        if key.to_unicode().map(|key| key.to_ascii_lowercase()) == Some('p')
+            && modifiers.contains(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK)
+        {
+            observed_modal_count.set(observed_modal_count.get() + 1);
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    sibling_query.add_controller(native_modal_keys);
+    sibling_dialog.set_child(Some(&sibling_query));
+    sibling_dialog.present(Some(&window));
+    sibling_query.grab_focus();
+    wait_for(widget, "sibling native modal is mapped", || {
+        window.visible_dialog().as_ref() == Some(&sibling_dialog)
+    });
+    assert!(!embedded_owns_quick_open_key(
+        &window,
+        gdk::Key::P,
+        ctrl_shift
+    ));
+    send("ctrl+shift+p");
+    wait_for(
+        widget,
+        "sibling native modal retains its own key handler",
+        || native_modal_count.get() == 1,
+    );
+    assert_eq!(terminal_palette_count.get(), 1);
+    navigation::close_dialog(&sibling_dialog);
+    wait_for(widget, "sibling modal dismissal", || {
+        window.visible_dialog().is_none()
+    });
+    editor.grab_focus();
+    send("ctrl+shift+p");
+    wait_for(
+        widget,
+        "embedded picker works again after sibling focus",
+        || window.visible_dialog().is_some(),
+    );
+    let picker = window.visible_dialog().unwrap();
+    descendants::<gtk::SearchEntry>(picker.upcast_ref())
+        .into_iter()
+        .next()
+        .unwrap()
+        .emit_stop_search();
+    wait_for(widget, "embedded picker final dismissal", || {
+        window.visible_dialog().is_none() && editor.has_focus()
+    });
+    editor.feed_child(b":qa!\r");
+    wait_for(widget, "embedded exit restores its waiting shell", || {
+        gtk::prelude::WidgetExt::is_visible(&source)
+            && gtk::prelude::RootExt::focus(&window).is_some_and(|focus| {
+                &focus == source.upcast_ref::<gtk::Widget>() || focus.is_ancestor(&source)
+            })
+            && !has_embedded_editor(&pane)
+    });
+    assert!(!embedded_owns_quick_open_key(
+        &window,
+        gdk::Key::P,
+        ctrl_shift
+    ));
+    window.close();
     std::fs::remove_dir_all(root).unwrap();
 }
 
