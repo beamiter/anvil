@@ -4141,6 +4141,240 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires GTK display; checks inline hint paint, caret, IME and removal"]
+    fn native_inline_hints_keep_source_caret_and_ime_geometry() {
+        gtk::init().expect("GTK display required");
+        let surface = BufferSurface::new();
+        surface.measure(gtk::Orientation::Horizontal, -1);
+        surface.measure(gtk::Orientation::Vertical, 360);
+        surface.allocate(360, 120, -1, None);
+        let normal = Vim9RenderStyle {
+            foreground: Some(0xeeddaa),
+            background: Some(0x182430),
+            ..Default::default()
+        };
+        let source_style = Vim9RenderStyle {
+            foreground: Some(0xabcde1),
+            background: Some(0x384858),
+            ..Default::default()
+        };
+        let mut frame = Vim9RenderFrame {
+            revision: 1,
+            supported: true,
+            rows: 4,
+            columns: 30,
+            window: 10,
+            buffer: 3,
+            changedtick: 7,
+            mode: "n".into(),
+            default_style: normal.clone(),
+            view: Vim9RenderRect {
+                rows: 4,
+                columns: 15,
+                ..Default::default()
+            },
+            cursor: Vim9RenderCursor {
+                column: 4,
+                width: 1,
+                visible: true,
+                line: 1,
+                byte_column: 4,
+                appearance: Some(Default::default()),
+                ..Default::default()
+            },
+            runs: vec![
+                Vim9RenderRun {
+                    window: 10,
+                    text: "let ".into(),
+                    cells: 4,
+                    line: 1,
+                    byte_end: 4,
+                    style: normal.clone(),
+                    ..Default::default()
+                },
+                Vim9RenderRun {
+                    window: 10,
+                    column: 4,
+                    text: "value".into(),
+                    cells: 5,
+                    line: 1,
+                    byte_start: 4,
+                    byte_end: 9,
+                    style: source_style.clone(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        frame.windows = vec![
+            Vim9RenderWindow {
+                window: 10,
+                buffer: 3,
+                changedtick: 7,
+                view: frame.view.clone(),
+                cursor: frame.cursor.clone(),
+                topline: 1,
+                botline: 1,
+                line_count: 1,
+                line_lengths: vec![9],
+                native_pointer: true,
+                native_scroll: true,
+                ..Default::default()
+            },
+            Vim9RenderWindow {
+                window: 20,
+                buffer: 4,
+                view: Vim9RenderRect {
+                    column: 16,
+                    columns: 14,
+                    ..frame.view.clone()
+                },
+                ..Default::default()
+            },
+        ];
+        let metrics = Metrics {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            cell_width: 8.0,
+            line_height: 20.0,
+        };
+        {
+            let mut state = surface.imp().state.borrow_mut();
+            state.metrics = metrics;
+            state.cursor_on = false;
+        }
+        let render = |frame: &Vim9RenderFrame| {
+            surface.imp().state.borrow_mut().frame = Some(Arc::new(frame.clone()));
+            let snapshot = gtk::Snapshot::new();
+            surface.imp().snapshot(&snapshot);
+            let mut image =
+                gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 360, 120).unwrap();
+            let cr = gtk::cairo::Context::new(&image).unwrap();
+            snapshot.to_node().unwrap().draw(&cr);
+            drop(cr);
+            let stride = image.stride() as usize;
+            let bytes = image.data().unwrap().to_vec();
+            (stride, bytes)
+        };
+        let pixel = |image: &(usize, Vec<u8>), x: usize, y: usize| {
+            let index = y * image.0 + x * 4;
+            u32::from_ne_bytes(image.1[index..index + 4].try_into().unwrap()) & 0xffffff
+        };
+        let count_color = |image: &(usize, Vec<u8>), left: usize, right: usize, color| {
+            (0..20)
+                .flat_map(|y| (left..right).map(move |x| (x, y)))
+                .filter(|(x, y)| pixel(image, *x, *y) == color)
+                .count()
+        };
+        let original = frame.clone();
+        let baseline = render(&frame);
+        assert_eq!(surface.imp().scene_builds.get(), 1);
+        assert_eq!(surface.presented_cursor().unwrap().x, 32.0);
+
+        // A provider changes display columns without inserting its hint into
+        // the buffer. The right-hand source retains the original byte range.
+        frame.runs[1].column = 7;
+        for (column, text, cells) in [(4, "参", 2), (6, "e\u{301}", 1)] {
+            frame.runs.push(Vim9RenderRun {
+                window: 10,
+                column,
+                text: text.into(),
+                cells,
+                style: Vim9RenderStyle {
+                    foreground: Some(0x19c3a7),
+                    background: Some(0x563412),
+                    italic: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
+        frame.cursor.column = 7;
+        frame.windows[0].cursor = frame.cursor.clone();
+        frame.revision += 1;
+        let labeled = render(&frame);
+        assert_eq!(surface.imp().scene_builds.get(), 2);
+        assert_eq!(frame.changedtick, original.changedtick);
+        assert_eq!(frame.runs[0], original.runs[0]);
+        assert_eq!(frame.runs[1].byte_start, 4);
+        assert_eq!(frame.runs[1].byte_end, 9);
+        assert_eq!(frame.runs[1].text, "value");
+        assert!(
+            frame.runs[2..]
+                .iter()
+                .all(|run| { run.line == 0 && run.byte_start == 0 && run.byte_end == 0 })
+        );
+        assert!(count_color(&labeled, 32, 56, 0x563412) > 0);
+        assert!(count_color(&labeled, 56, 96, 0x384858) > 0);
+        assert_eq!(pixel(&labeled, 130, 10), pixel(&baseline, 130, 10));
+        assert_eq!(surface.presented_cursor().unwrap().x, 56.0);
+        assert_eq!(surface.projected_cursor(), surface.presented_cursor());
+        assert_eq!(cursor_under_style(&frame), &source_style);
+        assert_eq!(surface.source_at(60.0, 10.0).unwrap().byte_column, 4);
+        assert!(frame.anchor_at_cell(0, 4).is_none());
+
+        // Cursor ink must use the shifted source's syntax palette, not the
+        // adjacent hint palette. Transient caret/IME paint reuses the scene.
+        {
+            let mut state = surface.imp().state.borrow_mut();
+            state.cursor_on = true;
+            state.focused = true;
+        }
+        let caret = render(&frame);
+        assert!(count_color(&caret, 56, 64, 0xabcde1) > 0);
+        assert_eq!(surface.imp().scene_builds.get(), 2);
+        surface.imp().state.borrow_mut().cursor_on = false;
+
+        // The GUI cell geometry changes on font zoom. Both the painted caret
+        // and the native input-method candidate rectangle move with it.
+        surface.imp().state.borrow_mut().metrics = Metrics {
+            cell_width: 10.0,
+            line_height: 24.0,
+            ..metrics
+        };
+        assert!(surface.presented_cursor().is_none());
+        render(&frame);
+        let zoomed_cursor = surface.presented_cursor().unwrap();
+        assert_eq!(
+            (zoomed_cursor.x, zoomed_cursor.width, zoomed_cursor.height),
+            (70.0, 10.0, 24.0)
+        );
+        assert_eq!(surface.source_at(75.0, 10.0).unwrap().byte_column, 4);
+        assert_eq!(surface.imp().scene_builds.get(), 3);
+        surface.imp().state.borrow_mut().preedit = Some(Preedit {
+            text: "文".into(),
+            attributes: pango::AttrList::new(),
+            cursor: 0,
+        });
+        let composed = render(&frame);
+        assert_eq!(pixel(&composed, 70, 2), 0xeeddaa);
+        assert_eq!(surface.presented_cursor(), Some(zoomed_cursor));
+        assert_eq!(surface.imp().scene_builds.get(), 3);
+
+        // Removing the provider's properties restores both source placement
+        // and every pixel, although no source generation has changed.
+        {
+            let mut state = surface.imp().state.borrow_mut();
+            state.metrics = metrics;
+            state.preedit = None;
+            state.focused = false;
+        }
+        frame = original;
+        frame.revision += 10;
+        assert!(
+            render(&frame) == baseline,
+            "cleared hints must restore every pixel"
+        );
+        assert_eq!(surface.presented_cursor().unwrap().x, 32.0);
+        assert_eq!(surface.imp().scene_builds.get(), 4);
+        frame.revision += 1;
+        assert!(
+            render(&frame) == baseline,
+            "cleared hints must restore every pixel"
+        );
+        assert_eq!(surface.imp().scene_builds.get(), 4);
+    }
+    #[test]
     #[ignore = "requires GTK display; checks popup layering and opaque render pixels"]
     fn native_popups_cover_split_gaps_and_obey_vim_zindex() {
         gtk::init().expect("GTK display required");

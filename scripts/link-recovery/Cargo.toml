@@ -7,4 +7,4 @@ publish = false
 [dependencies]
 gio = "=0.22.8"
 glib = "=0.22.8"
-jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "3b378da1dceadd2c0d6c6676a89d685e146b163f" }
+jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "a561ccdb6f9d5a35ef6e3e8e9741f2a628bb9063" }

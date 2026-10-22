@@ -163,3 +163,28 @@ a controlled VS Code comparison have not been measured. Nix packaging has not
 been rerun for this follow-up. Validation covers the exact checks listed above;
 it does not claim the complete application test suite. No installation or
 restart of the user's applications was performed.
+
+## Inline inlay hints in the native buffer
+
+When the shared Vim bridge supplies a supported inline virtual-text frame,
+GTK paints each hint at its supplied display column through the same Pango
+and RGB path as the source. The following source run keeps its original byte
+range even though the hint moves its display column. Hint runs carry no source
+bytes. Vim continues to decide supported layouts and pointer ownership.
+
+Caret paint and the native input-method candidate rectangle use the supplied
+Vim cursor column, including the inline display offset. Font geometry changes
+retire the previously submitted candidate rectangle until GTK paints the new
+frame. Hint insertion and removal invalidate the retained text scene without
+requiring a buffer `changedtick` change; transient caret and IME paint retain
+the unchanged scene.
+
+`native_inline_hints_keep_source_caret_and_ime_geometry` exercises the actual
+GTK/Pango/Cairo renderer under a display. Its source/hint/source fixture checks
+Chinese and combining glyphs, source byte preservation, hint and source colors,
+caret palette, IME position, font geometry, peer-split clipping and pixel-exact
+clearing. Run it with `cargo test
+native_inline_hints_keep_source_caret_and_ime_geometry -- --ignored --test-threads=1`
+in an available graphical session (or under Xvfb). The shared core's real-Vim
+virtual-text suite checks the producing bridge against Vim screen geometry;
+this host test verifies the resulting native paint and input coordinates.
