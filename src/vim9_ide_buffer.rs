@@ -3996,6 +3996,151 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires GTK display; checks virtual text property repaint and removal"]
+    fn native_virtual_text_repaints_without_a_source_edit() {
+        gtk::init().expect("GTK display required");
+        let surface = BufferSurface::new();
+        surface.measure(gtk::Orientation::Horizontal, -1);
+        surface.measure(gtk::Orientation::Vertical, 200);
+        surface.allocate(200, 80, -1, None);
+        let mut frame = Vim9RenderFrame {
+            revision: 1,
+            supported: true,
+            rows: 4,
+            columns: 25,
+            window: 10,
+            buffer: 3,
+            changedtick: 7,
+            default_style: Vim9RenderStyle {
+                foreground: Some(0xeeddaa),
+                background: Some(0x182430),
+                ..Default::default()
+            },
+            view: Vim9RenderRect {
+                rows: 4,
+                columns: 12,
+                ..Default::default()
+            },
+            runs: vec![Vim9RenderRun {
+                window: 10,
+                text: "let".into(),
+                cells: 3,
+                line: 1,
+                byte_end: 3,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        frame.windows = vec![
+            Vim9RenderWindow {
+                window: 10,
+                buffer: 3,
+                changedtick: 7,
+                view: frame.view.clone(),
+                ..Default::default()
+            },
+            Vim9RenderWindow {
+                window: 20,
+                buffer: 4,
+                view: Vim9RenderRect {
+                    column: 13,
+                    ..frame.view.clone()
+                },
+                ..Default::default()
+            },
+        ];
+        surface.imp().state.borrow_mut().metrics = Metrics {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            cell_width: 8.0,
+            line_height: 20.0,
+        };
+        let render = |frame: &Vim9RenderFrame| {
+            surface.imp().state.borrow_mut().frame = Some(Arc::new(frame.clone()));
+            let snapshot = gtk::Snapshot::new();
+            surface.imp().snapshot(&snapshot);
+            let mut image =
+                gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 200, 80).unwrap();
+            let cr = gtk::cairo::Context::new(&image).unwrap();
+            snapshot.to_node().unwrap().draw(&cr);
+            drop(cr);
+            let stride = image.stride() as usize;
+            let bytes = image.data().unwrap().to_vec();
+            (stride, bytes)
+        };
+        let pixel = |image: &(usize, Vec<u8>), x: usize, y: usize| {
+            let index = y * image.0 + x * 4;
+            u32::from_ne_bytes(image.1[index..index + 4].try_into().unwrap()) & 0xffffff
+        };
+        let baseline = render(&frame);
+        assert_eq!(surface.imp().scene_builds.get(), 1);
+        let source = frame.runs[0].clone();
+        for (column, text, cells) in [(4, "参", 2), (6, "e\u{301}", 1)] {
+            frame.runs.push(Vim9RenderRun {
+                window: 10,
+                column,
+                text: text.into(),
+                cells,
+                style: Vim9RenderStyle {
+                    foreground: Some(0x19c3a7),
+                    background: Some(0x563412),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
+        frame.revision += 1;
+        let labeled = render(&frame);
+        assert_eq!(surface.imp().scene_builds.get(), 2);
+        assert_eq!(frame.changedtick, 7);
+        assert_eq!(frame.runs[0], source);
+        let label_background_pixels = |image: &(usize, Vec<u8>), color: u32| {
+            (0..20)
+                .flat_map(|y| (32..48).map(move |x| (x, y)))
+                .filter(|(x, y)| pixel(image, *x, *y) == color)
+                .count()
+        };
+        // Fallback CJK glyphs may cover any particular sample with antialiasing.
+        // Inspect the label's complete two-cell rectangle instead of assuming
+        // the first scanline is blank for every installed font.
+        assert!(label_background_pixels(&labeled, 0x563412) > 0);
+        assert_eq!(pixel(&labeled, 105, 10), pixel(&baseline, 105, 10));
+        assert!(surface
+            .imp()
+            .layouts
+            .borrow()
+            .get("参", false, false)
+            .is_some());
+        assert!(surface
+            .imp()
+            .layouts
+            .borrow()
+            .get("e\u{301}", false, false)
+            .is_some());
+        assert!(frame.anchor_at_cell(0, 4).is_none());
+
+        // An asynchronous property update leaves the source changedtick alone.
+        // It must still retire the retained GTK text scene, including its RGB.
+        frame.runs[1].style.background = Some(0x235671);
+        frame.revision += 1;
+        let recolored = render(&frame);
+        assert_eq!(surface.imp().scene_builds.get(), 3);
+        assert!(label_background_pixels(&recolored, 0x235671) > 0);
+        assert_eq!(label_background_pixels(&recolored, 0x563412), 0);
+        frame.runs.truncate(1);
+        frame.revision += 1;
+        let cleared = render(&frame);
+        assert_eq!(surface.imp().scene_builds.get(), 4);
+        assert_eq!(
+            cleared, baseline,
+            "removed labels must leave no retained paint"
+        );
+        frame.revision += 1;
+        assert_eq!(render(&frame), baseline);
+        assert_eq!(surface.imp().scene_builds.get(), 4);
+    }
+
+    #[test]
     #[ignore = "requires GTK display; checks popup layering and opaque render pixels"]
     fn native_popups_cover_split_gaps_and_obey_vim_zindex() {
         gtk::init().expect("GTK display required");

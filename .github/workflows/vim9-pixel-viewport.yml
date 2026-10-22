@@ -48,3 +48,6 @@ jobs:
         run: dbus-run-session -- xvfb-run -a cargo test --quiet --locked native_popups_cover_split_gaps_and_obey_vim_zindex -- --ignored --test-threads=1
       - name: Exercise native popup input ownership
         run: dbus-run-session -- xvfb-run -a cargo test --quiet --locked native_popup_input_never_targets_underlying_source -- --ignored --test-threads=1
+
+      - name: Exercise virtual text property repaint and removal
+        run: dbus-run-session -- xvfb-run -a cargo test --quiet --locked native_virtual_text_repaints_without_a_source_edit -- --ignored --test-threads=1

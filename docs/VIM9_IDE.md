@@ -627,3 +627,18 @@ bytes for clicks, selection and saving; a line-end symbol is display-only.
 Each Vim split retains its own options and GUI highlight colors.
 Complex marker fields, default `^I` Tab geometry, active horizontal-edge
 markers and wrapped EOL continuations retain compatibility rendering.
+
+## Native end-of-line annotations
+
+SimpleCC CodeLens (`:SimpleCCCodeLens`) and virtual diagnostics can keep the
+native buffer surface when their end-of-line text properties use the supported
+`text_align: 'after'` layout. Their GUI colors, CJK and combining characters
+use the same native text painter as source code, clipped to the owning split.
+Property updates and removal repaint without changing the buffer or requiring
+a source edit.
+
+Annotations carry no source byte range and remain outside saved text and undo.
+Vim owns their lifetime and commands; use `:SimpleCCCodeLensRun` to execute a
+lens supplied by the language server. Inline inlay hints, above/below/right
+alignment and unsupported wrapping or clipping keep the explicit compatibility
+view. No user display option is rewritten to force native rendering.
