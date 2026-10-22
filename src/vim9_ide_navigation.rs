@@ -383,6 +383,19 @@ impl QuickOpen {
         } else {
             self.sync_files(&query, &editor);
         }
+        // Plugin context refreshes independently of the query and file index.
+        // Keep it inside the transient picker when persistent chrome is off.
+        let kind = if self.command_mode.get() {
+            "Commands"
+        } else {
+            "Project files"
+        };
+        let context = editor.workbench.status_text();
+        self.title.set_subtitle(&if context.is_empty() {
+            kind.to_owned()
+        } else {
+            format!("{kind} · {}", visible(&context))
+        });
     }
 
     fn sync_commands(&self, query: &str, command_query: &str, editor: &Vim9Snapshot) {

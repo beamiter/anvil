@@ -1069,10 +1069,52 @@ fn native_vim9_command_palette_modes_and_live_availability() {
     wait_for(widget, "fixture undo retains disk contents", || {
         window.title().is_some_and(|title| !title.contains('●'))
     });
+    // Exercise the optional provider through a real Vim process. The cached
+    // context must refresh even when neither the query nor file index changes.
+    let provider = root.join("simple-provider.vim");
+    let action_output = root.join("simple-action.txt");
+    std::fs::write(
+        &provider,
+        format!(
+            "let g:vim9_simple_branch = 'palette-main'\n\
+             function! VimrcWorkbenchCapabilities()\n\
+               return ['simple_git_status', 'simple_workbench']\n\
+             endfunction\n\
+             function! VimrcWorkbenchState()\n\
+               return {{'provider':'simple', 'git':{{'head':g:vim9_simple_branch,'ahead':1}}, 'diagnostics':{{'warning':2}}}}\n\
+             endfunction\n\
+             function! VimrcWorkbenchAction(action)\n\
+               call writefile([a:action], '{}')\n\
+             endfunction\n",
+            action_output.display()
+        ),
+    )
+    .unwrap();
+    editor.feed_child(format!(":source {}\r", provider.display()).as_bytes());
     let (picker, query, _) = open_picker();
-    query.set_text(">");
-    wait_for(widget, "palette screenshot catalog", || {
-        contains(&picker, "Save all buffers")
+    query.set_text(">simple git status");
+    wait_for(widget, "Simple provider in native palette", || {
+        contains(&picker, "Simple: Show Git status")
+            && contains(&picker, "palette-main ↑1")
+            && contains(&picker, "W2")
+    });
+    editor.feed_child(b":let g:vim9_simple_branch = 'palette-next'\r");
+    wait_for(widget, "Simple context refresh without query change", || {
+        contains(&picker, "palette-next ↑1") && !contains(&picker, "palette-main")
+    });
+    assert_eq!(query.text(), ">simple git status");
+    query.emit_activate();
+    wait_for(widget, "Simple typed action returns to Vim", || {
+        native_window.visible_dialog().is_none() && action_output.is_file()
+    });
+    assert_eq!(
+        std::fs::read_to_string(action_output).unwrap(),
+        "simple_git_status\n"
+    );
+    let (picker, query, _) = open_picker();
+    query.set_text(">simple");
+    wait_for(widget, "Simple palette screenshot catalog", || {
+        contains(&picker, "Simple: Show Git status") && contains(&picker, "palette-next ↑1")
     });
     if let Some(path) = std::env::var_os("JTERM_VIM9_TEST_SCREENSHOT") {
         let clock = window.frame_clock().unwrap();

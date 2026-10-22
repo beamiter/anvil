@@ -1899,8 +1899,14 @@ fn open_with_config_and_exit(
             &snapshot.file
         };
         let modified = if snapshot.modified { " ●" } else { "" };
+        let workbench = snapshot.workbench.status_text();
+        let workbench = if workbench.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", visible(&workbench))
+        };
         status.set_label(&format!(
-            "{} · {}{} · Ln {}/{}, Col {} · {} · {} · {} windows · {}{} buffers · {}",
+            "{} · {}{} · Ln {}/{}, Col {} · {} · {} · {} windows · {}{} buffers · {}{}",
             visible(&snapshot.mode).to_uppercase(),
             visible(file),
             modified,
@@ -1926,7 +1932,8 @@ fn open_with_config_and_exit(
                 "CONNECTED"
             } else {
                 "DISCONNECTED"
-            }
+            },
+            workbench
         ));
         title.set_title(&format!(
             "{}{} — Vim9 IDE",
