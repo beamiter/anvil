@@ -515,3 +515,88 @@ settings and dependency profiles were unchanged. Screenshot:
 `/tmp/anvil-vim9-completion-20a1c69.png`. GTK paint and pixel-scroll paths each
 compute the Pango baseline once per scene. Headless X11 validation does not
 establish physical-display or Wayland performance.
+
+## Buffer labels and pointer controls
+
+With `[vim9] buffer_tabs = true`, buffer names use the shortest distinguishing
+path suffix. For example, two `src/main.rs` files appear as
+`client/src/main.rs` and `server/src/main.rs`; full paths remain in tooltips.
+Unnamed or equivalent-path buffers retain distinct buffer IDs when needed.
+Middle-click a buffer entry to close that exact buffer. Vim refuses unsaved
+changes, just as with the existing close button.
+
+Switching buffers reveals the current entry automatically. Refreshing its
+modified marker does not pull the list away from a manually browsed position.
+
+Ctrl + wheel zooms by the supplied wheel distance; Ctrl + touchpad preserves
+fractional motion at 40 logical pixels per font point. It does not round every
+small touchpad event to a whole point. Alt/Super combinations and active IME
+preedit keep their existing input route.
+
+During fractional scrolling, cursor shapes retain their complete source-cell
+geometry and are clipped at the viewport edge. A partially visible row no
+longer compresses or relocates its horizontal caret. Mouse/IME coordinates
+continue to use the visible clip.
+Warm Pango layout lookups borrow the source text and reuse measured width
+and baseline. Font-context changes retire both measurements and cached scenes.
+
+## Native column highlights
+
+`set cursorcolumn` and `set colorcolumn=80,120` remain native in supported
+buffer views. Signed color columns follow Vim's `textwidth`; each split keeps
+its own guides. Syntax, search, Visual selection, tabs, wide characters and
+end-of-line whitespace retain Vim's source and highlight rules. Background
+decorations do not become source text or intercept source-position hits.
+Native undercurls keep a continuous phase across syntax runs, with each
+split and completion popup retaining its own origin and clipping bounds.
+
+## Plugin scratch buffers and per-window palettes
+
+Ordinary `nofile`, `nowrite` and `acwrite` buffers now support native text,
+source-pointer gestures and precision scrolling without changing Vim's buffer
+type, write callbacks or readonly/modifiable options. Terminal and prompt
+buffers retain compatibility rendering.
+
+A local `wincolor` keeps its own resolved Normal palette across text, empty
+rows, gutters and scroll margins. Native focus/caret fallbacks use that split's
+palette; changing the palette retires old scroll imagery. General
+`winhighlight` remapping remains a compatibility case.
+
+## Help and error-list windows
+
+Help, quickfix and location lists now use native text painting for supported
+plain views. QuickFixLine follows the list's current entry even when the text
+cursor moves independently; global and location-list state remains separate.
+These windows keep Vim's own mouse, wheel and keyboard processing, including
+Enter, Ctrl-] and double-click activation. The host does not add pixel-scroll
+animation to a window that explicitly delegates input to Vim. File/scratch
+splits alongside it retain their normal precision scrolling.
+
+Default help concealment and actual wrapped lines still require compatible
+display. User options and readonly/nomodifiable settings are preserved.
+
+In an embedded Vim, font zoom shortcuts are dispatched to the focused editor
+before the parent terminal's content-font shortcuts. Ctrl+wheel over the
+editor buffer also stays with its native font control; sidebar and sibling
+terminal zoom keep their own targets. The Editor font chooser updates both
+the Vim terminal grid and the Pango buffer surface.
+
+Mapped native dialogs own their keyboard input before workspace shortcuts.
+Quick Open and font chords therefore stay inside a dialog's focused field.
+Clicking the Vim body focuses it and immediately confirms the caret, even at
+the same position; its original `guicursor` blink wait then starts again.
+
+## Native visible whitespace
+
+Common `listchars` markers retain native buffer painting. For example:
+
+```vim
+set list listchars=tab:»·,trail:·,nbsp:␣,eol:↲
+```
+
+Explicit two/three-glyph Tab markers, `space`, `lead`, `trail`, `nbsp` and
+`eol` support single-cell symbols. Every marker keeps the original source
+bytes for clicks, selection and saving; a line-end symbol is display-only.
+Each Vim split retains its own options and GUI highlight colors.
+Complex marker fields, default `^I` Tab geometry, active horizontal-edge
+markers and wrapped EOL continuations retain compatibility rendering.

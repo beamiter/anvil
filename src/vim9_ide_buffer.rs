@@ -6,9 +6,9 @@ use super::gtk;
 use gtk::{gdk, glib, pango, subclass::prelude::*};
 use jterm_core::vim9::{
     Vim9BufferPosition, Vim9Command, Vim9CursorBlink, Vim9InputSnapshot, Vim9PixelRect,
-    Vim9PixelScroll, Vim9PointerPhase, Vim9RenderFrame, Vim9RenderMetrics, Vim9RenderRect,
-    Vim9RenderRun, Vim9RenderStyle, Vim9ScrollAccumulator, Vim9ScrollAnimation, Vim9Session,
-    Vim9Viewport,
+    Vim9PixelScroll, Vim9PointerPhase, Vim9RenderCursor, Vim9RenderFrame, Vim9RenderMetrics,
+    Vim9RenderRect, Vim9RenderRun, Vim9RenderStyle, Vim9RenderWindow, Vim9ScrollAccumulator,
+    Vim9ScrollAnimation, Vim9Session, Vim9Viewport,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -79,12 +79,72 @@ impl Default for PaintState {
     }
 }
 
-type LayoutKey = (String, bool, bool);
+impl PaintState {
+    fn restart_cursor_blink(&mut self) {
+        self.cursor_blink.reset();
+        self.cursor_on = true;
+    }
+}
 
-/// Trim cold layouts at the cache limit while keeping every shape used by
-/// this frame warm. Clearing the entire cache made long scrolls periodically
-/// reshape all visible text, including unchanged rows in sibling splits.
-fn trim_layout_cache<T>(frame: &Vim9RenderFrame, layouts: &mut HashMap<LayoutKey, T>) {
+/// Style buckets allow borrowed text lookup: a warm paint does not allocate
+/// a new String for each syntax run just to query the layout cache.
+struct StyledCache<T> {
+    buckets: [HashMap<String, T>; 4],
+}
+
+impl<T> Default for StyledCache<T> {
+    fn default() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| HashMap::new()),
+        }
+    }
+}
+
+impl<T> StyledCache<T> {
+    fn bucket(bold: bool, italic: bool) -> usize {
+        usize::from(bold) | (usize::from(italic) << 1)
+    }
+
+    fn get(&self, text: &str, bold: bool, italic: bool) -> Option<&T> {
+        self.buckets[Self::bucket(bold, italic)].get(text)
+    }
+
+    fn get_or_insert_with(
+        &mut self,
+        text: &str,
+        bold: bool,
+        italic: bool,
+        create: impl FnOnce() -> T,
+    ) -> &T {
+        let bucket = &mut self.buckets[Self::bucket(bold, italic)];
+        if !bucket.contains_key(text) {
+            bucket.insert(text.to_owned(), create());
+        }
+        &bucket[text]
+    }
+
+    fn len(&self) -> usize {
+        self.buckets.iter().map(HashMap::len).sum()
+    }
+
+    fn clear(&mut self) {
+        for bucket in &mut self.buckets {
+            bucket.clear();
+        }
+    }
+}
+
+struct ShapedLayout {
+    layout: pango::Layout,
+    width: f32,
+    baseline: f32,
+}
+
+type LayoutCache = StyledCache<ShapedLayout>;
+
+/// Retain live shapes under cache pressure without reintroducing allocating
+/// tuple keys. Style buckets preserve the same bold/italic shape identity.
+fn trim_layout_cache<T>(frame: &Vim9RenderFrame, layouts: &mut StyledCache<T>) {
     if layouts.len() <= 4096 {
         return;
     }
@@ -99,9 +159,16 @@ fn trim_layout_cache<T>(frame: &Vim9RenderFrame, layouts: &mut HashMap<LayoutKey
                 .flat_map(|row| &row.runs),
         )
         .chain(frame.completion.iter().flat_map(|menu| &menu.runs))
-        .map(|run| (run.text.as_str(), run.style.bold, run.style.italic))
+        .map(|run| {
+            (
+                StyledCache::<T>::bucket(run.style.bold, run.style.italic),
+                run.text.as_str(),
+            )
+        })
         .collect();
-    layouts.retain(|(text, bold, italic), _| live.contains(&(text.as_str(), *bold, *italic)));
+    for (style, bucket) in layouts.buckets.iter_mut().enumerate() {
+        bucket.retain(|text, _| live.contains(&(style, text.as_str())));
+    }
 }
 
 /// Retain the immutable text/background scene independently of cursor, focus
@@ -166,6 +233,40 @@ struct ScrollInput {
     requested: HashMap<i64, f64>,
 }
 
+/// Metadata distinguishes an explicit modern render-only window from old
+/// producers whose optional native-input flags were absent on the wire.
+fn render_only_window(window: &Vim9RenderWindow) -> bool {
+    window.line_count > 0
+        && !window.line_lengths.is_empty()
+        && !window.native_pointer
+        && !window.native_scroll
+}
+
+fn legacy_scroll_target(frame: &Vim9RenderFrame, window_id: i64) -> bool {
+    frame
+        .windows
+        .iter()
+        .any(|window| window.window == window_id && !render_only_window(window))
+}
+
+impl ScrollInput {
+    fn retire_window(&mut self, window: i64) {
+        self.fractions.discard(window);
+        self.pending.remove(&window);
+        self.requested.remove(&window);
+    }
+
+    fn retire_render_only(&mut self, frame: &Vim9RenderFrame) {
+        for window in frame
+            .windows
+            .iter()
+            .filter(|window| render_only_window(window))
+        {
+            self.retire_window(window.window);
+        }
+    }
+}
+
 fn paint_shifted_scene(
     snapshot: &gtk::Snapshot,
     node: &gtk::gsk::RenderNode,
@@ -186,7 +287,8 @@ mod imp {
     #[derive(Default)]
     pub struct BufferSurface {
         pub(super) state: RefCell<PaintState>,
-        pub(super) layouts: RefCell<HashMap<LayoutKey, pango::Layout>>,
+        pub(super) layouts: RefCell<LayoutCache>,
+        pub(super) layout_context_serial: Cell<u32>,
         pub(super) text_scene: RefCell<Option<TextScene>>,
         pub(super) motions: RefCell<HashMap<i64, WindowMotion>>,
         pub(super) scroll_input: RefCell<ScrollInput>,
@@ -215,6 +317,15 @@ mod imp {
     impl WidgetImpl for BufferSurface {
         fn snapshot(&self, snapshot: &gtk::Snapshot) {
             let surface = self.obj();
+            // Pango may update DPI/font options without changing GTK's integer
+            // scale factor. Cached measurements and render nodes share that
+            // context generation and must retire together.
+            let serial = surface.pango_context().serial();
+            if self.layout_context_serial.replace(serial) != serial {
+                self.layouts.borrow_mut().clear();
+                self.text_scene.borrow_mut().take();
+                self.motions.borrow_mut().clear();
+            }
             let state = self.state.borrow();
             let Some(frame) = state.frame.as_ref() else {
                 self.presented.borrow_mut().take();
@@ -264,8 +375,10 @@ mod imp {
                         for window in &frame.windows {
                             let view = view_rectangle(&window.view, metrics);
                             snapshot.push_clip(&view);
-                            let (_, background, _) =
-                                colors(&frame.default_style, &frame.default_style);
+                            let (_, background, _) = colors(
+                                window_normal_style(frame, window.window),
+                                &frame.default_style,
+                            );
                             snapshot.append_color(&rgb(background), &view);
                             if let Some(motion) = motions.get(&window.window) {
                                 let offset = motion.animation.offset(state.time) as f32;
@@ -315,7 +428,10 @@ mod imp {
                         snapshot.pop();
                         continue;
                     };
-                    let (foreground, _, _) = colors(&frame.default_style, &frame.default_style);
+                    let (foreground, _, _) = colors(
+                        window_normal_style(frame, frame.window),
+                        &frame.default_style,
+                    );
                     if state.cursor_on {
                         if frame.cursor.appearance.is_some() {
                             paint_native_cursor(
@@ -373,13 +489,14 @@ fn paint_active_split(
         return;
     };
     let view = view_rectangle(&window.view, state.metrics);
-    let (foreground, background, _) = colors(&frame.default_style, &frame.default_style);
+    let under = window_normal_style(frame, frame.window);
+    let (foreground, background, _) = colors(under, &frame.default_style);
     let accent = frame
         .cursor
         .appearance
         .as_ref()
         .map_or(foreground, |cursor| {
-            let (_, caret) = cursor.colors(&frame.default_style, &frame.default_style);
+            let (_, caret) = cursor.colors(under, &frame.default_style);
             if caret == background {
                 foreground
             } else {
@@ -418,7 +535,7 @@ fn build_text_scene(
     surface: &BufferSurface,
     state: &PaintState,
     frame: &Vim9RenderFrame,
-    layouts: &mut HashMap<LayoutKey, pango::Layout>,
+    layouts: &mut LayoutCache,
 ) -> Option<gtk::gsk::RenderNode> {
     let snapshot = gtk::Snapshot::new();
     let metrics = state.metrics;
@@ -427,10 +544,14 @@ fn build_text_scene(
     // bounding rectangle would erase live PTY status lines, split
     // separators and plugin-owned chrome between the native panes.
     trim_layout_cache(frame, layouts);
-    for region in frame.paint_views() {
+    for (index, region) in frame.paint_views().enumerate() {
         let view = view_rectangle(region, metrics);
         snapshot.push_clip(&view);
-        let (_, background, _) = colors(&frame.default_style, &frame.default_style);
+        let window = frame
+            .windows
+            .get(index)
+            .map_or(frame.window, |window| window.window);
+        let (_, background, _) = colors(window_normal_style(frame, window), &frame.default_style);
         snapshot.append_color(&rgb(background), &view);
 
         // Paint backgrounds before ink so a subsequent syntax run
@@ -476,6 +597,7 @@ fn build_text_scene(
                     height: metrics.line_height,
                 },
                 baseline,
+                decoration_phase_x(frame, run, metrics),
                 layouts,
             );
         }
@@ -490,7 +612,7 @@ fn paint_pixel_scene(
     snapshot: &gtk::Snapshot,
     state: &PaintState,
     frame: &Vim9RenderFrame,
-    layouts: &mut HashMap<LayoutKey, pango::Layout>,
+    layouts: &mut LayoutCache,
 ) {
     let metrics = state.metrics;
     let baseline = row_baseline(surface, state);
@@ -501,7 +623,10 @@ fn paint_pixel_scene(
             continue;
         };
         snapshot.push_clip(&graphene_rect(view.clip()));
-        let (_, background, _) = colors(&frame.default_style, &frame.default_style);
+        let (_, background, _) = colors(
+            window_normal_style(frame, window.window),
+            &frame.default_style,
+        );
         snapshot.append_color(&rgb(background), &graphene_rect(view.clip()));
         for projected in view.runs() {
             let (_, background, _) = colors(&projected.run.style, &frame.default_style);
@@ -516,6 +641,7 @@ fn paint_pixel_scene(
                 &frame.default_style,
                 projected.rect,
                 baseline,
+                decoration_phase_x(frame, projected.run, metrics),
                 layouts,
             );
         }
@@ -532,52 +658,58 @@ fn paint_text_run(
     normal: &Vim9RenderStyle,
     rect: Vim9PixelRect,
     baseline: f32,
-    layouts: &mut HashMap<LayoutKey, pango::Layout>,
+    decoration_phase: f32,
+    layouts: &mut LayoutCache,
 ) {
     let x = rect.x;
     let y = rect.y;
     let width = rect.width;
     let (foreground, _, special) = colors(&run.style, normal);
     if !run.text.is_empty() && width > 0.0 {
-        let key = (run.text.clone(), run.style.bold, run.style.italic);
-        let layout = layouts.entry(key).or_insert_with(|| {
-            let layout = surface.create_pango_layout(Some(&run.text));
-            let mut font = state.font.clone();
-            if run.style.bold {
-                font.set_weight(pango::Weight::Bold);
-            }
-            if run.style.italic {
-                font.set_style(pango::Style::Italic);
-            }
-            layout.set_font_description(Some(&font));
-            layout.set_single_paragraph_mode(true);
-            layout.set_auto_dir(false);
-            let attributes = pango::AttrList::new();
-            attributes.insert(pango::AttrFontFeatures::new(if state.ligatures {
-                "calt=1,liga=1"
-            } else {
-                "calt=0,liga=0"
-            }));
-            layout.set_attributes(Some(&attributes));
-            layout
-        });
-        let (_, logical) = layout.extents();
-        let logical_width = logical.width() as f32 / pango::SCALE as f32;
+        let shaped =
+            layouts.get_or_insert_with(&run.text, run.style.bold, run.style.italic, || {
+                let layout = surface.create_pango_layout(Some(&run.text));
+                let mut font = state.font.clone();
+                if run.style.bold {
+                    font.set_weight(pango::Weight::Bold);
+                }
+                if run.style.italic {
+                    font.set_style(pango::Style::Italic);
+                }
+                layout.set_font_description(Some(&font));
+                layout.set_single_paragraph_mode(true);
+                layout.set_auto_dir(false);
+                let attributes = pango::AttrList::new();
+                attributes.insert(pango::AttrFontFeatures::new(if state.ligatures {
+                    "calt=1,liga=1"
+                } else {
+                    "calt=0,liga=0"
+                }));
+                layout.set_attributes(Some(&attributes));
+                let (_, logical) = layout.extents();
+                let width = logical.width() as f32 / pango::SCALE as f32;
+                let baseline = layout.baseline() as f32 / pango::SCALE as f32;
+                ShapedLayout {
+                    layout,
+                    width,
+                    baseline,
+                }
+            });
         // A fallback CJK font can have different ascent and
         // descent from the Latin font. Centering every run's
         // logical box independently makes their baselines drift.
-        let text_y = y + baseline - layout.baseline() as f32 / pango::SCALE as f32;
+        let text_y = y + baseline - shaped.baseline;
         snapshot.save();
         snapshot.translate(&gtk::graphene::Point::new(x, text_y));
         // VTE rounds its input grid to whole logical pixels. Match
         // that advance without independently slicing Unicode or
         // breaking a shaped run into terminal-sized glyph boxes.
-        if logical_width > 0.0 {
-            snapshot.scale(width / logical_width, 1.0);
+        if shaped.width > 0.0 {
+            snapshot.scale(width / shaped.width, 1.0);
         }
-        snapshot.append_layout(layout, &rgb(foreground));
+        snapshot.append_layout(&shaped.layout, &rgb(foreground));
         snapshot.restore();
-        decorations(snapshot, &run.style, special, x, y, width, rect.height);
+        decorations(snapshot, &run.style, special, rect, decoration_phase);
     }
 }
 
@@ -586,7 +718,7 @@ fn paint_completion(
     snapshot: &gtk::Snapshot,
     state: &PaintState,
     frame: &Vim9RenderFrame,
-    layouts: &mut HashMap<LayoutKey, pango::Layout>,
+    layouts: &mut LayoutCache,
 ) {
     let Some(completion) = &frame.completion else {
         return;
@@ -650,6 +782,7 @@ fn paint_completion(
                 height: metrics.line_height,
             },
             baseline,
+            run.column.saturating_sub(completion.view.column) as f32 * metrics.cell_width,
             layouts,
         );
     }
@@ -721,15 +854,47 @@ fn colors(style: &Vim9RenderStyle, normal: &Vim9RenderStyle) -> (u32, u32, u32) 
     )
 }
 
+/// Keep the wave anchored to its own window when a split or widget moves.
+/// Syntax-run boundaries do not restart the phase.
+fn decoration_phase_x(frame: &Vim9RenderFrame, run: &Vim9RenderRun, metrics: Metrics) -> f32 {
+    let origin = frame
+        .windows
+        .iter()
+        .find(|window| window.window == run.window)
+        .map_or(frame.view.column, |window| window.view.column);
+    run.column.saturating_sub(origin) as f32 * metrics.cell_width
+}
+
+fn undercurl_displacement(phase: f32) -> f32 {
+    let phase = phase.rem_euclid(4.0);
+    -phase.min(4.0 - phase)
+}
+
+/// Emit a clipped piece of one continuous, four-logical-pixel wave. `phase`
+/// and `x` are separate so moving the window never shifts the wave in its text.
+fn undercurl_path(x: f32, y: f32, width: f32, phase: f32, mut point: impl FnMut(f32, f32)) {
+    point(x, y + undercurl_displacement(phase));
+    let mut distance = 2.0 - phase.rem_euclid(2.0);
+    while distance < width {
+        point(x + distance, y + undercurl_displacement(phase + distance));
+        distance += 2.0;
+    }
+    point(x + width, y + undercurl_displacement(phase + width));
+}
+
 fn decorations(
     snapshot: &gtk::Snapshot,
     style: &Vim9RenderStyle,
     color: u32,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: Vim9PixelRect,
+    phase: f32,
 ) {
+    let Vim9PixelRect {
+        x,
+        y,
+        width,
+        height,
+    } = rect;
     let color = rgb(color);
     if style.underline {
         snapshot.append_color(
@@ -752,17 +917,88 @@ fn decorations(
             color.blue() as f64,
         );
         cr.set_line_width(1.0);
-        cr.move_to(x as f64, (y + height - 2.0) as f64);
-        let mut offset = 0.0;
-        while offset < width {
-            let middle = (offset + 2.0).min(width);
-            let end = (offset + 4.0).min(width);
-            cr.line_to((x + middle) as f64, (y + height - 4.0) as f64);
-            cr.line_to((x + end) as f64, (y + height - 2.0) as f64);
-            offset += 4.0;
-        }
+        let mut first = true;
+        undercurl_path(x, y + height - 2.0, width, phase, |x, y| {
+            if first {
+                cr.move_to(f64::from(x), f64::from(y));
+                first = false;
+            } else {
+                cr.line_to(f64::from(x), f64::from(y));
+            }
+        });
         let _ = cr.stroke();
     }
+}
+
+/// Full-width empty line=0 rows carry the window's resolved Normal style.
+/// Do not mistake a narrow colorcolumn or a source glyph for that base palette.
+fn window_normal_style(frame: &Vim9RenderFrame, window_id: i64) -> &Vim9RenderStyle {
+    let view = frame
+        .windows
+        .iter()
+        .find(|window| window.window == window_id)
+        .map_or(&frame.view, |window| &window.view);
+    frame
+        .runs
+        .iter()
+        .find(|run| {
+            (frame.windows.is_empty() || run.window == window_id)
+                && run.row == view.row
+                && run.column == view.column
+                && run.cells == view.columns
+                && run.line == 0
+                && run.text.is_empty()
+                && run.byte_start == 0
+                && run.byte_end == 0
+        })
+        .map_or(&frame.default_style, |run| &run.style)
+}
+
+fn same_scroll_window(
+    previous_frame: &Vim9RenderFrame,
+    next_frame: &Vim9RenderFrame,
+    previous: &Vim9RenderWindow,
+    next: &Vim9RenderWindow,
+) -> bool {
+    !render_only_window(next)
+        && previous.window == next.window
+        && previous.buffer == next.buffer
+        && previous.changedtick == next.changedtick
+        && previous.view == next.view
+        && previous.leftcol == next.leftcol
+        && previous.textoff == next.textoff
+        && window_normal_style(previous_frame, previous.window)
+            == window_normal_style(next_frame, next.window)
+}
+
+fn run_under_cursor(frame: &Vim9RenderFrame, run: &Vim9RenderRun) -> bool {
+    (frame.windows.is_empty() || run.window == frame.window)
+        && run.row == frame.cursor.row
+        && run.column <= frame.cursor.column
+        && frame.cursor.column < run.column + run.cells
+}
+
+/// The final resolved run under the caret also supplies blank/EOL window
+/// colors. A per-window line=0 backdrop is paint, even without source bytes.
+fn cursor_under_style(frame: &Vim9RenderFrame) -> &Vim9RenderStyle {
+    frame
+        .runs
+        .iter()
+        .rfind(|run| run_under_cursor(frame, run))
+        .map_or(&frame.default_style, |run| &run.style)
+}
+
+fn cursor_paint_cell(
+    metrics: Metrics,
+    cursor: &Vim9RenderCursor,
+    offset: f32,
+) -> Option<Vim9PixelRect> {
+    if !offset.is_finite() {
+        return None;
+    }
+    let mut cell = metrics.cursor_rect(cursor)?;
+    cell.y += offset;
+    Some(cell)
 }
 
 fn paint_native_cursor(
@@ -771,64 +1007,65 @@ fn paint_native_cursor(
     state: &PaintState,
     frame: &Vim9RenderFrame,
     cell: &gtk::graphene::Rect,
-    layouts: &HashMap<LayoutKey, pango::Layout>,
+    layouts: &LayoutCache,
 ) {
     let Some(appearance) = &frame.cursor.appearance else {
         return;
     };
-    let runs: Vec<_> = frame
-        .runs
-        .iter()
-        .filter(|r| {
-            r.row == frame.cursor.row
-                && r.column <= frame.cursor.column
-                && frame.cursor.column < r.column + r.cells
-        })
-        .collect();
-    let under = runs.last().map_or(&frame.default_style, |run| &run.style);
+    let runs = || frame.runs.iter().filter(|run| run_under_cursor(frame, run));
+    let under = cursor_under_style(frame);
     let (fg, bg) = appearance.colors(under, &frame.default_style);
+    // `cell` is already clipped by Vim9Viewport. Shape against the complete
+    // source row, otherwise a partially hidden block caret moves its glyph
+    // baseline to the split edge and rescales horizontal/vertical carets.
+    let Some(full_cell) = cursor_paint_cell(
+        state.metrics,
+        &frame.cursor,
+        surface.presentation_offset(state, frame, frame.window),
+    ) else {
+        return;
+    };
+    snapshot.push_clip(cell);
     if !state.focused {
-        paint_cursor(snapshot, cell, bg, &frame.mode, false);
+        paint_cursor(snapshot, &graphene_rect(full_cell), bg, &frame.mode, false);
+        snapshot.pop();
         return;
     }
     let caret = graphene_rect(appearance.paint_rect(
-        Vim9PixelRect {
-            x: cell.x(),
-            y: cell.y(),
-            width: cell.width(),
-            height: cell.height(),
-        },
+        full_cell,
         state.metrics.cell_width,
         surface.scale_factor() as f32,
     ));
     snapshot.append_color(&rgb(bg), &caret);
     snapshot.push_clip(&caret);
     let baseline = row_baseline(surface, state);
-    for run in runs {
-        if let Some(layout) = layouts.get(&(run.text.clone(), run.style.bold, run.style.italic)) {
+    for run in runs() {
+        if let Some(shaped) = layouts.get(&run.text, run.style.bold, run.style.italic) {
             let width = run.cells as f32 * state.metrics.cell_width;
-            let (_, logical) = layout.extents();
-            let logical_width = logical.width() as f32 / pango::SCALE as f32;
             let x = state.metrics.origin_x + run.column as f32 * state.metrics.cell_width;
-            let y = cell.y() + baseline - layout.baseline() as f32 / pango::SCALE as f32;
+            let y = full_cell.y + baseline - shaped.baseline;
             snapshot.save();
             snapshot.translate(&gtk::graphene::Point::new(x, y));
-            if logical_width > 0.0 {
-                snapshot.scale(width / logical_width, 1.0);
+            if shaped.width > 0.0 {
+                snapshot.scale(width / shaped.width, 1.0);
             }
-            snapshot.append_layout(layout, &rgb(fg));
+            snapshot.append_layout(&shaped.layout, &rgb(fg));
             snapshot.restore();
             decorations(
                 snapshot,
                 &run.style,
                 fg,
-                x,
-                cell.y(),
-                width,
-                state.metrics.line_height,
+                Vim9PixelRect {
+                    x,
+                    y: full_cell.y,
+                    width,
+                    height: state.metrics.line_height,
+                },
+                decoration_phase_x(frame, run, state.metrics),
             );
         }
     }
+    snapshot.pop();
     snapshot.pop();
 }
 
@@ -893,7 +1130,10 @@ fn paint_preedit(
         .min((view.x() + view.width() - width as f32 - 4.0).max(view.x()));
     let y =
         cursor.y() + row_baseline(surface, state) - layout.baseline() as f32 / pango::SCALE as f32;
-    let (foreground, background, _) = colors(&frame.default_style, &frame.default_style);
+    let (foreground, background, _) = colors(
+        window_normal_style(frame, frame.window),
+        &frame.default_style,
+    );
     snapshot.append_color(
         &rgb(background),
         &gtk::graphene::Rect::new(x, cursor.y(), width as f32 + 4.0, state.metrics.line_height),
@@ -933,6 +1173,10 @@ impl BufferSurface {
         surface.set_can_target(false);
         surface.set_focusable(false);
         surface.pango_context().set_round_glyph_positions(false);
+        surface
+            .imp()
+            .layout_context_serial
+            .set(surface.pango_context().serial());
         surface.connect_unmap(|surface| {
             surface.cancel_scroll();
             surface.imp().pointer.set(None);
@@ -964,6 +1208,22 @@ impl BufferSurface {
         drop(state);
         self.imp().layouts.borrow_mut().clear();
         self.imp().text_scene.borrow_mut().take();
+        self.queue_draw();
+    }
+
+    fn contains_presented_buffer_point(&self, x: f64, y: f64) -> bool {
+        self.imp().presented.borrow().as_ref().is_some_and(|shown| {
+            shown.frame.paint_views().any(|view| {
+                shown
+                    .metrics
+                    .rect(view)
+                    .is_some_and(|rect| rect.contains(x as f32, y as f32))
+            })
+        })
+    }
+
+    fn restart_cursor_blink(&self) {
+        self.imp().state.borrow_mut().restart_cursor_blink();
         self.queue_draw();
     }
 
@@ -1082,13 +1342,8 @@ impl BufferSurface {
                 .windows
                 .iter()
                 .find(|old| old.window == window.window);
-            let Some(old) = old.filter(|old| {
-                old.buffer == window.buffer
-                    && old.changedtick == window.changedtick
-                    && old.view == window.view
-                    && old.leftcol == window.leftcol
-                    && old.textoff == window.textoff
-            }) else {
+            let Some(old) = old.filter(|old| same_scroll_window(previous, next, old, window))
+            else {
                 motions.remove(&window.window);
                 continue;
             };
@@ -1173,6 +1428,18 @@ impl BufferSurface {
         else {
             return false;
         };
+        if render_only_window(window) {
+            // Preserve the real Vim mouse protocol and mappings in help,
+            // quickfix and other explicitly render-only windows.
+            self.imp()
+                .scroll_input
+                .borrow_mut()
+                .retire_window(window.window);
+            // A controller can retire before GTK submits the integer image.
+            // Consume this transition event rather than route coordinates
+            // from a still-visible fractional image into the PTY grid.
+            return self.precision_image_at(x, y);
+        }
         if !dy.is_finite() || state.preedit.is_some() {
             return false;
         }
@@ -1542,6 +1809,18 @@ impl BufferSurface {
             }
             return;
         }
+        self.imp()
+            .scroll_input
+            .borrow_mut()
+            .retire_render_only(frame);
+        {
+            let mut motions = self.imp().motions.borrow_mut();
+            let before = motions.len();
+            motions.retain(|window, _| legacy_scroll_target(frame, *window));
+            if motions.len() != before {
+                self.queue_draw();
+            }
+        }
         let changed_geometry = {
             let state = self.imp().state.borrow();
             state.metrics != metrics
@@ -1635,6 +1914,11 @@ impl BufferSurface {
     }
 
     #[cfg(test)]
+    pub(super) fn native_font_size(&self) -> i32 {
+        self.imp().state.borrow().font.size()
+    }
+
+    #[cfg(test)]
     pub(super) fn scene_build_count(&self) -> usize {
         self.imp().scene_builds.get()
     }
@@ -1651,6 +1935,52 @@ impl BufferSurface {
         let presented = presented.as_ref()?;
         Some((presented.metrics, presented.cursor?))
     }
+}
+
+fn owns_scroll_zoom(modifiers: gdk::ModifierType, preediting: bool) -> bool {
+    !preediting
+        && modifiers.contains(gdk::ModifierType::CONTROL_MASK)
+        && !modifiers.intersects(gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK)
+}
+
+fn scroll_zoom_step(delta: f64, unit: gdk::ScrollUnit) -> Option<f64> {
+    if !delta.is_finite() || delta == 0.0 {
+        return None;
+    }
+    // GDK defines wheel units as detents and surface units as logical pixels.
+    // 40 pixels per point is our zoom sensitivity, not a device conversion.
+    Some(match unit {
+        gdk::ScrollUnit::Surface => -delta / 40.0,
+        _ => -delta,
+    })
+}
+
+pub(super) fn font_zoom_key(key: gdk::Key, modifiers: gdk::ModifierType) -> Option<Option<f64>> {
+    let character = match key {
+        gdk::Key::KP_Add => Some('+'),
+        gdk::Key::KP_Subtract => Some('-'),
+        gdk::Key::KP_0 => Some('0'),
+        _ => key.to_unicode(),
+    };
+    crate::vim9_zoom::key_step(
+        character,
+        modifiers.contains(gdk::ModifierType::CONTROL_MASK),
+        modifiers.intersects(gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK),
+    )
+}
+
+pub(super) fn contains_buffer_pointer(root: &gtk::Widget) -> bool {
+    if let Some(surface) = root.downcast_ref::<BufferSurface>() {
+        return surface.is_mapped() && surface.imp().pointer.get().is_some();
+    }
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        if contains_buffer_pointer(&widget) {
+            return true;
+        }
+        child = widget.next_sibling();
+    }
+    false
 }
 
 fn zoom_font(font_button: &gtk::FontDialogButton, step: Option<f64>) {
@@ -1882,7 +2212,13 @@ impl NativeBuffer {
                     surface.cancel_scroll();
                     return glib::Propagation::Stop;
                 }
-                if controller.current_event_state().intersects(
+                let modifiers = controller.current_event_state();
+                if owns_scroll_zoom(modifiers, surface.is_preediting()) {
+                    // The zoom controller owns this gesture and invalidates
+                    // old viewport geometry through the font-change handler.
+                    return glib::Propagation::Proceed;
+                }
+                if modifiers.intersects(
                     gdk::ModifierType::CONTROL_MASK
                         | gdk::ModifierType::ALT_MASK
                         | gdk::ModifierType::SUPER_MASK
@@ -1930,6 +2266,7 @@ impl NativeBuffer {
         }
         terminal.add_controller(editing);
         let clicking = gtk::GestureClick::new();
+        clicking.set_name(Some("vim9-buffer-click"));
         clicking.set_button(0);
         clicking.set_propagation_phase(gtk::PropagationPhase::Capture);
         {
@@ -1940,6 +2277,14 @@ impl NativeBuffer {
                 let Some(surface) = surface.upgrade() else {
                     return;
                 };
+                if surface.contains_presented_buffer_point(x, y) {
+                    if let Some(terminal) = terminal.upgrade() {
+                        terminal.grab_focus();
+                    }
+                    // A same-cell click has no cursor-frame change to restart
+                    // the clock. Show it now and retain Vim's next wait period.
+                    surface.restart_cursor_blink();
+                }
                 if surface.completion_visible() {
                     surface.cancel_scroll();
                     return;
@@ -1964,9 +2309,6 @@ impl NativeBuffer {
                     && surface.press_source(&session, x, y)
                 {
                     gesture.set_state(gtk::EventSequenceState::Claimed);
-                    if let Some(terminal) = terminal.upgrade() {
-                        terminal.grab_focus();
-                    }
                 } else {
                     surface.cancel_scroll();
                 }
@@ -2015,21 +2357,13 @@ impl NativeBuffer {
             let font = font.downgrade();
             let surface = surface.downgrade();
             zoom_keys.connect_key_pressed(move |_, key, _, modifiers| {
-                if !modifiers.contains(gdk::ModifierType::CONTROL_MASK)
-                    || modifiers
-                        .intersects(gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK)
-                    || surface
-                        .upgrade()
-                        .is_some_and(|surface| surface.is_preediting())
+                if surface
+                    .upgrade()
+                    .is_some_and(|surface| surface.is_preediting())
                 {
                     return glib::Propagation::Proceed;
                 }
-                let step = match key {
-                    gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add => Some(Some(1.0)),
-                    gdk::Key::minus | gdk::Key::KP_Subtract => Some(Some(-1.0)),
-                    gdk::Key::_0 | gdk::Key::KP_0 => Some(None),
-                    _ => None,
-                };
+                let step = font_zoom_key(key, modifiers);
                 match (font.upgrade(), step) {
                     (Some(font), Some(step)) => {
                         zoom_font(&font, step);
@@ -2040,33 +2374,29 @@ impl NativeBuffer {
             });
         }
         terminal.add_controller(zoom_keys);
-        let zoom_scroll = gtk::EventControllerScroll::new(
-            gtk::EventControllerScrollFlags::VERTICAL | gtk::EventControllerScrollFlags::DISCRETE,
-        );
+        let zoom_scroll =
+            gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
         zoom_scroll.set_name(Some("vim9-buffer-zoom-scroll"));
         zoom_scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
         {
             let font = font.downgrade();
             let surface = surface.downgrade();
             zoom_scroll.connect_scroll(move |controller, _, dy| {
-                if !controller
-                    .current_event_state()
-                    .contains(gdk::ModifierType::CONTROL_MASK)
-                    || controller
-                        .current_event_state()
-                        .intersects(gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK)
-                    || surface
+                if !owns_scroll_zoom(
+                    controller.current_event_state(),
+                    surface
                         .upgrade()
-                        .is_some_and(|surface| surface.is_preediting())
-                    || !dy.is_finite()
-                    || dy == 0.0
-                {
+                        .is_some_and(|surface| surface.is_preediting()),
+                ) {
                     return glib::Propagation::Proceed;
                 }
+                let Some(step) = scroll_zoom_step(dy, controller.unit()) else {
+                    return glib::Propagation::Proceed;
+                };
                 let Some(font) = font.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                zoom_font(&font, Some(-dy.signum()));
+                zoom_font(&font, Some(step));
                 glib::Propagation::Stop
             });
         }
@@ -2162,9 +2492,9 @@ impl NativeBuffer {
                     let pending = std::mem::take(&mut input.pending);
                     for (window, lines) in pending {
                         if lines == 0
-                            || !frame.as_ref().is_some_and(|frame| {
-                                frame.windows.iter().any(|view| view.window == window)
-                            })
+                            || !frame
+                                .as_ref()
+                                .is_some_and(|frame| legacy_scroll_target(frame, window))
                         {
                             continue;
                         }
@@ -2319,22 +2649,977 @@ mod tests {
             }),
             ..Default::default()
         };
-        let mut layouts: HashMap<_, _> = (0..4096)
-            .map(|index| ((format!("cold-{index}"), false, false), index))
-            .collect();
+        let mut layouts = StyledCache::default();
+        for index in 0..4096 {
+            layouts.get_or_insert_with(&format!("cold-{index}"), false, false, || index);
+        }
         for text in ["visible", "margin", "completion"] {
-            layouts.insert((text.into(), false, false), usize::MAX);
+            layouts.get_or_insert_with(text, false, false, || usize::MAX);
         }
         trim_layout_cache(&frame, &mut layouts);
         assert_eq!(layouts.len(), 3);
-        assert!(layouts.values().all(|value| *value == usize::MAX));
-        // Font style is part of shape identity; an old bold/italic variant
-        // cannot count as the visible regular shape under pressure.
-        layouts.extend((0..4096).map(|index| ((format!("cold-{index}"), true, false), index)));
-        layouts.insert(("visible".into(), true, false), 0);
+        assert!(layouts
+            .buckets
+            .iter()
+            .flat_map(|bucket| bucket.values())
+            .all(|value| *value == usize::MAX));
+        // A stale font variant must not count as the visible regular shape.
+        for index in 0..4096 {
+            layouts.get_or_insert_with(&format!("cold-{index}"), true, false, || index);
+        }
+        layouts.get_or_insert_with("visible", true, false, || 0);
         trim_layout_cache(&frame, &mut layouts);
         assert_eq!(layouts.len(), 3);
-        assert!(!layouts.contains_key(&("visible".into(), true, false)));
+        assert!(layouts.get("visible", true, false).is_none());
+        assert_eq!(layouts.get("visible", false, false), Some(&usize::MAX));
+    }
+
+    #[test]
+    #[ignore = "requires GTK display; verifies clipped native cursor pixels"]
+    fn native_cursor_shape_does_not_move_into_clipped_row() {
+        use jterm_core::vim9::{Vim9CursorAppearance, Vim9CursorShape};
+        gtk::init().unwrap();
+        let surface = BufferSurface::new();
+        let state = PaintState {
+            focused: true,
+            metrics: Metrics {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                cell_width: 8.0,
+                line_height: 20.0,
+            },
+            ..Default::default()
+        };
+        let frame = Vim9RenderFrame {
+            default_style: Vim9RenderStyle {
+                foreground: Some(0xffffff),
+                background: Some(0),
+                ..Default::default()
+            },
+            cursor: Vim9RenderCursor {
+                visible: true,
+                width: 1,
+                appearance: Some(Vim9CursorAppearance {
+                    shape: Vim9CursorShape::Horizontal,
+                    percentage: 20,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let render = |height: f32| {
+            let snapshot = gtk::Snapshot::new();
+            snapshot.append_color(&rgb(0), &gtk::graphene::Rect::new(0.0, 0.0, 8.0, 20.0));
+            paint_native_cursor(
+                &surface,
+                &snapshot,
+                &state,
+                &frame,
+                &gtk::graphene::Rect::new(0.0, 0.0, 8.0, height),
+                &LayoutCache::default(),
+            );
+            let mut image =
+                gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 8, 20).unwrap();
+            let cr = gtk::cairo::Context::new(&image).unwrap();
+            snapshot.to_node().unwrap().draw(&cr);
+            drop(cr);
+            let pixels = image.data().unwrap().to_vec();
+            pixels
+        };
+        let full = render(20.0);
+        assert!(full.chunks_exact(4).any(|pixel| pixel[..3] != [0, 0, 0]));
+        let cropped = render(10.0);
+        assert!(
+            cropped.chunks_exact(4).all(|pixel| pixel[..3] == [0, 0, 0]),
+            "clipping the bottom half must hide, not reposition, the underline"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires GTK display; verifies background-only runs and paint layer order"]
+    fn native_background_layers_keep_ink_and_peer_split_clip() {
+        use jterm_core::vim9::Vim9RenderWindow;
+        gtk::init().unwrap();
+        let surface = BufferSurface::new();
+        let state = PaintState {
+            metrics: Metrics {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                cell_width: 8.0,
+                line_height: 10.0,
+            },
+            ..Default::default()
+        };
+        for marker in ["→", "·"] {
+            let run = Vim9RenderRun {
+                text: marker.into(),
+                cells: 1,
+                line: 1,
+                byte_start: 0,
+                byte_end: 1,
+                style: Vim9RenderStyle {
+                    underline: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let marker_snapshot = gtk::Snapshot::new();
+            let mut cache = LayoutCache::default();
+            paint_text_run(
+                &surface,
+                &marker_snapshot,
+                &state,
+                &run,
+                &Vim9RenderStyle::default(),
+                Vim9PixelRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: state.metrics.cell_width,
+                    height: state.metrics.line_height,
+                },
+                row_baseline(&surface, &state),
+                0.0,
+                &mut cache,
+            );
+            assert!(cache.get(marker, false, false).unwrap().width > 0.0);
+            assert!(
+                marker_snapshot.to_node().unwrap().bounds().width()
+                    <= state.metrics.cell_width + 0.5,
+                "listchars marker must retain one-cell advance"
+            );
+        }
+        let left = Vim9RenderRect {
+            row: 0,
+            column: 0,
+            rows: 1,
+            columns: 2,
+        };
+        let right = Vim9RenderRect {
+            column: 3,
+            ..left.clone()
+        };
+        let frame = Vim9RenderFrame {
+            supported: true,
+            view: left.clone(),
+            default_style: Vim9RenderStyle {
+                foreground: Some(0xffffff),
+                background: Some(0),
+                ..Default::default()
+            },
+            windows: vec![
+                Vim9RenderWindow {
+                    window: 10,
+                    view: left,
+                    ..Default::default()
+                },
+                Vim9RenderWindow {
+                    window: 20,
+                    view: right,
+                    ..Default::default()
+                },
+            ],
+            runs: vec![
+                // The later empty background must not erase earlier ink.
+                Vim9RenderRun {
+                    window: 10,
+                    cells: 2,
+                    text: "  ".into(),
+                    line: 1,
+                    style: Vim9RenderStyle {
+                        underline: true,
+                        special: Some(0xff0000),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                Vim9RenderRun {
+                    window: 10,
+                    cells: 2,
+                    line: 0,
+                    style: Vim9RenderStyle {
+                        background: Some(0x0000ff),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                Vim9RenderRun {
+                    window: 20,
+                    column: 3,
+                    cells: 2,
+                    line: 0,
+                    style: Vim9RenderStyle {
+                        background: Some(0x00ff00),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        for pixel_path in [false, true] {
+            let snapshot = gtk::Snapshot::new();
+            snapshot.append_color(&rgb(0), &gtk::graphene::Rect::new(0.0, 0.0, 40.0, 10.0));
+            let mut layouts = LayoutCache::default();
+            if pixel_path {
+                paint_pixel_scene(&surface, &snapshot, &state, &frame, &mut layouts);
+            } else {
+                snapshot.append_node(
+                    &build_text_scene(&surface, &state, &frame, &mut layouts).unwrap(),
+                );
+            }
+            let mut image =
+                gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 40, 10).unwrap();
+            let cr = gtk::cairo::Context::new(&image).unwrap();
+            snapshot.to_node().unwrap().draw(&cr);
+            drop(cr);
+            let stride = image.stride() as usize;
+            let bytes = image.data().unwrap().to_vec();
+            let pixel = |x: usize, y: usize| {
+                let i = y * stride + x * 4;
+                u32::from_ne_bytes(bytes[i..i + 4].try_into().unwrap()) & 0xffffff
+            };
+            assert_eq!(pixel(4, 3), 0x0000ff);
+            assert_eq!(pixel(4, 8), 0xff0000);
+            assert_eq!(pixel(18, 3), 0x000000);
+            assert_eq!(pixel(28, 3), 0x00ff00);
+        }
+    }
+
+    #[test]
+    fn same_cell_cursor_confirmation_restarts_original_vim_blink_wait() {
+        use jterm_core::vim9::Vim9CursorAppearance;
+        let frame = Vim9RenderFrame {
+            cursor: Vim9RenderCursor {
+                visible: true,
+                appearance: Some(Vim9CursorAppearance {
+                    blinkwait: 100,
+                    blinkon: 100,
+                    blinkoff: 1000,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let start = std::time::Instant::now();
+        let mut state = PaintState::default();
+        assert!(state.cursor_blink.sample(&frame, true, start).0);
+        state.cursor_on = state
+            .cursor_blink
+            .sample(&frame, true, start + std::time::Duration::from_millis(101))
+            .0;
+        assert!(!state.cursor_on);
+        state.restart_cursor_blink();
+        assert!(
+            state.cursor_on,
+            "a same-cell click immediately reveals the caret"
+        );
+        assert!(
+            state
+                .cursor_blink
+                .sample(&frame, true, start + std::time::Duration::from_millis(102))
+                .0
+        );
+        assert!(
+            state
+                .cursor_blink
+                .sample(&frame, true, start + std::time::Duration::from_millis(201))
+                .0
+        );
+        assert!(
+            !state
+                .cursor_blink
+                .sample(&frame, true, start + std::time::Duration::from_millis(203))
+                .0,
+            "confirmation restarts rather than disables Vim's blink timing"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires GTK display; verifies native body focus and same-cell cursor confirmation"]
+    fn native_body_press_focuses_editor_and_reveals_hidden_cursor() {
+        if !jterm_core::child_env::inherited_environment_is_captured() {
+            jterm_core::child_env::capture_inherited_environment().unwrap();
+        }
+        gtk::init().unwrap();
+        let session = Vim9Session::start(jterm_core::vim9::Vim9EntryRequest::user_action(
+            std::env::temp_dir(),
+        ))
+        .unwrap();
+        let terminal = vte4::Terminal::new();
+        let native = NativeBuffer::new(&session, &terminal, true, true);
+        let field = gtk::Entry::new();
+        let layout = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        layout.append(&native.widget);
+        layout.append(&field);
+        let window = gtk::Window::new();
+        window.set_default_size(320, 160);
+        window.set_child(Some(&layout));
+        window.present();
+        while glib::MainContext::default().pending() {
+            glib::MainContext::default().iteration(false);
+        }
+        field.grab_focus();
+        assert!(!terminal.is_focus());
+        {
+            let mut state = native.surface.imp().state.borrow_mut();
+            state.frame = Some(Arc::new(Vim9RenderFrame {
+                supported: true,
+                view: Vim9RenderRect {
+                    rows: 2,
+                    columns: 10,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
+            state.metrics = Metrics {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                cell_width: 8.0,
+                line_height: 20.0,
+            };
+        }
+        let snapshot = gtk::Snapshot::new();
+        native.surface.imp().snapshot(&snapshot);
+        assert!(snapshot.to_node().is_some());
+        let controllers = terminal.observe_controllers();
+        let click = (0..controllers.n_items())
+            .find_map(|index| {
+                controllers
+                    .item(index)?
+                    .downcast::<gtk::GestureClick>()
+                    .ok()
+                    .filter(|controller| controller.name().as_deref() == Some("vim9-buffer-click"))
+            })
+            .unwrap();
+        for _ in 0..2 {
+            native.surface.imp().state.borrow_mut().cursor_on = false;
+            click.emit_by_name::<()>("pressed", &[&1_i32, &4.0_f64, &4.0_f64]);
+            assert!(terminal.is_focus());
+            assert!(native.surface.imp().state.borrow().cursor_on);
+        }
+        window.close();
+    }
+
+    #[test]
+    fn render_only_policy_preserves_legacy_and_supported_native_inputs() {
+        let mut window = Vim9RenderWindow::default();
+        assert!(!render_only_window(&window));
+        window.line_count = 1;
+        assert!(
+            !render_only_window(&window),
+            "metadata must be complete before routing changes"
+        );
+        window.line_lengths = vec![0];
+        assert!(
+            render_only_window(&window),
+            "an empty modern buffer still has an explicit line"
+        );
+        window.native_pointer = true;
+        assert!(
+            !render_only_window(&window),
+            "Visual pointer ownership keeps its frozen pixel image"
+        );
+        window.native_pointer = false;
+        window.native_scroll = true;
+        assert!(
+            !render_only_window(&window),
+            "Insert/custom-mouse windows keep native scrolling"
+        );
+        window.native_scroll = false;
+        window.line_count = 0;
+        assert!(
+            !render_only_window(&window),
+            "old metadata does not opt into render-only input"
+        );
+    }
+
+    #[test]
+    fn render_only_transition_discards_queued_legacy_scroll_without_touching_peers() {
+        let render_only = Vim9RenderWindow {
+            window: 10,
+            line_count: 1,
+            line_lengths: vec![0],
+            ..Default::default()
+        };
+        let native = Vim9RenderWindow {
+            window: 20,
+            native_scroll: true,
+            ..render_only.clone()
+        };
+        let legacy = Vim9RenderWindow {
+            window: 30,
+            ..Default::default()
+        };
+        let frame = Vim9RenderFrame {
+            windows: vec![render_only.clone(), native, legacy],
+            ..Default::default()
+        };
+        let mut input = ScrollInput::default();
+        for window in [10, 20, 30] {
+            input.pending.insert(window, 3);
+            input.requested.insert(window, 1.0);
+            assert_eq!(input.fractions.add(window, 0.6), 0);
+        }
+        input.retire_render_only(&frame);
+        assert!(!input.pending.contains_key(&10));
+        assert!(!input.requested.contains_key(&10));
+        assert_eq!(input.fractions.add(10, 0.6), 0);
+        assert!(
+            !legacy_scroll_target(&frame, 10),
+            "the final command-send gate also refuses this window"
+        );
+        for window in [20, 30] {
+            assert_eq!(input.pending.get(&window), Some(&3));
+            assert_eq!(input.requested.get(&window), Some(&1.0));
+            assert_eq!(input.fractions.add(window, 0.6), 1);
+            assert!(legacy_scroll_target(&frame, window));
+        }
+        let mut previous_window = render_only.clone();
+        previous_window.native_pointer = true;
+        assert!(
+            !same_scroll_window(&frame, &frame, &previous_window, &render_only),
+            "render-only windows never inherit a legacy animation"
+        );
+    }
+
+    #[test]
+    fn window_normal_changes_retire_only_the_affected_scroll_history() {
+        let previous = Vim9RenderFrame {
+            window: 10,
+            windows: vec![
+                Vim9RenderWindow {
+                    window: 10,
+                    view: Vim9RenderRect {
+                        rows: 2,
+                        columns: 4,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                Vim9RenderWindow {
+                    window: 20,
+                    view: Vim9RenderRect {
+                        column: 5,
+                        rows: 2,
+                        columns: 4,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            runs: vec![
+                Vim9RenderRun {
+                    window: 10,
+                    cells: 4,
+                    style: Vim9RenderStyle {
+                        background: Some(0x102030),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                Vim9RenderRun {
+                    window: 20,
+                    column: 5,
+                    cells: 4,
+                    style: Vim9RenderStyle {
+                        background: Some(0xffeedd),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let mut next = previous.clone();
+        // A normal acknowledgement may retain history across a topline move.
+        next.windows[0].topline += 1;
+        assert!(same_scroll_window(
+            &previous,
+            &next,
+            &previous.windows[0],
+            &next.windows[0]
+        ));
+        // A stationary peer's palette change still retires that peer's motion;
+        // the comparison must happen before the equal-topline early return.
+        next.runs[1].style.background = Some(0x334455);
+        assert_eq!(window_normal_style(&next, 10).background, Some(0x102030));
+        assert_eq!(window_normal_style(&next, 20).background, Some(0x334455));
+        assert!(same_scroll_window(
+            &previous,
+            &next,
+            &previous.windows[0],
+            &next.windows[0]
+        ));
+        assert!(!same_scroll_window(
+            &previous,
+            &next,
+            &previous.windows[1],
+            &next.windows[1]
+        ));
+        next = previous.clone();
+        next.runs[0].style.foreground = Some(0xffffff);
+        assert!(!same_scroll_window(
+            &previous,
+            &next,
+            &previous.windows[0],
+            &next.windows[0]
+        ));
+        next = previous.clone();
+        next.runs[0].style.bold = true;
+        assert!(!same_scroll_window(
+            &previous,
+            &next,
+            &previous.windows[0],
+            &next.windows[0]
+        ));
+        assert!(same_scroll_window(
+            &previous,
+            &next,
+            &previous.windows[1],
+            &next.windows[1]
+        ));
+    }
+
+    #[test]
+    fn cursor_palette_resolves_blank_eol_and_glyph_styles_per_window() {
+        use jterm_core::vim9::{Vim9CursorAppearance, Vim9RenderWindow};
+        let light = Vim9RenderStyle {
+            foreground: Some(0x102030),
+            background: Some(0xffeedd),
+            ..Default::default()
+        };
+        let dark = Vim9RenderStyle {
+            foreground: Some(0xddeeff),
+            background: Some(0x203040),
+            ..Default::default()
+        };
+        let token = Vim9RenderStyle {
+            foreground: Some(0xaa3300),
+            ..light.clone()
+        };
+        let mut frame = Vim9RenderFrame {
+            window: 10,
+            default_style: Vim9RenderStyle {
+                foreground: Some(0xffffff),
+                background: Some(0),
+                ..Default::default()
+            },
+            cursor: Vim9RenderCursor {
+                row: 0,
+                column: 3,
+                visible: true,
+                width: 1,
+                ..Default::default()
+            },
+            windows: vec![
+                Vim9RenderWindow {
+                    window: 10,
+                    view: Vim9RenderRect {
+                        rows: 1,
+                        columns: 4,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                Vim9RenderWindow {
+                    window: 20,
+                    view: Vim9RenderRect {
+                        column: 5,
+                        rows: 1,
+                        columns: 4,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            runs: vec![
+                Vim9RenderRun {
+                    window: 10,
+                    cells: 4,
+                    line: 0,
+                    style: light.clone(),
+                    ..Default::default()
+                },
+                Vim9RenderRun {
+                    window: 10,
+                    cells: 1,
+                    line: 1,
+                    text: "a".into(),
+                    style: token.clone(),
+                    ..Default::default()
+                },
+                Vim9RenderRun {
+                    window: 20,
+                    column: 5,
+                    cells: 4,
+                    line: 0,
+                    style: dark.clone(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(window_normal_style(&frame, frame.window), &light);
+        assert_eq!(
+            cursor_under_style(&frame),
+            &light,
+            "blank/EOL must use its own full-row backdrop"
+        );
+        assert_eq!(
+            Vim9CursorAppearance::default()
+                .colors(cursor_under_style(&frame), &frame.default_style),
+            (0xffeedd, 0x102030)
+        );
+        frame.cursor.column = 0;
+        assert_eq!(
+            window_normal_style(&frame, frame.window),
+            &light,
+            "IME Normal is independent of syntax"
+        );
+        assert_eq!(
+            cursor_under_style(&frame),
+            &token,
+            "resolved glyph style wins over backdrop"
+        );
+        frame.window = 20;
+        frame.cursor.column = 7;
+        assert_eq!(cursor_under_style(&frame), &dark);
+        assert_eq!(window_normal_style(&frame, frame.window), &dark);
+        frame.cursor.row = 99;
+        assert_eq!(
+            window_normal_style(&frame, frame.window),
+            &dark,
+            "offscreen caret keeps its window Normal"
+        );
+        frame.cursor.row = 0;
+        // A peer's source cannot supply the active palette, even if queried
+        // during an inconsistent incoming frame before its geometry retires.
+        frame.cursor.column = 0;
+        assert_eq!(cursor_under_style(&frame), &frame.default_style);
+        let mut legacy_palette = frame.clone();
+        legacy_palette.window = 10;
+        legacy_palette.runs.retain(|run| !run.text.is_empty());
+        assert_eq!(
+            window_normal_style(&legacy_palette, legacy_palette.window),
+            &legacy_palette.default_style,
+            "older producers preserve their global Normal overlay palette"
+        );
+        assert_eq!(cursor_under_style(&legacy_palette), &token);
+        frame.windows.clear();
+        assert_eq!(
+            cursor_under_style(&frame),
+            &token,
+            "legacy single-view frames retain their palette"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires GTK display; verifies per-window IME composition background"]
+    fn native_preedit_uses_blank_window_backdrop() {
+        gtk::init().unwrap();
+        let surface = BufferSurface::new();
+        let frame = Vim9RenderFrame {
+            window: 10,
+            view: Vim9RenderRect {
+                rows: 1,
+                columns: 4,
+                ..Default::default()
+            },
+            default_style: Vim9RenderStyle {
+                foreground: Some(0xffffff),
+                background: Some(0),
+                ..Default::default()
+            },
+            cursor: Vim9RenderCursor {
+                column: 1,
+                width: 1,
+                visible: true,
+                ..Default::default()
+            },
+            runs: vec![Vim9RenderRun {
+                window: 10,
+                cells: 4,
+                line: 0,
+                style: Vim9RenderStyle {
+                    foreground: Some(0x102030),
+                    background: Some(0xffeedd),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let state = PaintState {
+            frame: Some(Arc::new(frame)),
+            metrics: Metrics {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                cell_width: 8.0,
+                line_height: 20.0,
+            },
+            ..Default::default()
+        };
+        let preedit = Preedit {
+            text: " ".into(),
+            attributes: pango::AttrList::new(),
+            cursor: 0,
+        };
+        let snapshot = gtk::Snapshot::new();
+        snapshot.append_color(&rgb(0), &gtk::graphene::Rect::new(0.0, 0.0, 40.0, 20.0));
+        paint_preedit(
+            &surface,
+            &snapshot,
+            &state,
+            &preedit,
+            &gtk::graphene::Rect::new(8.0, 0.0, 8.0, 20.0),
+            &gtk::graphene::Rect::new(0.0, 0.0, 40.0, 20.0),
+        );
+        let mut image =
+            gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 40, 20).unwrap();
+        let cr = gtk::cairo::Context::new(&image).unwrap();
+        snapshot.to_node().unwrap().draw(&cr);
+        drop(cr);
+        let stride = image.stride() as usize;
+        let bytes = image.data().unwrap().to_vec();
+        let i = 2 * stride + 9 * 4;
+        assert_eq!(
+            u32::from_ne_bytes(bytes[i..i + 4].try_into().unwrap()) & 0xffffff,
+            0xffeedd
+        );
+    }
+
+    #[test]
+    fn undercurl_is_continuous_across_run_splits_at_fractional_origins_and_font_sizes() {
+        fn points(x: f32, y: f32, width: f32, phase: f32) -> Vec<(f32, f32)> {
+            let mut points = Vec::new();
+            undercurl_path(x, y, width, phase, |x, y| points.push((x, y)));
+            points
+        }
+        fn sample(points: &[(f32, f32)], x: f32) -> f32 {
+            let edge = points
+                .windows(2)
+                .find(|edge| x >= edge[0].0 && x <= edge[1].0)
+                .unwrap();
+            let t = (x - edge[0].0) / (edge[1].0 - edge[0].0);
+            edge[0].1 + t * (edge[1].1 - edge[0].1)
+        }
+        for cell_width in [6.75, 8.0, 10.5] {
+            for origin in [-3.5, 0.0, 123.375] {
+                let phase = cell_width * 1.25;
+                let widths = [cell_width * 0.25, cell_width * 1.75, cell_width * 0.5];
+                let width = widths.iter().sum();
+                let whole = points(origin, 30.25, width, phase);
+                let mut offset = 0.0;
+                let mut previous = None;
+                for width in widths {
+                    let part = points(origin + offset, 30.25, width, phase + offset);
+                    if let Some(previous) = previous {
+                        assert_eq!(part[0], previous, "run boundary changed curl phase");
+                    }
+                    previous = part.last().copied();
+                    for step in 0..=32 {
+                        let x = origin + offset + width * step as f32 / 32.0;
+                        assert!((sample(&whole, x) - sample(&part, x)).abs() < 0.0001);
+                    }
+                    offset += width;
+                }
+                let translated = points(origin + 17.5, 23.0, width, phase);
+                assert_eq!(whole.len(), translated.len());
+                for (a, b) in whole.iter().zip(translated) {
+                    assert_eq!((a.0 + 17.5, a.1 - 7.25), b);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn undercurl_phase_follows_own_window_not_widget_or_peer_split_origin() {
+        use jterm_core::vim9::Vim9RenderWindow;
+        let metrics = Metrics {
+            origin_x: 91.25,
+            origin_y: 17.5,
+            cell_width: 7.5,
+            line_height: 20.0,
+        };
+        let mut frame = Vim9RenderFrame {
+            windows: vec![
+                Vim9RenderWindow {
+                    window: 10,
+                    view: Vim9RenderRect {
+                        column: 2,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                Vim9RenderWindow {
+                    window: 20,
+                    view: Vim9RenderRect {
+                        column: 42,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let left = Vim9RenderRun {
+            window: 10,
+            column: 5,
+            ..Default::default()
+        };
+        let mut right = Vim9RenderRun {
+            window: 20,
+            column: 45,
+            ..Default::default()
+        };
+        assert_eq!(decoration_phase_x(&frame, &left, metrics), 22.5);
+        assert_eq!(decoration_phase_x(&frame, &right, metrics), 22.5);
+        frame.windows[1].view.column += 3;
+        right.column += 3;
+        assert_eq!(decoration_phase_x(&frame, &right, metrics), 22.5);
+        assert_eq!(
+            decoration_phase_x(
+                &frame,
+                &left,
+                Metrics {
+                    origin_x: 0.0,
+                    ..metrics
+                }
+            ),
+            22.5
+        );
+    }
+
+    #[test]
+    fn background_only_run_changes_invalidate_retained_scene() {
+        let frame = Vim9RenderFrame {
+            view: Vim9RenderRect {
+                rows: 1,
+                columns: 8,
+                ..Default::default()
+            },
+            runs: vec![Vim9RenderRun {
+                cells: 1,
+                line: 0,
+                text: String::new(),
+                style: Vim9RenderStyle {
+                    background: Some(0x102030),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut next = frame.clone();
+        next.cursor.column = 1;
+        assert!(same_text_content(&frame, &next));
+        next.runs[0].style.background = Some(0x203040);
+        assert!(!same_text_content(&frame, &next));
+        next = frame.clone();
+        next.runs[0].column += 1;
+        assert!(!same_text_content(&frame, &next));
+        let mut layers = frame.clone();
+        layers.runs.push(Vim9RenderRun {
+            style: Vim9RenderStyle {
+                background: Some(0x304050),
+                ..Default::default()
+            },
+            ..layers.runs[0].clone()
+        });
+        let mut swapped = layers.clone();
+        swapped.runs.reverse();
+        assert!(!same_text_content(&layers, &swapped));
+    }
+
+    #[test]
+    fn styled_layout_cache_reuses_hits_and_keeps_font_variants_separate() {
+        let mut cache = StyledCache::default();
+        let builds = Cell::new(0);
+        for bold in [false, true] {
+            for italic in [false, true] {
+                let expected = builds.get() + 1;
+                for _ in 0..240 {
+                    assert_eq!(
+                        *cache.get_or_insert_with("中文 -> ligature", bold, italic, || {
+                            builds.set(builds.get() + 1);
+                            builds.get()
+                        }),
+                        expected
+                    );
+                }
+            }
+        }
+        assert_eq!(builds.get(), 4);
+        assert_eq!(cache.len(), 4);
+        assert_eq!(cache.get("中文 -> ligature", true, true), Some(&4));
+        assert_eq!(cache.get("different source", true, true), None);
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.get("中文 -> ligature", true, true).is_none());
+    }
+
+    #[test]
+    fn fractional_cursor_paint_uses_full_row_before_viewport_clip() {
+        use jterm_core::vim9::{Vim9CursorAppearance, Vim9CursorShape};
+        let metrics = Metrics {
+            origin_x: 2.0,
+            origin_y: 10.0,
+            cell_width: 8.0,
+            line_height: 20.0,
+        };
+        let cursor = Vim9RenderCursor {
+            visible: true,
+            row: 0,
+            column: 2,
+            width: 1,
+            ..Default::default()
+        };
+        let full = cursor_paint_cell(metrics, &cursor, -6.25).unwrap();
+        assert_eq!(full.y, 3.75);
+        assert_eq!(full.height, 20.0);
+        let bar = Vim9CursorAppearance {
+            shape: Vim9CursorShape::Horizontal,
+            percentage: 20,
+            ..Default::default()
+        };
+        let painted = bar.paint_rect(full, metrics.cell_width, 1.0);
+        assert_eq!(painted.y, 19.75);
+        assert_eq!(painted.height, 4.0);
+        // Cropping belongs to the viewport, not to the shape input. A row
+        // cut by the bottom edge must not move its underline into view.
+        let bottom = cursor_paint_cell(metrics, &cursor, 6.25).unwrap();
+        assert_eq!(bar.paint_rect(bottom, metrics.cell_width, 1.0).y, 32.25);
+        assert!(cursor_paint_cell(metrics, &cursor, f32::NAN).is_none());
+    }
+
+    #[test]
+    fn scroll_zoom_preserves_device_distance_and_modifier_ownership() {
+        assert_eq!(scroll_zoom_step(1.0, gdk::ScrollUnit::Wheel), Some(-1.0));
+        assert_eq!(
+            scroll_zoom_step(0.125, gdk::ScrollUnit::Wheel),
+            Some(-0.125)
+        );
+        assert_eq!(
+            scroll_zoom_step(10.0, gdk::ScrollUnit::Surface),
+            Some(-0.25)
+        );
+        assert_eq!(scroll_zoom_step(-40.0, gdk::ScrollUnit::Surface), Some(1.0));
+        for invalid in [0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(scroll_zoom_step(invalid, gdk::ScrollUnit::Surface), None);
+        }
+        let control = gdk::ModifierType::CONTROL_MASK;
+        assert!(owns_scroll_zoom(control, false));
+        assert!(owns_scroll_zoom(
+            control | gdk::ModifierType::SHIFT_MASK,
+            false
+        ));
+        assert!(!owns_scroll_zoom(control, true));
+        assert!(!owns_scroll_zoom(gdk::ModifierType::empty(), false));
+        for modifier in [gdk::ModifierType::ALT_MASK, gdk::ModifierType::SUPER_MASK] {
+            assert!(!owns_scroll_zoom(control | modifier, false));
+        }
     }
 
     #[test]
@@ -2570,7 +3855,13 @@ mod tests {
                 &rgb(0xc0c0c0),
                 &gtk::graphene::Rect::new(0.0, 0.0, 104.0, 80.0),
             );
-            paint_completion(&surface, &snapshot, &state, frame, &mut HashMap::new());
+            paint_completion(
+                &surface,
+                &snapshot,
+                &state,
+                frame,
+                &mut LayoutCache::default(),
+            );
             let mut image =
                 gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 104, 80).unwrap();
             let cr = gtk::cairo::Context::new(&image).unwrap();
@@ -2970,5 +4261,70 @@ mod tests {
             assert_eq!(surface.scroll_offset(10), -(delta * 3.0 * 20.0).min(20.0));
             assert!(!surface.imp().pixels.borrow()[&10].is_animating());
         }
+        // A normal source window can turn into display-only help/quickfix
+        // without resizing its split. No queued native transaction survives.
+        surface.cancel_scroll();
+        surface.imp().state.borrow_mut().frame = Some(frame.clone());
+        assert!(surface.enqueue_scroll(8.0, 10.0, 1.25, gdk::ScrollUnit::Surface));
+        let snapshot = gtk::Snapshot::new();
+        surface.imp().snapshot(&snapshot);
+        assert!(snapshot.to_node().is_some());
+        assert!(surface.precision_image_at(8.0, 10.0));
+        {
+            let mut input = surface.imp().scroll_input.borrow_mut();
+            input.pending.insert(10, 3);
+            input.requested.insert(10, 1.0);
+            input.fractions.add(10, 0.6);
+        }
+        surface
+            .imp()
+            .motions
+            .borrow_mut()
+            .insert(10, WindowMotion::default());
+        *surface.imp().source_gesture.borrow_mut() = Some(SourceGesture {
+            gesture: 999,
+            request: 999,
+            last,
+            pending: None,
+            released: false,
+        });
+        let mut render_only = (*frame).clone();
+        render_only.windows[0].native_pointer = false;
+        render_only.windows[0].native_scroll = false;
+        let render_only = Some(Arc::new(render_only));
+        surface.advance_native_input(
+            &session,
+            &Vim9InputSnapshot::default(),
+            &render_only,
+            metrics,
+            true,
+        );
+        assert!(surface.imp().pixels.borrow().is_empty());
+        assert!(surface.imp().source_gesture.borrow().is_none());
+        assert!(surface.imp().motions.borrow().is_empty());
+        assert!(surface.imp().scroll_input.borrow().pending.is_empty());
+        assert!(surface.imp().scroll_input.borrow().requested.is_empty());
+        surface.imp().state.borrow_mut().frame = render_only;
+        for unit in [gdk::ScrollUnit::Surface, gdk::ScrollUnit::Wheel] {
+            assert!(
+                surface.enqueue_scroll(8.0, 10.0, 1.0, unit),
+                "the still-presented fractional image must settle before PTY handoff"
+            );
+            assert!(surface.imp().scroll_input.borrow().pending.is_empty());
+        }
+        let snapshot = gtk::Snapshot::new();
+        surface.imp().snapshot(&snapshot);
+        assert!(snapshot.to_node().is_some());
+        for unit in [gdk::ScrollUnit::Surface, gdk::ScrollUnit::Wheel] {
+            assert!(
+                !surface.enqueue_scroll(8.0, 10.0, 1.0, unit),
+                "VTE owns render-only wheel events after the new frame is submitted"
+            );
+        }
+        assert!(
+            !surface.should_settle_press(8.0, 10.0, 1, 2, false),
+            "a stationary render-only double click remains Vim-owned"
+        );
+        assert!(surface.direct_source_at(8.0, 10.0).is_none());
     }
 }

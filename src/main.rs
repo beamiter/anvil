@@ -67,7 +67,9 @@ mod tab_strip;
 mod task_ops;
 mod terminal;
 mod top_bar;
+mod vim9_buffer_labels;
 mod vim9_ide;
+mod vim9_zoom;
 mod vte_pty;
 mod workflow_ops;
 mod workflows;
@@ -1583,7 +1585,10 @@ impl SimpleComponent for AppModel {
             key_controller.connect_key_pressed(move |_c, keyval, keycode, state| {
                 // Embedded Vim owns Quick Open before the shell's global
                 // command-palette binding can consume this capture event.
-                if crate::vim9_ide::embedded_owns_quick_open_key(&window, keyval, state) {
+                if crate::vim9_ide::native_dialog_owns_keyboard(&window)
+                    || crate::vim9_ide::embedded_owns_quick_open_key(&window, keyval, state)
+                    || crate::vim9_ide::embedded_owns_font_key(&window, keyval, state)
+                {
                     return glib::Propagation::Proceed;
                 }
                 let focused = gtk::prelude::RootExt::focus(&window);
@@ -1717,6 +1722,14 @@ impl SimpleComponent for AppModel {
                 let control = controller
                     .current_event_state()
                     .contains(gtk::gdk::ModifierType::CONTROL_MASK);
+                if crate::vim9_zoom::owns_wheel(
+                    control,
+                    controller
+                        .widget()
+                        .is_some_and(|root| crate::vim9_ide::embedded_owns_font_scroll(&root)),
+                ) {
+                    return glib::Propagation::Proceed;
+                }
                 let notches = if controller.unit() == gtk::gdk::ScrollUnit::Surface {
                     dy / jterm_core::wheel::SURFACE_UNITS_PER_STEP
                 } else {

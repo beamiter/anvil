@@ -1118,6 +1118,16 @@ fn native_vim9_command_palette_modes_and_live_availability() {
 #[test]
 #[ignore = "needs an X11 display, xdotool and Vim 9 with +channel +job +timers"]
 fn native_embedded_vim9_palette_precedes_parent_and_preserves_sibling_keys() {
+    exercise_embedded_vim9_capture(false);
+}
+
+#[test]
+#[ignore = "needs a display, xdotool and Vim 9 with +channel +job +timers"]
+fn native_embedded_vim9_font_capture_routes_keyboard_and_wheel() {
+    exercise_embedded_vim9_capture(true);
+}
+
+fn exercise_embedded_vim9_capture(font_only: bool) {
     use std::io::Write;
     if !jterm_core::child_env::inherited_environment_is_captured() {
         jterm_core::child_env::capture_inherited_environment().unwrap();
@@ -1149,16 +1159,25 @@ fn native_embedded_vim9_palette_precedes_parent_and_preserves_sibling_keys() {
     layout.append(&sibling);
     window.set_content(Some(&layout));
     let terminal_palette_count = Rc::new(Cell::new(0));
+    let terminal_font_count = Rc::new(Cell::new(0));
     let parent_keys = gtk::EventControllerKey::new();
     parent_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     let parent_window = window.downgrade();
     let parent_count = terminal_palette_count.clone();
+    let parent_font_count = terminal_font_count.clone();
     parent_keys.connect_key_pressed(move |_, key, _, modifiers| {
         let window = parent_window.upgrade().unwrap();
         // Same boundary as the real terminal window's Capture callback. Real
         // X11 events below must pass it before reaching embedded content.
-        if embedded_owns_quick_open_key(&window, key, modifiers) {
+        if native_dialog_owns_keyboard(&window)
+            || embedded_owns_quick_open_key(&window, key, modifiers)
+            || embedded_owns_font_key(&window, key, modifiers)
+        {
             return glib::Propagation::Proceed;
+        }
+        if native_buffer::font_zoom_key(key, modifiers).is_some() {
+            parent_font_count.set(parent_font_count.get() + 1);
+            return glib::Propagation::Stop;
         }
         if key.to_unicode().map(|key| key.to_ascii_lowercase()) == Some('p')
             && modifiers.contains(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK)
@@ -1169,6 +1188,29 @@ fn native_embedded_vim9_palette_precedes_parent_and_preserves_sibling_keys() {
         glib::Propagation::Proceed
     });
     window.add_controller(parent_keys);
+    let parent_wheel_count = Rc::new(Cell::new(0));
+    let wheel_count = parent_wheel_count.clone();
+    let parent_scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+    parent_scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+    parent_scroll.connect_scroll(move |controller, _, _| {
+        let control = controller
+            .current_event_state()
+            .contains(gdk::ModifierType::CONTROL_MASK);
+        if crate::vim9_zoom::owns_wheel(
+            control,
+            controller
+                .widget()
+                .is_some_and(|root| embedded_owns_font_scroll(&root)),
+        ) {
+            return glib::Propagation::Proceed;
+        }
+        if control {
+            wheel_count.set(wheel_count.get() + 1);
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    layout.add_controller(parent_scroll);
     window.present();
     // Obtain an ordinary authenticated shell completion so the real
     // EmbeddedHost attach/finish path is exercised without a second GUI.
@@ -1180,9 +1222,27 @@ fn native_embedded_vim9_palette_precedes_parent_and_preserves_sibling_keys() {
         .collect::<std::collections::HashMap<_, _>>();
     let mut connection =
         std::os::unix::net::UnixStream::connect(&environment["JTERM_VIM9_HOST_SOCKET"]).unwrap();
+    // The authenticated shell boundary requires a real absolute executable,
+    // whereas the ordinary session launcher may resolve a bare PATH name.
+    let requested = std::env::var_os("JTERM_VIM9_BIN").unwrap_or_else(|| "vim".into());
+    let requested = std::path::PathBuf::from(requested);
+    let program = if requested.components().count() > 1 || requested.is_absolute() {
+        requested
+    } else {
+        use std::os::unix::fs::PermissionsExt;
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|directory| directory.join(&requested))
+            .find(|path| {
+                path.metadata().is_ok_and(|metadata| {
+                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                })
+            })
+            .expect("Vim executable on PATH")
+    };
+    let program = program.canonicalize().expect("absolute Vim executable");
     let argv = [
         "--vim-shell".into(),
-        std::env::var_os("JTERM_VIM9_BIN").unwrap_or_else(|| "vim".into()),
+        program.into_os_string(),
         "--".into(),
         "sample.txt".into(),
     ];
@@ -1274,6 +1334,121 @@ fn native_embedded_vim9_palette_precedes_parent_and_preserves_sibling_keys() {
             .unwrap()
             .success());
     };
+    if font_only {
+        let buffer = descendants::<native_buffer::BufferSurface>(widget)
+            .into_iter()
+            .next()
+            .unwrap();
+        wait_for(widget, "embedded native buffer geometry", || {
+            buffer.painted_geometry().is_some()
+        });
+        let old_line_height = buffer.painted_geometry().unwrap().0.line_height;
+        let old_size = editor.font().unwrap().size();
+        assert!(embedded_owns_font_key(
+            &window,
+            gdk::Key::equal,
+            gdk::ModifierType::CONTROL_MASK
+        ));
+        send("ctrl+equal");
+        wait_for(
+            widget,
+            "parent capture defers to embedded buffer font",
+            || {
+                editor.font().unwrap().size() == old_size + gtk::pango::SCALE
+                    && buffer.native_font_size() == old_size + gtk::pango::SCALE
+                    && buffer
+                        .painted_geometry()
+                        .is_some_and(|(metrics, _)| metrics.line_height > old_line_height)
+            },
+        );
+        assert_eq!(terminal_font_count.get(), 0);
+        send("ctrl+0");
+        wait_for(widget, "embedded buffer font reset", || {
+            editor.font().unwrap().size() == 12 * gtk::pango::SCALE
+                && buffer.native_font_size() == 12 * gtk::pango::SCALE
+        });
+        wait_for(widget, "font reset restores buffer grid", || {
+            buffer
+                .painted_geometry()
+                .is_some_and(|(metrics, _)| metrics.line_height == old_line_height)
+        });
+        let move_pointer = |target: &gtk::Widget| {
+            let bounds = target.compute_bounds(widget).unwrap();
+            let x = (bounds.x() + bounds.width() * 0.5).round().to_string();
+            let y = (bounds.y() + bounds.height() * 0.5).round().to_string();
+            assert!(std::process::Command::new("xdotool")
+                .args(["mousemove", "--window", id, &x, &y])
+                .status()
+                .unwrap()
+                .success());
+        };
+        let wheel_up = || {
+            for args in [
+                vec!["keydown", "Control_L"],
+                vec!["click", "4"],
+                vec!["keyup", "Control_L"],
+            ] {
+                assert!(std::process::Command::new("xdotool")
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+        };
+        move_pointer(editor.upcast_ref());
+        wait_for(widget, "pointer enters embedded Vim buffer", || {
+            embedded_owns_font_scroll(layout.upcast_ref())
+        });
+        wheel_up();
+        wait_for(
+            widget,
+            "parent capture defers real Ctrl-wheel to buffer font",
+            || {
+                editor.font().unwrap().size() == 13 * gtk::pango::SCALE
+                    && buffer.native_font_size() == 13 * gtk::pango::SCALE
+                    && buffer
+                        .painted_geometry()
+                        .is_some_and(|(metrics, _)| metrics.line_height > old_line_height)
+            },
+        );
+        assert_eq!(parent_wheel_count.get(), 0);
+        send("ctrl+0");
+        wait_for(widget, "wheel font reset restores buffer grid", || {
+            editor.font().unwrap().size() == 12 * gtk::pango::SCALE
+                && buffer
+                    .painted_geometry()
+                    .is_some_and(|(metrics, _)| metrics.line_height == old_line_height)
+        });
+        move_pointer(sibling.upcast_ref());
+        wait_for(widget, "pointer leaves embedded Vim buffer", || {
+            !embedded_owns_font_scroll(layout.upcast_ref())
+        });
+        wheel_up();
+        wait_for(widget, "sibling wheel remains owned by parent", || {
+            parent_wheel_count.get() == 1
+        });
+        assert_eq!(buffer.native_font_size(), 12 * gtk::pango::SCALE);
+        sibling.grab_focus();
+        assert!(!embedded_owns_font_key(
+            &window,
+            gdk::Key::equal,
+            gdk::ModifierType::CONTROL_MASK
+        ));
+        send("ctrl+equal");
+        wait_for(widget, "sibling keeps its normal font shortcut", || {
+            terminal_font_count.get() == 1
+        });
+        assert_eq!(buffer.native_font_size(), 12 * gtk::pango::SCALE);
+        eprintln!("font capture verified: keyboard and real Ctrl-wheel changed VTE/Pango/grid, sibling font routes preserved");
+        editor.grab_focus();
+        editor.feed_child(b":qa!\r");
+        wait_for(widget, "font-test embedded exit restores shell", || {
+            gtk::prelude::WidgetExt::is_visible(&source) && !has_embedded_editor(&pane)
+        });
+        window.close();
+        std::fs::remove_dir_all(root).unwrap();
+        return;
+    }
     send("ctrl+shift+p");
     wait_for(widget, "parent capture defers to embedded picker", || {
         window.visible_dialog().is_some()
@@ -1315,10 +1490,16 @@ fn native_embedded_vim9_palette_precedes_parent_and_preserves_sibling_keys() {
     let sibling_dialog = adw::Dialog::new();
     let sibling_query = gtk::Entry::new();
     let native_modal_count = Rc::new(Cell::new(0));
+    let native_modal_font_count = Rc::new(Cell::new(0));
+    let observed_modal_font_count = native_modal_font_count.clone();
     let observed_modal_count = native_modal_count.clone();
     let native_modal_keys = gtk::EventControllerKey::new();
     native_modal_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     native_modal_keys.connect_key_pressed(move |_, key, _, modifiers| {
+        if native_buffer::font_zoom_key(key, modifiers).is_some() {
+            observed_modal_font_count.set(observed_modal_font_count.get() + 1);
+            return glib::Propagation::Stop;
+        }
         if key.to_unicode().map(|key| key.to_ascii_lowercase()) == Some('p')
             && modifiers.contains(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK)
         {
@@ -1330,10 +1511,16 @@ fn native_embedded_vim9_palette_precedes_parent_and_preserves_sibling_keys() {
     sibling_query.add_controller(native_modal_keys);
     sibling_dialog.set_child(Some(&sibling_query));
     sibling_dialog.present(Some(&window));
-    sibling_query.grab_focus();
     wait_for(widget, "sibling native modal is mapped", || {
-        window.visible_dialog().as_ref() == Some(&sibling_dialog)
+        window.visible_dialog().as_ref() == Some(&sibling_dialog) && sibling_query.is_mapped()
     });
+    assert!(sibling_query.grab_focus());
+    wait_for(widget, "sibling modal field actually owns focus", || {
+        gtk::prelude::RootExt::focus(&window).is_some_and(|focus| {
+            &focus == sibling_query.upcast_ref::<gtk::Widget>() || focus.is_ancestor(&sibling_query)
+        })
+    });
+    assert!(native_dialog_owns_keyboard(&window));
     assert!(!embedded_owns_quick_open_key(
         &window,
         gdk::Key::P,
@@ -1346,6 +1533,14 @@ fn native_embedded_vim9_palette_precedes_parent_and_preserves_sibling_keys() {
         || native_modal_count.get() == 1,
     );
     assert_eq!(terminal_palette_count.get(), 1);
+    send("ctrl+equal");
+    wait_for(widget, "sibling native modal retains its font key", || {
+        native_modal_font_count.get() == 1
+    });
+    assert_eq!(terminal_font_count.get(), 0);
+    eprintln!("native modal ownership: parent_palette={}, modal_palette={}, parent_font={}, modal_font={}, field_focus={}",
+        terminal_palette_count.get(), native_modal_count.get(), terminal_font_count.get(), native_modal_font_count.get(),
+        gtk::prelude::RootExt::focus(&window).is_some_and(|focus| &focus == sibling_query.upcast_ref::<gtk::Widget>() || focus.is_ancestor(&sibling_query)));
     navigation::close_dialog(&sibling_dialog);
     wait_for(widget, "sibling modal dismissal", || {
         window.visible_dialog().is_none()

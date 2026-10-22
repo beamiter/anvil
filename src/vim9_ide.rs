@@ -487,6 +487,44 @@ pub(crate) fn embedded_owns_quick_open_key(
     })
 }
 
+/// A mapped native modal owns its complete keyboard path, including fields
+/// whose local shortcuts must run before the shell's global capture bindings.
+pub(crate) fn native_dialog_owns_keyboard(window: &adw::ApplicationWindow) -> bool {
+    window
+        .visible_dialog()
+        .is_some_and(|dialog| dialog.is_mapped())
+}
+
+/// Parent capture handlers must let the Vim terminal own its zoom keys.
+/// A search field or sibling shell continues using its usual application route.
+pub(crate) fn embedded_owns_font_key(
+    window: &adw::ApplicationWindow,
+    key: gdk::Key,
+    modifiers: gdk::ModifierType,
+) -> bool {
+    crate::vim9_zoom::owns_keyboard(
+        native_buffer::font_zoom_key(key, modifiers).is_some(),
+        gtk::prelude::RootExt::focus(window).is_some_and(|focus| {
+            focus.is_mapped() && focus.is::<vte4::Terminal>() && has_embedded_editor(&focus)
+        }),
+    )
+}
+
+/// Wheel routing follows the native buffer's actual pointer ownership, not
+/// keyboard focus. An ancestor content-zoom controller must not swallow it.
+pub(crate) fn embedded_owns_font_scroll(root: &gtk::Widget) -> bool {
+    EMBEDDED_EDITORS.with_borrow(|editors| {
+        editors.iter().any(|(container, _)| {
+            container.upgrade().is_some_and(|container| {
+                container.is_mapped()
+                    && (container.upcast_ref::<gtk::Widget>() == root
+                        || container.is_ancestor(root))
+                    && native_buffer::contains_buffer_pointer(container.upcast_ref())
+            })
+        })
+    })
+}
+
 /// Tab/pane/window close first asks the actual Vim to quit. A modified buffer
 /// can refuse without losing either the editor or its waiting shell.
 pub(crate) fn request_embedded_close(root: &impl IsA<gtk::Widget>) -> bool {
@@ -1945,9 +1983,12 @@ fn open_with_config_and_exit(
             .map(|b| (b.id, b.name.clone(), b.modified, b.current))
             .collect::<Vec<_>>();
         if buffer_rows != old_buffers {
+            let reveal_current = old_buffers.iter().find(|row| row.3).map(|row| row.0)
+                != buffer_rows.iter().find(|row| row.3).map(|row| row.0);
             buffers.remove_all();
             buffer_ids.borrow_mut().clear();
-            for buffer in &snapshot.buffers {
+            let labels = crate::vim9_buffer_labels::vim9_buffer_labels(&snapshot.buffers);
+            for (buffer, caption) in snapshot.buffers.iter().zip(labels) {
                 let name = if buffer.name.is_empty() {
                     "[No Name]"
                 } else {
@@ -1957,14 +1998,66 @@ fn open_with_config_and_exit(
                     "{}{} {}",
                     if buffer.current { "▸" } else { " " },
                     if buffer.modified { "●" } else { " " },
-                    visible(name)
+                    visible(&caption)
                 ));
                 row.set_margin_start(8);
                 row.set_margin_end(8);
                 row.set_margin_top(5);
                 row.set_margin_bottom(5);
-                row.set_tooltip_text(Some(&visible(name)));
+                row.set_tooltip_text(Some(&format!("{}\nMiddle-click to close", visible(name))));
+                // Keep the buffer identity captured by this row: a metadata
+                // refresh must never redirect a middle-click to another file.
+                let close = gtk::GestureClick::new();
+                close.set_button(2);
+                close.set_propagation_phase(gtk::PropagationPhase::Capture);
+                let close_session = session.clone();
+                let close_message = message.clone();
+                let close_editor = poll_editor.clone();
+                let buffer_id = buffer.id;
+                close.connect_pressed(move |gesture, _, _, _| {
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                    dispatch(
+                        &close_session,
+                        Vim9Command::CloseBuffer { buffer: buffer_id },
+                        &close_message,
+                        &close_editor,
+                    );
+                });
+                row.add_controller(close);
                 buffers.append(&row);
+                if buffer.current {
+                    if let Some(list_row) = row.parent().and_downcast::<gtk::ListBoxRow>() {
+                        buffers.select_row(Some(&list_row));
+                        if !reveal_current {
+                            buffer_ids.borrow_mut().push(buffer.id);
+                            continue;
+                        }
+                        let scroll = buffer_scroll.downgrade();
+                        let list = buffers.downgrade();
+                        // Newly inserted rows have no allocation yet. Reveal
+                        // after layout, preserving scroll for ordinary updates.
+                        list_row.add_tick_callback(move |row, _| {
+                            let (Some(scroll), Some(list)) = (scroll.upgrade(), list.upgrade())
+                            else {
+                                return glib::ControlFlow::Break;
+                            };
+                            if let Some(bounds) = row.compute_bounds(&list) {
+                                if bounds.height() <= 0.0 {
+                                    return glib::ControlFlow::Continue;
+                                }
+                                let adjustment = scroll.vadjustment();
+                                let top = f64::from(bounds.y());
+                                let bottom = top + f64::from(bounds.height());
+                                if top < adjustment.value() {
+                                    adjustment.set_value(top);
+                                } else if bottom > adjustment.value() + adjustment.page_size() {
+                                    adjustment.set_value(bottom - adjustment.page_size());
+                                }
+                            }
+                            glib::ControlFlow::Break
+                        });
+                    }
+                }
                 buffer_ids.borrow_mut().push(buffer.id);
             }
             old_buffers = buffer_rows;
