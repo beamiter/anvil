@@ -2516,3 +2516,16 @@ fn native_vim9_shell_argv_and_exit_status() {
     );
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn terminal_modes_keep_diagnostic_function_keys_with_vim() {
+    for visible in [false, true] {
+        for mode in ["t", "nt", "ntT"] {
+            assert!(!diagnostic_shortcuts_enabled(visible, mode));
+        }
+    }
+    for mode in ["n", "i", "v", "no"] {
+        assert!(diagnostic_shortcuts_enabled(true, mode));
+        assert!(!diagnostic_shortcuts_enabled(false, mode));
+    }
+}

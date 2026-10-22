@@ -22,6 +22,11 @@ mod navigation;
 #[path = "vim9_ide_search.rs"]
 mod project_search;
 
+fn diagnostic_shortcuts_enabled(visible: bool, mode: &str) -> bool {
+    // Terminal job/normal mode owns F8, including SimpleTerminal's popup.
+    visible && mode != "t" && !mode.starts_with("nt")
+}
+
 fn visible(text: &str) -> String {
     jterm_core::review_input::safe_inline_display(text, 1024)
 }
@@ -1649,11 +1654,20 @@ fn open_with_config_and_exit(
                     }
                     return glib::Propagation::Stop;
                 }
-                _ if key == gdk::Key::F8 && !ctrl && !alt && config.tool_panel => Some(if shift {
-                    Vim9Command::PreviousDiagnostic
-                } else {
-                    Vim9Command::NextDiagnostic
-                }),
+                _ if key == gdk::Key::F8
+                    && !ctrl
+                    && !alt
+                    && diagnostic_shortcuts_enabled(
+                        config.tool_panel,
+                        &session.snapshot().mode,
+                    ) =>
+                {
+                    Some(if shift {
+                        Vim9Command::PreviousDiagnostic
+                    } else {
+                        Vim9Command::NextDiagnostic
+                    })
+                }
                 _ if key == gdk::Key::Page_Up && ctrl && shift && !alt && config.buffer_tabs => {
                     Some(Vim9Command::PreviousBuffer)
                 }
