@@ -1099,9 +1099,11 @@ fn native_vim9_command_palette_modes_and_live_availability() {
             && contains(&picker, "W2")
     });
     editor.feed_child(b":let g:vim9_simple_branch = 'palette-next'\r");
-    wait_for(widget, "Simple context refresh without query change", || {
-        contains(&picker, "palette-next ↑1") && !contains(&picker, "palette-main")
-    });
+    wait_for(
+        widget,
+        "Simple context refresh without query change",
+        || contains(&picker, "palette-next ↑1") && !contains(&picker, "palette-main"),
+    );
     assert_eq!(query.text(), ">simple git status");
     query.emit_activate();
     wait_for(widget, "Simple typed action returns to Vim", || {
