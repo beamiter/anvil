@@ -10,10 +10,8 @@ revive a revoked entry, and queued native paint must belong to its active entry.
 ## Shared dependency
 
 Normal and test dependencies pin the public Git revision
-`3385b5f92198a7b476b4940fa96978fb01bda81c` of `beamiter/jterm_core`. Its source tree is
-identical to the reviewed local core `46576f94295461b143a6c476e4db46cf16c297c7`.
-The published commit was created through the official GitHub connector with a
-non-force, expected-head update after the ordinary Git push path failed.
+`d604e698dcb1ffa803857403b70a82429ec95f1a` of `beamiter/jterm_core`. This published revision includes
+semantic navigation actions and cursor-bound request validation.
 No adjacent source checkout or local Cargo patch is required.
 
 Use `cargo build --locked`; GTK frontends require their Nix development

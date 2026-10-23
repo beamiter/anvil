@@ -22,6 +22,33 @@ mod navigation;
 #[path = "vim9_ide_search.rs"]
 mod project_search;
 
+// The channel handshake can precede Vim's first buffer metadata.
+fn editor_state_ready(snapshot: &jterm_core::vim9::Vim9Snapshot) -> bool {
+    snapshot.connected
+        && snapshot.buffer > 0
+        && snapshot.window > 0
+        && snapshot.line > 0
+        && snapshot.column > 0
+        && !snapshot.mode.is_empty()
+}
+
+#[test]
+fn editor_readiness_requires_initial_metadata() {
+    let mut snapshot = jterm_core::vim9::Vim9Snapshot {
+        connected: true,
+        ..Default::default()
+    };
+    assert!(!editor_state_ready(&snapshot));
+    snapshot.buffer = 1;
+    snapshot.window = 1000;
+    snapshot.line = 1;
+    snapshot.column = 1;
+    snapshot.mode = "n".into();
+    assert!(editor_state_ready(&snapshot));
+    snapshot.connected = false;
+    assert!(!editor_state_ready(&snapshot));
+}
+
 fn diagnostic_shortcuts_enabled(visible: bool, mode: &str) -> bool {
     // Terminal job/normal mode owns F8, including SimpleTerminal's popup.
     visible && mode != "t" && !mode.starts_with("nt")
@@ -1870,23 +1897,24 @@ fn open_with_config_and_exit(
         let _ = &browser;
         let snapshot = session.snapshot();
         let connected = snapshot.connected && !child_finished.get();
+        let ready = editor_state_ready(&snapshot) && !child_finished.get();
         for button in &connected_controls {
-            button.set_sensitive(connected);
+            button.set_sensitive(ready);
         }
-        search.set_sensitive(connected);
-        search_options.menu.set_sensitive(connected);
-        cancel_search.set_sensitive(connected && snapshot.search.running);
-        navigate_back.set_sensitive(connected && snapshot.navigation.can_go_back);
-        navigate_forward.set_sensitive(connected && snapshot.navigation.can_go_forward);
-        build.set_sensitive(connected && !snapshot.build.running);
-        save_and_build.set_sensitive(connected && !snapshot.build.running);
-        cancel_build.set_sensitive(connected && snapshot.build.running);
+        search.set_sensitive(ready);
+        search_options.menu.set_sensitive(ready);
+        cancel_search.set_sensitive(ready && snapshot.search.running);
+        navigate_back.set_sensitive(ready && snapshot.navigation.can_go_back);
+        navigate_forward.set_sensitive(ready && snapshot.navigation.can_go_forward);
+        build.set_sensitive(ready && !snapshot.build.running);
+        save_and_build.set_sensitive(ready && !snapshot.build.running);
+        cancel_build.set_sensitive(ready && snapshot.build.running);
         for (capability, button, tooltip) in &language_actions {
             let supported = snapshot
                 .capabilities
                 .iter()
                 .any(|available| available == capability);
-            button.set_sensitive(connected && supported);
+            button.set_sensitive(ready && supported);
             if supported {
                 button.set_tooltip_text(Some(tooltip));
             } else {

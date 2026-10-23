@@ -746,23 +746,36 @@ fn paint_popup(
     let metrics = state.metrics;
     let baseline = row_baseline(surface, state);
     let view = view_rectangle(&popup.view, metrics);
-    // A popup is opaque across its entire rectangle, including padding,
-    // border cells, empty lines and any Vim status/split rows beneath it.
-    // Its border and padding are supplied by Vim as runs; adding a second
-    // host border would alter the published geometry and GUI colors.
+    let card = popup.is_documentation_card();
+    let (foreground, background, _) = colors(&popup.default_style, &frame.default_style);
     snapshot.push_clip(&gtk::graphene::Rect::new(
         0.0,
         0.0,
         surface.width() as f32,
         surface.height() as f32,
     ));
-    snapshot.push_clip(&view);
-    let (_, background, _) = colors(&popup.default_style, &frame.default_style);
+    let rounded = gtk::gsk::RoundedRect::from_rect(view, 6.0);
+    if card {
+        snapshot.append_outset_shadow(
+            &rounded,
+            &gdk::RGBA::new(0.0, 0.0, 0.0, 0.18),
+            0.0,
+            2.0,
+            0.0,
+            6.0,
+        );
+        snapshot.push_rounded_clip(&rounded);
+    } else {
+        snapshot.push_clip(&view);
+    }
     snapshot.append_color(&rgb(background), &view);
     for run in &popup.runs {
-        let (_, background, _) = colors(&run.style, &popup.default_style);
+        let (_, run_background, _) = colors(&run.style, &popup.default_style);
+        if card && run_background == background {
+            continue;
+        }
         snapshot.append_color(
-            &rgb(background),
+            &rgb(run_background),
             &view_rectangle(
                 &Vim9RenderRect {
                     row: run.row,
@@ -792,6 +805,12 @@ fn paint_popup(
             run.column.saturating_sub(popup.view.column) as f32 * metrics.cell_width,
             layouts,
         );
+    }
+    if card {
+        let mut border = rgb(foreground);
+        border.set_alpha(0.20);
+        let pixel = 1.0 / surface.scale_factor().max(1) as f32;
+        snapshot.append_border(&rounded, &[pixel; 4], &[border; 4]);
     }
     snapshot.pop();
     snapshot.pop();
@@ -4380,6 +4399,77 @@ mod tests {
         assert_eq!(surface.imp().scene_builds.get(), 4);
     }
     #[test]
+    #[ignore = "requires GTK display; checks documentation card pixels"]
+    fn documentation_card_rounds_corners_without_moving_popup_geometry() {
+        gtk::init().expect("GTK display required");
+        let surface = BufferSurface::new();
+        surface.allocate(160, 120, -1, None);
+        let state = PaintState {
+            metrics: Metrics {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                cell_width: 10.0,
+                line_height: 20.0,
+            },
+            ..Default::default()
+        };
+        let popup: Vim9RenderPopup = serde_json::from_value(serde_json::json!({
+            "id":5,"kind":"hover","zindex":50,
+            "view":{"row":1,"column":2,"rows":3,"columns":8},
+            "default_style":{"background":0x123456,"foreground":0xddeeff},
+            "runs":[{"row":1,"column":2,"cells":8,"text":""}]
+        }))
+        .unwrap();
+        let render = |popup: &Vim9RenderPopup| {
+            let snapshot = gtk::Snapshot::new();
+            snapshot.append_color(
+                &rgb(0xffffff),
+                &gtk::graphene::Rect::new(0.0, 0.0, 160.0, 120.0),
+            );
+            paint_popup(
+                &surface,
+                &snapshot,
+                &state,
+                &Vim9RenderFrame::default(),
+                popup,
+                &mut LayoutCache::default(),
+            );
+            let mut image =
+                gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 160, 120).unwrap();
+            let cr = gtk::cairo::Context::new(&image).unwrap();
+            snapshot.to_node().unwrap().draw(&cr);
+            drop(cr);
+            let stride = image.stride() as usize;
+            let bytes = image.data().unwrap().to_vec();
+            (stride, bytes)
+        };
+        let mut plain = popup.clone();
+        plain.kind.clear();
+        let card = render(&popup);
+        let flat = render(&plain);
+        let pixel = |image: &(usize, Vec<u8>), x: usize, y: usize| {
+            image.1[y * image.0 + x * 4..y * image.0 + x * 4 + 3].to_vec()
+        };
+        assert_ne!(
+            pixel(&card, 20, 20),
+            pixel(&flat, 20, 20),
+            "card corner must reveal the underlying surface"
+        );
+        assert_eq!(
+            pixel(&card, 50, 50),
+            pixel(&flat, 50, 50),
+            "opaque body retains the Vim GUI background"
+        );
+        assert_ne!(
+            pixel(&card, 50, 82),
+            pixel(&flat, 50, 82),
+            "card shadow stays outside content geometry"
+        );
+        assert_eq!(popup.view, plain.view);
+        assert_eq!(popup.runs, plain.runs);
+    }
+
+    #[test]
     #[ignore = "requires GTK display; checks popup layering and opaque render pixels"]
     fn native_popups_cover_split_gaps_and_obey_vim_zindex() {
         gtk::init().expect("GTK display required");
@@ -4404,6 +4494,7 @@ mod tests {
             ..Default::default()
         };
         let upper = Vim9RenderPopup {
+            kind: String::new(),
             id: 20,
             zindex: 100,
             view: Vim9RenderRect {

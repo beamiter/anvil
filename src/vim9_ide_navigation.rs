@@ -214,6 +214,7 @@ pub(super) struct QuickOpen {
     last_query: RefCell<String>,
     command_mode: Cell<bool>,
     activation_error: RefCell<Option<(String, String)>>,
+    refreshing_rows: Cell<bool>,
     dismissing: Cell<bool>,
     closed: Cell<bool>,
     session: Vim9Session,
@@ -280,6 +281,7 @@ impl QuickOpen {
             last_query: RefCell::new(String::new()),
             command_mode: Cell::new(false),
             activation_error: RefCell::new(None),
+            refreshing_rows: Cell::new(false),
             dismissing: Cell::new(false),
             closed: Cell::new(false),
             session: session.clone(),
@@ -316,7 +318,9 @@ impl QuickOpen {
         let weak = Rc::downgrade(&this);
         this.list.connect_row_selected(move |_, _| {
             if let Some(this) = weak.upgrade() {
-                this.activation_error.borrow_mut().take();
+                if !this.refreshing_rows.get() {
+                    this.activation_error.borrow_mut().take();
+                }
             }
         });
         let weak = Rc::downgrade(&this);
@@ -377,6 +381,9 @@ impl QuickOpen {
             return;
         }
         let query = self.query.text().to_string();
+        if *self.last_query.borrow() != query {
+            self.activation_error.borrow_mut().take();
+        }
         let editor = self.session.snapshot();
         if let Some(command_query) = vim9_palette_query(&query) {
             self.sync_commands(&query, command_query, &editor);
@@ -513,7 +520,9 @@ impl QuickOpen {
                 .ok()
                 .and_then(|index| self.targets.borrow().get(index).cloned())
         });
-        self.activation_error.borrow_mut().take();
+        // Availability refreshes replace GTK rows without changing user intent.
+        // Preserve a rejected action's feedback until the query or selection changes.
+        self.refreshing_rows.set(true);
         self.list.remove_all();
         let mut selected_index = 0;
         for (index, target) in targets.iter().enumerate() {
@@ -566,6 +575,7 @@ impl QuickOpen {
         *self.targets.borrow_mut() = targets;
         self.list
             .select_row(self.list.row_at_index(selected_index).as_ref());
+        self.refreshing_rows.set(false);
     }
 
     fn set_feedback(&self, text: String, is_error: bool) {

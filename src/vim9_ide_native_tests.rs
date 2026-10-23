@@ -1018,10 +1018,19 @@ fn native_vim9_command_palette_modes_and_live_availability() {
         widget,
         "live command availability with unchanged query",
         || {
-            contains(&picker, "Go to next quickfix problem")
-                && !contains(&picker, "The quickfix list has no problems")
+            descendants::<gtk::Label>(list.upcast_ref())
+                .iter()
+                .any(|label| {
+                    label.text() == "Go to next quickfix problem"
+                        && !label.has_css_class("dim-label")
+                })
         },
     );
+    assert!(descendants::<gtk::Label>(picker.upcast_ref())
+        .iter()
+        .any(|label| {
+            label.has_css_class("error") && label.text() == "The quickfix list has no problems"
+        }));
     assert_eq!(query.text(), ">next diagnostic");
     query.emit_by_name::<()>("stop-search", &[]);
     wait_for(widget, "Escape returns palette focus", || {
@@ -1107,12 +1116,54 @@ fn native_vim9_command_palette_modes_and_live_availability() {
     assert_eq!(query.text(), ">simple git status");
     query.emit_activate();
     wait_for(widget, "Simple typed action returns to Vim", || {
-        native_window.visible_dialog().is_none() && action_output.is_file()
+        native_window.visible_dialog().is_none()
+            && std::fs::read_to_string(&action_output)
+                .is_ok_and(|text| text == "simple_git_status\n")
     });
     assert_eq!(
         std::fs::read_to_string(action_output).unwrap(),
         "simple_git_status\n"
     );
+    let (picker, query, list) = open_picker();
+    query.set_text(">format");
+    wait_for(
+        widget,
+        "format unavailable before capability refresh",
+        || {
+            contains(&picker, "Format current buffer")
+                && descendants::<gtk::Label>(list.upcast_ref())
+                    .iter()
+                    .any(|label| {
+                        label.text() == "Format current buffer" && label.has_css_class("dim-label")
+                    })
+        },
+    );
+    query.emit_activate();
+    let format_error = "The current buffer's language service does not provide this action";
+    assert!(contains(&picker, format_error));
+    editor.feed_child(b":command! LspFormat echo 'format fixture'\r");
+    wait_for(
+        widget,
+        "format capability refresh preserves activation feedback",
+        || {
+            descendants::<gtk::Label>(list.upcast_ref())
+                .iter()
+                .any(|label| {
+                    label.text() == "Format current buffer" && !label.has_css_class("dim-label")
+                })
+        },
+    );
+    assert!(contains(&picker, format_error));
+    query.set_text(">simple");
+    wait_for(
+        widget,
+        "query change clears prior activation feedback",
+        || contains(&picker, "Simple: Show Git status") && !contains(&picker, format_error),
+    );
+    query.emit_by_name::<()>("stop-search", &[]);
+    wait_for(widget, "format feedback fixture dismissal", || {
+        native_window.visible_dialog().is_none()
+    });
     let (picker, query, _) = open_picker();
     query.set_text(">simple");
     wait_for(widget, "Simple palette screenshot catalog", || {
