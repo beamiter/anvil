@@ -661,9 +661,9 @@ impl AppModel {
                 crate::agent_sessions::show(
                     &self.window,
                     self.active_cwd(),
-                    move |launch, title| {
-                        sender.input(AppMsg::ResumeAgentSession(launch, title));
-                    },
+                    self.agent_session_library.clone(),
+                    self.agent_session_tabs.keys().cloned().collect(),
+                    move |request| sender.input(AppMsg::ResumeAgentSession(Box::new(request))),
                 );
             }
             Action::OpenAgent => {

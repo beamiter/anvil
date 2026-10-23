@@ -1,23 +1,56 @@
 //! Native session switcher for provider-owned CLI conversations.
 use gtk::prelude::*;
 use jterm_core::agent_sessions::{
-    AgentSession, SessionCatalog, SessionLaunch, SessionProvider, SessionQuery, SessionScanner,
-    SessionSearchIndex, SessionSort, SessionStatus,
+    AgentSession, SessionCatalog, SessionLaunch, SessionLibraryFilter, SessionLibrarySnapshot,
+    SessionLibraryStore, SessionPreflight, SessionPreflightState, SessionProvider, SessionQuery,
+    SessionScanner, SessionSearchIndex, SessionSort, SessionStatus,
 };
 use relm4::gtk;
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 thread_local! {
     #[cfg(test)]
-    static TEST_MANAGER: RefCell<std::rc::Weak<Manager>> = RefCell::new(std::rc::Weak::new());
+    static TEST_MANAGER: RefCell<std::rc::Weak<Manager>> = const { RefCell::new(std::rc::Weak::new()) };
     static MANAGER_WINDOW: RefCell<gtk::glib::WeakRef<gtk::Window>> = RefCell::new(gtk::glib::WeakRef::new());
+}
+
+pub(crate) type SessionIdentity = (SessionProvider, String);
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResumeRequest {
+    pub provider: SessionProvider,
+    pub id: String,
+    pub title: String,
+    /// None requests a verified same-window tab switch.
+    pub launch: Option<SessionLaunch>,
+    pub completion: Sender<Result<(), String>>,
+}
+
+struct Activation {
+    key: SessionIdentity,
+    existing: bool,
+    result: Receiver<Result<(), String>>,
 }
 
 struct Manager {
     window: gtk::glib::WeakRef<gtk::Window>,
+    library: Rc<RefCell<SessionLibraryStore>>,
+    existing: RefCell<HashSet<SessionIdentity>>,
+    preflight: RefCell<SessionPreflight>,
+    confirmation: RefCell<Option<SessionIdentity>>,
+    activation: RefCell<Option<Activation>>,
+    enter_down: Rc<Cell<bool>>,
+    completed_activation: Rc<Cell<bool>>,
+    saved_view: gtk::DropDown,
+    pinned_first: gtk::CheckButton,
+    pin: gtk::ToggleButton,
+    library_status: gtk::Label,
+    readiness: gtk::Label,
     scanner: RefCell<SessionScanner>,
     catalog: RefCell<SessionCatalog>,
     visible: RefCell<Vec<AgentSession>>,
@@ -47,7 +80,7 @@ struct Manager {
     refresh: gtk::Button,
     selected: RefCell<Option<String>>,
     last_refresh: RefCell<Instant>,
-    launch: Box<dyn Fn(SessionLaunch, String)>,
+    launch: Box<dyn Fn(ResumeRequest)>,
 }
 
 fn identity(session: &AgentSession) -> String {
@@ -120,8 +153,24 @@ impl SessionRow {
         }
     }
 
-    fn update(&self, session: &AgentSession, catalog: &SessionCatalog) {
-        set_label(&self.title, &session.title);
+    fn update(
+        &self,
+        session: &AgentSession,
+        catalog: &SessionCatalog,
+        library: &SessionLibrarySnapshot,
+    ) {
+        set_label(
+            &self.title,
+            &format!(
+                "{}{}",
+                if library.is_pinned(session.provider, &session.id) {
+                    "★ "
+                } else {
+                    ""
+                },
+                session.title
+            ),
+        );
         let pids = catalog.live_pids(session);
         let live = if pids.is_empty() {
             String::new()
@@ -134,12 +183,15 @@ impl SessionRow {
                     .join(", ")
             )
         };
+        let resumed = library
+            .last_resumed(session.provider, &session.id)
+            .map(|time| format!(" · Resumed {}", age(time)))
+            .unwrap_or_default();
         let meta = format!(
-            "{}  ·  {}  ·  {}{}",
+            "{}  ·  {}  ·  {}{live}{resumed}",
             session.provider.label(),
             session.status.label(),
-            age(session.updated_at_ms),
-            live
+            age(session.updated_at_ms)
         );
         if self.meta.text().as_str() != meta {
             self.meta.set_text(&meta);
@@ -173,7 +225,9 @@ impl Manager {
             // Neither the model nor GTK row identities are replaced on an
             // unchanged scan. Only relative ages may need a label update.
             if let Some(notice) = self.refresh_notice.borrow_mut().take() {
-                self.notice.set_text(&notice);
+                if self.notice.text().as_str() == "Reading local Codex and Claude sessions…" {
+                    self.notice.set_text(&notice);
+                }
             }
             self.update_rows();
             self.show_selection(self.list.selected_row().map(|row| row.index() as usize));
@@ -198,6 +252,8 @@ impl Manager {
         self.live_only.set_active(false);
         self.project_only.set_active(false);
         self.sort.set_selected(0);
+        self.saved_view.set_selected(0);
+        self.pinned_first.set_active(true);
         self.updating.set(false);
         self.page.set(0);
         self.selected.borrow_mut().take();
@@ -240,10 +296,19 @@ impl Manager {
             sort: match self.sort.selected() {
                 1 => SessionSort::Recent,
                 2 => SessionSort::LiveFirst,
+                3 => SessionSort::RecentlyResumed,
                 _ => SessionSort::Relevance,
             },
         };
-        let matches = self.search_index.borrow().query(&query);
+        let matches = self.search_index.borrow().query_with_library(
+            &query,
+            self.library.borrow().snapshot(),
+            SessionLibraryFilter {
+                pinned_only: self.saved_view.selected() == 1,
+                recent_only: self.saved_view.selected() == 2,
+                pinned_first: self.pinned_first.is_active(),
+            },
+        );
         let catalog = self.catalog.borrow();
         if preserve_view {
             if let Some(position) = matches.iter().position(|index| {
@@ -294,7 +359,9 @@ impl Manager {
                 || self.status.selected() != 0
                 || self.live_only.is_active()
                 || self.project_only.is_active()
-                || self.sort.selected() != 0,
+                || self.sort.selected() != 0
+                || self.saved_view.selected() != 0
+                || !self.pinned_first.is_active(),
         );
         self.notice.set_text(if catalog.sessions.is_empty() {
             "No saved sessions found. Start Codex or Claude, then refresh. Custom CODEX_HOME and CLAUDE_CONFIG_DIR are supported."
@@ -351,7 +418,7 @@ impl Manager {
     fn update_rows(&self) {
         let catalog = self.catalog.borrow();
         for (row, session) in self.rows.borrow().iter().zip(self.visible.borrow().iter()) {
-            row.update(session, &catalog);
+            row.update(session, &catalog, self.library.borrow().snapshot());
         }
     }
 
@@ -407,16 +474,81 @@ impl Manager {
         let visible = self.visible.borrow();
         let Some(session) = index.and_then(|index| visible.get(index)) else {
             self.selected.borrow_mut().take();
+            self.preflight.borrow_mut().select(None);
+            self.confirmation.borrow_mut().take();
+            set_label(&self.readiness, "Select a session to check readiness");
+            self.pin.set_sensitive(false);
+            self.pin.set_label("☆ Pin session");
             set_label(&self.detail, "Select a session to inspect its project and recent conversation.\n\nSearch by title, project, branch, session ID or conversation text.");
             self.resume.set_sensitive(false);
             return;
         };
         *self.selected.borrow_mut() = Some(identity(session));
-        let launch = session.resume_launch();
-        let command = launch
-            .as_ref()
-            .map(|launch| launch.display_command())
-            .unwrap_or_else(|error| error.clone());
+        let existing = self
+            .existing
+            .borrow()
+            .contains(&(session.provider, session.id.clone()));
+        let changed =
+            self.preflight
+                .borrow_mut()
+                .select(if existing { None } else { Some(session) });
+        if changed {
+            self.confirmation.borrow_mut().take();
+        }
+        let preflight = self.preflight.borrow();
+        let ready = preflight.ready_launch(session).is_some();
+        let readiness = if self.completed_activation.get() {
+            "Session opened — release Enter to switch".into()
+        } else if self.activation.borrow().is_some() {
+            "Opening session…".into()
+        } else if existing {
+            "Already open in this window — switch to its terminal".into()
+        } else {
+            match preflight.state() {
+                SessionPreflightState::Idle => "Select a session to check readiness".into(),
+                SessionPreflightState::Checking => "Checking project and CLI readiness…".into(),
+                SessionPreflightState::Ready(launch) => format!(
+                    "Ready · {}",
+                    launch
+                        .args
+                        .get(launch.args.len().saturating_sub(3))
+                        .map(String::as_str)
+                        .unwrap_or(&launch.program)
+                ),
+                SessionPreflightState::Unavailable(error) => error.clone(),
+            }
+        };
+        set_label(&self.readiness, &readiness);
+        self.resume.set_label(if existing {
+            "Switch to Session"
+        } else {
+            "Resume in New Tab"
+        });
+        let command = format!(
+            "{} {} {}",
+            session.provider.label().to_lowercase(),
+            if session.provider == SessionProvider::Codex {
+                "resume"
+            } else {
+                "--resume"
+            },
+            session.id
+        );
+        let library = self.library.borrow();
+        let pinned = library.snapshot().is_pinned(session.provider, &session.id);
+        self.updating.set(true);
+        self.pin.set_active(pinned);
+        self.updating.set(false);
+        self.pin.set_label(if pinned {
+            "★ Pinned"
+        } else {
+            "☆ Pin session"
+        });
+        let saved = library
+            .snapshot()
+            .last_resumed(session.provider, &session.id)
+            .map(|time| format!("Last resumed {}", age(time)))
+            .unwrap_or_else(|| "Not resumed from a terminal manager yet".into());
         let pids = self.catalog.borrow().live_pids(session);
         let process = if pids.is_empty() {
             "No matching resumed CLI process observed".into()
@@ -432,7 +564,7 @@ impl Manager {
         set_label(
             &self.detail,
             &format!(
-                "{}\n\n{} · {} · {}\nSession {}\nProject {}\nBranch {}\n{}\n\n{}\n\n{}",
+                "{}\n\n{} · {} · {}\nSession {}\nProject {}\nBranch {}\n{}\n\n{}\n\n{saved}\n\n{command}",
                 session.title,
                 session.provider.label(),
                 session.status.label(),
@@ -441,34 +573,187 @@ impl Manager {
                 session.cwd.display(),
                 session.branch.as_deref().unwrap_or("—"),
                 process,
-                session.preview,
-                command
+                session.preview
             ),
         );
-        self.resume.set_sensitive(launch.is_ok());
+        self.resume.set_sensitive(
+            (existing || ready)
+                && self.activation.borrow().is_none()
+                && self.confirmation.borrow().is_none()
+                && !self.completed_activation.get(),
+        );
+        drop(library);
+        drop(preflight);
+        self.update_library_status();
     }
-    fn resume_selected(&self) {
+    fn update_library_status(&self) {
+        let library = self.library.borrow();
+        let loaded = library.is_loaded();
+        let busy = library.is_busy();
+        let message = if let Some(error) = library.error() {
+            format!("Saved sessions unavailable: {error}")
+        } else if !loaded {
+            "Loading saved sessions…".into()
+        } else if busy {
+            "Saving session library…".into()
+        } else {
+            format!(
+                "{} pinned · Shared across terminals",
+                library.snapshot().pinned_count()
+            )
+        };
+        if self.library_status.text().as_str() != message {
+            self.library_status.set_text(&message);
+            self.library_status.set_tooltip_text(Some(&message));
+        }
+        self.saved_view.set_sensitive(loaded);
+        self.pinned_first.set_sensitive(loaded);
+        self.pin.set_sensitive(
+            loaded && !busy && library.error().is_none() && self.selected.borrow().is_some(),
+        );
+    }
+
+    fn toggle_pin(&self) {
+        if self.updating.get() {
+            return;
+        }
+        let session = self.selected_session();
+        let Some(session) = session else {
+            return;
+        };
+        let pinned = self.pin.is_active();
+        let result = self
+            .library
+            .borrow_mut()
+            .set_pinned(session.provider, &session.id, pinned);
+        if let Err(error) = result {
+            set_label(&self.library_status, &error);
+        } else {
+            self.update_library_status();
+        }
+    }
+
+    fn selected_session(&self) -> Option<AgentSession> {
         let selected = self.selected.borrow().clone();
-        let session = self
-            .visible
+        self.visible
             .borrow()
             .iter()
             .find(|session| selected.as_deref() == Some(identity(session).as_str()))
-            .cloned();
-        if let Some(session) = session {
-            match session.resume_launch() {
-                Ok(launch) => {
-                    crate::enter_ownership::claim_held();
-                    (self.launch)(
-                        launch,
-                        format!("{} · {}", session.provider.label(), session.title),
-                    );
-                    if let Some(window) = self.window.upgrade() {
-                        window.close();
-                    }
+            .cloned()
+    }
+
+    fn dispatch_activation(&self, session: AgentSession, launch: Option<SessionLaunch>) {
+        let key = (session.provider, session.id.clone());
+        let (completion, result) = mpsc::channel();
+        *self.activation.borrow_mut() = Some(Activation {
+            key: key.clone(),
+            existing: launch.is_none(),
+            result,
+        });
+        self.confirmation.borrow_mut().take();
+        self.resume.set_sensitive(false);
+        set_label(&self.readiness, "Opening session…");
+        (self.launch)(ResumeRequest {
+            provider: session.provider,
+            id: session.id,
+            title: format!("{} · {}", session.provider.label(), session.title),
+            launch,
+            completion,
+        });
+    }
+
+    fn poll_activation(&self) {
+        let outcome = {
+            let pending = self.activation.borrow();
+            pending
+                .as_ref()
+                .and_then(|pending| match pending.result.try_recv() {
+                    Ok(result) => Some((pending.key.clone(), pending.existing, result)),
+                    Err(mpsc::TryRecvError::Disconnected) => Some((
+                        pending.key.clone(),
+                        pending.existing,
+                        Err("The terminal window could not finish opening this session.".into()),
+                    )),
+                    Err(mpsc::TryRecvError::Empty) => None,
+                })
+        };
+        if let Some((key, existing, result)) = outcome {
+            self.activation.borrow_mut().take();
+            match result {
+                Ok(()) => {
+                    self.completed_activation.set(true);
+                    set_label(&self.readiness, "Session opened — release Enter to switch");
+                    self.close_when_released();
                 }
-                Err(error) => self.notice.set_text(&error),
+                Err(error) => {
+                    if existing {
+                        self.existing.borrow_mut().remove(&key);
+                    }
+                    self.notice.set_text(&error);
+                    self.preflight.borrow_mut().refresh();
+                    self.show_selection(self.list.selected_row().map(|row| row.index() as usize));
+                }
             }
+        }
+    }
+
+    fn close_when_released(&self) {
+        let window = self.window.clone();
+        let down = self.enter_down.clone();
+        let completed = self.completed_activation.clone();
+        // The shared ownership controller queues physical-release settlement
+        // before this idle, so focus transfer cannot invalidate that release.
+        gtk::glib::idle_add_local_once(move || {
+            if completed.get() && !down.get() {
+                if let Some(window) = window.upgrade() {
+                    window.close();
+                }
+            }
+        });
+    }
+
+    fn poll_confirmation(&self) {
+        if self.activation.borrow().is_some() {
+            return;
+        }
+        let Some(key) = self.confirmation.borrow().clone() else {
+            return;
+        };
+        let Some(session) = self.selected_session() else {
+            self.confirmation.borrow_mut().take();
+            return;
+        };
+        if key != (session.provider, session.id.clone()) {
+            self.confirmation.borrow_mut().take();
+            return;
+        }
+        let ready = self.preflight.borrow().ready_launch(&session).cloned();
+        if let Some(launch) = ready {
+            self.dispatch_activation(session, Some(launch));
+        } else if let SessionPreflightState::Unavailable(error) = self.preflight.borrow().state() {
+            self.notice.set_text(error);
+            self.confirmation.borrow_mut().take();
+        }
+    }
+
+    fn resume_selected(&self) {
+        if self.activation.borrow().is_some()
+            || self.confirmation.borrow().is_some()
+            || self.completed_activation.get()
+        {
+            return;
+        }
+        let Some(session) = self.selected_session() else {
+            return;
+        };
+        crate::enter_ownership::claim_held();
+        let key = (session.provider, session.id.clone());
+        if self.existing.borrow().contains(&key) {
+            self.dispatch_activation(session, None);
+        } else {
+            *self.confirmation.borrow_mut() = Some(key);
+            self.preflight.borrow_mut().refresh();
+            self.show_selection(self.list.selected_row().map(|row| row.index() as usize));
         }
     }
 }
@@ -476,15 +761,19 @@ impl Manager {
 pub(crate) fn show(
     parent: &impl IsA<gtk::Window>,
     current_directory: Option<PathBuf>,
-    launch: impl Fn(SessionLaunch, String) + 'static,
+    library: Rc<RefCell<SessionLibraryStore>>,
+    existing: HashSet<SessionIdentity>,
+    launch: impl Fn(ResumeRequest) + 'static,
 ) {
-    show_inner(parent, current_directory, launch, true);
+    show_inner(parent, current_directory, library, existing, launch, true);
 }
 
 fn show_inner(
     parent: &impl IsA<gtk::Window>,
     current_directory: Option<PathBuf>,
-    launch: impl Fn(SessionLaunch, String) + 'static,
+    library: Rc<RefCell<SessionLibraryStore>>,
+    existing: HashSet<SessionIdentity>,
+    launch: impl Fn(ResumeRequest) + 'static,
     auto_scan: bool,
 ) {
     if let Some(window) = MANAGER_WINDOW.with(|slot| slot.borrow().upgrade()) {
@@ -550,7 +839,12 @@ fn show_inner(
                 "No local working directory is available for the active pane".into()
             }),
     ));
-    let sort = gtk::DropDown::from_strings(&["Best match", "Most recent", "Live first"]);
+    let sort = gtk::DropDown::from_strings(&[
+        "Best match",
+        "Most recent",
+        "Live first",
+        "Recently resumed",
+    ]);
     sort.set_tooltip_text(Some("Order matching sessions"));
     let clear = gtk::Button::with_label("Clear filters");
     clear.add_css_class("flat");
@@ -558,9 +852,25 @@ fn show_inner(
     filters.append(&status);
     filters.append(&live_only);
     filters.append(&project_only);
-    filters.append(&sort);
-    filters.append(&clear);
     root.append(&filters);
+    let saved_filters = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let saved_view =
+        gtk::DropDown::from_strings(&["All sessions", "★ Pinned only", "Recently resumed only"]);
+    saved_view.set_tooltip_text(Some("Saved metadata shared across all four terminals"));
+    let pinned_first = gtk::CheckButton::with_label("Pinned first");
+    pinned_first.set_active(true);
+    pinned_first.set_tooltip_text(Some("Prioritize pins only for an empty best-match search"));
+    let library_status = gtk::Label::new(Some("Loading saved sessions…"));
+    library_status.set_hexpand(true);
+    library_status.set_xalign(0.0);
+    library_status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    library_status.add_css_class("dim-label");
+    saved_filters.append(&saved_view);
+    saved_filters.append(&pinned_first);
+    saved_filters.append(&sort);
+    saved_filters.append(&clear);
+    saved_filters.append(&library_status);
+    root.append(&saved_filters);
     let list = gtk::ListBox::new();
     list.set_selection_mode(gtk::SelectionMode::Single);
     list.add_css_class("navigation-sidebar");
@@ -611,11 +921,33 @@ fn show_inner(
     root.append(&notice);
     let resume = gtk::Button::with_label("Resume in New Tab");
     resume.add_css_class("suggested-action");
-    resume.set_halign(gtk::Align::End);
-    root.append(&resume);
+    let pin = gtk::ToggleButton::with_label("☆ Pin session");
+    let readiness = gtk::Label::new(Some("Select a session to check readiness"));
+    readiness.set_hexpand(true);
+    readiness.set_xalign(0.0);
+    readiness.set_wrap(true);
+    readiness.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    readiness.add_css_class("dim-label");
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    actions.append(&pin);
+    actions.append(&readiness);
+    actions.append(&resume);
+    root.append(&actions);
     window.set_child(Some(&root));
     let manager = Rc::new(Manager {
         window: window.downgrade(),
+        library,
+        existing: RefCell::new(existing),
+        preflight: RefCell::new(SessionPreflight::new()),
+        confirmation: RefCell::new(None),
+        activation: RefCell::new(None),
+        enter_down: Rc::new(Cell::new(false)),
+        completed_activation: Rc::new(Cell::new(false)),
+        saved_view,
+        pinned_first,
+        pin,
+        library_status,
+        readiness,
         scanner: RefCell::new(SessionScanner::new()),
         catalog: RefCell::new(SessionCatalog {
             sessions: Vec::new(),
@@ -706,6 +1038,24 @@ fn show_inner(
         }
     });
     let weak = Rc::downgrade(&manager);
+    manager.saved_view.connect_selected_notify(move |_| {
+        if let Some(manager) = weak.upgrade() {
+            manager.filters_changed();
+        }
+    });
+    let weak = Rc::downgrade(&manager);
+    manager.pinned_first.connect_toggled(move |_| {
+        if let Some(manager) = weak.upgrade() {
+            manager.filters_changed();
+        }
+    });
+    let weak = Rc::downgrade(&manager);
+    manager.pin.connect_clicked(move |_| {
+        if let Some(manager) = weak.upgrade() {
+            manager.toggle_pin();
+        }
+    });
+    let weak = Rc::downgrade(&manager);
     manager.list.connect_row_selected(move |_, row| {
         if let Some(manager) = weak.upgrade() {
             manager.show_selection(row.map(|row| row.index() as usize));
@@ -746,7 +1096,7 @@ fn show_inner(
     list_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     let weak = Rc::downgrade(&manager);
     list_keys.connect_key_pressed(move |_, key, _, modifiers| {
-        if !modifiers.is_empty() {
+        if !(modifiers - gtk::gdk::ModifierType::LOCK_MASK).is_empty() {
             return gtk::glib::Propagation::Proceed;
         }
         if weak.upgrade().is_some_and(|manager| manager.navigate(key)) {
@@ -766,6 +1116,8 @@ fn show_inner(
     let weak = Rc::downgrade(&manager);
     manager.refresh.connect_clicked(move |_| {
         if let Some(manager) = weak.upgrade() {
+            manager.preflight.borrow_mut().refresh();
+            manager.library.borrow_mut().refresh();
             manager.refresh();
         }
     });
@@ -777,7 +1129,62 @@ fn show_inner(
     });
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
-    crate::enter_ownership::install_controller(&keys);
+    let weak = Rc::downgrade(&manager);
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if matches!(
+            key,
+            gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter | gtk::gdk::Key::ISO_Enter
+        ) {
+            if let Some(manager) = weak.upgrade() {
+                let confirms_session = manager
+                    .window
+                    .upgrade()
+                    .and_then(|window| gtk::prelude::GtkWindowExt::focus(&window))
+                    .is_some_and(|focus| {
+                        [
+                            manager.search.upcast_ref::<gtk::Widget>(),
+                            manager.list.upcast_ref(),
+                            manager.resume.upcast_ref(),
+                        ]
+                        .iter()
+                        .any(|target| focus == **target || focus.is_ancestor(*target))
+                    });
+                if confirms_session {
+                    manager.enter_down.set(true);
+                }
+            }
+        }
+        gtk::glib::Propagation::Proceed
+    });
+    let hint_owner = Rc::downgrade(&manager);
+    crate::enter_ownership::install_controller_with_hint(&keys, move || {
+        if let Some(manager) = hint_owner.upgrade() {
+            manager
+                .notice
+                .set_text(crate::enter_ownership::RELEASE_HINT);
+        }
+    });
+    let weak = Rc::downgrade(&manager);
+    keys.connect_key_released(move |controller, key, _, _| {
+        if controller
+            .current_event()
+            .is_none_or(|event| event.event_type() != gtk::gdk::EventType::KeyRelease)
+        {
+            return;
+        }
+        if matches!(
+            key,
+            gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter | gtk::gdk::Key::ISO_Enter
+        ) {
+            if let Some(manager) = weak.upgrade() {
+                manager.enter_down.set(false);
+                if manager.completed_activation.get() {
+                    manager.close_when_released();
+                }
+            }
+        }
+    });
+
     crate::enter_ownership::watch_window(&window);
     let window_weak = window.downgrade();
     let weak = Rc::downgrade(&manager);
@@ -822,11 +1229,23 @@ fn show_inner(
         if !window.is_visible() {
             return gtk::glib::ControlFlow::Break;
         }
+        let library_changed = manager.library.borrow_mut().poll();
+        if library_changed {
+            manager.render_view(true);
+        }
+        manager.update_library_status();
+        let ready_changed = manager.preflight.borrow_mut().poll();
+        if ready_changed {
+            manager.show_selection(manager.list.selected_row().map(|row| row.index() as usize));
+        }
+        manager.poll_confirmation();
+        manager.poll_activation();
         let catalog = manager.scanner.borrow_mut().poll();
         if let Some(catalog) = catalog {
             manager.accept_catalog(catalog);
         }
         if auto_scan && manager.last_refresh.borrow().elapsed() >= Duration::from_secs(5) {
+            manager.library.borrow_mut().refresh();
             manager.refresh();
         }
         gtk::glib::ControlFlow::Continue
@@ -851,13 +1270,23 @@ mod native_tests {
         std::fs::create_dir(&directory).unwrap();
         let source = directory.join("session.jsonl");
         std::fs::write(&source, "{}\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let library = Rc::new(RefCell::new(SessionLibraryStore::with_path(
+            directory.join("library.json"),
+        )));
         let received = Rc::new(RefCell::new(None));
         let captured = received.clone();
         let parent = gtk::Window::new();
         show_inner(
             &parent,
             Some(directory.clone()),
-            move |launch, _| *captured.borrow_mut() = Some(launch),
+            library.clone(),
+            HashSet::new(),
+            move |request| {
+                *captured.borrow_mut() = request.launch.clone();
+                let _ = request.completion.send(Ok(()));
+            },
             false,
         );
         let manager = TEST_MANAGER.with(|slot| slot.borrow().upgrade()).unwrap();
@@ -913,6 +1342,88 @@ mod native_tests {
         }
 
         assert!(manager.overview.text().contains("1 last needed input"));
+        let wait_library = |library: &Rc<RefCell<SessionLibraryStore>>| {
+            let end = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < end {
+                library.borrow_mut().poll();
+                if library.borrow().is_loaded() && !library.borrow().is_busy() {
+                    library.borrow_mut().poll();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(
+                library.borrow().error().is_none(),
+                "{:?}",
+                library.borrow().error()
+            );
+        };
+        wait_library(&library);
+        manager.show_selection(Some(0));
+        let pinned = manager.selected_session().unwrap();
+        let pinned_row = manager.list.row_at_index(0).unwrap();
+        manager.pin.set_active(true);
+        manager.toggle_pin();
+        wait_library(&library);
+        manager.render_view(true);
+        assert!(library
+            .borrow()
+            .snapshot()
+            .is_pinned(pinned.provider, &pinned.id));
+        assert_eq!(
+            manager.list.row_at_index(0).unwrap(),
+            pinned_row,
+            "pin marker updates reuse the GTK row"
+        );
+        assert!(manager.rows.borrow()[0].title.text().starts_with('★'));
+        assert!(
+            received.borrow().is_none(),
+            "pinning never launches a session"
+        );
+        let restarted = Rc::new(RefCell::new(SessionLibraryStore::with_path(
+            directory.join("library.json"),
+        )));
+        wait_library(&restarted);
+        assert!(
+            restarted
+                .borrow()
+                .snapshot()
+                .is_pinned(pinned.provider, &pinned.id),
+            "pins survive a fresh store instance"
+        );
+        manager.saved_view.set_selected(1);
+        assert_eq!(manager.matched.borrow().len(), 1);
+        manager.pin.set_active(false);
+        manager.toggle_pin();
+        wait_library(&library);
+        manager.render_view(true);
+        assert!(
+            manager.visible.borrow().is_empty(),
+            "unpinning respects the pinned-only filter"
+        );
+        assert!(received.borrow().is_none());
+        manager.clear_filters();
+        let resumed = manager.catalog.borrow().sessions[1].clone();
+        // The host alone records a completed activation; opening/filtering the
+        // manager and both pin mutations have left all resume timestamps empty.
+        assert!(library
+            .borrow()
+            .snapshot()
+            .last_resumed(pinned.provider, &pinned.id)
+            .is_none());
+        library
+            .borrow_mut()
+            .record_resumed(resumed.provider, &resumed.id)
+            .unwrap();
+        wait_library(&library);
+        manager.render_view(true);
+        manager.saved_view.set_selected(2);
+        assert_eq!(manager.visible.borrow().len(), 1);
+        assert_eq!(manager.selected_session().unwrap().id, resumed.id);
+        manager.sort.set_selected(3);
+        assert!(manager.rows.borrow()[0].meta.text().contains("Resumed"));
+        manager.clear_filters();
+
         manager
             .list
             .select_row(manager.list.row_at_index(1).as_ref());
@@ -1022,26 +1533,46 @@ mod native_tests {
         assert!(manager.visible.borrow().is_empty());
         assert!(!manager.resume.is_sensitive());
         manager.search.set_text("renderer");
-        assert!(manager.resume.is_sensitive());
+        let wait_ready = |manager: &Manager| {
+            let end = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < end {
+                manager.preflight.borrow_mut().poll();
+                if !manager.preflight.borrow().is_busy() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            manager.show_selection(manager.list.selected_row().map(|row| row.index() as usize));
+        };
+        wait_ready(&manager);
         std::fs::remove_file(&source).unwrap();
-        manager.resume.emit_clicked();
+        manager.resume_selected();
+        wait_ready(&manager);
+        manager.poll_confirmation();
         assert!(
             received.borrow().is_none(),
             "stale history cannot launch from a displayed snapshot"
         );
         assert!(manager.notice.text().contains("no longer exists"));
         std::fs::write(&source, "{}\n").unwrap();
-        manager.search.emit_activate();
-        let launch = received
+        // An already open tab remains switchable independently of launch
+        // readiness; the host acknowledges it without a new process plan.
+        manager.confirmation.borrow_mut().take();
+        let target = manager.selected_session().unwrap();
+        manager
+            .existing
             .borrow_mut()
-            .take()
-            .expect("explicit confirmation emits launch");
-        assert_eq!(launch.program, "codex");
-        assert_eq!(
-            launch.args,
-            ["resume", "01912345-1234-7123-8123-123456789abc"]
+            .insert((target.provider, target.id.clone()));
+        manager.search.emit_activate();
+        manager.poll_activation();
+        assert!(
+            received.borrow().is_none(),
+            "existing focus never requests a process launch"
         );
-        assert_eq!(launch.cwd, directory);
+        // Prepared launch correctness is covered by native host smoke; this
+        // component test also validates generic provider/session identity.
+        assert_eq!(target.provider, SessionProvider::Codex);
+        assert_eq!(target.id, "01912345-1234-7123-8123-123456789abc");
         parent.close();
         std::fs::remove_dir_all(directory).unwrap();
     }

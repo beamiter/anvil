@@ -319,7 +319,9 @@ struct AppModel {
     kbmap: Rc<RefCell<KeybindingMap>>,
     shell_argv: Rc<Vec<String>>,
     tabs: Vec<Tab>,
-    agent_session_tabs: std::collections::HashMap<String, u64>,
+    agent_session_tabs: std::collections::HashMap<agent_sessions::SessionIdentity, u64>,
+    agent_session_library: Rc<RefCell<jterm_core::agent_sessions::SessionLibraryStore>>,
+    agent_session_pending: std::collections::HashMap<u64, agent_sessions::ResumeRequest>,
     active: usize,
     /// Stable source/original-active identities for a tab drag. A delayed
     /// hover preview is reverted if the source still exists when drag ends.
@@ -1329,6 +1331,10 @@ impl SimpleComponent for AppModel {
             shell_argv,
             tabs: Vec::new(),
             agent_session_tabs: std::collections::HashMap::new(),
+            agent_session_library: Rc::new(RefCell::new(
+                jterm_core::agent_sessions::SessionLibraryStore::new(),
+            )),
+            agent_session_pending: std::collections::HashMap::new(),
             active: 0,
             tab_drag_origin: None,
             tab_drag_coordinator,
@@ -1879,9 +1885,7 @@ impl SimpleComponent for AppModel {
 
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
         match msg {
-            AppMsg::ResumeAgentSession(launch, title) => {
-                self.add_agent_session_tab(launch, &title, &sender)
-            }
+            AppMsg::ResumeAgentSession(request) => self.add_agent_session_tab(*request, &sender),
             AppMsg::NewTab => {
                 let startup = self.config.borrow().startup_commands.clone();
                 self.add_tab(startup, &sender);
@@ -1974,6 +1978,13 @@ impl SimpleComponent for AppModel {
             AppMsg::AgentTasksTick => self.agent_tasks_tick(&sender),
             AppMsg::ReloadConfig => self.reload_config(&sender),
             AppMsg::PaneLaunched(pane_id) => {
+                if let Some(request) = self.agent_session_pending.remove(&pane_id) {
+                    let _ = self
+                        .agent_session_library
+                        .borrow_mut()
+                        .record_resumed(request.provider, &request.id);
+                    let _ = request.completion.send(Ok(()));
+                }
                 if let Some((source_tab_id, _)) = self.pending_split_spawns.remove(&pane_id) {
                     if let Some((tab_index, _)) = self.find_pane(pane_id) {
                         if self.tabs[tab_index].id == source_tab_id {
@@ -1996,6 +2007,11 @@ impl SimpleComponent for AppModel {
             }
             AppMsg::PaneLaunchFailed(pane_id, message) => {
                 self.agent_session_tabs.retain(|_, bound| *bound != pane_id);
+                if let Some(request) = self.agent_session_pending.remove(&pane_id) {
+                    self.close_pane(pane_id, &sender);
+                    let _ = request.completion.send(Err(message));
+                    return;
+                }
                 self.note_task_terminal_launch_failed(pane_id);
                 if let Some((source_tab_id, source_pane_id)) =
                     self.pending_split_spawns.remove(&pane_id)
