@@ -188,7 +188,24 @@ pub(super) fn layout(
         let Some(canvas) = frame.child().and_downcast::<gtk::Box>() else {
             return;
         };
-        let focused = terminal.has_focus();
+        let focus_root = terminal.root();
+        let focused = focus_root
+            .as_ref()
+            .and_then(|root| root.focus())
+            .is_some_and(|owner| owner == *terminal.upcast_ref::<gtk::Widget>());
+        let destination = if in_transcript { &holder } else { &dock };
+        let moving_dock = native != (dock.parent().as_ref() == Some(frame.upcast_ref()));
+        let moving_clip = clip.parent().as_ref() != Some(destination.upcast_ref());
+        // VTE rebinds its IM client during reparenting. A logically focused
+        // terminal can otherwise keep GTK focus without giving the rebound
+        // fcitx context a fresh focus-in. End that ownership before unrooting,
+        // then restore it once the new host is visible. Background peers keep
+        // their focus, including when this window is inactive.
+        if focused && (moving_dock || moving_clip) {
+            if let Some(root) = &focus_root {
+                root.set_focus(gtk::Widget::NONE);
+            }
+        }
         let mut moved = false;
         // Native takeover must not make its old grid the window's minimum size.
         // Prompt's External scroller likewise has a bounded minimum, so a long
@@ -204,7 +221,6 @@ pub(super) fn layout(
             prompt_scroll.set_child(Some(&dock));
             moved = true;
         }
-        let destination = if in_transcript { &holder } else { &dock };
         if clip.parent().as_ref() != Some(destination.upcast_ref()) {
             if let Some(parent) = clip.parent().and_downcast::<gtk::Box>() {
                 parent.remove(&clip);

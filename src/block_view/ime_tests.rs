@@ -35,6 +35,91 @@ fn native_ime_expect(pty: &crate::pty::OwnedPty, expected: &[u8]) {
 }
 
 #[test]
+#[ignore = "requires isolated X11 DISPLAY and GTK_IM_MODULE=simple"]
+fn native_chat_passthrough_initial_focus_accepts_composition() {
+    assert_eq!(std::env::var("GTK_IM_MODULE").as_deref(), Ok("simple"));
+    crate::child_env::capture_inherited_environment().expect("test child environment");
+    gtk::init().expect("GTK display");
+    let view = TermView::new_with_spawner(
+        &crate::config::Config::safe_defaults(),
+        &crate::config::TerminalMode::Chat,
+        &["sh".into()],
+        None,
+        false,
+        None,
+        "chat-passthrough-ime-test",
+        &[],
+        &[],
+        |_, _, _, _| crate::pty::OwnedPty::from_openpty(Some(true)),
+    )
+    .expect("nonexecuting PTY recorder");
+    view.block_onboarding.history_resolved(false);
+    let sidebar = gtk::Entry::new();
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    row.append(&sidebar);
+    row.append(&view.root);
+    let window = gtk::Window::builder()
+        .title("anvil-native-ime-qa")
+        .default_width(800)
+        .default_height(600)
+        .child(&row)
+        .build();
+    assert!(!view.active_vte.is_mapped());
+    view.grab_focus();
+    window.present();
+    wait_for(
+        "passthrough terminal maps and receives requested focus",
+        || view.active_vte.is_mapped() && view.active_vte.has_focus(),
+    );
+    pump_for(Duration::from_millis(180));
+    assert_ne!(
+        view.bstate.get(),
+        BlockState::AwaitingCommand,
+        "startup must exercise passthrough without a shell prompt"
+    );
+    view.pty.drain_test_slave(Duration::from_millis(30));
+    native_ime_keys("compose");
+    assert!(view
+        .pty
+        .drain_test_slave(Duration::from_millis(30))
+        .is_empty());
+    native_ime_keys("commit");
+    native_ime_expect(&view.pty, "中".as_bytes());
+    // Exercise both directions of the real Chat reparent: the initial native
+    // overlay docks at a shell prompt, then a foreground fullscreen surface
+    // takes over again. Each rebound VTE context must still accept composition.
+    for (output, state) in [
+        (PROMPT, BlockState::AwaitingCommand),
+        (START, BlockState::CollectingOutput),
+        (b"\x1b[?1049h".as_slice(), BlockState::AltScreen),
+    ] {
+        drive(&view, output, state);
+        assert!(
+            view.active_vte.has_focus(),
+            "Chat reparent must preserve its own logical focus"
+        );
+        view.pty.drain_test_slave(Duration::from_millis(30));
+        native_ime_keys("compose");
+        assert!(view
+            .pty
+            .drain_test_slave(Duration::from_millis(30))
+            .is_empty());
+        native_ime_keys("commit");
+        native_ime_expect(&view.pty, "中".as_bytes());
+    }
+    sidebar.grab_focus();
+    pump_for(Duration::from_millis(100));
+    assert!(
+        gtk::prelude::GtkWindowExt::focus(&window)
+            .is_some_and(|focus| focus == *sidebar.upcast_ref::<gtk::Widget>()
+                || focus.is_ancestor(&sidebar)),
+        "retired startup request must not steal sidebar focus"
+    );
+    window.close();
+    view.pty.kill();
+}
+
+#[test]
 #[ignore = "requires isolated X11 DISPLAY and GTK_IM_MODULE=simple; run through test-gtk-display.sh"]
 fn native_ime_commit_cancel_and_independent_ptys() {
     assert_eq!(std::env::var("GTK_IM_MODULE").as_deref(), Ok("simple"));
