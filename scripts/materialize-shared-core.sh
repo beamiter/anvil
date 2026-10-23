@@ -17,7 +17,9 @@ parent=$(dirname -- "$core_dir")
 mkdir -p -- "$parent"
 stage=$(mktemp -d "$parent/.jterm-core-materialize.XXXXXX")
 trap 'rm -rf -- "$stage"' EXIT
-tar --no-same-owner --no-same-permissions -xzf "$repo_dir/packaging/jterm-core-src.tar.gz" -C "$stage"
+# The archive has reproducible epoch mtimes. Fresh extraction timestamps make
+# Cargo invalidate older cached path-dependency metadata after a core upgrade.
+tar --touch --no-same-owner --no-same-permissions -xzf "$repo_dir/packaging/jterm-core-src.tar.gz" -C "$stage"
 test -f "$stage/src/agent_sessions.rs"
 test -f "$stage/Cargo.toml"
 mv -- "$stage" "$core_dir"
