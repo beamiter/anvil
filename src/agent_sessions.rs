@@ -13,6 +13,9 @@ use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[path = "session_bulk.rs"]
+mod session_bulk;
+
 thread_local! {
     #[cfg(test)]
     static TEST_MANAGER: RefCell<std::rc::Weak<Manager>> = const { RefCell::new(std::rc::Weak::new()) };
@@ -82,6 +85,7 @@ impl SessionQuickView {
 }
 
 struct Manager {
+    bulk: session_bulk::SessionBulk,
     window: gtk::glib::WeakRef<gtk::Window>,
     library: Rc<RefCell<SessionLibraryStore>>,
     existing: RefCell<HashSet<SessionIdentity>>,
@@ -171,6 +175,7 @@ const PAGE_SIZE: usize = 80;
 struct SessionRow {
     key: String,
     row: gtk::ListBoxRow,
+    checked: gtk::CheckButton,
     title: gtk::Label,
     meta: gtk::Label,
     cwd: gtk::Label,
@@ -205,10 +210,24 @@ impl SessionRow {
         content.append(&title);
         content.append(&meta);
         content.append(&cwd);
-        row.set_child(Some(&content));
+        let checked = gtk::CheckButton::new();
+        checked.set_valign(gtk::Align::Center);
+        checked.set_tooltip_text(Some(
+            "Select this session for batch changes · Space to toggle",
+        ));
+        checked.update_property(&[gtk::accessible::Property::Label(
+            "Select session for batch changes",
+        )]);
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        line.set_margin_start(8);
+        content.set_hexpand(true);
+        line.append(&checked);
+        line.append(&content);
+        row.set_child(Some(&line));
         Self {
             key: identity(session),
             row,
+            checked,
             title,
             meta,
             cwd,
@@ -627,12 +646,15 @@ impl Manager {
                 self.list.remove(&child);
             }
             let rows: Vec<_> = self.visible.borrow().iter().map(SessionRow::new).collect();
-            for row in &rows {
+            for (row, session) in rows.iter().zip(self.visible.borrow().iter()) {
+                self.wire_batch_check(row, (session.provider, session.id.clone()));
                 self.list.append(&row.row);
             }
             *self.rows.borrow_mut() = rows;
         }
         self.update_rows();
+        self.sync_batch_checks();
+        self.update_batch_controls();
         let selected_index = self
             .visible
             .borrow()
@@ -1110,6 +1132,7 @@ impl Manager {
         );
         drop(library);
         self.update_organization_controls();
+        self.update_batch_controls();
     }
 
     fn toggle_pin(&self) {
@@ -1437,6 +1460,8 @@ fn show_inner(
     saved_filters.append(&clear);
     saved_filters.append(&library_status);
     root.append(&saved_filters);
+    let bulk = session_bulk::SessionBulk::new();
+    root.append(&bulk.root);
     let list = gtk::ListBox::new();
     list.set_selection_mode(gtk::SelectionMode::Single);
     list.add_css_class("navigation-sidebar");
@@ -1567,6 +1592,7 @@ fn show_inner(
     root.append(&actions);
     window.set_child(Some(&root));
     let manager = Rc::new(Manager {
+        bulk,
         window: window.downgrade(),
         library,
         existing: RefCell::new(existing),
@@ -1633,6 +1659,7 @@ fn show_inner(
         last_refresh: RefCell::new(Instant::now()),
         launch: Box::new(launch),
     });
+    manager.bulk.connect(&manager);
     for (view, button) in &manager.quick_views {
         let weak = Rc::downgrade(&manager);
         let view = *view;
@@ -1780,6 +1807,9 @@ fn show_inner(
     let weak = Rc::downgrade(&manager);
     manager.list.connect_row_activated(move |_, _| {
         if let Some(manager) = weak.upgrade() {
+            if manager.batch_focus_is_editing() {
+                return;
+            }
             manager.resume_selected();
         }
     });
@@ -1865,7 +1895,7 @@ fn show_inner(
                         .iter()
                         .any(|target| focus == **target || focus.is_ancestor(*target))
                     });
-                if confirms_session {
+                if confirms_session && !manager.batch_focus_is_editing() {
                     manager.enter_down.set(true);
                 }
             }

@@ -121,6 +121,7 @@ fn task_action_allowed(enabled: bool, action: &TaskPanelAction) -> bool {
                 | TaskPanelAction::ReviewDiff(_)
                 | TaskPanelAction::Archive(_)
                 | TaskPanelAction::Complete(_)
+                | TaskPanelAction::AcceptReviewed(_)
         )
 }
 
@@ -227,6 +228,9 @@ impl AppModel {
                         if self.config.borrow().agent_tasks_enabled {
                             self.register_prepared_task(prepared, sender);
                         } else {
+                            if let Some(request) = prepared.project_request {
+                                request.finish(Err("Agent tasks were disabled while preparing the worktree. Your draft is preserved.".into()));
+                            }
                             self.show_toast("Task creation finished after tasks were disabled; its worktree was preserved without starting an agent");
                         }
                     }
@@ -364,12 +368,17 @@ impl AppModel {
         sender: &ComponentSender<AppModel>,
     ) {
         if !task_action_allowed(self.config.borrow().agent_tasks_enabled, &action) {
+            if let TaskPanelAction::CreateProject(request) = &action {
+                request.finish(Err("Agent tasks are disabled in the configuration".into()));
+            }
             self.show_toast("Agent tasks are disabled in the configuration");
             return;
         }
         self.announce_task_transitions();
         match action {
             TaskPanelAction::CreateFromBlock => self.create_task_from_block(sender),
+            TaskPanelAction::ComposeProject => self.compose_project_task(sender),
+            TaskPanelAction::CreateProject(draft) => self.create_project_task(draft, sender),
             TaskPanelAction::Select(task_id) => {
                 self.selected_task = Some(task_id);
                 self.sync_tasks_panel();
@@ -378,16 +387,39 @@ impl AppModel {
                 self.tasks_panel_visible.set(false);
                 self.sync_side_panel();
             }
-            TaskPanelAction::StartCodex(task_id) => {
+            TaskPanelAction::StartNative(task_id) => {
+                let Some(provider) = self.task_manager.get(task_id).map(|task| task.provider)
+                else {
+                    return;
+                };
                 let policy = self.task_prompt_policy();
-                match self
-                    .agent_runtime
-                    .start_codex(&mut self.task_manager, task_id, policy)
-                {
-                    Ok(()) => {
-                        self.show_toast("Preparing native Codex prerequisites in the background…")
+                let result = match provider {
+                    AgentProvider::Codex => {
+                        self.agent_runtime
+                            .start_codex(&mut self.task_manager, task_id, policy)
                     }
-                    Err(error) => self.show_toast(format!("Could not start native Codex: {error}")),
+                    AgentProvider::Claude => {
+                        self.agent_runtime
+                            .start_claude(&mut self.task_manager, task_id, policy)
+                    }
+                    AgentProvider::Kimi => {
+                        self.agent_runtime
+                            .start_kimi(&mut self.task_manager, task_id, policy)
+                    }
+                    AgentProvider::OpenCode => {
+                        self.show_toast("Use Start terminal for OpenCode");
+                        return;
+                    }
+                };
+                match result {
+                    Ok(()) => self.show_toast(format!(
+                        "Preparing {} in the background…",
+                        provider.display_name()
+                    )),
+                    Err(error) => self.show_toast(format!(
+                        "Could not start {}: {error}",
+                        provider.display_name()
+                    )),
                 }
             }
             TaskPanelAction::StartTerminal(task_id) => {
@@ -446,6 +478,11 @@ impl AppModel {
                     Err(error) => self.show_toast(error.to_string()),
                 }
             }
+            TaskPanelAction::AcceptReviewed(task_id) => {
+                if let Err(error) = self.task_manager.complete_after_manual_review(task_id) {
+                    self.show_toast(error.to_string());
+                }
+            }
             TaskPanelAction::ReviewDiff(task_id) => {
                 let task_review = self
                     .task_manager
@@ -495,6 +532,53 @@ impl AppModel {
         {
             Ok(()) => self.show_toast(label),
             Err(error) => self.show_toast(error.to_string()),
+        }
+    }
+
+    fn compose_project_task(&self, sender: &ComponentSender<AppModel>) {
+        if self.pending_task_creation.is_some() {
+            self.show_toast("Another task worktree is still being created");
+            return;
+        }
+        let directory = self
+            .active_pane()
+            .and_then(|pane| pane.local_cwd())
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_dir().ok());
+        let sender = sender.clone();
+        agent_task_ui::task_composer::show(
+            &self.window,
+            directory,
+            self.shell_argv.first().cloned(),
+            move |draft| {
+                sender.input(AppMsg::TaskPanelAction(TaskPanelAction::CreateProject(
+                    draft,
+                )));
+            },
+        );
+    }
+
+    fn create_project_task(
+        &mut self,
+        request: agent_task_ui::TaskProjectRequest,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        if self.pending_task_creation.is_some() {
+            self.show_toast("Another task worktree is still being created");
+            request.finish(Err("Another task worktree is still being created".into()));
+            return;
+        }
+        match agent_task_ui::begin_project_worktree_creation(request.clone()) {
+            Ok(pending) => {
+                self.pending_task_creation = Some(pending);
+                self.show_toast("Creating the isolated project task…");
+                self.ensure_agent_tasks_timer(sender);
+                self.sync_tasks_panel();
+            }
+            Err(error) => {
+                request.finish(Err(error.clone()));
+                self.show_toast(format!("Could not create task: {error}"));
+            }
         }
     }
 
@@ -594,6 +678,14 @@ impl AppModel {
         prepared: agent_task_ui::PreparedTask,
         sender: &ComponentSender<AppModel>,
     ) {
+        if prepared
+            .project_request
+            .as_ref()
+            .is_some_and(|request| request.cancelled())
+        {
+            return;
+        }
+        let project_request = prepared.project_request;
         let new_task = NewTask {
             title: prepared.title,
             provider: prepared.provider,
@@ -601,12 +693,19 @@ impl AppModel {
             worktree_path: prepared.worktree.path.clone(),
             branch: prepared.worktree.branch.clone(),
             base_commit: prepared.worktree.head.clone(),
-            source_context: Some(prepared.context),
+            source_context: prepared.context,
         };
-        match self.task_manager.create(new_task) {
+        let result = match prepared.brief {
+            Some(brief) => self.task_manager.create_with_brief(new_task, brief),
+            None => self.task_manager.create(new_task),
+        };
+        if let Some(request) = &project_request {
+            request.finish(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+        }
+        match result {
             Ok(task_id) => {
                 self.selected_task = Some(task_id);
-                self.show_toast("Task created in an isolated worktree; start Codex when ready");
+                self.show_toast("Task created in an isolated worktree; choose Start when ready");
             }
             Err(error) => {
                 self.show_toast(format!("Could not register task: {error}"));
@@ -670,6 +769,19 @@ impl AppModel {
                         );
                     }
                     self.show_toast(error.to_string());
+                    return;
+                }
+            };
+        let Some(task) = self.task_manager.get(task_id) else {
+            return;
+        };
+        let authored = task.brief.is_some();
+        let launch =
+            match agent_task_ui::prepare_authored_terminal(task, self.task_prompt_policy(), launch)
+            {
+                Ok(launch) => launch,
+                Err(error) => {
+                    self.show_toast(error);
                     return;
                 }
             };
@@ -742,10 +854,18 @@ impl AppModel {
             self.agent_runtime.clear_retained(task_id);
         }
         self.persist_session();
-        self.show_toast(format!(
-            "Opened {} in an isolated task terminal; task context remains in Anvil",
-            provider.display_name()
-        ));
+        self.show_toast(if authored {
+            format!(
+                "Opened {} · Task brief: {}. Ask the Agent to read this file before working.",
+                provider.display_name(),
+                crate::agent_task::pty_task_brief_relative()
+            )
+        } else {
+            format!(
+                "Opened {} in an isolated task terminal; task context remains in Anvil",
+                provider.display_name()
+            )
+        });
     }
 
     /// Rerun the task's exact validation command in a fresh PTY inside the
@@ -1012,6 +1132,12 @@ impl AppModel {
             Default::default(),
         );
         let sync = TasksPanelSync {
+            workspaces: self
+                .task_manager
+                .tasks()
+                .iter()
+                .map(|task| (task.id, task.repo_root.clone()))
+                .collect(),
             rows,
             dashboard,
             selected,
@@ -1132,6 +1258,13 @@ impl AppModel {
             title: task.title.clone(),
             status_line,
             branch: task.branch.clone(),
+            inspector: agent_task_ui::task_inspector_text(task),
+            native_label: format!("Start {}", task.provider.display_name()),
+            manual_review: task.requires_manual_review(),
+            can_accept_review: task.requires_manual_review()
+                && task.status == TaskStatus::ReadyForReview
+                && task.validation.status == TaskValidationStatus::NotRun
+                && !has_stream,
             stream: view.map(Box::new),
             approvals: self
                 .agent_runtime
@@ -1142,7 +1275,8 @@ impl AppModel {
                 .agent_runtime
                 .snapshot(task_id)
                 .map_or(0, |snapshot| snapshot.completed_turns),
-            can_start_codex: task.status == TaskStatus::Created
+            can_start_native: task.provider.supports_native_driver()
+                && task.status == TaskStatus::Created
                 && task.runtime_kind == TaskRuntimeKind::Unassigned
                 && !native_preparing
                 && native_ai_enabled,
@@ -1151,7 +1285,8 @@ impl AppModel {
             can_focus_validation,
             can_stop: (native_preparing || has_stream) && !native_idle,
             can_finish: native_idle,
-            can_run_validation: task.status == TaskStatus::ReadyForReview
+            can_run_validation: task.validation_command().is_some()
+                && task.status == TaskStatus::ReadyForReview
                 && task.validation.status != TaskValidationStatus::Running
                 && !has_stream,
             can_complete: task.status == TaskStatus::ReadyForReview
@@ -1385,7 +1520,7 @@ mod disabled_task_lifecycle_tests {
         let approval = crate::agent_task::ApprovalId::new();
         for action in [
             TaskPanelAction::CreateFromBlock,
-            TaskPanelAction::StartCodex(task),
+            TaskPanelAction::StartNative(task),
             TaskPanelAction::StartTerminal(task),
             TaskPanelAction::FollowUp(task, "next turn".into()),
             TaskPanelAction::Approve(task, approval),

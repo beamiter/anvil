@@ -1612,6 +1612,18 @@ preserve task identity and follow-up drafts. See the
 [Agent management guide](docs/agent-management.md) for the workflow, search syntax
 and storage compatibility details.
 
+**New task** now creates work directly from a project, with a multiline goal,
+provider choice and an optional explicit validation recipe. Worktree preparation
+keeps the form and draft available until registration succeeds. **Details**
+shows the real repository, runtime and validation state; authored work without
+a validation recipe uses the explicit **Accept reviewed work** action. Native
+Codex, Claude and Kimi start through the existing consent and approval gates.
+
+In Agent Manager, independent checkboxes support atomic batches of up to 256
+sessions: pin/unpin, archive/restore and add/remove one tag. The selected,
+visible and hidden counts make filtered selections explicit. Failed writes
+retain the selection and drafts, and organization never starts a provider.
+
 Development builds use the sibling `../jterm_core` checkout. Isolated Nix
 builds unpack the deterministic `packaging/jterm-core-src.tar.gz` snapshot
 beside this application. After shared-core changes, refresh it with

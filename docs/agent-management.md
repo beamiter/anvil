@@ -51,6 +51,27 @@ provider identity visible. Resuming uses that original identity and directory;
 the new tab uses the saved local name. A conversation already open in this
 window focuses its live tab. Editing or saving organization does not resume it.
 
+## Organize several conversations
+
+Check the boxes beside conversations to create a batch selection independently
+of the conversation being inspected. **Select visible** adds the current page;
+**Clear selection** removes all checks. The counter shows the total selected,
+selected on this page, and selected outside the current view. Filtering,
+paging, refresh and a completed operation preserve those checked identities.
+A batch can contain at most 256 conversations.
+
+Choose **Pin**, **Unpin**, **Archive**, **Restore**, **Add tag** or **Remove tag**.
+The tag field takes one tag; an add preserves existing tags and a remove
+preserves all other tags. The shared store validates the whole batch and saves
+it atomically. A busy store, invalid tag or failed write keeps both the checks
+and entered text available. Save or Revert any selected conversation's pending
+name/tag edits before changing its tags or archive state.
+
+Batch controls retain the exact provider/session IDs and tag shown when the
+interaction begins. A change to the checked selection or tag cancels that
+pending interaction. Enter in a name, tag or checkbox never resumes a session.
+These actions change local organization only; they do not launch or stop a CLI.
+
 ## Prioritize native tasks
 
 Enable the experimental Agent Tasks setting to use the **Tasks** panel
@@ -63,6 +84,49 @@ Alongside status, provider and repository filters, choose **Needs you first**,
 review. Selecting or sorting a task does not start or approve it. Follow-up
 drafts remain attached to stable task IDs. If a filter hides the current task,
 the panel offers to reveal it instead of silently selecting a different task.
+
+## Create work from a project
+
+Choose **New task** in the Tasks panel. Enter a short title, an absolute local
+Git repository directory, the provider and the actual goal. The goal supports
+multiple lines, up to 16 KiB. An optional validation command is a single shell
+command executed at the isolated worktree root with the displayed configured
+absolute shell. Enter in an editor does not submit the form.
+
+**Create task** prepares an isolated branch/worktree and registers the task.
+It never starts a provider or executes the validation command. The form stays
+open while Git prepares the worktree; any preparation or registration failure
+shows an inline error with the exact authored draft intact for correction and
+retry. Cancel stops this submission from registering late. The authored goal
+is not added to the older terminal recovery journals.
+
+The selected-block creation action remains available for failed-command work.
+Its exact recorded command/cwd evidence and existing validation rules remain
+separate from project-authored goals.
+
+## Inspect, start and review a task
+
+Open **Details** to read the shared task projection: provider, repository,
+worktree, branch/baseline, runtime, lifecycle, terminal bindings, validation
+result and the authored goal where present. This page is read-only. **Stream**
+continues to show actual native activity and turn history; **Diff** shows the
+existing baseline-aware review. Details does not fabricate past events.
+
+Native **Start Codex**, **Start Claude** and **Start Kimi** use the existing
+provider drivers and preparation/consent gates. **Start terminal** remains
+available for compatible provider CLIs, including OpenCode. Authored terminal
+tasks require AI and command-context sharing before the local task brief can
+be written. The task shows the brief location inside its worktree. Where the
+existing launcher cannot carry an initial prompt, ask the CLI to read that
+brief; the terminal is never fed synthetic input.
+
+A task with a validation recipe offers **Validate** when the task is ready for
+review, and existing passed-validation completion rules apply. For an authored
+task without a recipe, the action is explicitly **Accept reviewed work**. It
+becomes available only after the task reaches Ready for Review, has no active
+Agent stream and has not started validation. Inspect the results and diff
+before accepting. Switching tasks cancels a pending button activation, so a
+held review action cannot apply to the newly selected task.
 
 ## Shared metadata compatibility
 

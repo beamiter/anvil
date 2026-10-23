@@ -14,6 +14,10 @@ use relm4::adw::prelude::*;
 use relm4::gtk;
 use relm4::prelude::*;
 
+#[path = "task_filters.rs"]
+mod task_filters;
+use task_filters::{TaskFilters, STATES};
+
 use crate::agent_task::{ApprovalId, CodexAppServerApproval, TaskId};
 use crate::agent_task_ui::{
     approval_summary, native_follow_up_can_send, plan_list_refresh, render_stream_history,
@@ -40,13 +44,16 @@ fn dashboard_filter_label(
 
 const STREAM_PAGE: &str = "stream";
 const DIFF_PAGE: &str = "diff";
+const INSPECTOR_PAGE: &str = "details";
 const CREATE_TASK_LABEL: &str = "New agent task from selected block";
 const CLOSE_TASKS_LABEL: &str = "Close Tasks panel";
 
 /// Derive the stack page and both mutually exclusive button states from one
 /// request instead of treating the Diff button as the source of truth.
 fn task_page_presentation(requested: &str) -> (&'static str, bool, bool) {
-    if requested == DIFF_PAGE {
+    if requested == INSPECTOR_PAGE {
+        (INSPECTOR_PAGE, false, false)
+    } else if requested == DIFF_PAGE {
         (DIFF_PAGE, false, true)
     } else {
         (STREAM_PAGE, true, false)
@@ -65,6 +72,7 @@ fn task_page_toggle_request(
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TasksPanelSync {
     pub(crate) rows: Vec<TaskRowSnapshot>,
+    pub(crate) workspaces: HashMap<TaskId, std::path::PathBuf>,
     pub(crate) dashboard: crate::agent_task::DashboardSnapshot,
     pub(crate) selected: Option<TaskId>,
     pub(crate) detail: Option<Box<TaskDetailSync>>,
@@ -80,10 +88,14 @@ pub(crate) struct TaskDetailSync {
     pub(crate) title: String,
     pub(crate) status_line: String,
     pub(crate) branch: String,
+    pub(crate) inspector: String,
+    pub(crate) native_label: String,
+    pub(crate) manual_review: bool,
+    pub(crate) can_accept_review: bool,
     pub(crate) stream: Option<Box<crate::agent_task::CodexAppServerViewSnapshot>>,
     pub(crate) approvals: Vec<CodexAppServerApproval>,
     pub(crate) completed_turns: usize,
-    pub(crate) can_start_codex: bool,
+    pub(crate) can_start_native: bool,
     pub(crate) can_start_terminal: bool,
     pub(crate) can_focus_terminal: bool,
     pub(crate) can_focus_validation: bool,
@@ -110,7 +122,7 @@ pub(crate) struct DiffSync {
 /// the message is handled, never captured into a stale GTK closure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActionKind {
-    StartCodex,
+    StartNative,
     StartTerminal,
     FocusTerminal,
     FocusValidation,
@@ -118,12 +130,13 @@ pub(crate) enum ActionKind {
     FinishCodex,
     RunValidation,
     Complete,
+    AcceptReviewed,
     ReviewDiff,
     Archive,
 }
 
-const ACTION_KINDS: [(ActionKind, &str); 10] = [
-    (ActionKind::StartCodex, "Start Codex"),
+const ACTION_KINDS: [(ActionKind, &str); 11] = [
+    (ActionKind::StartNative, "Start provider"),
     (ActionKind::StartTerminal, "Start terminal"),
     (ActionKind::FocusTerminal, "Agent terminal"),
     (ActionKind::FocusValidation, "Validation output"),
@@ -131,6 +144,7 @@ const ACTION_KINDS: [(ActionKind, &str); 10] = [
     (ActionKind::FinishCodex, "Finish"),
     (ActionKind::RunValidation, "Validate"),
     (ActionKind::Complete, "Complete"),
+    (ActionKind::AcceptReviewed, "Accept reviewed work"),
     (ActionKind::ReviewDiff, "Diff"),
     (ActionKind::Archive, "Archive"),
 ];
@@ -143,6 +157,9 @@ pub(crate) enum TasksPanelMsg {
     ClearDashboardFilters,
     DashboardView(crate::agent_task::DashboardView),
     DashboardSort(crate::agent_task::DashboardSort),
+    ProviderFilter(Option<crate::agent_task::AgentProvider>),
+    ProjectFilter(Option<std::path::PathBuf>),
+    StatusFilter(Option<crate::agent_task::TaskStatus>),
     NextAttention,
     /// Stable identity captured when the row gesture occurs. A later filter
     /// change may hide it, but must never retarget a queued gesture.
@@ -150,6 +167,7 @@ pub(crate) enum TasksPanelMsg {
     FollowUpChanged(String),
     SendFollowUp,
     Create,
+    ComposeProject,
     Act(TaskId, ActionKind),
     Decide(TaskId, ApprovalId, bool),
     ShowPage(&'static str),
@@ -278,6 +296,8 @@ pub(crate) struct TasksPanelModel {
     dashboard_view: crate::agent_task::DashboardView,
     dashboard_sort: crate::agent_task::DashboardSort,
     dashboard_sort_guard: Rc<Cell<bool>>,
+    filters: TaskFilters,
+    workspace_choices: Rc<RefCell<Vec<std::path::PathBuf>>>,
     dashboard_summary: String,
     dashboard_counts: crate::agent_task::DashboardCounts,
     dashboard_buttons: Vec<(crate::agent_task::DashboardView, gtk::Button)>,
@@ -310,8 +330,9 @@ pub(crate) struct TasksPanelModel {
 impl TasksPanelModel {
     fn apply_dashboard_filters(&mut self) {
         let mut sync = self.unfiltered_sync.clone();
-        let mut dashboard = crate::agent_task::DashboardSnapshot::filter_rows(
-            &sync.dashboard.rows,
+        let mut dashboard = self.filters.project(
+            &sync.dashboard,
+            &sync.workspaces,
             &self.dashboard_query,
             self.dashboard_view,
         );
@@ -520,6 +541,14 @@ impl Component for TasksPanelModel {
                     add_css_class: "heading",
                 },
 
+                #[name(compose_button)]
+                gtk::Button {
+                    set_label: "New task",
+                    add_css_class: "suggested-action",
+                    set_tooltip_text: Some("Create a project task from your own goal"),
+                    connect_clicked => TasksPanelMsg::ComposeProject,
+                },
+
                 #[name(create_button)]
                 gtk::Button {
                     set_icon_name: "list-add-symbolic",
@@ -562,6 +591,44 @@ impl Component for TasksPanelModel {
                     sender.input(TasksPanelMsg::DashboardQuery(entry.text().to_string()));
                 },
                 connect_activate => TasksPanelMsg::OpenDashboardResult,
+            },
+            gtk::Box {
+                set_orientation: gtk::Orientation::Vertical,
+                set_spacing: 4,
+                #[name(provider_filter)]
+                gtk::DropDown {
+                    set_model: Some(&gtk::StringList::new(&std::iter::once("All providers").chain(crate::agent_task::AgentProvider::ALL.iter().map(|provider| provider.display_name())).collect::<Vec<_>>())),
+                    update_property: &[gtk::accessible::Property::Label("Task provider filter")],
+                    connect_selected_notify[sender, guard = model.dashboard_sort_guard.clone()] => move |dropdown| {
+                        if !guard.get() {
+                            let provider = dropdown.selected().checked_sub(1).and_then(|index| crate::agent_task::AgentProvider::ALL.get(index as usize).copied());
+                            sender.input(TasksPanelMsg::ProviderFilter(provider));
+                        }
+                    },
+                },
+                #[name(workspace_filter)]
+                gtk::DropDown {
+                    set_model: Some(&gtk::StringList::new(&["All projects"])),
+                    set_enable_search: true,
+                    update_property: &[gtk::accessible::Property::Label("Task project filter")],
+                    connect_selected_notify[sender, guard = model.dashboard_sort_guard.clone(), paths = model.workspace_choices.clone()] => move |dropdown| {
+                        if !guard.get() {
+                            let project = dropdown.selected().checked_sub(1).and_then(|index| paths.borrow().get(index as usize).cloned());
+                            sender.input(TasksPanelMsg::ProjectFilter(project));
+                        }
+                    },
+                },
+                #[name(status_filter)]
+                gtk::DropDown {
+                    set_model: Some(&gtk::StringList::new(&std::iter::once("All states").chain(STATES.iter().map(|status| status.label())).collect::<Vec<_>>())),
+                    update_property: &[gtk::accessible::Property::Label("Task state filter")],
+                    connect_selected_notify[sender, guard = model.dashboard_sort_guard.clone()] => move |dropdown| {
+                        if !guard.get() {
+                            let status = dropdown.selected().checked_sub(1).and_then(|index| STATES.get(index as usize).copied());
+                            sender.input(TasksPanelMsg::StatusFilter(status));
+                        }
+                    },
+                },
             },
             #[name(dashboard_filters)]
             gtk::FlowBox {
@@ -686,6 +753,14 @@ impl Component for TasksPanelModel {
                             add_css_class: "caption",
                         },
 
+                        #[name(inspector_page_button)]
+                        gtk::Button {
+                            set_label: "Details",
+                            add_css_class: "flat",
+                            add_css_class: "caption",
+                            connect_clicked => TasksPanelMsg::ShowPage(INSPECTOR_PAGE),
+                        },
+
                         #[name(diff_page_button)]
                         gtk::ToggleButton {
                             set_label: "Diff",
@@ -758,6 +833,20 @@ impl Component for TasksPanelModel {
                                     set_right_margin: 4,
                                     add_css_class: "ai-explain-body",
                                 },
+                            },
+                        },
+
+                        add_named[Some(INSPECTOR_PAGE)] = &gtk::ScrolledWindow {
+                            set_policy: (gtk::PolicyType::Never, gtk::PolicyType::Automatic),
+                            #[name(inspector_view)]
+                            gtk::TextView {
+                                set_editable: false,
+                                set_cursor_visible: false,
+                                set_wrap_mode: gtk::WrapMode::WordChar,
+                                set_left_margin: 6,
+                                set_right_margin: 6,
+                                set_top_margin: 8,
+                                set_bottom_margin: 8,
                             },
                         },
 
@@ -848,6 +937,8 @@ impl Component for TasksPanelModel {
             dashboard_view: crate::agent_task::DashboardView::All,
             dashboard_sort: crate::agent_task::DashboardSort::default(),
             dashboard_sort_guard: Rc::new(Cell::new(false)),
+            filters: TaskFilters::default(),
+            workspace_choices: Rc::new(RefCell::new(Vec::new())),
             dashboard_summary: String::new(),
             dashboard_counts: Default::default(),
             dashboard_buttons: Vec::new(),
@@ -866,6 +957,29 @@ impl Component for TasksPanelModel {
             page_guard: page_guard.clone(),
         };
         let widgets: TasksPanelModelWidgets = view_output!();
+        let factory = gtk::SignalListItemFactory::new();
+        factory.connect_setup(|_, item| {
+            let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+            let label = gtk::Label::new(None);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+            label.set_max_width_chars(24);
+            label.set_halign(gtk::Align::Start);
+            item.set_child(Some(&label));
+        });
+        factory.connect_bind(|_, item| {
+            let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+            let value = item
+                .item()
+                .unwrap()
+                .downcast::<gtk::StringObject>()
+                .unwrap();
+            let label = item.child().unwrap().downcast::<gtk::Label>().unwrap();
+            label.set_label(&value.string());
+            label.set_tooltip_text(Some(&value.string()));
+        });
+        widgets.workspace_filter.set_factory(Some(&factory));
+        widgets.workspace_filter.set_list_factory(Some(&factory));
+
         widgets
             .diff_page_button
             .set_group(Some(&widgets.stream_page_button));
@@ -1061,6 +1175,7 @@ impl Component for TasksPanelModel {
                 self.apply_dashboard_filters();
             }
             TasksPanelMsg::ClearDashboardFilters => {
+                self.filters = TaskFilters::default();
                 self.dashboard_query.clear();
                 self.dashboard_view = crate::agent_task::DashboardView::All;
                 self.dashboard_sort = crate::agent_task::DashboardSort::default();
@@ -1085,6 +1200,18 @@ impl Component for TasksPanelModel {
             }
             TasksPanelMsg::DashboardSort(sort) => {
                 self.dashboard_sort = sort;
+                self.apply_dashboard_filters();
+            }
+            TasksPanelMsg::ProviderFilter(provider) => {
+                self.filters.provider = provider;
+                self.apply_dashboard_filters();
+            }
+            TasksPanelMsg::ProjectFilter(project) => {
+                self.filters.workspace = project;
+                self.apply_dashboard_filters();
+            }
+            TasksPanelMsg::StatusFilter(status) => {
+                self.filters.status = status;
                 self.apply_dashboard_filters();
             }
             TasksPanelMsg::NextAttention => {
@@ -1120,6 +1247,9 @@ impl Component for TasksPanelModel {
                     }
                 }
             }
+            TasksPanelMsg::ComposeProject => {
+                self.emit_action(TaskPanelAction::ComposeProject, &sender);
+            }
             TasksPanelMsg::Create => {
                 self.emit_action(TaskPanelAction::CreateFromBlock, &sender);
             }
@@ -1127,7 +1257,7 @@ impl Component for TasksPanelModel {
                 // Keep the clicked task even if a queued Sync changes selection.
                 // The application/runtime rechecks this task and its live gates.
                 let action = match kind {
-                    ActionKind::StartCodex => TaskPanelAction::StartCodex(id),
+                    ActionKind::StartNative => TaskPanelAction::StartNative(id),
                     ActionKind::StartTerminal => TaskPanelAction::StartTerminal(id),
                     ActionKind::FocusTerminal => TaskPanelAction::FocusTerminal(id),
                     ActionKind::FocusValidation => TaskPanelAction::FocusValidation(id),
@@ -1135,6 +1265,7 @@ impl Component for TasksPanelModel {
                     ActionKind::FinishCodex => TaskPanelAction::FinishCodex(id),
                     ActionKind::RunValidation => TaskPanelAction::RunValidation(id),
                     ActionKind::Complete => TaskPanelAction::Complete(id),
+                    ActionKind::AcceptReviewed => TaskPanelAction::AcceptReviewed(id),
                     ActionKind::ReviewDiff => TaskPanelAction::ReviewDiff(id),
                     ActionKind::Archive => TaskPanelAction::Archive(id),
                 };
@@ -1169,6 +1300,9 @@ impl TasksPanelModel {
         sender: &ComponentSender<Self>,
     ) {
         widgets
+            .compose_button
+            .set_sensitive(self.sync.create_enabled && !self.sync.pending_creation);
+        widgets
             .create_button
             .set_sensitive(self.sync.create_enabled && !self.sync.pending_creation);
         let show_hint = !self.sync.create_hint.is_empty();
@@ -1177,9 +1311,56 @@ impl TasksPanelModel {
             widgets.create_hint.set_label(&self.sync.create_hint);
         }
 
+        let guard = self.dashboard_sort_guard.replace(true);
+        let choices = self
+            .filters
+            .workspace_choices(&self.unfiltered_sync.workspaces);
+        if *self.workspace_choices.borrow() != choices {
+            let labels = std::iter::once("All projects".to_string())
+                .chain(choices.iter().map(|path| {
+                    jterm_core::review_input::safe_inline_display(&path.to_string_lossy(), 160)
+                }))
+                .collect::<Vec<_>>();
+            widgets
+                .workspace_filter
+                .set_model(Some(&gtk::StringList::new(
+                    &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+                )));
+            *self.workspace_choices.borrow_mut() = choices;
+        }
+        widgets.provider_filter.set_selected(
+            self.filters
+                .provider
+                .and_then(|provider| {
+                    crate::agent_task::AgentProvider::ALL
+                        .iter()
+                        .position(|candidate| *candidate == provider)
+                })
+                .map_or(0, |index| index as u32 + 1),
+        );
+        widgets.workspace_filter.set_selected(
+            self.filters
+                .workspace
+                .as_ref()
+                .and_then(|path| {
+                    self.workspace_choices
+                        .borrow()
+                        .iter()
+                        .position(|candidate| candidate == path)
+                })
+                .map_or(0, |index| index as u32 + 1),
+        );
+        widgets.status_filter.set_selected(
+            self.filters
+                .status
+                .and_then(|status| STATES.iter().position(|candidate| *candidate == status))
+                .map_or(0, |index| index as u32 + 1),
+        );
+        self.dashboard_sort_guard.set(guard);
         widgets.dashboard_summary.set_label(&self.dashboard_summary);
         widgets.dashboard_clear.set_visible(
-            !self.dashboard_query.is_empty()
+            self.filters != TaskFilters::default()
+                || !self.dashboard_query.is_empty()
                 || self.dashboard_view != crate::agent_task::DashboardView::All
                 || self.dashboard_sort != crate::agent_task::DashboardSort::default(),
         );
@@ -1225,11 +1406,16 @@ impl TasksPanelModel {
             self.history_task = detail.map(|detail| detail.id);
             self.history_ordinal = None;
         }
+        if self.action_target.get() != detail.map(|detail| detail.id) {
+            for (_, button) in &self.action_buttons {
+                cancel_task_action_activation(button);
+            }
+        }
         self.action_target.set(detail.map(|detail| detail.id));
         for (kind, button) in &self.action_buttons {
             let sensitive = detail.is_some_and(|detail| {
                 match kind {
-                    ActionKind::StartCodex => detail.can_start_codex,
+                    ActionKind::StartNative => detail.can_start_native,
                     ActionKind::StartTerminal => detail.can_start_terminal,
                     ActionKind::FocusTerminal => detail.can_focus_terminal,
                     ActionKind::FocusValidation => detail.can_focus_validation,
@@ -1237,17 +1423,33 @@ impl TasksPanelModel {
                     ActionKind::FinishCodex => detail.can_finish,
                     ActionKind::RunValidation => detail.can_run_validation,
                     ActionKind::Complete => detail.can_complete,
+                    ActionKind::AcceptReviewed => detail.can_accept_review,
                     ActionKind::ReviewDiff => true,
                     // Archiving is always safe to offer for a selected task.
                     ActionKind::Archive => true,
                 }
             });
             button.set_sensitive(sensitive);
+            let visible = detail.is_some_and(|detail| match kind {
+                ActionKind::Complete => !detail.manual_review,
+                ActionKind::AcceptReviewed => detail.manual_review,
+                _ => true,
+            });
+            button.set_visible(visible);
+            if let Some(holder) = button.parent().and_downcast::<gtk::FlowBoxChild>() {
+                holder.set_visible(visible);
+            }
+            if *kind == ActionKind::StartNative {
+                if let Some(detail) = detail {
+                    button.set_label(&detail.native_label);
+                }
+            }
         }
         widgets.actions_box.set_visible(detail.is_some());
         widgets.detail_title.set_visible(detail.is_some());
         widgets.detail_status.set_visible(detail.is_some());
         widgets.page_stack.set_visible(detail.is_some());
+        widgets.inspector_page_button.set_visible(detail.is_some());
         widgets.stream_page_button.set_visible(detail.is_some());
         widgets.diff_page_button.set_visible(detail.is_some());
         widgets
@@ -1259,6 +1461,7 @@ impl TasksPanelModel {
         }
 
         if let Some(detail) = detail {
+            set_view_text(&widgets.inspector_view, &detail.inspector);
             widgets.detail_title.set_label(&detail.title);
             widgets
                 .detail_status
@@ -1268,9 +1471,7 @@ impl TasksPanelModel {
                 .stream
                 .as_deref()
                 .map(render_stream_text)
-                .unwrap_or_else(|| {
-                    "No native Codex session snapshot for this task yet.".to_string()
-                });
+                .unwrap_or_else(|| "No native session snapshot for this task yet.".to_string());
             set_view_text(&widgets.stream_view, &stream_text);
             let snapshot = detail.stream.as_deref();
             widgets
@@ -1350,6 +1551,16 @@ impl TasksPanelModel {
 
 /// Set a read-only text view's buffer only when the content actually
 /// changed; re-setting identical text still forces a fresh layout pass.
+// GTK's delayed keyboard activation survives a sensitivity toggle. Reparenting
+// cancels that pending activation before a button can acquire another task.
+fn cancel_task_action_activation(button: &gtk::Button) {
+    button.set_sensitive(false);
+    if let Some(holder) = button.parent().and_downcast::<gtk::FlowBoxChild>() {
+        holder.set_child(None::<&gtk::Widget>);
+        holder.set_child(Some(button));
+    }
+}
+
 fn set_view_text(view: &gtk::TextView, text: &str) {
     let buffer = view.buffer();
     if buffer
@@ -1495,10 +1706,14 @@ mod tests {
             title: "First task".into(),
             status_line: "Created".into(),
             branch: "test/dashboard".into(),
+            inspector: "Repository\n/tmp/project".into(),
+            native_label: "Start Codex".into(),
+            manual_review: false,
+            can_accept_review: false,
             stream: None,
             approvals: Vec::new(),
             completed_turns: 0,
-            can_start_codex: false,
+            can_start_native: false,
             can_start_terminal: false,
             can_focus_terminal: false,
             can_focus_validation: false,
@@ -1511,12 +1726,118 @@ mod tests {
             diff: None,
         };
         TasksPanelSync {
+            workspaces: tasks
+                .iter()
+                .map(|task| (task.id, task.repo_root.clone()))
+                .collect(),
             rows,
             dashboard,
             selected: Some(selected),
             detail: Some(Box::new(detail)),
             ..Default::default()
         }
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn agent_management_v3_inspector_and_manual_review_keep_task_identity() {
+        gtk::init().expect("GTK display");
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let sink = actions.clone();
+        let controller =
+            TasksPanelModel::builder()
+                .launch(())
+                .connect_receiver(move |_, output| {
+                    let TasksPanelOutput::Action(action) = output;
+                    sink.borrow_mut().push(action);
+                });
+        let window = gtk::Window::builder()
+            .default_width(520)
+            .default_height(920)
+            .build();
+        window.set_child(Some(controller.widget()));
+        window.present();
+        let drain = || {
+            while gtk::glib::MainContext::default().pending() {
+                gtk::glib::MainContext::default().iteration(false);
+            }
+        };
+        let mut sync = dashboard_test_sync();
+        let selected = sync.selected.unwrap();
+        let detail = sync.detail.as_mut().unwrap();
+        detail.manual_review = true;
+        detail.can_accept_review = true;
+        detail.native_label = "Start Claude".into();
+        detail.inspector = "Provider\nClaude\n\nRepository\n/tmp/project\n\nGoal\nReview the work before accepting it".into();
+        controller.emit(TasksPanelMsg::Sync(Box::new(sync)));
+        drain();
+        let action_button = |kind| {
+            controller
+                .model()
+                .action_buttons
+                .iter()
+                .find(|(candidate, _)| *candidate == kind)
+                .unwrap()
+                .1
+                .clone()
+        };
+        let accept = action_button(ActionKind::AcceptReviewed);
+        assert!(accept.is_visible() && accept.is_sensitive());
+        assert!(!action_button(ActionKind::Complete).is_visible());
+        assert_eq!(
+            action_button(ActionKind::StartNative).label().as_deref(),
+            Some("Start Claude")
+        );
+        controller.widgets().inspector_page_button.emit_clicked();
+        drain();
+        assert_eq!(
+            controller
+                .widgets()
+                .page_stack
+                .visible_child_name()
+                .as_deref(),
+            Some(INSPECTOR_PAGE)
+        );
+        assert!(!controller.widgets().inspector_view.is_editable());
+        assert!(
+            actions.borrow().is_empty(),
+            "reading details does not operate a task"
+        );
+        if let Some(path) = std::env::var_os("JTERM_TASK_INSPECTOR_SCREENSHOT") {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
+            while std::time::Instant::now() < deadline {
+                drain();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(std::process::Command::new("import")
+                .args(["-window", "root"])
+                .arg(path)
+                .status()
+                .unwrap()
+                .success());
+        }
+        accept.emit_clicked();
+        drain();
+        assert_eq!(
+            actions.borrow().as_slice(),
+            &[TaskPanelAction::AcceptReviewed(selected)]
+        );
+        actions.borrow_mut().clear();
+        accept.emit_by_name::<()>("activate", &[]);
+        let mut replacement = dashboard_test_sync();
+        replacement.detail.as_mut().unwrap().manual_review = true;
+        replacement.detail.as_mut().unwrap().can_accept_review = true;
+        controller.emit(TasksPanelMsg::Sync(Box::new(replacement)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(320);
+        while std::time::Instant::now() < deadline {
+            drain();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            actions.borrow().is_empty(),
+            "a delayed review action cannot accept a newly selected task"
+        );
+        window.close();
     }
 
     #[test]

@@ -9,6 +9,10 @@
 //! are headless-testable. Ported from ember's `app/tasks.rs` and frost's
 //! `agent_task_ui.rs`.
 
+#[path = "task_composer.rs"]
+pub(crate) mod task_composer;
+pub(crate) use task_composer::TaskProjectRequest;
+
 /// Resolve the current binding without interpreting its opaque session identity.
 pub(crate) fn task_terminal_binding(
     task: &crate::agent_task::AgentTask,
@@ -123,7 +127,9 @@ pub(crate) fn native_follow_up_can_send(text: &str, completed_turns: usize) -> b
 pub(crate) enum TaskPanelAction {
     /// Create a task from the active pane's selected block evidence.
     CreateFromBlock,
-    StartCodex(TaskId),
+    ComposeProject,
+    CreateProject(TaskProjectRequest),
+    StartNative(TaskId),
     StartTerminal(TaskId),
     FocusTerminal(TaskId),
     FocusValidation(TaskId),
@@ -134,16 +140,62 @@ pub(crate) enum TaskPanelAction {
     Deny(TaskId, crate::agent_task::ApprovalId),
     RunValidation(TaskId),
     Complete(TaskId),
+    AcceptReviewed(TaskId),
     ReviewDiff(TaskId),
     Archive(TaskId),
     Select(TaskId),
     Close,
 }
 
+/// Read-only details use the shared bounded projection and contain no inferred history.
+pub(crate) fn task_inspector_text(task: &crate::agent_task::AgentTask) -> String {
+    let inspector = crate::agent_task::TaskInspector::from_task(task);
+    let mut text = inspector
+        .fields
+        .into_iter()
+        .map(|field| format!("{}\n{}", field.label, field.value))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if let Some(goal) = inspector.goal {
+        text.push_str("\n\nGoal\n");
+        text.push_str(&goal);
+    }
+    if task.brief.is_some() {
+        text.push_str("\n\nTerminal brief\n");
+        text.push_str(&format!("On Start terminal, read {} inside the task worktree. Sharing consent is required before the brief is written.", crate::agent_task::pty_task_brief_relative()));
+    }
+    text
+}
+
+/// Deliver an authored goal only after the existing explicit sharing gate allows it.
+pub(crate) fn prepare_authored_terminal(
+    task: &crate::agent_task::AgentTask,
+    policy: NativePromptPolicy,
+    launch: crate::agent_task::AgentLaunchSpec,
+) -> Result<crate::agent_task::AgentLaunchSpec, String> {
+    if task.brief.is_none() {
+        return Ok(launch);
+    }
+    let brief =
+        crate::agent_task::write_pty_task_brief(task, policy).map_err(|error| error.to_string())?;
+    if brief.is_none() {
+        return Err(
+            "Enable AI features and command-context sharing before starting this authored task"
+                .into(),
+        );
+    }
+    Ok(launch.with_pty_seed_prompt(&format!(
+        "Read {} and carry out the task goal inside this isolated worktree.",
+        crate::agent_task::pty_task_brief_relative()
+    )))
+}
+
 /// Fully prepared task registration produced by the background worktree
 /// worker. The UI thread only registers it with the task manager.
 pub(crate) struct PreparedTask {
-    pub(crate) context: SemanticCommandContext,
+    pub(crate) project_request: Option<TaskProjectRequest>,
+    pub(crate) context: Option<SemanticCommandContext>,
+    pub(crate) brief: Option<crate::agent_task::TaskBrief>,
     pub(crate) title: String,
     pub(crate) provider: AgentProvider,
     pub(crate) worktree: ManagedWorktree,
@@ -180,10 +232,6 @@ pub(crate) fn begin_worktree_creation(
     context: SemanticCommandContext,
     provider: AgentProvider,
 ) -> Result<PendingTaskCreation, String> {
-    let worktree_root = dirs::data_local_dir()
-        .ok_or_else(|| "cannot locate the per-user data directory".to_string())?
-        .join("anvil")
-        .join("agent-tasks");
     let cwd = context
         .cwd
         .as_deref()
@@ -195,16 +243,52 @@ pub(crate) fn begin_worktree_creation(
         "Fix {}",
         visible_bounded(command, MAX_TASK_TITLE_DISPLAY_BYTES)
     );
+    begin_task_worktree_creation(cwd, title, provider, Some(context), None, None)
+}
+
+pub(crate) fn begin_project_worktree_creation(
+    request: TaskProjectRequest,
+) -> Result<PendingTaskCreation, String> {
+    let draft = request.draft.clone();
+    draft.validate()?;
+    if request.cancelled() {
+        return Err("Task creation was cancelled".into());
+    }
+    begin_task_worktree_creation(
+        draft.directory,
+        draft.title,
+        draft.provider,
+        None,
+        Some(draft.brief),
+        Some(request),
+    )
+}
+
+fn begin_task_worktree_creation(
+    cwd: PathBuf,
+    title: String,
+    provider: AgentProvider,
+    context: Option<SemanticCommandContext>,
+    brief: Option<crate::agent_task::TaskBrief>,
+    project_request: Option<TaskProjectRequest>,
+) -> Result<PendingTaskCreation, String> {
+    let worktree_root = dirs::data_local_dir()
+        .ok_or_else(|| "cannot locate the per-user data directory".to_string())?
+        .join("anvil")
+        .join("agent-tasks");
     let token = uuid::Uuid::new_v4().simple().to_string();
     let task_name = format!("task-{token}");
     let branch = format!("anvil/{task_name}");
     let (sender, receiver) = mpsc::sync_channel(1);
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = project_request
+        .as_ref()
+        .map(TaskProjectRequest::worktree_cancel_flag)
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let worker_cancel = Arc::clone(&cancel);
     let worker = std::thread::Builder::new()
         .name("anvil-task-worktree".to_string())
         .spawn(move || {
-            let result = (|| {
+            let result: Result<PreparedTask, String> = (|| {
                 let service = WorktreeService::new(worktree_root)
                     .map_err(|error| error.to_string())?
                     .with_cancel_flag(worker_cancel);
@@ -218,12 +302,17 @@ pub(crate) fn begin_worktree_creation(
                     .create(&request)
                     .map_err(|error| error.to_string())?;
                 Ok(PreparedTask {
+                    project_request: project_request.clone(),
                     context,
+                    brief,
                     title,
                     provider,
                     worktree,
                 })
             })();
+            if let (Some(request), Err(error)) = (&project_request, &result) {
+                request.finish(Err(error.clone()));
+            }
             let _ = sender.send(result);
         })
         .map_err(|error| format!("could not start task worktree worker: {error}"))?;
