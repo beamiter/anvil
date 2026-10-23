@@ -1575,7 +1575,7 @@ binary and configuration. If an older copy comes first in PATH, the installer
 prints the conflicting path.
 
 
-### Agent session manager
+### Agent management
 
 Open **Agent Sessions** using the grid button in the top bar,
 **Ctrl+Alt+Shift+G**, or the command palette. The `open_agent_sessions`
@@ -1584,8 +1584,18 @@ This manager discovers existing Codex and Claude CLI history across projects,
 including custom `CODEX_HOME` and `CLAUDE_CONFIG_DIR` locations. It is separate
 from the isolated-worktree Tasks dashboard and does not require an API key.
 
+The **Agent Manager** adds quick views for active conversations, recorded input
+requests, observed live CLIs, pins and local archives. Choose a project and its
+subdirectories, give conversations local names and tags, or archive and restore
+them without changing provider history. **Save** and **Revert** act on the selected
+conversation; unsaved drafts survive row changes and background refreshes.
+Saved organization is shared with Forge, Ember and Frost on the same account.
+
 Search by project, title, session ID, branch, or conversation preview; combine
-provider and recorded-state filters. Select a conversation to inspect its
+provider and recorded-state filters. Aliases and tags are searchable too:
+`provider:codex tag:review`, `title:"release plan"`, `project:/work/repo` and
+`-tag:done` can be combined. Invalid queries explain what needs correcting.
+Select a conversation to inspect its
 original directory, branch, recent text and exact resume command, then choose
 **Resume in New Tab**. The provider receives an argv directly in a conventional
 PTY at the original project directory. Selecting a session already opened by
@@ -1595,6 +1605,12 @@ sessions show an explanation instead of launching in the wrong project.
 Discovery runs on a bounded background worker and refreshes while the manager
 is open. Transcript states are labeled as *last recorded*; they do not claim a
 process is still alive. No provider is started until explicit confirmation.
+
+The **Tasks** panel adds Attention, Recent, Oldest, Title and Project sorting,
+plus **Next needs you** navigation across the visible tasks. Filters and sorting
+preserve task identity and follow-up drafts. See the
+[Agent management guide](docs/agent-management.md) for the workflow, search syntax
+and storage compatibility details.
 
 Development builds use the sibling `../jterm_core` checkout. Isolated Nix
 builds unpack the deterministic `packaging/jterm-core-src.tar.gz` snapshot

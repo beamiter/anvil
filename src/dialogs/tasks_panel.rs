@@ -142,6 +142,8 @@ pub(crate) enum TasksPanelMsg {
     OpenDashboardResult,
     ClearDashboardFilters,
     DashboardView(crate::agent_task::DashboardView),
+    DashboardSort(crate::agent_task::DashboardSort),
+    NextAttention,
     /// Stable identity captured when the row gesture occurs. A later filter
     /// change may hide it, but must never retarget a queued gesture.
     SelectRow(TaskId),
@@ -274,6 +276,8 @@ pub(crate) struct TasksPanelModel {
     unfiltered_sync: TasksPanelSync,
     dashboard_query: String,
     dashboard_view: crate::agent_task::DashboardView,
+    dashboard_sort: crate::agent_task::DashboardSort,
+    dashboard_sort_guard: Rc<Cell<bool>>,
     dashboard_summary: String,
     dashboard_counts: crate::agent_task::DashboardCounts,
     dashboard_buttons: Vec<(crate::agent_task::DashboardView, gtk::Button)>,
@@ -306,11 +310,12 @@ pub(crate) struct TasksPanelModel {
 impl TasksPanelModel {
     fn apply_dashboard_filters(&mut self) {
         let mut sync = self.unfiltered_sync.clone();
-        let dashboard = crate::agent_task::DashboardSnapshot::filter_rows(
+        let mut dashboard = crate::agent_task::DashboardSnapshot::filter_rows(
             &sync.dashboard.rows,
             &self.dashboard_query,
             self.dashboard_view,
         );
+        dashboard.sort_rows(self.dashboard_sort);
         let mut by_id: HashMap<_, _> = sync.rows.into_iter().map(|row| (row.id, row)).collect();
         sync.rows = dashboard
             .rows
@@ -334,7 +339,8 @@ impl TasksPanelModel {
             dashboard.counts.attention,
             dashboard.counts.pending_approval,
         );
-        self.dashboard_counts = dashboard.counts;
+        self.dashboard_counts = dashboard.counts.clone();
+        sync.dashboard = dashboard;
         self.sync = sync;
     }
 
@@ -566,6 +572,32 @@ impl Component for TasksPanelModel {
             gtk::Label {
                 set_wrap: true,
                 add_css_class: "caption",
+            },
+
+            gtk::Box {
+                set_orientation: gtk::Orientation::Horizontal,
+                set_spacing: 6,
+                #[name(dashboard_sort)]
+                gtk::DropDown {
+                    set_model: Some(&gtk::StringList::new(&crate::agent_task::DashboardSort::ALL.map(|sort| sort.label()))),
+                    set_hexpand: true,
+                    set_tooltip_text: Some("Order visible tasks"),
+                    update_property: &[gtk::accessible::Property::Label("Task sort order")],
+                    connect_selected_notify[sender, guard = model.dashboard_sort_guard.clone()] => move |dropdown| {
+                        if guard.get() {
+                            return;
+                        }
+                        if let Some(sort) = crate::agent_task::DashboardSort::ALL.get(dropdown.selected() as usize) {
+                            sender.input(TasksPanelMsg::DashboardSort(*sort));
+                        }
+                    },
+                },
+                #[name(next_attention)]
+                gtk::Button {
+                    set_label: "Next needs you",
+                    set_tooltip_text: Some("Select the next visible task needing attention"),
+                    connect_clicked => TasksPanelMsg::NextAttention,
+                },
             },
 
             #[name(dashboard_clear)]
@@ -814,6 +846,8 @@ impl Component for TasksPanelModel {
             unfiltered_sync: TasksPanelSync::default(),
             dashboard_query: String::new(),
             dashboard_view: crate::agent_task::DashboardView::All,
+            dashboard_sort: crate::agent_task::DashboardSort::default(),
+            dashboard_sort_guard: Rc::new(Cell::new(false)),
             dashboard_summary: String::new(),
             dashboard_counts: Default::default(),
             dashboard_buttons: Vec::new(),
@@ -1029,6 +1063,7 @@ impl Component for TasksPanelModel {
             TasksPanelMsg::ClearDashboardFilters => {
                 self.dashboard_query.clear();
                 self.dashboard_view = crate::agent_task::DashboardView::All;
+                self.dashboard_sort = crate::agent_task::DashboardSort::default();
                 widgets.dashboard_query_entry.set_text("");
                 self.apply_dashboard_filters();
             }
@@ -1047,6 +1082,18 @@ impl Component for TasksPanelModel {
             TasksPanelMsg::DashboardView(view) => {
                 self.dashboard_view = view;
                 self.apply_dashboard_filters();
+            }
+            TasksPanelMsg::DashboardSort(sort) => {
+                self.dashboard_sort = sort;
+                self.apply_dashboard_filters();
+            }
+            TasksPanelMsg::NextAttention => {
+                self.apply_dashboard_filters();
+                if let Some(id) = self.sync.dashboard.next_attention(self.sync.selected) {
+                    if Some(id) != self.sync.selected {
+                        self.emit_action(TaskPanelAction::Select(id), &sender);
+                    }
+                }
             }
             TasksPanelMsg::SelectRow(id) => {
                 if self.sync.selected != Some(id) && self.sync.rows.iter().any(|row| row.id == id) {
@@ -1133,7 +1180,23 @@ impl TasksPanelModel {
         widgets.dashboard_summary.set_label(&self.dashboard_summary);
         widgets.dashboard_clear.set_visible(
             !self.dashboard_query.is_empty()
-                || self.dashboard_view != crate::agent_task::DashboardView::All,
+                || self.dashboard_view != crate::agent_task::DashboardView::All
+                || self.dashboard_sort != crate::agent_task::DashboardSort::default(),
+        );
+        let sort_index = crate::agent_task::DashboardSort::ALL
+            .iter()
+            .position(|sort| *sort == self.dashboard_sort)
+            .unwrap_or(0) as u32;
+        if widgets.dashboard_sort.selected() != sort_index {
+            let previous = self.dashboard_sort_guard.replace(true);
+            widgets.dashboard_sort.set_selected(sort_index);
+            self.dashboard_sort_guard.set(previous);
+        }
+        widgets.next_attention.set_sensitive(
+            self.sync
+                .dashboard
+                .next_attention(self.sync.selected)
+                .is_some(),
         );
         let hidden = self.sync.selected.is_some_and(|id| {
             self.unfiltered_sync
@@ -1771,6 +1834,30 @@ mod tests {
         assert_eq!(controller.model().sync.selected, selected);
         assert_eq!(controller.model().unfiltered_sync.rows, sync.rows);
         assert!(actions.borrow().is_empty());
+        controller.emit(TasksPanelMsg::ClearDashboardFilters);
+        controller.emit(TasksPanelMsg::DashboardSort(
+            crate::agent_task::DashboardSort::Title,
+        ));
+        drain();
+        assert_eq!(controller.model().sync.rows[0].title, "First task");
+        assert!(actions.borrow().is_empty(), "sorting never operates a task");
+        let attention = sync.rows.iter().find(|row| row.needs_attention).unwrap().id;
+        controller.emit(TasksPanelMsg::NextAttention);
+        drain();
+        assert_eq!(
+            actions.borrow().as_slice(),
+            &[TaskPanelAction::Select(attention)]
+        );
+        actions.borrow_mut().clear();
+        controller.widgets().dashboard_query_entry.set_text("First");
+        drain();
+        assert!(!controller.widgets().next_attention.is_sensitive());
+        controller.emit(TasksPanelMsg::NextAttention);
+        drain();
+        assert!(
+            actions.borrow().is_empty(),
+            "next-attention cannot select a hidden task"
+        );
         window.close();
     }
 
