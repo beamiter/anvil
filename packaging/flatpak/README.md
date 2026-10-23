@@ -60,3 +60,8 @@ To regenerate `cargo-sources.json`, use the pinned Flatpak Cargo generator
 against the repository's current `Cargo.lock`. Verify each registry package's
 archive and checksum entries, each Git dependency's locked revision and vendored
 manifest, and the final Cargo source config.
+
+The shared `jterm_core` source is bundled in the verified
+`packaging/jterm-core-src.tar.gz` snapshot. The build materializes it below
+`.shared/jterm_core` and adjusts the local path dependency inside the isolated
+build directory. It is not fetched as an obsolete Git-vendored dependency.

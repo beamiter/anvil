@@ -656,6 +656,12 @@ impl AppModel {
                     "AI context for a finished block",
                 );
             }
+            Action::OpenAgentSessions => {
+                let sender = sender.clone();
+                crate::agent_sessions::show(&self.window, move |launch, title| {
+                    sender.input(AppMsg::ResumeAgentSession(launch, title));
+                });
+            }
             Action::OpenAgent => {
                 self.open_agent_panel(sender);
             }

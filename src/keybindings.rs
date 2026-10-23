@@ -135,6 +135,8 @@ pub(crate) enum Action {
     OpenWorkflows,
     /// Open the multi-turn agent panel (Warp-style). Ctrl+Alt+G by default.
     OpenAgent,
+    /// Browse and resume provider-owned Codex and Claude conversations.
+    OpenAgentSessions,
     /// Show or hide the native Codex agent Tasks panel (isolated-worktree
     /// tasks). Ctrl+Alt+Shift+T by default; requires `agent_tasks_enabled`.
     ToggleTasksPanel,
@@ -254,6 +256,7 @@ impl Action {
             Action::OpenAiPanel => "Open AI panel",
             Action::AskAiAboutSelectedBlock => "Ask AI about selected block",
             Action::OpenWorkflows => "Open workflows",
+            Action::OpenAgentSessions => "Agent Sessions: browse and resume Codex / Claude",
             Action::OpenAgent => "Toggle Shell Agent",
             Action::ToggleTasksPanel => "Toggle agent Tasks panel",
             Action::CrossBlockSearch => "Search across blocks (ripgrep)",
@@ -358,6 +361,7 @@ impl Action {
             Action::OpenAiPanel => Some("open_ai_panel"),
             Action::AskAiAboutSelectedBlock => Some("ask_ai_about_selected_block"),
             Action::OpenWorkflows => Some("open_workflows"),
+            Action::OpenAgentSessions => Some("open_agent_sessions"),
             Action::OpenAgent => Some("open_agent"),
             Action::ToggleTasksPanel => Some("toggle_tasks_panel"),
             Action::CrossBlockSearch => Some("cross_block_search"),
@@ -471,6 +475,7 @@ impl Action {
             Action::AskAiAboutSelectedBlock,
             Action::OpenWorkflows,
             Action::OpenAgent,
+            Action::OpenAgentSessions,
             Action::ToggleTasksPanel,
             Action::CrossBlockSearch,
             Action::PreviousCommand,
@@ -485,6 +490,9 @@ impl Action {
     /// one shared `[keybindings]` table works in both frontends. Canonical
     /// keys remain the values returned by [`Self::config_key`].
     pub(crate) fn from_config_key(key: &str) -> Option<Action> {
+        if key == "agent:sessions" {
+            return Some(Action::OpenAgentSessions);
+        }
         let alias = match key {
             "block:collapse_selected" => Some(Action::CollapseSelectedBlocks),
             "block:expand_selected" => Some(Action::ExpandSelectedBlocks),
@@ -667,6 +675,7 @@ impl KeybindingMap {
         bind("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock);
         bind("Ctrl+Shift+M", Action::OpenWorkflows);
         bind("Ctrl+Alt+G", Action::OpenAgent);
+        bind("Ctrl+Alt+Shift+G", Action::OpenAgentSessions);
         bind("Ctrl+Alt+Shift+T", Action::ToggleTasksPanel);
         bind("Ctrl+Shift+G", Action::CrossBlockSearch);
 
@@ -1351,6 +1360,7 @@ history_palette = "F10"
             ("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock),
             ("Ctrl+Shift+M", Action::OpenWorkflows),
             ("Ctrl+Alt+G", Action::OpenAgent),
+            ("Ctrl+Alt+Shift+G", Action::OpenAgentSessions),
             ("Ctrl+Alt+Shift+T", Action::ToggleTasksPanel),
             ("Ctrl+Shift+G", Action::CrossBlockSearch),
         ];

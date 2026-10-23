@@ -38,6 +38,12 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "scripts/materialize-shared-core.sh" ]]; then
+            bash "scripts/materialize-shared-core.sh"
+          fi
       - name: Initialize failure evidence
         run: |
           mkdir -m 0700 evidence

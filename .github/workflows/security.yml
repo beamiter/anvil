@@ -31,6 +31,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "scripts/materialize-shared-core.sh" ]]; then
+            bash "scripts/materialize-shared-core.sh"
+          fi
       - name: Install Rust toolchain
         run: |
           rustup show

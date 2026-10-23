@@ -770,6 +770,47 @@ impl AppModel {
     /// Used for one-shot helpers such as the jsh installer: they emit no
     /// shell-integration sequences, so Block mode would have nothing to build
     /// blocks from, and their prompts expect a plain terminal to type into.
+    pub(crate) fn add_agent_session_tab(
+        &mut self,
+        launch: jterm_core::agent_sessions::SessionLaunch,
+        title: &str,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        let key = format!("{}:{:?}", launch.program, launch.args);
+        if let Some(pane_id) = self.agent_session_tabs.get(&key).copied() {
+            if let Some((ti, pi)) = self.tabs.iter().enumerate().find_map(|(ti, tab)| {
+                tab.panes
+                    .iter()
+                    .position(|pane| pane.id == pane_id)
+                    .map(|pi| (ti, pi))
+            }) {
+                if self.tabs[ti].zoom.is_some() && self.tabs[ti].active_pane != pi {
+                    self.toggle_pane_zoom_for(ti);
+                }
+                let tab_id = self.tabs[ti].id;
+                self.select_tab(tab_id, sender);
+                let delta = pi as i32 - self.tabs[ti].active_pane as i32;
+                if delta != 0 {
+                    self.cycle_pane_focus(delta);
+                }
+                return;
+            }
+            self.agent_session_tabs.remove(&key);
+        }
+        let mut argv = vec![launch.program];
+        argv.extend(launch.args);
+        if let Some((_, pane_id)) = self.add_tab_full_inner(
+            InitialCommands::default(),
+            Some(launch.cwd.to_string_lossy().into_owned()),
+            Rc::new(argv),
+            Some((TerminalMode::Vte, title.to_string())),
+            Vec::new(),
+            sender,
+        ) {
+            self.agent_session_tabs.insert(key, pane_id);
+        }
+    }
+
     pub(crate) fn add_command_tab(
         &mut self,
         title: &str,

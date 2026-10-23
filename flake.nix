@@ -23,6 +23,12 @@
             pname = manifest.package.name;
             version = manifest.package.version;
             src = self;
+            # Cargo resolves the shared core relative to this application's
+            # unpacked source, preserving the same sibling layout as development.
+            postUnpack = ''
+              mkdir jterm_core
+              tar -xzf ${./packaging/jterm-core-src.tar.gz} -C jterm_core
+            '';
 
             cargoLock = {
               lockFile = ./Cargo.lock;
@@ -35,8 +41,6 @@
               outputHashes = {
                 # d5492320686879c8b92106d2e31e4293ff125a5a
                 "jagent-0.7.0" = "sha256-VoockpfPMDhYutNOVaY8Rp2juKYt8dWz031PBfGUIvM=";
-                # d3b1eb6180ea0e3bd4f6e0d1a09ef129ab3d442b
-                "jterm_core-0.2.0" = "sha256-ceM5EOrkUGU9ttA4wy7R8tHCrzRSCt+OUlcxxHUkRr0=";
               };
             };
             strictDeps = true;

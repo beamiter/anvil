@@ -8,6 +8,7 @@ use crate::keybindings::Action;
 #[derive(Debug, Clone)]
 pub(crate) enum AppMsg {
     NewTab,
+    ResumeAgentSession(jterm_core::agent_sessions::SessionLaunch, String),
     CloseTab(u64),
     ForceCloseTab(u64),
     ForceClosePane(u64),

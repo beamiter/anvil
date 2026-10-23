@@ -33,6 +33,12 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "scripts/materialize-shared-core.sh" ]]; then
+            bash "scripts/materialize-shared-core.sh"
+          fi
       - name: Validate pure comparator and lineage contracts
         run: |
           set -euo pipefail
@@ -57,6 +63,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "scripts/materialize-shared-core.sh" ]]; then
+            bash "scripts/materialize-shared-core.sh"
+          fi
       - name: Install GTK, VTE, and validation packages
         run: |
           sudo apt-get update
@@ -341,6 +353,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "scripts/materialize-shared-core.sh" ]]; then
+            bash "scripts/materialize-shared-core.sh"
+          fi
       - name: Install Nix
         uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24  # v31
         with:

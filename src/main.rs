@@ -4,6 +4,7 @@ mod action_ops;
 mod agent;
 mod agent_capability;
 mod agent_ops;
+mod agent_sessions;
 mod agent_task;
 mod agent_task_ui;
 mod ai;
@@ -318,6 +319,7 @@ struct AppModel {
     kbmap: Rc<RefCell<KeybindingMap>>,
     shell_argv: Rc<Vec<String>>,
     tabs: Vec<Tab>,
+    agent_session_tabs: std::collections::HashMap<String, u64>,
     active: usize,
     /// Stable source/original-active identities for a tab drag. A delayed
     /// hover preview is reverted if the source still exists when drag ends.
@@ -933,6 +935,9 @@ impl SimpleComponent for AppModel {
                     AppMsg::Action(Action::ToggleTabPlacement)
                 }
                 top_bar::TopBarOutput::ToggleAgent => AppMsg::OpenAgent,
+                top_bar::TopBarOutput::OpenAgentSessions => {
+                    AppMsg::Action(Action::OpenAgentSessions)
+                }
                 top_bar::TopBarOutput::NewTab => AppMsg::NewTab,
                 top_bar::TopBarOutput::MinimizeWindow => AppMsg::MinimizeWindow,
                 top_bar::TopBarOutput::ToggleMaximizedWindow => AppMsg::ToggleMaximizedWindow,
@@ -1323,6 +1328,7 @@ impl SimpleComponent for AppModel {
             kbmap,
             shell_argv,
             tabs: Vec::new(),
+            agent_session_tabs: std::collections::HashMap::new(),
             active: 0,
             tab_drag_origin: None,
             tab_drag_coordinator,
@@ -1873,6 +1879,9 @@ impl SimpleComponent for AppModel {
 
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
         match msg {
+            AppMsg::ResumeAgentSession(launch, title) => {
+                self.add_agent_session_tab(launch, &title, &sender)
+            }
             AppMsg::NewTab => {
                 let startup = self.config.borrow().startup_commands.clone();
                 self.add_tab(startup, &sender);
@@ -1986,6 +1995,7 @@ impl SimpleComponent for AppModel {
                 self.note_pane_launched_task_pin(pane_id);
             }
             AppMsg::PaneLaunchFailed(pane_id, message) => {
+                self.agent_session_tabs.retain(|_, bound| *bound != pane_id);
                 self.note_task_terminal_launch_failed(pane_id);
                 if let Some((source_tab_id, source_pane_id)) =
                     self.pending_split_spawns.remove(&pane_id)
@@ -2038,6 +2048,7 @@ impl SimpleComponent for AppModel {
                 self.persist_config();
             }
             AppMsg::PaneExited(_, pane_id, code) => {
+                self.agent_session_tabs.retain(|_, bound| *bound != pane_id);
                 // A task terminal's exit is authoritative task evidence; the
                 // task model consumes it before the pane closes. Validation
                 // and agent terminals are never remote-reconnect candidates.

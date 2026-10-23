@@ -10,8 +10,8 @@ keywords = ["terminal", "gtk", "rust", "shell", "productivity"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
-# Pin the shared shell GUI entry and precise scrolling contract.
-jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "d3b1eb6180ea0e3bd4f6e0d1a09ef129ab3d442b" }
+# Shared family source; Nix stages the deterministic packaging source snapshot.
+jterm_core = { path = "../jterm_core" }
 relm4 = { version = "0.11", features = ["libadwaita", "gnome_46"] }
 vte4 = { version = "0.10.0", features = ["v0_76"] }
 log = { version = "0.4", features = ["std"] }
@@ -41,7 +41,7 @@ io-lifetimes = "3"
 env_logger = "0.11"
 
 [dev-dependencies]
-jterm_core = { git = "https://github.com/beamiter/jterm_core.git", rev = "d3b1eb6180ea0e3bd4f6e0d1a09ef129ab3d442b", features = ["session-parity-tests"] }
+jterm_core = { path = "../jterm_core", features = ["session-parity-tests"] }
 
 [profile.dev]
 opt-level = 1

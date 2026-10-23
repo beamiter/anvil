@@ -44,6 +44,7 @@ pub(crate) enum TopBarOutput {
     ToggleSidebar,
     ToggleTabPlacement,
     ToggleAgent,
+    OpenAgentSessions,
     NewTab,
     MinimizeWindow,
     ToggleMaximizedWindow,
@@ -148,6 +149,17 @@ impl Component for TopBarModel {
                 set_valign: gtk::Align::Center,
                 add_css_class: "top-bar-actions",
                 add_css_class: "window-controls",
+
+                gtk::Button {
+                    set_icon_name: "view-grid-symbolic",
+                    set_focus_on_click: false,
+                    set_tooltip_text: Some("Agent Sessions: resume Codex / Claude (Ctrl+Alt+Shift+G)"),
+                    update_property: &[gtk::accessible::Property::Label("Agent Sessions")],
+                    add_css_class: "flat",
+                    connect_clicked[sender] => move |_| {
+                        let _ = sender.output(TopBarOutput::OpenAgentSessions);
+                    },
+                },
 
                 #[name(agent_toggle)]
                 gtk::ToggleButton {

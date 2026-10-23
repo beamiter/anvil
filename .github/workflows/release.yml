@@ -26,6 +26,12 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "scripts/materialize-shared-core.sh" ]]; then
+            bash "scripts/materialize-shared-core.sh"
+          fi
       - name: Install GTK and VTE development packages
         run: |
           sudo apt-get update

@@ -54,12 +54,24 @@ jobs:
           path: candidate
           fetch-depth: 2
           persist-credentials: false
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "candidate/scripts/materialize-shared-core.sh" ]]; then
+            bash "candidate/scripts/materialize-shared-core.sh"
+          fi
       - name: Check out immutable baseline
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.BASELINE_SHA }}
           path: baseline
           persist-credentials: false
+      - name: Materialize bundled shared core
+        shell: bash
+        run: |
+          if [[ -f "baseline/scripts/materialize-shared-core.sh" ]]; then
+            bash "baseline/scripts/materialize-shared-core.sh"
+          fi
       - name: Install native smoke dependencies
         run: |
           sudo apt-get update
