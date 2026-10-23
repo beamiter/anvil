@@ -132,21 +132,44 @@ pub(super) fn editor_escape(widget: &impl IsA<gtk::Widget>, editor: &vte4::Termi
     widget.add_controller(keys);
 }
 
+fn paged_list_index(current: Option<i32>, count: i32, delta: i32) -> i32 {
+    current.map_or(0, |index| {
+        index.saturating_add(delta).clamp(0, (count - 1).max(0))
+    })
+}
+
 /// Keep typing in the search entry while navigating the selected native row.
 pub(super) fn list_navigation(entry: &gtk::SearchEntry, list: &gtk::ListBox) {
     let keys = gtk::EventControllerKey::new();
+    keys.set_name(Some("vim9-native-list-navigation"));
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     let list = list.clone();
     keys.connect_key_pressed(move |_, key, _, modifiers| {
-        if !plain_key(modifiers) || (key != gdk::Key::Down && key != gdk::Key::Up) {
+        if !plain_key(modifiers) {
             return glib::Propagation::Proceed;
         }
-        let current = list.selected_row().map(|row| row.index());
-        let next = match (key == gdk::Key::Down, current) {
-            (true, Some(current)) => current + 1,
-            (false, Some(current)) => (current - 1).max(0),
-            (_, None) => 0,
+        let scroll = list
+            .ancestor(gtk::ScrolledWindow::static_type())
+            .and_then(|widget| widget.downcast::<gtk::ScrolledWindow>().ok());
+        let current = list.selected_row();
+        let height = current.as_ref().map(|row| row.height()).unwrap_or(1).max(1);
+        let page = scroll
+            .as_ref()
+            .map(|scroll| (scroll.vadjustment().page_size() / f64::from(height)).floor() as i32)
+            .unwrap_or(1)
+            .max(1);
+        let delta = match key {
+            gdk::Key::Down => 1,
+            gdk::Key::Up => -1,
+            gdk::Key::Page_Down => page,
+            gdk::Key::Page_Up => -page,
+            _ => return glib::Propagation::Proceed,
         };
+        let mut count = 0;
+        while list.row_at_index(count).is_some() {
+            count += 1;
+        }
+        let next = paged_list_index(current.as_ref().map(|row| row.index()), count, delta);
         if let Some(row) = list.row_at_index(next) {
             list.select_row(Some(&row));
             if let Some(scroll) = list
@@ -696,5 +719,91 @@ mod tests {
                 "accepted invalid position {input:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod paging_tests {
+    use super::*;
+
+    #[test]
+    fn page_selection_clamps_at_both_ends_without_wrapping() {
+        assert_eq!(paged_list_index(None, 40, 8), 0);
+        assert_eq!(paged_list_index(Some(4), 40, 8), 12);
+        assert_eq!(paged_list_index(Some(4), 40, -8), 0);
+        assert_eq!(paged_list_index(Some(38), 40, 8), 39);
+        assert_eq!(paged_list_index(Some(0), 0, 8), 0);
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display; run under Xvfb with one test thread"]
+    fn native_page_keys_preserve_query_focus_and_modifier_shortcuts() {
+        gtk::init().unwrap();
+        let entry = gtk::SearchEntry::new();
+        let list = gtk::ListBox::new();
+        for index in 0..40 {
+            list.append(&gtk::Label::new(Some(&format!("Result {index}"))));
+        }
+        let scroll = gtk::ScrolledWindow::builder()
+            .child(&list)
+            .height_request(180)
+            .build();
+        let layout = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        layout.append(&entry);
+        layout.append(&scroll);
+        let window = gtk::Window::builder()
+            .child(&layout)
+            .default_width(400)
+            .default_height(240)
+            .build();
+        list_navigation(&entry, &list);
+        window.present();
+        entry.grab_focus();
+        let context = glib::MainContext::default();
+        for _ in 0..40 {
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        list.select_row(list.row_at_index(0).as_ref());
+        let controller = entry
+            .observe_controllers()
+            .iter::<glib::Object>()
+            .filter_map(Result::ok)
+            .filter_map(|controller| controller.downcast::<gtk::EventControllerKey>().ok())
+            .find(|controller| controller.name().as_deref() == Some("vim9-native-list-navigation"))
+            .unwrap();
+        let page = (scroll.vadjustment().page_size()
+            / f64::from(list.row_at_index(0).unwrap().height()))
+        .floor() as i32;
+        assert!(controller.emit_by_name::<bool>(
+            "key-pressed",
+            &[&gdk::Key::Page_Down, &0u32, &gdk::ModifierType::empty()]
+        ));
+        assert_eq!(list.selected_row().unwrap().index(), page.clamp(1, 39));
+        let selected = list.selected_row().unwrap().index();
+        for modifiers in [
+            gdk::ModifierType::CONTROL_MASK,
+            gdk::ModifierType::SHIFT_MASK,
+            gdk::ModifierType::ALT_MASK,
+            gdk::ModifierType::SUPER_MASK,
+        ] {
+            assert!(!controller
+                .emit_by_name::<bool>("key-pressed", &[&gdk::Key::Page_Down, &0u32, &modifiers]));
+        }
+        assert_eq!(list.selected_row().unwrap().index(), selected);
+        assert!(
+            entry.has_focus()
+                || gtk::prelude::GtkWindowExt::focus(&window)
+                    .unwrap()
+                    .is_ancestor(&entry)
+        );
+        assert!(controller.emit_by_name::<bool>(
+            "key-pressed",
+            &[&gdk::Key::Page_Up, &0u32, &gdk::ModifierType::empty()]
+        ));
+        assert_eq!(list.selected_row().unwrap().index(), 0);
+        window.close();
     }
 }

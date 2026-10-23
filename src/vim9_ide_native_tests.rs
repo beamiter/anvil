@@ -1534,7 +1534,9 @@ fn exercise_embedded_vim9_capture(font_only: bool) {
             terminal_font_count.get() == 1
         });
         assert_eq!(buffer.native_font_size(), 12 * gtk::pango::SCALE);
-        eprintln!("font capture verified: keyboard and real Ctrl-wheel changed VTE/Pango/grid, sibling font routes preserved");
+        eprintln!(
+            "font capture verified: keyboard and real Ctrl-wheel changed VTE/Pango/grid, sibling font routes preserved"
+        );
         editor.grab_focus();
         editor.feed_child(b":qa!\r");
         wait_for(widget, "font-test embedded exit restores shell", || {
@@ -1633,9 +1635,16 @@ fn exercise_embedded_vim9_capture(font_only: bool) {
         native_modal_font_count.get() == 1
     });
     assert_eq!(terminal_font_count.get(), 0);
-    eprintln!("native modal ownership: parent_palette={}, modal_palette={}, parent_font={}, modal_font={}, field_focus={}",
-        terminal_palette_count.get(), native_modal_count.get(), terminal_font_count.get(), native_modal_font_count.get(),
-        gtk::prelude::RootExt::focus(&window).is_some_and(|focus| &focus == sibling_query.upcast_ref::<gtk::Widget>() || focus.is_ancestor(&sibling_query)));
+    eprintln!(
+        "native modal ownership: parent_palette={}, modal_palette={}, parent_font={}, modal_font={}, field_focus={}",
+        terminal_palette_count.get(),
+        native_modal_count.get(),
+        terminal_font_count.get(),
+        native_modal_font_count.get(),
+        gtk::prelude::RootExt::focus(&window)
+            .is_some_and(|focus| &focus == sibling_query.upcast_ref::<gtk::Widget>()
+                || focus.is_ancestor(&sibling_query))
+    );
     navigation::close_dialog(&sibling_dialog);
     wait_for(widget, "sibling modal dismissal", || {
         window.visible_dialog().is_none()
@@ -2581,4 +2590,63 @@ fn terminal_modes_keep_diagnostic_function_keys_with_vim() {
         assert!(diagnostic_shortcuts_enabled(true, mode));
         assert!(!diagnostic_shortcuts_enabled(false, mode));
     }
+}
+
+#[test]
+#[ignore = "requires GTK display; run under Xvfb"]
+fn workspace_search_options_restore_without_running_search() {
+    gtk::init().unwrap();
+    let controls = project_search::SearchOptions::new();
+    let options = jterm_core::vim9::Vim9SearchOptions {
+        case: jterm_core::vim9::Vim9SearchCase::Sensitive,
+        regex: true,
+        whole_word: true,
+        glob: "src/**/*.rs".into(),
+    };
+    controls.restore(&options);
+    assert_eq!(controls.options(), options);
+    controls.restore(&Default::default());
+    assert_eq!(controls.options(), Default::default());
+}
+
+#[test]
+#[ignore = "requires GTK display; run under Xvfb"]
+fn workspace_output_focus_restores_the_visible_target_or_editor() {
+    gtk::init().unwrap();
+    let stack = gtk::Stack::new();
+    let output = gtk::TextView::new();
+    output.set_editable(false);
+    output.set_cursor_visible(false);
+    let problems = gtk::ListBox::new();
+    problems.append(&gtk::Label::new(Some("A problem")));
+    stack.add_named(&output, Some("output"));
+    stack.add_named(&problems, Some("problems"));
+    let editor = gtk::Entry::new();
+    let layout = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    layout.append(&stack);
+    layout.append(&editor);
+    let window = gtk::Window::builder().child(&layout).build();
+    window.present();
+    let context = glib::MainContext::default();
+    for _ in 0..30 {
+        while context.pending() {
+            context.iteration(false);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let owns_focus = |target: &gtk::Widget| {
+        gtk::prelude::GtkWindowExt::focus(&window)
+            .is_some_and(|focused| focused == *target || focused.is_ancestor(target))
+    };
+    stack.set_visible_child_name("output");
+    restore_workspace_output_focus(&stack, &output, &problems, &editor);
+    assert!(owns_focus(output.upcast_ref()));
+    stack.set_visible_child_name("problems");
+    restore_workspace_output_focus(&stack, &output, &problems, &editor);
+    assert!(owns_focus(problems.upcast_ref()));
+    stack.set_visible_child_name("output");
+    output.set_sensitive(false);
+    restore_workspace_output_focus(&stack, &output, &problems, &editor);
+    assert!(owns_focus(editor.upcast_ref()));
+    window.close();
 }

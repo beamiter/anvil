@@ -62,6 +62,17 @@ impl SearchOptions {
         }
     }
 
+    pub(super) fn restore(&self, options: &Vim9SearchOptions) {
+        self.case.set_selected(match options.case {
+            Vim9SearchCase::Sensitive => 1,
+            Vim9SearchCase::Ignore => 2,
+            Vim9SearchCase::Smart => 0,
+        });
+        self.regex.set_active(options.regex);
+        self.whole_word.set_active(options.whole_word);
+        self.glob.set_text(&options.glob);
+    }
+
     pub(super) fn options(&self) -> Vim9SearchOptions {
         Vim9SearchOptions {
             case: match self.case.selected() {

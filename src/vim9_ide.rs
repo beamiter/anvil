@@ -22,6 +22,24 @@ mod navigation;
 #[path = "vim9_ide_search.rs"]
 mod project_search;
 
+// Stack itself is not a keyboard target. Restore its visible content and
+// return to the editor when that content cannot accept keyboard focus.
+fn restore_workspace_output_focus(
+    stack: &gtk::Stack,
+    output: &gtk::TextView,
+    problems: &gtk::ListBox,
+    editor: &impl IsA<gtk::Widget>,
+) {
+    let focused = if stack.visible_child_name().as_deref() == Some("output") {
+        output.grab_focus()
+    } else {
+        problems.grab_focus()
+    };
+    if !focused {
+        editor.grab_focus();
+    }
+}
+
 // The channel handshake can precede Vim's first buffer metadata.
 fn editor_state_ready(snapshot: &jterm_core::vim9::Vim9Snapshot) -> bool {
     snapshot.connected
@@ -727,6 +745,14 @@ fn open_with_config_and_exit(
             return;
         }
     };
+    let mut workspace_store =
+        jterm_core::vim9::Vim9WorkspaceStateStore::new(session.root(), "anvil");
+    let workspace =
+        workspace_store.restore(jterm_core::vim9::Vim9WorkspaceState::for_config(&config));
+    let workspace_store = Rc::new(RefCell::new(workspace_store));
+    let mut config = config;
+    config.project_panel = workspace.files_visible;
+    config.tool_panel = workspace.tools_visible;
     let window = if embedded.is_some() {
         parent
             .expect("embedded Vim belongs to an existing window")
@@ -919,7 +945,9 @@ fn open_with_config_and_exit(
     search.set_tooltip_text(Some("Search project text and populate Vim quickfix"));
     tools.append(&search);
     navigation::editor_escape(&search, &editor);
+    search.set_text(&workspace.search_query);
     let search_options = project_search::SearchOptions::new();
+    search_options.restore(&workspace.search_options);
     tools.append(&search_options.menu);
     let run_search = button(
         "system-search-symbolic",
@@ -1254,7 +1282,12 @@ fn open_with_config_and_exit(
     let output_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     output_box.append(&output_tabs);
     output_box.append(&output_stack);
-    output_box.set_visible(config.tool_panel);
+    output_box.set_visible(workspace.output_visible);
+    output_stack.set_visible_child_name(if workspace.output_tab {
+        "output"
+    } else {
+        "problems"
+    });
     let editor_split = gtk::Paned::new(gtk::Orientation::Vertical);
     editor_split.set_start_child(Some(&native.widget));
     editor_split.set_end_child(Some(&output_box));
@@ -1270,7 +1303,7 @@ fn open_with_config_and_exit(
     main_split.set_shrink_start_child(true);
     main_split.set_resize_end_child(true);
     main_split.set_shrink_end_child(false);
-    main_split.set_position(260);
+    main_split.set_position(i32::from(workspace.project_width.unwrap_or(260)));
     main_split.set_vexpand(true);
     let toggle_project = button("view-sidebar-symbolic", "Show or hide project panel");
     {
@@ -1881,6 +1914,10 @@ fn open_with_config_and_exit(
     for button in &connected_controls {
         button.set_sensitive(false);
     }
+    // The poll owns the store until this workbench closes; Drop flushes the
+    // last pending data-only state even for embedded editors.
+    let mut workspace_focus_pending = Some(workspace.focus);
+    let mut workspace_height_pending = workspace.output_height;
     let poll_editor = editor.clone();
     let embedded_poll = embedded.clone();
     glib::timeout_add_local(Duration::from_millis(100), move || {
@@ -1898,6 +1935,68 @@ fn open_with_config_and_exit(
         let snapshot = session.snapshot();
         let connected = snapshot.connected && !child_finished.get();
         let ready = editor_state_ready(&snapshot) && !child_finished.get();
+        if ready {
+            if let Some(height) = workspace_height_pending.take() {
+                editor_split.set_position((editor_split.height() - i32::from(height)).max(80));
+            }
+            if let Some(focus) = workspace_focus_pending.take() {
+                use jterm_core::vim9::Vim9WorkbenchFocus;
+                match focus {
+                    Vim9WorkbenchFocus::Search if tools.is_visible() => {
+                        search.grab_focus();
+                    }
+                    Vim9WorkbenchFocus::Build if build_bar.is_visible() => {
+                        build_command.grab_focus();
+                    }
+                    Vim9WorkbenchFocus::Files if files_section.is_visible() => {
+                        files.grab_focus();
+                    }
+                    Vim9WorkbenchFocus::Output if output_box.is_visible() => {
+                        restore_workspace_output_focus(
+                            &output_stack,
+                            &build_output,
+                            &problems,
+                            &poll_editor,
+                        );
+                    }
+                    _ => {
+                        poll_editor.grab_focus();
+                    }
+                }
+            }
+            let focus = gtk::prelude::GtkWindowExt::focus(&window);
+            let contains = |widget: &gtk::Widget| {
+                focus
+                    .as_ref()
+                    .is_some_and(|focused| focused == widget || focused.is_ancestor(widget))
+            };
+            use jterm_core::vim9::{Vim9WorkbenchFocus, Vim9WorkspaceState};
+            let focus = if contains(search.upcast_ref()) {
+                Vim9WorkbenchFocus::Search
+            } else if contains(build_command.upcast_ref()) {
+                Vim9WorkbenchFocus::Build
+            } else if contains(files_section.upcast_ref()) {
+                Vim9WorkbenchFocus::Files
+            } else if contains(output_box.upcast_ref()) {
+                Vim9WorkbenchFocus::Output
+            } else {
+                Vim9WorkbenchFocus::Editor
+            };
+            workspace_store.borrow_mut().remember(Vim9WorkspaceState {
+                search_query: search.text().into(),
+                search_options: search_options.options(),
+                files_visible: files_section.is_visible(),
+                tools_visible: tools.is_visible(),
+                output_visible: output_box.is_visible(),
+                output_tab: output_stack.visible_child_name().as_deref() == Some("output"),
+                project_width: u16::try_from(main_split.position()).ok(),
+                output_height: u16::try_from(output_box.height())
+                    .ok()
+                    .filter(|height| *height > 0),
+                focus,
+            });
+        }
+
         for button in &connected_controls {
             button.set_sensitive(ready);
         }
