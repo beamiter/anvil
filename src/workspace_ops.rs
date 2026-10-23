@@ -797,6 +797,13 @@ impl AppModel {
             }
             self.agent_session_tabs.remove(&key);
         }
+        let launch = match launch.resolve_for_spawn() {
+            Ok(launch) => launch,
+            Err(error) => {
+                self.show_toast(error);
+                return;
+            }
+        };
         let mut argv = vec![launch.program];
         argv.extend(launch.args);
         if let Some((_, pane_id)) = self.add_tab_full_inner(

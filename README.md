@@ -1601,3 +1601,7 @@ builds unpack the deterministic `packaging/jterm-core-src.tar.gz` snapshot
 beside this application. After shared-core changes, refresh it with
 `scripts/package-shared-core.sh`; its companion SHA-256 file records the exact
 packaged source. Targets and Git internals are excluded.
+
+Resume resolves the CLI executable and its runtime when activated, including
+Node installations managed by NVM when a desktop launcher supplies a minimal
+`PATH`. The resolved runtime search path applies only to the new CLI process.
