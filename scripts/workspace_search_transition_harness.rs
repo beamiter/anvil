@@ -76,6 +76,31 @@ mod gtk {
         }
     }
 }
+// The native editor owns its asynchronous close confirmation. Model that
+// external boundary while executing the unchanged workspace methods below.
+mod vim9_ide {
+    use super::gtk;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static OPEN: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+        static REQUESTED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub fn configure(open: &[u64]) {
+        OPEN.with_borrow_mut(|widgets| *widgets = open.to_vec());
+        REQUESTED.with_borrow_mut(Vec::clear);
+    }
+
+    pub fn request_embedded_close(widget: &gtk::Widget) -> bool {
+        REQUESTED.with_borrow_mut(|widgets| widgets.push(widget.0));
+        OPEN.with_borrow(|widgets| widgets.contains(&widget.0))
+    }
+
+    pub fn requested() -> Vec<u64> {
+        REQUESTED.with_borrow(Clone::clone)
+    }
+}
 struct Pane {
     id: u64,
     terminal: Terminal,
@@ -167,6 +192,7 @@ impl AppModel {
     }
 }
 fn model() -> (AppModel, Events) {
+    vim9_ide::configure(&[]);
     let events = Events::default();
     let panes = (1..=3)
         .map(|id| Pane {
@@ -245,6 +271,19 @@ fn closing_inactive_split_does_not_clear_search() {
     let (mut m, e) = model();
     m.close_pane(2, &ComponentSender(PhantomData));
     assert_eq!(*e.borrow(), vec![Event::Terminal(1, VteInput::GrabFocus)]);
+}
+#[test]
+fn embedded_editor_close_preserves_pane_and_search_until_confirmation() {
+    let (mut m, e) = model();
+    m.pending_split_spawns.insert(1, (10, 1));
+    vim9_ide::configure(&[1]);
+    m.close_pane(1, &ComponentSender(PhantomData));
+    assert_eq!(vim9_ide::requested(), vec![1]);
+    assert_eq!(m.active_pane_id(), Some(1));
+    assert_eq!(m.tabs[0].panes.len(), 3);
+    assert_eq!(m.pending_split_spawns.get(&1), Some(&(10, 1)));
+    assert_eq!(m.tabs[0].panes[0].terminal.draft, "draft 1");
+    assert!(e.borrow().is_empty());
 }
 #[test]
 fn failed_detachment_restores_original_search() {
@@ -327,6 +366,16 @@ fn closing_selected_first_tab_clears_destroyed_owner_and_replays_once() {
     );
 }
 #[test]
+fn embedded_editor_close_preserves_tab_and_search_until_confirmation() {
+    let (mut m, e) = tabs_model();
+    vim9_ide::configure(&[10]);
+    m.close_tab(10, &ComponentSender(PhantomData));
+    assert_eq!(vim9_ide::requested(), vec![10]);
+    assert_eq!(m.active_pane_id(), Some(11));
+    assert_eq!(m.tabs.len(), 3);
+    assert!(e.borrow().is_empty());
+}
+#[test]
 fn closing_selected_last_tab_uses_previous_pane_identity() {
     let (mut m, e) = tabs_model();
     m.active = 2;
@@ -365,6 +414,16 @@ fn batch_selected_close_replays_only_once_after_all_removals() {
             Event::Replay
         ]
     );
+}
+#[test]
+fn batch_close_requests_each_selected_editor_before_any_workspace_mutation() {
+    let (mut m, e) = tabs_model();
+    vim9_ide::configure(&[10, 20]);
+    m.close_tabs(vec![10, 20, 99], &ComponentSender(PhantomData));
+    assert_eq!(vim9_ide::requested(), vec![10, 20]);
+    assert_eq!(m.active_pane_id(), Some(11));
+    assert_eq!(m.tabs.len(), 3);
+    assert!(e.borrow().is_empty());
 }
 #[test]
 fn batch_background_close_does_not_replay_or_grab_focus() {

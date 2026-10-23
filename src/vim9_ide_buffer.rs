@@ -2816,10 +2816,18 @@ mod tests {
             pixels
         };
         let full = render(20.0);
-        assert!(full.chunks_exact(4).any(|pixel| pixel[..3] != [0, 0, 0]));
+        assert!(full
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[..3] != [0, 0, 0]));
         let cropped = render(10.0);
         assert!(
-            cropped.chunks_exact(4).all(|pixel| pixel[..3] == [0, 0, 0]),
+            cropped
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| pixel[..3] == [0, 0, 0]),
             "clipping the bottom half must hide, not reposition, the underline"
         );
     }
@@ -2952,9 +2960,8 @@ mod tests {
             if pixel_path {
                 paint_pixel_scene(&surface, &snapshot, &state, &frame, &mut layouts);
             } else {
-                snapshot.append_node(
-                    &build_text_scene(&surface, &state, &frame, &mut layouts).unwrap(),
-                );
+                snapshot
+                    .append_node(build_text_scene(&surface, &state, &frame, &mut layouts).unwrap());
             }
             let mut image =
                 gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 40, 10).unwrap();
@@ -4299,11 +4306,9 @@ mod tests {
         assert_eq!(frame.runs[1].byte_start, 4);
         assert_eq!(frame.runs[1].byte_end, 9);
         assert_eq!(frame.runs[1].text, "value");
-        assert!(
-            frame.runs[2..]
-                .iter()
-                .all(|run| { run.line == 0 && run.byte_start == 0 && run.byte_end == 0 })
-        );
+        assert!(frame.runs[2..]
+            .iter()
+            .all(|run| { run.line == 0 && run.byte_start == 0 && run.byte_end == 0 }));
         assert!(count_color(&labeled, 32, 56, 0x563412) > 0);
         assert!(count_color(&labeled, 56, 96, 0x384858) > 0);
         assert_eq!(pixel(&labeled, 130, 10), pixel(&baseline, 130, 10));

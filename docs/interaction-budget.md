@@ -646,3 +646,38 @@ separator geometry still requires the hosted short gate. This review permits
 the existing short 1/8/32-total paired pixel/control scenarios only. Source
 review is not a successful native result, a Vim GUI acceptance result, a
 physical-scanout measurement or permission for the full performance matrix.
+
+### Inline Vim successor source review (2026-10-22)
+
+The next single-parent successor is reviewed against publication head
+`5a5c465db6fedbe6b5f79f7faff7f2d8941f9a58`. The workflow advances its fixed
+parent pin to that reviewed head; it does not discover or accept a parent at
+runtime. The historical baseline remains
+`88c3f4c565cb5b9f8d47d22eb3ad07f47a822ae4`, and another parent change still
+requires a new source review.
+
+The reviewed range from `2fb6d7edb8310c47e47535acd496b619562b41f1` contains
+33 commits and 30 changed files. The interaction scripts, observer patch and
+probe, PTY fixture, pixel validators and process-cleanup implementation are
+unchanged across those endpoints. The disposable observer applies cleanly to
+the reviewed target, and recording complete original and observed source
+identities succeeds. The combined observer identity remains
+`eac561f4c56d15c6038ceee148c0bb2bba24280b95c7d8144f9d288c8dffd26b`.
+
+The production changes include native Vim rendering, shared-core updates and
+shell-to-GUI routing. The collector still launches ordinary Block mode with its
+fixture executable, without `--ide`, and the shell shim excludes that fixture.
+Editor keyboard, wheel and close interception requires an actual embedded
+editor. However, the application now installs a 100 ms shell-request poller,
+and the resolved default for the ASCII organism is enabled. These changes are
+not assumed to be idle-cost or pixel-neutral; the existing paired short gate
+must measure the resulting candidate.
+
+Candidate/event identity, exact single-parent equality, byte-identical overlays,
+complete source hashes, separate fresh locked builds, actual compiler and binary
+identities, rejection of identical binaries, clean original checkouts, the
+existing pixel thresholds and owned-process cleanup remain required. This source
+review permits only the existing short 1/8/32-total correctness/control scenarios.
+Local preparation and provenance validation do not establish a successful hosted
+pixel result, a Vim GUI acceptance result or the full 1200-second performance
+matrix.

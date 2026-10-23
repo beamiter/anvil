@@ -1135,7 +1135,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
         window
             .renderer()
             .unwrap()
-            .render_texture(&snapshot.to_node().unwrap(), None)
+            .render_texture(snapshot.to_node().unwrap(), None)
             .save_to_png(PathBuf::from(path).with_extension("palette.png"))
             .unwrap();
     }
@@ -2025,7 +2025,9 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
         let mut pixels = vec![0; stride * texture.height() as usize];
         texture.download(&mut pixels, stride);
         let positions: Vec<_> = pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .enumerate()
             .filter(|(_, p)| {
                 (u32::from(p[2]) << 16 | u32::from(p[1]) << 8 | u32::from(p[0])) == target
