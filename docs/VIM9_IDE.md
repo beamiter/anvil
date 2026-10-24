@@ -15,6 +15,27 @@ available. The same context appears in the optional native status bar. No
 extra panel is enabled, and the native buffer retains all space when the
 picker is closed. Context collection does not start Git, LSP, or remote jobs.
 
+The picker now provides **Git**, **Code**, **Tree**, **Plugins**, and **Status**
+filters. Each button shows the corresponding live cached state on hover;
+selecting it keeps focus in the search field and displays a detailed summary.
+The filters can also be typed directly:
+
+| Filter | Available workflows |
+| --- | --- |
+| `>simplegit` | Status, diff, hunk preview/navigation/staging/confirmed undo, blame and history |
+| `>simplecc` | Language actions, diagnostics, language-service status/restart/log |
+| `>simpletree` | Toggle, reveal and refresh the project tree |
+| `>simpleplug` | Plugin status, update checks, install/update/stop, change review, startup profile and health |
+| `>simpleline` or `>simplestatusbar` | Statusline health and visibility |
+
+A filter chooses a category; a command runs only after selecting a result.
+Unavailable commands retain their explanation. Switching filters clears old
+selection/activation state, and every editor action is resolved against the
+current source buffer, window, changedtick and cursor. Plugin progress, LSP
+state, tree context and statusline state refresh from the Vim configuration's
+published caches. The normal minimal editor layout is unchanged when the
+picker closes.
+
 Vim and the Simple plugins continue to own the action's editing behavior and
 popups. Ordinary supported completion menus use the native paint path; other
 plugin popups and preview views can still use the live compatibility display.

@@ -228,6 +228,9 @@ pub(super) struct QuickOpen {
     refresh: gtk::Button,
     help: gtk::Label,
     query: gtk::SearchEntry,
+    section_filters: gtk::FlowBox,
+    section_buttons: RefCell<Vec<(String, gtk::Button)>>,
+    section_detail: gtk::Label,
     list: gtk::ListBox,
     feedback: gtk::Label,
     targets: RefCell<Vec<QuickOpenTarget>>,
@@ -271,6 +274,24 @@ impl QuickOpen {
         query.set_margin_start(12);
         query.set_margin_end(12);
         content.append(&query);
+        let section_filters = gtk::FlowBox::new();
+        section_filters.set_selection_mode(gtk::SelectionMode::None);
+        section_filters.set_homogeneous(true);
+        section_filters.set_min_children_per_line(1);
+        section_filters.set_max_children_per_line(5);
+        section_filters.set_row_spacing(4);
+        section_filters.set_column_spacing(4);
+        section_filters.set_margin_start(12);
+        section_filters.set_margin_end(12);
+        section_filters.set_visible(false);
+        content.append(&section_filters);
+        let section_detail = label("");
+        section_detail.set_wrap(true);
+        section_detail.add_css_class("caption");
+        section_detail.set_margin_start(12);
+        section_detail.set_margin_end(12);
+        section_detail.set_visible(false);
+        content.append(&section_detail);
         let feedback = label("Indexing project files…");
         feedback.set_margin_start(12);
         feedback.set_margin_end(12);
@@ -295,6 +316,9 @@ impl QuickOpen {
             refresh,
             help,
             query,
+            section_filters,
+            section_buttons: RefCell::new(Vec::new()),
+            section_detail,
             list,
             feedback,
             targets: RefCell::new(Vec::new()),
@@ -408,6 +432,7 @@ impl QuickOpen {
             self.activation_error.borrow_mut().take();
         }
         let editor = self.session.snapshot();
+        self.sync_sections(&query, &editor);
         if let Some(command_query) = vim9_palette_query(&query) {
             self.sync_commands(&query, command_query, &editor);
         } else {
@@ -426,6 +451,54 @@ impl QuickOpen {
         } else {
             format!("{kind} · {}", visible(&context))
         });
+    }
+
+    fn sync_sections(&self, query: &str, editor: &Vim9Snapshot) {
+        let sections = editor.workbench.sections();
+        let mut buttons = self.section_buttons.borrow_mut();
+        if buttons.len() != sections.len()
+            || buttons
+                .iter()
+                .zip(&sections)
+                .any(|((query, _), section)| query != section.query)
+        {
+            while let Some(child) = self.section_filters.first_child() {
+                self.section_filters.remove(&child);
+            }
+            buttons.clear();
+            for section in &sections {
+                let button = gtk::Button::with_label(section.title);
+                button.set_widget_name(&format!(
+                    "vim9-section-{}",
+                    section.title.to_ascii_lowercase()
+                ));
+                let query = self.query.clone();
+                let filter = section.query.to_owned();
+                button.connect_clicked(move |_| {
+                    // This only chooses a filter. Enter or an explicit result
+                    // click still resolves against the live editor snapshot.
+                    query.set_text(&filter);
+                    query.grab_focus();
+                });
+                self.section_filters.insert(&button, -1);
+                buttons.push((section.query.to_owned(), button));
+            }
+        }
+        let mut detail = None;
+        for ((_, button), section) in buttons.iter().zip(&sections) {
+            button.set_tooltip_text(Some(&visible(&section.summary)));
+            let active = section.matches_query(query);
+            if active {
+                button.add_css_class("suggested-action");
+                detail = Some(format!("{} · {}", section.title, visible(&section.summary)));
+            } else {
+                button.remove_css_class("suggested-action");
+            }
+        }
+        self.section_filters.set_visible(!sections.is_empty());
+        self.section_detail.set_visible(detail.is_some());
+        self.section_detail
+            .set_label(detail.as_deref().unwrap_or(""));
     }
 
     fn sync_commands(&self, query: &str, command_query: &str, editor: &Vim9Snapshot) {

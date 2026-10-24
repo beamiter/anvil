@@ -971,10 +971,11 @@ fn native_vim9_command_palette_modes_and_live_availability() {
     };
     let (picker, query, _) = open_picker();
     assert_eq!(picker.title(), "Quick open project file");
-    query.set_text(">");
+    query.set_text(">save current buffer");
     query.emit_activate();
     // Immediate Enter uses command mode without waiting for the file index
-    // or SearchEntry debounce. Save on this unchanged fixture is harmless.
+    // or SearchEntry debounce. Name the harmless action explicitly because
+    // command recency can legitimately change the unfiltered first result.
     wait_for(widget, "palette save returns focus", || {
         native_window.visible_dialog().is_none() && editor.has_focus()
     });
@@ -1107,13 +1108,54 @@ fn native_vim9_command_palette_modes_and_live_availability() {
             && contains(&picker, "palette-main ↑1")
             && contains(&picker, "W2")
     });
+    let section_button = |name: &str| {
+        descendants::<gtk::Button>(picker.upcast_ref())
+            .into_iter()
+            .find(|button| button.widget_name() == name)
+            .unwrap()
+    };
+    section_button("vim9-section-plugins").emit_clicked();
+    wait_for(
+        widget,
+        "Plugins category filters the current picker",
+        || query.text() == ">simpleplug" && contains(&picker, "Plugins"),
+    );
+    assert!(
+        !action_output.exists(),
+        "choosing a category must not run a command"
+    );
+    assert!(navigation::native_text_has_focus(&native_window));
+    section_button("vim9-section-git").emit_clicked();
+    wait_for(
+        widget,
+        "Git category shows cached context and typed actions",
+        || query.text() == ">simplegit" && contains(&picker, "Simple: Show Git status"),
+    );
+    assert!(!action_output.exists());
+    if let Some(path) = std::env::var_os("JTERM_VIM9_PALETTE_SCREENSHOT") {
+        let clock = window.frame_clock().expect("mapped palette frame clock");
+        let frame = clock.frame_counter();
+        window.queue_draw();
+        wait_for(widget, "Simple palette paint", || {
+            clock.frame_counter() > frame
+        });
+        gtk::prelude::WidgetExt::display(&window).flush();
+        let captured = std::process::Command::new("import")
+            .arg("-window")
+            .arg("root")
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(captured.success(), "native Simple palette screenshot");
+    }
+    query.set_text(">simplegit status");
     editor.feed_child(b":let g:vim9_simple_branch = 'palette-next'\r");
     wait_for(
         widget,
         "Simple context refresh without query change",
         || contains(&picker, "palette-next ↑1") && !contains(&picker, "palette-main"),
     );
-    assert_eq!(query.text(), ">simple git status");
+    assert_eq!(query.text(), ">simplegit status");
     query.emit_activate();
     wait_for(widget, "Simple typed action returns to Vim", || {
         native_window.visible_dialog().is_none()
