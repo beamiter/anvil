@@ -11,7 +11,7 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 # Shared family source; Nix stages the deterministic packaging source snapshot.
-jterm_core = { path = "../jterm_core" }
+jterm_core = { version = "0.2.0", path = "../jterm_core" }
 relm4 = { version = "0.11", features = ["libadwaita", "gnome_46"] }
 vte4 = { version = "0.10.0", features = ["v0_76"] }
 log = { version = "0.4", features = ["std"] }
@@ -41,7 +41,7 @@ io-lifetimes = "3"
 env_logger = "0.11"
 
 [dev-dependencies]
-jterm_core = { path = "../jterm_core", features = ["session-parity-tests"] }
+jterm_core = { version = "0.2.0", path = "../jterm_core", features = ["session-parity-tests"] }
 
 [profile.dev]
 opt-level = 1
