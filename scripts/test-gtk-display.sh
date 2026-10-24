@@ -77,6 +77,7 @@ tests=(
     dialogs::tasks_panel::tests::dashboard_filter_counts_follow_search_not_selected_view
     dialogs::tasks_panel::tests::task_terminal_buttons_only_emit_focus_for_existing_bindings
     dialogs::tasks_panel::tests::task_reason_updates_and_disappears_without_retargeting
+    dialogs::tasks_panel::control_tests::task_control_center_preserves_search_action_identity_and_rejected_drafts
     dialogs::tasks_panel::stream_tests::stream_paging_preserves_current_and_copies_only_visible_history
     dialogs::tasks_panel::keyed_tests::keyed_rows_update_only_changed_widgets_and_prune_archives
     dialogs::tasks_panel::keyed_tests::keyed_selected_row_survives_move_hide_and_reveal
