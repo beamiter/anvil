@@ -22,7 +22,7 @@ use crate::agent_task::{ApprovalId, CodexAppServerApproval, TaskId};
 use crate::agent_task_ui::{
     approval_summary, native_follow_up_can_send, plan_list_refresh, render_stream_history,
     render_stream_status, render_stream_text, row_status_line, stream_history_index, task_reason,
-    TaskPanelAction, TaskRowSnapshot,
+    FollowUpReceipts, TaskFollowUpRequest, TaskPanelAction, TaskRowSnapshot,
 };
 
 /// Counts describe current search matches before the selected quick view.
@@ -89,6 +89,8 @@ pub(crate) struct TaskDetailSync {
     pub(crate) status_line: String,
     pub(crate) branch: String,
     pub(crate) inspector: String,
+    pub(crate) guidance: crate::agent_task::TaskGuidance,
+    pub(crate) validation_status: crate::agent_task::TaskValidationStatus,
     pub(crate) native_label: String,
     pub(crate) manual_review: bool,
     pub(crate) can_accept_review: bool,
@@ -135,6 +137,42 @@ pub(crate) enum ActionKind {
     Archive,
 }
 
+/// Choose a visible next operation only from the adapter's runtime gates.
+/// Guidance text never grants permission or approves a pending request.
+fn primary_task_action(detail: &TaskDetailSync) -> Option<(ActionKind, String)> {
+    let (kind, label) = if !detail.approvals.is_empty() {
+        return None;
+    } else if detail.can_finish {
+        (ActionKind::FinishCodex, "Finish session")
+    } else if detail.can_focus_validation
+        && (detail.validation_status.needs_attention()
+            || detail.validation_status == crate::agent_task::TaskValidationStatus::Running)
+    {
+        (ActionKind::FocusValidation, "Open validation output")
+    } else if detail.can_complete {
+        (ActionKind::Complete, "Mark complete")
+    } else if detail.can_accept_review {
+        (ActionKind::ReviewDiff, "Review changes")
+    } else if detail.can_run_validation {
+        (ActionKind::RunValidation, "Run validation")
+    } else if detail.can_start_native {
+        return Some((ActionKind::StartNative, detail.native_label.clone()));
+    } else if detail.can_start_terminal {
+        (ActionKind::StartTerminal, "Start terminal")
+    } else if detail.can_stop {
+        return detail
+            .can_focus_terminal
+            .then(|| (ActionKind::FocusTerminal, "Open agent terminal".into()));
+    } else if detail.can_focus_validation {
+        (ActionKind::FocusValidation, "Open validation output")
+    } else if detail.can_focus_terminal {
+        (ActionKind::FocusTerminal, "Open agent terminal")
+    } else {
+        (ActionKind::ReviewDiff, "Review changes")
+    };
+    Some((kind, label.to_string()))
+}
+
 const ACTION_KINDS: [(ActionKind, &str); 11] = [
     (ActionKind::StartNative, "Start provider"),
     (ActionKind::StartTerminal, "Start terminal"),
@@ -156,6 +194,7 @@ pub(crate) enum TasksPanelMsg {
     OpenDashboardResult,
     ClearDashboardFilters,
     DashboardView(crate::agent_task::DashboardView),
+    AttentionFilter(Option<crate::agent_task::DashboardAttentionKind>),
     DashboardSort(crate::agent_task::DashboardSort),
     ProviderFilter(Option<crate::agent_task::AgentProvider>),
     ProjectFilter(Option<std::path::PathBuf>),
@@ -164,8 +203,9 @@ pub(crate) enum TasksPanelMsg {
     /// Stable identity captured when the row gesture occurs. A later filter
     /// change may hide it, but must never retarget a queued gesture.
     SelectRow(TaskId),
-    FollowUpChanged(String),
-    SendFollowUp,
+    FollowUpChanged(TaskId, String),
+    SendFollowUp(TaskId),
+    FollowUpResolved(TaskFollowUpRequest, Result<(), String>),
     Create,
     ComposeProject,
     Act(TaskId, ActionKind),
@@ -294,6 +334,8 @@ pub(crate) struct TasksPanelModel {
     unfiltered_sync: TasksPanelSync,
     dashboard_query: String,
     dashboard_view: crate::agent_task::DashboardView,
+    attention_kind: Option<crate::agent_task::DashboardAttentionKind>,
+    attention_counts: Vec<usize>,
     dashboard_sort: crate::agent_task::DashboardSort,
     dashboard_sort_guard: Rc<Cell<bool>>,
     filters: TaskFilters,
@@ -304,9 +346,12 @@ pub(crate) struct TasksPanelModel {
     /// Per-task follow-up drafts; the app never sees keystrokes, only the
     /// final text carried by `TaskPanelAction::FollowUp`.
     follow_up_drafts: HashMap<TaskId, String>,
+    follow_up_receipts: FollowUpReceipts,
+    follow_up_guard: Rc<Cell<bool>>,
     action_buttons: Vec<(ActionKind, gtk::Button)>,
     /// Task shown by the action buttons, captured before queuing a click.
     action_target: Rc<Cell<Option<TaskId>>>,
+    primary_target: Rc<Cell<Option<(TaskId, ActionKind)>>>,
     /// Render cache: what the list and approval widgets currently show.
     /// Refresh diffs each pushed Sync against it and touches GTK only on
     /// real change, so an unchanged Sync is a pure no-op — no widget churn,
@@ -330,12 +375,37 @@ pub(crate) struct TasksPanelModel {
 impl TasksPanelModel {
     fn apply_dashboard_filters(&mut self) {
         let mut sync = self.unfiltered_sync.clone();
+        let attention_scope = TaskFilters {
+            status: None,
+            ..self.filters.clone()
+        }
+        .project(
+            &sync.dashboard,
+            &sync.workspaces,
+            &self.dashboard_query,
+            crate::agent_task::DashboardView::All,
+        );
+        self.attention_counts = crate::agent_task::DashboardAttentionKind::ALL
+            .iter()
+            .map(|kind| {
+                attention_scope
+                    .rows
+                    .iter()
+                    .filter(|row| row.attention_kind() == Some(*kind))
+                    .count()
+            })
+            .collect();
         let mut dashboard = self.filters.project(
             &sync.dashboard,
             &sync.workspaces,
             &self.dashboard_query,
             self.dashboard_view,
         );
+        if let Some(kind) = self.attention_kind {
+            dashboard
+                .rows
+                .retain(|row| row.attention_kind() == Some(kind));
+        }
         dashboard.sort_rows(self.dashboard_sort);
         let mut by_id: HashMap<_, _> = sync.rows.into_iter().map(|row| (row.id, row)).collect();
         sync.rows = dashboard
@@ -584,50 +654,86 @@ impl Component for TasksPanelModel {
 
             #[name(dashboard_query_entry)]
             gtk::Entry {
-                set_placeholder_text: Some("Search tasks, providers or repositories · Enter to open"),
-                set_max_length: 256,
+                set_placeholder_text: Some("Search tasks · provider:codex status:review"),
+                set_max_length: 4096,
                 update_property: &[gtk::accessible::Property::Label("Search agent tasks")],
                 connect_changed[sender] => move |entry| {
                     sender.input(TasksPanelMsg::DashboardQuery(entry.text().to_string()));
                 },
                 connect_activate => TasksPanelMsg::OpenDashboardResult,
             },
-            gtk::Box {
-                set_orientation: gtk::Orientation::Vertical,
-                set_spacing: 4,
-                #[name(provider_filter)]
-                gtk::DropDown {
-                    set_model: Some(&gtk::StringList::new(&std::iter::once("All providers").chain(crate::agent_task::AgentProvider::ALL.iter().map(|provider| provider.display_name())).collect::<Vec<_>>())),
-                    update_property: &[gtk::accessible::Property::Label("Task provider filter")],
-                    connect_selected_notify[sender, guard = model.dashboard_sort_guard.clone()] => move |dropdown| {
-                        if !guard.get() {
-                            let provider = dropdown.selected().checked_sub(1).and_then(|index| crate::agent_task::AgentProvider::ALL.get(index as usize).copied());
-                            sender.input(TasksPanelMsg::ProviderFilter(provider));
-                        }
+            #[name(dashboard_query_error)]
+            gtk::Label {
+                set_xalign: 0.0,
+                set_wrap: true,
+                set_visible: false,
+                add_css_class: "error",
+                add_css_class: "caption",
+            },
+            gtk::Expander {
+                set_label: Some("Search syntax"),
+                gtk::Label {
+                    set_label: "Words combine with AND. Quote phrases and use - to exclude.\nprovider:codex status:working,review\nattention:approval validation:failed\nproject:repo branch:feature -runtime:terminal\nOther fields: id:, is:. Filters and views stay active.",
+                    set_xalign: 0.0,
+                    set_wrap: true,
+                    set_selectable: true,
+                    set_max_width_chars: 36,
+                    add_css_class: "caption",
+                    set_margin_all: 6,
+                },
+            },
+            #[name(scope_filters)]
+            gtk::Expander {
+                set_label: Some("Provider, project and state"),
+                gtk::Box {
+                    set_orientation: gtk::Orientation::Vertical,
+                    set_spacing: 4,
+                    #[name(provider_filter)]
+                    gtk::DropDown {
+                        set_model: Some(&gtk::StringList::new(&std::iter::once("All providers").chain(crate::agent_task::AgentProvider::ALL.iter().map(|provider| provider.display_name())).collect::<Vec<_>>())),
+                        update_property: &[gtk::accessible::Property::Label("Task provider filter")],
+                        connect_selected_notify[sender, guard = model.dashboard_sort_guard.clone()] => move |dropdown| {
+                            if !guard.get() {
+                                let provider = dropdown.selected().checked_sub(1).and_then(|index| crate::agent_task::AgentProvider::ALL.get(index as usize).copied());
+                                sender.input(TasksPanelMsg::ProviderFilter(provider));
+                            }
+                        },
+                    },
+                    #[name(workspace_filter)]
+                    gtk::DropDown {
+                        set_model: Some(&gtk::StringList::new(&["All projects"])),
+                        set_enable_search: true,
+                        update_property: &[gtk::accessible::Property::Label("Task project filter")],
+                        connect_selected_notify[sender, guard = model.dashboard_sort_guard.clone(), paths = model.workspace_choices.clone()] => move |dropdown| {
+                            if !guard.get() {
+                                let project = dropdown.selected().checked_sub(1).and_then(|index| paths.borrow().get(index as usize).cloned());
+                                sender.input(TasksPanelMsg::ProjectFilter(project));
+                            }
+                        },
+                    },
+                    #[name(status_filter)]
+                    gtk::DropDown {
+                        set_model: Some(&gtk::StringList::new(&std::iter::once("All states").chain(STATES.iter().map(|status| status.label())).collect::<Vec<_>>())),
+                        update_property: &[gtk::accessible::Property::Label("Task state filter")],
+                        connect_selected_notify[sender, guard = model.dashboard_sort_guard.clone()] => move |dropdown| {
+                            if !guard.get() {
+                                let status = dropdown.selected().checked_sub(1).and_then(|index| STATES.get(index as usize).copied());
+                                sender.input(TasksPanelMsg::StatusFilter(status));
+                            }
+                        },
                     },
                 },
-                #[name(workspace_filter)]
-                gtk::DropDown {
-                    set_model: Some(&gtk::StringList::new(&["All projects"])),
-                    set_enable_search: true,
-                    update_property: &[gtk::accessible::Property::Label("Task project filter")],
-                    connect_selected_notify[sender, guard = model.dashboard_sort_guard.clone(), paths = model.workspace_choices.clone()] => move |dropdown| {
-                        if !guard.get() {
-                            let project = dropdown.selected().checked_sub(1).and_then(|index| paths.borrow().get(index as usize).cloned());
-                            sender.input(TasksPanelMsg::ProjectFilter(project));
-                        }
-                    },
-                },
-                #[name(status_filter)]
-                gtk::DropDown {
-                    set_model: Some(&gtk::StringList::new(&std::iter::once("All states").chain(STATES.iter().map(|status| status.label())).collect::<Vec<_>>())),
-                    update_property: &[gtk::accessible::Property::Label("Task state filter")],
-                    connect_selected_notify[sender, guard = model.dashboard_sort_guard.clone()] => move |dropdown| {
-                        if !guard.get() {
-                            let status = dropdown.selected().checked_sub(1).and_then(|index| STATES.get(index as usize).copied());
-                            sender.input(TasksPanelMsg::StatusFilter(status));
-                        }
-                    },
+            },
+            #[name(attention_filter)]
+            gtk::DropDown {
+                set_model: Some(&gtk::StringList::new(&["All attention reasons"])),
+                update_property: &[gtk::accessible::Property::Label("Task attention reason")],
+                set_tooltip_text: Some("Focus approvals, questions, failed validations, review or failed tasks without replacing your search"),
+                connect_selected_notify[sender, guard = model.dashboard_sort_guard.clone()] => move |dropdown| {
+                    if !guard.get() {
+                        let kind = dropdown.selected().checked_sub(1).and_then(|index| crate::agent_task::DashboardAttentionKind::ALL.get(index as usize).copied());
+                        sender.input(TasksPanelMsg::AttentionFilter(kind));
+                    }
                 },
             },
             #[name(dashboard_filters)]
@@ -702,217 +808,277 @@ impl Component for TasksPanelModel {
                 },
 
                 #[wrap(Some)]
-                set_end_child = &gtk::Box {
-                    set_orientation: gtk::Orientation::Vertical,
-                    set_spacing: 4,
-                    set_margin_all: 6,
-
-                    #[name(detail_title)]
-                    gtk::Label {
-                        set_halign: gtk::Align::Start,
-                        set_ellipsize: gtk::pango::EllipsizeMode::End,
-                        add_css_class: "heading",
-                        set_visible: false,
-                    },
-
-                    #[name(detail_status)]
-                    gtk::Label {
-                        set_halign: gtk::Align::Start,
-                        set_ellipsize: gtk::pango::EllipsizeMode::End,
-                        add_css_class: "dim-label",
-                        add_css_class: "caption",
-                        set_visible: false,
-                    },
-
-                    #[name(actions_box)]
-                    gtk::FlowBox {
-                        set_selection_mode: gtk::SelectionMode::None,
-                        set_column_spacing: 4,
-                        set_row_spacing: 4,
-                        set_max_children_per_line: 4,
-                        set_visible: false,
-                    },
-
-                    #[name(approvals_box)]
-                    gtk::Box {
-                        set_orientation: gtk::Orientation::Vertical,
-                        set_spacing: 4,
-                        set_visible: false,
-                    },
-
-                    gtk::Box {
-                        set_orientation: gtk::Orientation::Horizontal,
-                        set_spacing: 0,
-                        set_halign: gtk::Align::Center,
-
-                        #[name(stream_page_button)]
-                        gtk::ToggleButton {
-                            set_label: "Stream",
-                            set_active: true,
-                            add_css_class: "flat",
-                            add_css_class: "caption",
-                        },
-
-                        #[name(inspector_page_button)]
-                        gtk::Button {
-                            set_label: "Details",
-                            add_css_class: "flat",
-                            add_css_class: "caption",
-                            connect_clicked => TasksPanelMsg::ShowPage(INSPECTOR_PAGE),
-                        },
-
-                        #[name(diff_page_button)]
-                        gtk::ToggleButton {
-                            set_label: "Diff",
-                            add_css_class: "flat",
-                            add_css_class: "caption",
-                        },
-                    },
-
-                    #[name(page_stack)]
-                    gtk::Stack {
-                        set_hexpand: true,
-                        set_vexpand: true,
-
-                        add_named[Some(STREAM_PAGE)] = &gtk::Box {
+                set_end_child = &gtk::ScrolledWindow {
+                    set_policy: (gtk::PolicyType::Never, gtk::PolicyType::Automatic),
+                    #[name(detail_viewport)]
+                    gtk::Viewport {
+                        #[wrap(Some)]
+                        set_child = &gtk::Box {
                             set_orientation: gtk::Orientation::Vertical,
                             set_spacing: 4,
-                            #[name(stream_status)]
+                            set_margin_all: 6,
+
+                            #[name(detail_title)]
                             gtk::Label {
                                 set_halign: gtk::Align::Start,
-                                set_wrap: true,
-                                set_lines: 3,
                                 set_ellipsize: gtk::pango::EllipsizeMode::End,
+                                add_css_class: "heading",
+                                set_visible: false,
                             },
-                            gtk::ScrolledWindow {
-                                set_policy: (gtk::PolicyType::Never, gtk::PolicyType::Automatic),
-                                set_vexpand: true,
-                                set_min_content_height: 100,
-                                #[name(stream_view)]
-                                gtk::TextView {
-                                    set_editable: false,
-                                    set_cursor_visible: false,
-                                    set_wrap_mode: gtk::WrapMode::WordChar,
-                                    set_left_margin: 4,
-                                    set_right_margin: 4,
-                                    add_css_class: "ai-explain-body",
-                                },
+
+                            #[name(detail_status)]
+                            gtk::Label {
+                                set_halign: gtk::Align::Start,
+                                set_ellipsize: gtk::pango::EllipsizeMode::End,
+                                add_css_class: "dim-label",
+                                add_css_class: "caption",
+                                set_visible: false,
                             },
+
+                            #[name(next_step_card)]
                             gtk::Box {
+                                set_orientation: gtk::Orientation::Vertical,
                                 set_spacing: 4,
-                                #[name(history_older)]
+                                set_margin_top: 4,
+                                set_margin_bottom: 4,
+                                add_css_class: "card",
+                                set_visible: false,
+                                #[name(next_step_title)]
+                                gtk::Label {
+                                    set_halign: gtk::Align::Start,
+                                    set_margin_start: 8,
+                                    set_margin_end: 8,
+                                    set_margin_top: 6,
+                                    set_wrap: true,
+                                    add_css_class: "heading",
+                                },
+                                #[name(next_step_detail)]
+                                gtk::Label {
+                                    set_xalign: 0.0,
+                                    set_margin_start: 8,
+                                    set_margin_end: 8,
+                                    set_wrap: true,
+                                    set_max_width_chars: 36,
+                                    set_lines: 3,
+                                    set_ellipsize: gtk::pango::EllipsizeMode::End,
+                                    add_css_class: "caption",
+                                },
+                                #[name(next_step_reason)]
+                                gtk::Label {
+                                    set_xalign: 0.0,
+                                    set_margin_start: 8,
+                                    set_margin_end: 8,
+                                    set_wrap: true,
+                                    set_max_width_chars: 36,
+                                    set_lines: 3,
+                                    set_ellipsize: gtk::pango::EllipsizeMode::End,
+                                    add_css_class: "caption",
+                                    add_css_class: "warning",
+                                },
+                                #[name(primary_action)]
                                 gtk::Button {
-                                    set_label: "Older",
+                                    set_halign: gtk::Align::Start,
+                                    set_margin_all: 6,
+                                    add_css_class: "suggested-action",
+                                    update_property: &[gtk::accessible::Property::Label("Recommended task action")],
                                 },
-                                #[name(history_newer)]
+                            },
+
+                            #[name(actions_expander)]
+                            gtk::Expander {
+                                set_label: Some("All task actions"),
+                                set_visible: false,
+                                #[name(actions_box)]
+                                gtk::FlowBox {
+                                    set_selection_mode: gtk::SelectionMode::None,
+                                    set_column_spacing: 4,
+                                    set_row_spacing: 4,
+                                    set_max_children_per_line: 4,
+                                },
+                            },
+
+                            #[name(approvals_box)]
+                            gtk::Box {
+                                set_orientation: gtk::Orientation::Vertical,
+                                set_spacing: 4,
+                                set_visible: false,
+                            },
+
+                            gtk::Box {
+                                set_orientation: gtk::Orientation::Horizontal,
+                                set_spacing: 0,
+                                set_halign: gtk::Align::Center,
+
+                                #[name(stream_page_button)]
+                                gtk::ToggleButton {
+                                    set_label: "Stream",
+                                    set_active: true,
+                                    add_css_class: "flat",
+                                    add_css_class: "caption",
+                                },
+
+                                #[name(inspector_page_button)]
                                 gtk::Button {
-                                    set_label: "Newer",
+                                    set_label: "Details",
+                                    add_css_class: "flat",
+                                    add_css_class: "caption",
+                                    connect_clicked => TasksPanelMsg::ShowPage(INSPECTOR_PAGE),
                                 },
-                                #[name(history_latest)]
-                                gtk::Button {
-                                    set_label: "Latest history",
-                                },
-                            },
-                            gtk::Label {
-                                set_label: "Select and copy visible text in either pane. Select All copies only that pane; updates or paging replace that pane’s selection. Omitted text is not copied.",
-                                set_wrap: true,
-                                add_css_class: "caption",
-                                add_css_class: "dim-label",
-                            },
-                            #[name(history_scroll)]
-                            gtk::ScrolledWindow {
-                                set_policy: (gtk::PolicyType::Never, gtk::PolicyType::Automatic),
-                                set_vexpand: true,
-                                set_min_content_height: 100,
-                                #[name(history_view)]
-                                gtk::TextView {
-                                    set_editable: false,
-                                    set_cursor_visible: false,
-                                    set_wrap_mode: gtk::WrapMode::WordChar,
-                                    set_left_margin: 4,
-                                    set_right_margin: 4,
-                                    add_css_class: "ai-explain-body",
+
+                                #[name(diff_page_button)]
+                                gtk::ToggleButton {
+                                    set_label: "Diff",
+                                    add_css_class: "flat",
+                                    add_css_class: "caption",
                                 },
                             },
-                        },
 
-                        add_named[Some(INSPECTOR_PAGE)] = &gtk::ScrolledWindow {
-                            set_policy: (gtk::PolicyType::Never, gtk::PolicyType::Automatic),
-                            #[name(inspector_view)]
-                            gtk::TextView {
-                                set_editable: false,
-                                set_cursor_visible: false,
-                                set_wrap_mode: gtk::WrapMode::WordChar,
-                                set_left_margin: 6,
-                                set_right_margin: 6,
-                                set_top_margin: 8,
-                                set_bottom_margin: 8,
-                            },
-                        },
-
-                        add_named[Some(DIFF_PAGE)] = &gtk::Box {
-                            set_orientation: gtk::Orientation::Vertical,
-                            set_spacing: 2,
-
-                            #[name(diff_header)]
-                            gtk::Label {
-                                set_halign: gtk::Align::Start,
-                                set_ellipsize: gtk::pango::EllipsizeMode::Middle,
-                                add_css_class: "dim-label",
-                                add_css_class: "caption",
-                            },
-
-                            gtk::Label {
-                                set_halign: gtk::Align::Start,
-                                set_wrap: true,
-                                add_css_class: "warning",
-                                add_css_class: "caption",
-                                set_label: "Repository-controlled paths and content are untrusted; control and bidirectional formatting characters are made visible or replaced.",
-                            },
-
-                            gtk::ScrolledWindow {
+                            #[name(page_stack)]
+                            gtk::Stack {
                                 set_hexpand: true,
                                 set_vexpand: true,
-                                set_policy: (gtk::PolicyType::Automatic, gtk::PolicyType::Automatic),
 
-                                #[name(diff_view)]
-                                gtk::TextView {
-                                    set_editable: false,
-                                    set_cursor_visible: false,
-                                    set_monospace: true,
-                                    set_left_margin: 4,
-                                    set_right_margin: 4,
+                                add_named[Some(STREAM_PAGE)] = &gtk::Box {
+                                    set_orientation: gtk::Orientation::Vertical,
+                                    set_spacing: 4,
+                                    #[name(stream_status)]
+                                    gtk::Label {
+                                        set_halign: gtk::Align::Start,
+                                        set_wrap: true,
+                                        set_lines: 3,
+                                        set_ellipsize: gtk::pango::EllipsizeMode::End,
+                                    },
+                                    gtk::ScrolledWindow {
+                                        set_policy: (gtk::PolicyType::Never, gtk::PolicyType::Automatic),
+                                        set_vexpand: true,
+                                        set_min_content_height: 100,
+                                        #[name(stream_view)]
+                                        gtk::TextView {
+                                            set_editable: false,
+                                            set_cursor_visible: false,
+                                            set_wrap_mode: gtk::WrapMode::WordChar,
+                                            set_left_margin: 4,
+                                            set_right_margin: 4,
+                                            add_css_class: "ai-explain-body",
+                                        },
+                                    },
+                                    gtk::Box {
+                                        set_spacing: 4,
+                                        #[name(history_older)]
+                                        gtk::Button {
+                                            set_label: "Older",
+                                        },
+                                        #[name(history_newer)]
+                                        gtk::Button {
+                                            set_label: "Newer",
+                                        },
+                                        #[name(history_latest)]
+                                        gtk::Button {
+                                            set_label: "Latest history",
+                                        },
+                                    },
+                                    gtk::Label {
+                                        set_label: "Select and copy visible text in either pane. Select All copies only that pane; updates or paging replace that pane’s selection. Omitted text is not copied.",
+                                        set_wrap: true,
+                                        add_css_class: "caption",
+                                        add_css_class: "dim-label",
+                                    },
+                                    #[name(history_scroll)]
+                                    gtk::ScrolledWindow {
+                                        set_policy: (gtk::PolicyType::Never, gtk::PolicyType::Automatic),
+                                        set_vexpand: true,
+                                        set_min_content_height: 100,
+                                        #[name(history_view)]
+                                        gtk::TextView {
+                                            set_editable: false,
+                                            set_cursor_visible: false,
+                                            set_wrap_mode: gtk::WrapMode::WordChar,
+                                            set_left_margin: 4,
+                                            set_right_margin: 4,
+                                            add_css_class: "ai-explain-body",
+                                        },
+                                    },
+                                },
+
+                                add_named[Some(INSPECTOR_PAGE)] = &gtk::ScrolledWindow {
+                                    set_policy: (gtk::PolicyType::Never, gtk::PolicyType::Automatic),
+                                    #[name(inspector_view)]
+                                    gtk::TextView {
+                                        set_editable: false,
+                                        set_cursor_visible: false,
+                                        set_wrap_mode: gtk::WrapMode::WordChar,
+                                        set_left_margin: 6,
+                                        set_right_margin: 6,
+                                        set_top_margin: 8,
+                                        set_bottom_margin: 8,
+                                    },
+                                },
+
+                                add_named[Some(DIFF_PAGE)] = &gtk::Box {
+                                    set_orientation: gtk::Orientation::Vertical,
+                                    set_spacing: 2,
+
+                                    #[name(diff_header)]
+                                    gtk::Label {
+                                        set_halign: gtk::Align::Start,
+                                        set_ellipsize: gtk::pango::EllipsizeMode::Middle,
+                                        add_css_class: "dim-label",
+                                        add_css_class: "caption",
+                                    },
+
+                                    gtk::Label {
+                                        set_halign: gtk::Align::Start,
+                                        set_wrap: true,
+                                        add_css_class: "warning",
+                                        add_css_class: "caption",
+                                        set_label: "Repository-controlled paths and content are untrusted; control and bidirectional formatting characters are made visible or replaced.",
+                                    },
+
+                                    gtk::ScrolledWindow {
+                                        set_hexpand: true,
+                                        set_vexpand: true,
+                                        set_policy: (gtk::PolicyType::Automatic, gtk::PolicyType::Automatic),
+
+                                        #[name(diff_view)]
+                                        gtk::TextView {
+                                            set_editable: false,
+                                            set_cursor_visible: false,
+                                            set_monospace: true,
+                                            set_left_margin: 4,
+                                            set_right_margin: 4,
+                                        },
+                                    },
                                 },
                             },
-                        },
-                    },
 
-                    #[name(follow_up_hint)]
-                    gtk::Label {
-                        set_halign: gtk::Align::Start,
-                        add_css_class: "dim-label",
-                        add_css_class: "caption",
-                        set_ellipsize: gtk::pango::EllipsizeMode::End,
-                        set_visible: false,
-                    },
+                            #[name(follow_up_hint)]
+                            gtk::Label {
+                                set_halign: gtk::Align::Start,
+                                add_css_class: "dim-label",
+                                add_css_class: "caption",
+                                set_ellipsize: gtk::pango::EllipsizeMode::End,
+                                set_visible: false,
+                            },
 
-                    #[name(follow_up_row)]
-                    gtk::Box {
-                        set_orientation: gtk::Orientation::Horizontal,
-                        set_spacing: 4,
-                        set_visible: false,
+                            #[name(follow_up_row)]
+                            gtk::Box {
+                                set_orientation: gtk::Orientation::Horizontal,
+                                set_spacing: 4,
+                                set_visible: false,
 
-                        #[name(follow_up_entry)]
-                        gtk::Entry {
-                            set_hexpand: true,
-                            set_placeholder_text: Some("Follow-up turn for Codex…"),
-                        },
+                                #[name(follow_up_entry)]
+                                gtk::Entry {
+                                    set_hexpand: true,
+                                    set_placeholder_text: Some("Follow-up turn for Codex…"),
+                                },
 
-                        #[name(follow_up_send)]
-                        gtk::Button {
-                            set_icon_name: "go-next-symbolic",
-                            add_css_class: "flat",
-                            set_tooltip_text: Some("Send follow-up turn"),
+                                #[name(follow_up_send)]
+                                gtk::Button {
+                                    set_icon_name: "go-next-symbolic",
+                                    add_css_class: "flat",
+                                    set_tooltip_text: Some("Send follow-up turn"),
+                                },
+                            },
                         },
                     },
                 },
@@ -927,6 +1093,8 @@ impl Component for TasksPanelModel {
     ) -> ComponentParts<Self> {
         let mut action_buttons = Vec::new();
         let action_target = Rc::new(Cell::new(None));
+        let primary_target = Rc::new(Cell::new(None));
+        let follow_up_guard = Rc::new(Cell::new(false));
         let selection_guard = Rc::new(Cell::new(false));
         let selection_ids = Rc::new(RefCell::new(Vec::<TaskId>::new()));
         let page_guard = Rc::new(Cell::new(false));
@@ -935,6 +1103,8 @@ impl Component for TasksPanelModel {
             unfiltered_sync: TasksPanelSync::default(),
             dashboard_query: String::new(),
             dashboard_view: crate::agent_task::DashboardView::All,
+            attention_kind: None,
+            attention_counts: Vec::new(),
             dashboard_sort: crate::agent_task::DashboardSort::default(),
             dashboard_sort_guard: Rc::new(Cell::new(false)),
             filters: TaskFilters::default(),
@@ -943,8 +1113,11 @@ impl Component for TasksPanelModel {
             dashboard_counts: Default::default(),
             dashboard_buttons: Vec::new(),
             follow_up_drafts: HashMap::new(),
+            follow_up_receipts: FollowUpReceipts::default(),
+            follow_up_guard: follow_up_guard.clone(),
             action_buttons: Vec::new(),
             action_target: action_target.clone(),
+            primary_target: primary_target.clone(),
             rendered_rows: Vec::new(),
             row_widgets: HashMap::new(),
             rendered_selected: None,
@@ -997,6 +1170,15 @@ impl Component for TasksPanelModel {
                 }
             });
         }
+        widgets.primary_action.connect_clicked({
+            let sender = sender.clone();
+            let target = primary_target.clone();
+            move |_| {
+                if let Some((id, kind)) = target.get() {
+                    sender.input(TasksPanelMsg::Act(id, kind));
+                }
+            }
+        });
         for (kind, label) in ACTION_KINDS {
             let button = gtk::Button::with_label(label);
             button.add_css_class("caption");
@@ -1075,17 +1257,34 @@ impl Component for TasksPanelModel {
         });
         widgets.follow_up_entry.connect_changed({
             let sender = sender.clone();
+            let target = action_target.clone();
+            let guard = follow_up_guard.clone();
             move |entry| {
-                sender.input(TasksPanelMsg::FollowUpChanged(entry.text().to_string()));
+                if guard.get() {
+                    return;
+                }
+                if let Some(id) = target.get() {
+                    sender.input(TasksPanelMsg::FollowUpChanged(id, entry.text().to_string()));
+                }
             }
         });
         widgets.follow_up_entry.connect_activate({
             let sender = sender.clone();
-            move |_| sender.input(TasksPanelMsg::SendFollowUp)
+            let target = action_target.clone();
+            move |_| {
+                if let Some(id) = target.get() {
+                    sender.input(TasksPanelMsg::SendFollowUp(id));
+                }
+            }
         });
         widgets.follow_up_send.connect_clicked({
             let sender = sender.clone();
-            move |_| sender.input(TasksPanelMsg::SendFollowUp)
+            let target = action_target.clone();
+            move |_| {
+                if let Some(id) = target.get() {
+                    sender.input(TasksPanelMsg::SendFollowUp(id));
+                }
+            }
         });
         widgets.stream_page_button.connect_toggled({
             let sender = sender.clone();
@@ -1175,6 +1374,7 @@ impl Component for TasksPanelModel {
                 self.apply_dashboard_filters();
             }
             TasksPanelMsg::ClearDashboardFilters => {
+                self.attention_kind = None;
                 self.filters = TaskFilters::default();
                 self.dashboard_query.clear();
                 self.dashboard_view = crate::agent_task::DashboardView::All;
@@ -1191,10 +1391,17 @@ impl Component for TasksPanelModel {
                 }
             }
             TasksPanelMsg::DashboardQuery(query) => {
-                self.dashboard_query = query.chars().take(256).collect();
+                self.dashboard_query = query;
+                self.apply_dashboard_filters();
+            }
+            TasksPanelMsg::AttentionFilter(kind) => {
+                self.attention_kind = kind;
+                self.filters.status = None;
+                self.dashboard_view = crate::agent_task::DashboardView::All;
                 self.apply_dashboard_filters();
             }
             TasksPanelMsg::DashboardView(view) => {
+                self.attention_kind = None;
                 self.dashboard_view = view;
                 self.apply_dashboard_filters();
             }
@@ -1211,6 +1418,7 @@ impl Component for TasksPanelModel {
                 self.apply_dashboard_filters();
             }
             TasksPanelMsg::StatusFilter(status) => {
+                self.attention_kind = None;
                 self.filters.status = status;
                 self.apply_dashboard_filters();
             }
@@ -1227,13 +1435,15 @@ impl Component for TasksPanelModel {
                     self.emit_action(TaskPanelAction::Select(id), &sender);
                 }
             }
-            TasksPanelMsg::FollowUpChanged(text) => {
-                if let Some(id) = self.sync.selected {
-                    self.follow_up_drafts.insert(id, text);
-                }
+            TasksPanelMsg::FollowUpChanged(id, text) => {
+                self.follow_up_drafts.insert(id, text);
             }
-            TasksPanelMsg::SendFollowUp => {
-                if let Some(detail) = self.sync.detail.as_deref() {
+            TasksPanelMsg::FollowUpResolved(request, result) => {
+                self.follow_up_receipts
+                    .resolve(&mut self.follow_up_drafts, &request, result);
+            }
+            TasksPanelMsg::SendFollowUp(id) => {
+                if let Some(detail) = self.sync.detail.as_deref().filter(|detail| detail.id == id) {
                     let text = self
                         .follow_up_drafts
                         .get(&detail.id)
@@ -1242,8 +1452,9 @@ impl Component for TasksPanelModel {
                     if native_follow_up_can_send(&text, detail.completed_turns)
                         && detail.can_follow_up
                     {
-                        self.follow_up_drafts.remove(&detail.id);
-                        self.emit_action(TaskPanelAction::FollowUp(detail.id, text), &sender);
+                        if let Some(request) = self.follow_up_receipts.begin(id, text) {
+                            self.emit_action(TaskPanelAction::FollowUp(request), &sender);
+                        }
                     }
                 }
             }
@@ -1356,10 +1567,75 @@ impl TasksPanelModel {
                 .and_then(|status| STATES.iter().position(|candidate| *candidate == status))
                 .map_or(0, |index| index as u32 + 1),
         );
+        let attention_labels = std::iter::once("All attention reasons".to_string())
+            .chain(
+                crate::agent_task::DashboardAttentionKind::ALL
+                    .iter()
+                    .enumerate()
+                    .map(|(index, kind)| {
+                        format!(
+                            "{} · {}",
+                            kind.label(),
+                            self.attention_counts.get(index).copied().unwrap_or(0)
+                        )
+                    }),
+            )
+            .collect::<Vec<_>>();
+        let labels_changed = widgets
+            .attention_filter
+            .model()
+            .and_downcast::<gtk::StringList>()
+            .is_none_or(|list| {
+                list.n_items() as usize != attention_labels.len()
+                    || attention_labels.iter().enumerate().any(|(index, label)| {
+                        list.string(index as u32).as_deref() != Some(label.as_str())
+                    })
+            });
+        if labels_changed {
+            widgets
+                .attention_filter
+                .set_model(Some(&gtk::StringList::new(
+                    &attention_labels
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                )));
+        }
+        widgets.attention_filter.set_selected(
+            self.attention_kind
+                .and_then(|kind| {
+                    crate::agent_task::DashboardAttentionKind::ALL
+                        .iter()
+                        .position(|candidate| *candidate == kind)
+                })
+                .map_or(0, |index| index as u32 + 1),
+        );
         self.dashboard_sort_guard.set(guard);
+        let query_error = crate::agent_task::dashboard_query_error(&self.dashboard_query);
+        widgets
+            .dashboard_query_error
+            .set_visible(query_error.is_some());
+        widgets
+            .dashboard_query_error
+            .set_label(query_error.as_deref().unwrap_or_default());
+        if query_error.is_some() {
+            widgets.dashboard_query_entry.add_css_class("error");
+        } else {
+            widgets.dashboard_query_entry.remove_css_class("error");
+        }
+        let active_scope = usize::from(self.filters.provider.is_some())
+            + usize::from(self.filters.workspace.is_some())
+            + usize::from(self.filters.status.is_some());
+        let scope_label = if active_scope == 0 {
+            "Provider, project and state".to_string()
+        } else {
+            format!("Filters · {active_scope} active")
+        };
+        widgets.scope_filters.set_label(Some(&scope_label));
         widgets.dashboard_summary.set_label(&self.dashboard_summary);
         widgets.dashboard_clear.set_visible(
             self.filters != TaskFilters::default()
+                || self.attention_kind.is_some()
                 || !self.dashboard_query.is_empty()
                 || self.dashboard_view != crate::agent_task::DashboardView::All
                 || self.dashboard_sort != crate::agent_task::DashboardSort::default(),
@@ -1393,7 +1669,7 @@ impl TasksPanelModel {
             if button.label().as_deref() != Some(label.as_str()) {
                 button.set_label(&label);
             }
-            if *view == self.dashboard_view {
+            if *view == self.dashboard_view && self.attention_kind.is_none() {
                 button.add_css_class("suggested-action");
             } else {
                 button.remove_css_class("suggested-action");
@@ -1410,8 +1686,56 @@ impl TasksPanelModel {
             for (_, button) in &self.action_buttons {
                 cancel_task_action_activation(button);
             }
+            cancel_task_action_activation(&widgets.follow_up_send);
+            if let Some(adjustment) = widgets.detail_viewport.vadjustment() {
+                adjustment.set_value(0.0);
+            }
         }
         self.action_target.set(detail.map(|detail| detail.id));
+        let primary = detail.and_then(|detail| {
+            primary_task_action(detail).filter(|(kind, _)| {
+                if *kind != ActionKind::FinishCodex {
+                    return true;
+                }
+                let has_draft = self
+                    .follow_up_drafts
+                    .get(&detail.id)
+                    .is_some_and(|draft| !draft.trim().is_empty());
+                !has_draft && !self.follow_up_receipts.is_pending(detail.id)
+            })
+        });
+        let primary_target = detail
+            .zip(primary.as_ref())
+            .map(|(detail, (kind, _))| (detail.id, *kind));
+        if self.primary_target.get() != primary_target {
+            cancel_task_action_activation(&widgets.primary_action);
+            self.primary_target.set(primary_target);
+        }
+        widgets.primary_action.set_visible(primary.is_some());
+        widgets.primary_action.set_sensitive(primary.is_some());
+        if let Some((_, label)) = primary {
+            widgets.primary_action.set_label(&label);
+            widgets
+                .primary_action
+                .update_property(&[gtk::accessible::Property::Label(&label)]);
+        }
+        widgets.next_step_card.set_visible(detail.is_some());
+        if let Some(detail) = detail {
+            widgets.next_step_title.set_label(detail.guidance.title);
+            widgets.next_step_detail.set_label(detail.guidance.detail);
+            widgets
+                .next_step_detail
+                .set_tooltip_text(Some(detail.guidance.detail));
+            widgets
+                .next_step_reason
+                .set_visible(detail.guidance.reason.is_some());
+            widgets
+                .next_step_reason
+                .set_label(detail.guidance.reason.as_deref().unwrap_or_default());
+            widgets
+                .next_step_reason
+                .set_tooltip_text(detail.guidance.reason.as_deref());
+        }
         for (kind, button) in &self.action_buttons {
             let sensitive = detail.is_some_and(|detail| {
                 match kind {
@@ -1445,7 +1769,7 @@ impl TasksPanelModel {
                 }
             }
         }
-        widgets.actions_box.set_visible(detail.is_some());
+        widgets.actions_expander.set_visible(detail.is_some());
         widgets.detail_title.set_visible(detail.is_some());
         widgets.detail_status.set_visible(detail.is_some());
         widgets.page_stack.set_visible(detail.is_some());
@@ -1521,10 +1845,15 @@ impl TasksPanelModel {
             }
 
             widgets.follow_up_row.set_visible(detail.can_follow_up);
-            let show_hint = !detail.follow_up_hint.is_empty();
-            widgets.follow_up_hint.set_visible(show_hint);
-            if show_hint {
-                widgets.follow_up_hint.set_label(&detail.follow_up_hint);
+            let error = self.follow_up_receipts.error(detail.id);
+            let hint = error.unwrap_or(&detail.follow_up_hint);
+            widgets.follow_up_hint.set_visible(!hint.is_empty());
+            widgets.follow_up_hint.set_label(hint);
+            widgets.follow_up_hint.set_tooltip_text(error);
+            if error.is_some() {
+                widgets.follow_up_hint.add_css_class("error");
+            } else {
+                widgets.follow_up_hint.remove_css_class("error");
             }
             let draft = self
                 .follow_up_drafts
@@ -1532,10 +1861,16 @@ impl TasksPanelModel {
                 .cloned()
                 .unwrap_or_default();
             if widgets.follow_up_entry.text().as_str() != draft {
+                // Replacing nonempty Entry text emits delete/insert notifications.
+                // View synchronization must never enqueue another authored edit.
+                let guard = self.follow_up_guard.replace(true);
                 widgets.follow_up_entry.set_text(&draft);
+                self.follow_up_guard.set(guard);
             }
             widgets.follow_up_send.set_sensitive(
-                detail.can_follow_up && native_follow_up_can_send(&draft, detail.completed_turns),
+                detail.can_follow_up
+                    && !self.follow_up_receipts.is_pending(detail.id)
+                    && native_follow_up_can_send(&draft, detail.completed_turns),
             );
         }
 
@@ -1558,6 +1893,10 @@ fn cancel_task_action_activation(button: &gtk::Button) {
     if let Some(holder) = button.parent().and_downcast::<gtk::FlowBoxChild>() {
         holder.set_child(None::<&gtk::Widget>);
         holder.set_child(Some(button));
+    } else if let Some(parent) = button.parent().and_downcast::<gtk::Box>() {
+        let previous = button.prev_sibling();
+        parent.remove(button);
+        parent.insert_child_after(button, previous.as_ref());
     }
 }
 
@@ -1707,6 +2046,8 @@ mod tests {
             status_line: "Created".into(),
             branch: "test/dashboard".into(),
             inspector: "Repository\n/tmp/project".into(),
+            guidance: crate::agent_task::TaskGuidance::from_task(&tasks[0], Default::default()),
+            validation_status: tasks[0].validation.status,
             native_label: "Start Codex".into(),
             manual_review: false,
             can_accept_review: false,
@@ -1770,6 +2111,7 @@ mod tests {
         detail.native_label = "Start Claude".into();
         detail.inspector = "Provider\nClaude\n\nRepository\n/tmp/project\n\nGoal\nReview the work before accepting it".into();
         controller.emit(TasksPanelMsg::Sync(Box::new(sync)));
+        controller.widgets().actions_expander.set_expanded(true);
         drain();
         let action_button = |kind| {
             controller
@@ -1944,7 +2286,7 @@ mod tests {
         let mut sync = dashboard_test_sync();
         let selected = sync.selected.unwrap();
         let row = sync.rows.iter_mut().find(|row| row.id == selected).unwrap();
-        row.status = crate::agent_task::TaskStatus::Failed;
+        row.status = crate::agent_task::TaskStatus::ReadyForReview;
         row.status_detail = Some("task reason".into());
         row.validation_status = crate::agent_task::TaskValidationStatus::Failed;
         row.validation_detail = Some("validation old".into());
@@ -1954,7 +2296,7 @@ mod tests {
             .iter_mut()
             .find(|row| row.id == selected)
             .unwrap();
-        row.status = crate::agent_task::TaskStatus::Failed;
+        row.status = crate::agent_task::TaskStatus::ReadyForReview;
         row.status_detail = Some("task reason".into());
         row.validation_status = crate::agent_task::TaskValidationStatus::Failed;
         controller.emit(TasksPanelMsg::Sync(Box::new(sync.clone())));
@@ -2328,3 +2670,7 @@ mod keyed_tests;
 #[cfg(test)]
 #[path = "tasks_panel_stream_tests.rs"]
 mod stream_tests;
+
+#[cfg(test)]
+#[path = "tasks_panel_control_tests.rs"]
+mod control_tests;

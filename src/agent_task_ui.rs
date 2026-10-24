@@ -13,6 +13,10 @@
 pub(crate) mod task_composer;
 pub(crate) use task_composer::TaskProjectRequest;
 
+#[path = "task_follow_up.rs"]
+mod task_follow_up;
+pub(crate) use task_follow_up::{FollowUpReceipts, TaskFollowUpRequest};
+
 /// Resolve the current binding without interpreting its opaque session identity.
 pub(crate) fn task_terminal_binding(
     task: &crate::agent_task::AgentTask,
@@ -52,25 +56,13 @@ pub(crate) fn task_reason(
     status_detail: Option<&str>,
     validation_detail: Option<&str>,
 ) -> Option<String> {
-    use crate::agent_task::{TaskStatus, TaskValidationStatus};
-    let nonempty = |text: &&str| !text.trim().is_empty();
-    let validation_reason = matches!(
-        validation,
-        TaskValidationStatus::Failed | TaskValidationStatus::Inconclusive
-    )
-    .then_some(validation_detail)
-    .flatten()
-    .filter(nonempty);
-    let task_reason = matches!(
+    crate::agent_task::TaskGuidance::reason_for(
         status,
-        TaskStatus::Failed | TaskStatus::WaitingForHuman | TaskStatus::WaitingForApproval
+        validation,
+        status_detail,
+        validation_detail,
     )
-    .then_some(status_detail)
-    .flatten()
-    .filter(nonempty);
-    validation_reason
-        .or(task_reason)
-        .map(|text| jterm_core::review_input::safe_inline_display(text.trim(), 1024))
+    .map(|reason| jterm_core::review_input::safe_inline_display(&reason, 1024))
 }
 
 use crate::agent_task::{
@@ -134,7 +126,7 @@ pub(crate) enum TaskPanelAction {
     FocusTerminal(TaskId),
     FocusValidation(TaskId),
     StopCodex(TaskId),
-    FollowUp(TaskId, String),
+    FollowUp(TaskFollowUpRequest),
     FinishCodex(TaskId),
     Approve(TaskId, crate::agent_task::ApprovalId),
     Deny(TaskId, crate::agent_task::ApprovalId),
@@ -822,11 +814,11 @@ pub(crate) fn approval_summary(approval: &crate::agent_task::CodexAppServerAppro
 #[cfg(test)]
 mod tests {
     #[test]
-    fn task_reason_prefers_validation_and_drops_stale_or_empty_detail() {
+    fn task_reason_prefers_current_requests_then_validation_and_drops_stale_detail() {
         use crate::agent_task::{TaskStatus as S, TaskValidationStatus as V};
         assert_eq!(
             super::task_reason(
-                S::Failed,
+                S::ReadyForReview,
                 V::Failed,
                 Some("task failed"),
                 Some("tests failed")
@@ -836,7 +828,7 @@ mod tests {
         );
         assert_eq!(
             super::task_reason(
-                S::Failed,
+                S::ReadyForReview,
                 V::Inconclusive,
                 Some("task failed"),
                 Some("no exit status")
@@ -853,7 +845,31 @@ mod tests {
                 super::task_reason(status, V::NotRun, Some("needs a decision"), None).as_deref(),
                 Some("needs a decision")
             );
+            assert_eq!(
+                super::task_reason(
+                    status,
+                    V::Failed,
+                    Some("approve the current command"),
+                    Some("old validation failure")
+                )
+                .as_deref(),
+                Some("approve the current command")
+            );
+            assert_eq!(
+                super::task_reason(status, V::Failed, None, Some("old validation failure")),
+                None
+            );
         }
+        assert_eq!(
+            super::task_reason(
+                S::ReadyForReview,
+                V::Cancelled,
+                None,
+                Some("validation interrupted")
+            )
+            .as_deref(),
+            Some("validation interrupted")
+        );
         assert_eq!(
             super::task_reason(
                 S::Completed,

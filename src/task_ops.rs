@@ -368,6 +368,12 @@ impl AppModel {
         sender: &ComponentSender<AppModel>,
     ) {
         if !task_action_allowed(self.config.borrow().agent_tasks_enabled, &action) {
+            if let TaskPanelAction::FollowUp(request) = &action {
+                self.tasks_panel.emit(TasksPanelMsg::FollowUpResolved(
+                    request.clone(),
+                    Err("Agent tasks are disabled. Your follow-up draft is preserved.".into()),
+                ));
+            }
             if let TaskPanelAction::CreateProject(request) = &action {
                 request.finish(Err("Agent tasks are disabled in the configuration".into()));
             }
@@ -443,15 +449,18 @@ impl AppModel {
                 }
                 Err(error) => self.show_toast(error.to_string()),
             },
-            TaskPanelAction::FollowUp(task_id, text) => {
+            TaskPanelAction::FollowUp(request) => {
                 let policy = self.task_prompt_policy();
-                match self
+                let result = self
                     .agent_runtime
-                    .prompt_codex(&self.task_manager, task_id, &text, policy)
-                {
+                    .prompt_codex(&self.task_manager, request.task_id, &request.text, policy)
+                    .map_err(|error| error.to_string());
+                match &result {
                     Ok(()) => self.show_toast("Follow-up queued on the existing Codex thread…"),
-                    Err(error) => self.show_toast(error.to_string()),
+                    Err(error) => self.show_toast(error.clone()),
                 }
+                self.tasks_panel
+                    .emit(TasksPanelMsg::FollowUpResolved(request, result));
             }
             TaskPanelAction::FinishCodex(task_id) => {
                 match self.agent_runtime.finish_codex(&self.task_manager, task_id) {
@@ -1259,6 +1268,16 @@ impl AppModel {
             status_line,
             branch: task.branch.clone(),
             inspector: agent_task_ui::task_inspector_text(task),
+            validation_status: task.validation.status,
+            guidance: crate::agent_task::TaskGuidance::from_task(
+                task,
+                crate::agent_task::DashboardActivity {
+                    has_agent_terminal: can_focus_terminal,
+                    has_validation_terminal: can_focus_validation,
+                    has_active_agent_stream: has_stream,
+                    native_preparing,
+                },
+            ),
             native_label: format!("Start {}", task.provider.display_name()),
             manual_review: task.requires_manual_review(),
             can_accept_review: task.requires_manual_review()
@@ -1276,6 +1295,7 @@ impl AppModel {
                 .snapshot(task_id)
                 .map_or(0, |snapshot| snapshot.completed_turns),
             can_start_native: task.provider.supports_native_driver()
+                && (task.brief.is_some() || task.source_context.is_some())
                 && task.status == TaskStatus::Created
                 && task.runtime_kind == TaskRuntimeKind::Unassigned
                 && !native_preparing
@@ -1290,7 +1310,8 @@ impl AppModel {
                 && task.validation.status != TaskValidationStatus::Running
                 && !has_stream,
             can_complete: task.status == TaskStatus::ReadyForReview
-                && task.validation.status == TaskValidationStatus::Passed,
+                && task.validation.status == TaskValidationStatus::Passed
+                && !has_stream,
             can_follow_up: native_idle && native_ai_enabled,
             follow_up_hint,
             diff,
@@ -1522,7 +1543,10 @@ mod disabled_task_lifecycle_tests {
             TaskPanelAction::CreateFromBlock,
             TaskPanelAction::StartNative(task),
             TaskPanelAction::StartTerminal(task),
-            TaskPanelAction::FollowUp(task, "next turn".into()),
+            TaskPanelAction::FollowUp(agent_task_ui::TaskFollowUpRequest::new(
+                task,
+                "next turn".into(),
+            )),
             TaskPanelAction::Approve(task, approval),
             TaskPanelAction::RunValidation(task),
         ] {

@@ -128,6 +128,65 @@ Agent stream and has not started validation. Inspect the results and diff
 before accepting. Switching tasks cancels a pending button activation, so a
 held review action cannot apply to the newly selected task.
 
+
+## Triage by attention reason and structured task search
+
+Expand **Provider, project and state** to adjust the additional scope controls;
+its heading reports how many are active. Search, attention and quick views stay
+visible in the compact sidebar.
+
+The **Attention** selector separates pending approvals, requests for a reply,
+validation issues, work ready for review, and failed tasks. Each count uses the
+current provider, project and text search before applying the state/view
+selection. Choosing an attention reason preserves the search and exact project
+identity and clears the single-state filter. Choosing a state or ordinary quick
+view clears the attention reason;
+**Clear filters** resets both. A task can remain selected while hidden, but
+hidden details and action controls are not exposed as another task.
+
+Task search now supports explicit fields. Terms combine with AND; enum values
+within a field may be separated by commas for OR. Quoted phrases and negative
+terms are supported. Expand **Search syntax** for examples.
+
+| Task search | Result |
+| --- | --- |
+| `provider:codex status:working,review` | Codex tasks working or ready for review |
+| `attention:approval` | Tasks awaiting a specific approval decision |
+| `validation:failed -runtime:terminal` | Failed validation outside the ordinary terminal runtime |
+| `project:repo branch:feature` | Matching project and branch text |
+| `"render race" -status:completed` | A phrase with completed tasks excluded |
+
+Malformed expressions and unknown field values show an inline explanation and
+zero results. Queries longer than 256 UTF-8 bytes are rejected with an
+explanation instead of silently truncating a trailing condition. Enter cannot select an unrelated task from an invalid query.
+These task filters do not change execution state or provider transcripts.
+
+## A clear next step and reliable follow-up drafts
+
+The detail header presents the shared next-step explanation and current failure
+or question reason. The highlighted action is selected from the runtime's actual
+capabilities: start, finish a live native session, run validation, complete a
+validated task, or open the relevant output/diff. Pending approvals remain
+individual decisions in their existing cards. Guidance never grants permission,
+accepts a task, or implies that validation has passed.
+A nonempty follow-up draft or a pending submission suppresses the highlighted
+Finish suggestion; the explicit secondary Finish control remains available.
+Native starts require retained task instructions, and completion remains unavailable
+while the native event stream is live.
+
+Changing the selected task or changing a highlighted button's operation cancels
+any delayed GTK activation before that control gains its new meaning. Existing
+secondary actions and their domain checks remain available under **All task actions**.
+The detail pane scrolls independently, so guidance, approvals and follow-up input
+remain reachable in smaller windows without clipping the controls.
+
+Sending a follow-up keeps the authored text until the runtime acknowledges the
+exact submission. While that attempt is pending, duplicate sends are disabled.
+A rejected submission shows its error inline and retains the draft for correction
+or retry. Successful acknowledgement clears only the submitted text; a newer edit,
+a draft on another task, or a newer retry is never removed by an old receipt.
+These in-memory drafts are not written into terminal recovery journals.
+
 ## Shared metadata compatibility
 
 Organization lives in the private shared session-library JSON, separately from
