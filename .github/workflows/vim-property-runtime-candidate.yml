@@ -1,0 +1,13 @@
+name: Native Vim property runtime candidate
+on:
+  push:
+    branches: [codex/vim-property-runtime-20261024]
+    paths: [.github/workflows/vim-property-runtime-candidate.yml]
+permissions:
+  contents: write
+jobs:
+  validate:
+    uses: beamiter/jterm_core/.github/workflows/vim-runtime-bundle-candidate.yml@d45239f83d316e0d6d5f4087a91548da12f84c0c
+    with:
+      base: 2bcad9e95ddb61442c4df218bf0eb3562ac6764a
+      core: 63e97ebc8c104fcc279309fc66c280dc1c0e19e3
