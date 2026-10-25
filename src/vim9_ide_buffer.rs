@@ -532,6 +532,32 @@ fn paint_active_split(
     }
 }
 
+/// Elide fills already supplied by the window backdrop. Once a row contains
+/// another color, preserve all later fills: a Normal run may erase a guide or
+/// selection beneath it. Empty sets allocate nothing for ordinary source text.
+struct BackgroundRows {
+    normal: u32,
+    changed: HashSet<usize>,
+}
+
+impl BackgroundRows {
+    fn new(normal: u32) -> Self {
+        Self {
+            normal,
+            changed: HashSet::new(),
+        }
+    }
+
+    fn needs_fill(&mut self, row: usize, background: u32) -> bool {
+        if background != self.normal {
+            self.changed.insert(row);
+            true
+        } else {
+            self.changed.contains(&row)
+        }
+    }
+}
+
 fn build_text_scene(
     surface: &BufferSurface,
     state: &PaintState,
@@ -554,6 +580,7 @@ fn build_text_scene(
             .map_or(frame.window, |window| window.window);
         let (_, background, _) = colors(window_normal_style(frame, window), &frame.default_style);
         snapshot.append_color(&rgb(background), &view);
+        let mut backgrounds = BackgroundRows::new(background);
 
         // Paint backgrounds before ink so a subsequent syntax run
         // cannot erase italic glyphs from the previous run.
@@ -563,6 +590,9 @@ fn build_text_scene(
             .filter(|run| region.contains(run.row, run.column))
         {
             let (_, background, _) = colors(&run.style, &frame.default_style);
+            if !backgrounds.needs_fill(run.row, background) {
+                continue;
+            }
             snapshot.append_color(
                 &rgb(background),
                 &gtk::graphene::Rect::new(
@@ -629,9 +659,14 @@ fn paint_pixel_scene(
             &frame.default_style,
         );
         snapshot.append_color(&rgb(background), &graphene_rect(view.clip()));
+        let mut backgrounds = BackgroundRows::new(background);
         for projected in view.runs() {
             let (_, background, _) = colors(&projected.run.style, &frame.default_style);
-            snapshot.append_color(&rgb(background), &graphene_rect(projected.clip));
+            // Pixel Y identifies the presented row, including overscan whose
+            // source run.row may alias a visible row's coordinate.
+            if backgrounds.needs_fill(projected.rect.y.to_bits() as usize, background) {
+                snapshot.append_color(&rgb(background), &graphene_rect(projected.clip));
+            }
         }
         for projected in view.runs() {
             paint_text_run(
@@ -667,49 +702,52 @@ fn paint_text_run(
     let width = rect.width;
     let (foreground, _, special) = colors(&run.style, normal);
     if !run.text.is_empty() && width > 0.0 {
-        let shaped =
-            layouts.get_or_insert_with(&run.text, run.style.bold, run.style.italic, || {
-                let layout = surface.create_pango_layout(Some(&run.text));
-                let mut font = state.font.clone();
-                if run.style.bold {
-                    font.set_weight(pango::Weight::Bold);
-                }
-                if run.style.italic {
-                    font.set_style(pango::Style::Italic);
-                }
-                layout.set_font_description(Some(&font));
-                layout.set_single_paragraph_mode(true);
-                layout.set_auto_dir(false);
-                let attributes = pango::AttrList::new();
-                attributes.insert(pango::AttrFontFeatures::new(if state.ligatures {
-                    "calt=1,liga=1"
-                } else {
-                    "calt=0,liga=0"
-                }));
-                layout.set_attributes(Some(&attributes));
-                let (_, logical) = layout.extents();
-                let width = logical.width() as f32 / pango::SCALE as f32;
-                let baseline = layout.baseline() as f32 / pango::SCALE as f32;
-                ShapedLayout {
-                    layout,
-                    width,
-                    baseline,
-                }
-            });
-        // A fallback CJK font can have different ascent and
-        // descent from the Latin font. Centering every run's
-        // logical box independently makes their baselines drift.
-        let text_y = y + baseline - shaped.baseline;
-        snapshot.save();
-        snapshot.translate(&gtk::graphene::Point::new(x, text_y));
-        // VTE rounds its input grid to whole logical pixels. Match
-        // that advance without independently slicing Unicode or
-        // breaking a shaped run into terminal-sized glyph boxes.
-        if shaped.width > 0.0 {
-            snapshot.scale(width / shaped.width, 1.0);
+        // Spaces have no glyph ink; their background and decorations remain.
+        if run.text.bytes().any(|byte| byte != b' ') {
+            let shaped =
+                layouts.get_or_insert_with(&run.text, run.style.bold, run.style.italic, || {
+                    let layout = surface.create_pango_layout(Some(&run.text));
+                    let mut font = state.font.clone();
+                    if run.style.bold {
+                        font.set_weight(pango::Weight::Bold);
+                    }
+                    if run.style.italic {
+                        font.set_style(pango::Style::Italic);
+                    }
+                    layout.set_font_description(Some(&font));
+                    layout.set_single_paragraph_mode(true);
+                    layout.set_auto_dir(false);
+                    let attributes = pango::AttrList::new();
+                    attributes.insert(pango::AttrFontFeatures::new(if state.ligatures {
+                        "calt=1,liga=1"
+                    } else {
+                        "calt=0,liga=0"
+                    }));
+                    layout.set_attributes(Some(&attributes));
+                    let (_, logical) = layout.extents();
+                    let width = logical.width() as f32 / pango::SCALE as f32;
+                    let baseline = layout.baseline() as f32 / pango::SCALE as f32;
+                    ShapedLayout {
+                        layout,
+                        width,
+                        baseline,
+                    }
+                });
+            // A fallback CJK font can have different ascent and
+            // descent from the Latin font. Centering every run's
+            // logical box independently makes their baselines drift.
+            let text_y = y + baseline - shaped.baseline;
+            snapshot.save();
+            snapshot.translate(&gtk::graphene::Point::new(x, text_y));
+            // VTE rounds its input grid to whole logical pixels. Match
+            // that advance without independently slicing Unicode or
+            // breaking a shaped run into terminal-sized glyph boxes.
+            if shaped.width > 0.0 {
+                snapshot.scale(width / shaped.width, 1.0);
+            }
+            snapshot.append_layout(&shaped.layout, &rgb(foreground));
+            snapshot.restore();
         }
-        snapshot.append_layout(&shaped.layout, &rgb(foreground));
-        snapshot.restore();
         decorations(snapshot, &run.style, special, rect, decoration_phase);
     }
 }
@@ -3897,6 +3935,119 @@ mod tests {
         assert!(same_text_content(&frame, &delta));
         delta.runs[0].style.background = Some(0x123456);
         assert!(!same_text_content(&frame, &delta));
+    }
+
+    #[test]
+    fn background_elision_preserves_overlapping_layers_and_row_isolation() {
+        let normal = 0x102030;
+        let mut backgrounds = BackgroundRows::new(normal);
+        let mut full = [[normal; 12]; 4];
+        let mut reduced = full;
+        let mut state = 41_u32;
+        // Normal text, overlapping guides/selection, and a subsequent Normal
+        // layer exercise restoration as well as the no-fill common case.
+        for i in 0..300 {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let row = (state as usize >> 8) % 4;
+            let start = (state as usize >> 16) % 10;
+            let end = (start + 1 + i % 4).min(12);
+            let color = if i % 7 < 5 { normal } else { state & 0xffffff };
+            full[row][start..end].fill(color);
+            if backgrounds.needs_fill(row, color) {
+                reduced[row][start..end].fill(color);
+            }
+            assert_eq!(full, reduced, "paint order changed at run {i}");
+        }
+        let mut backgrounds = BackgroundRows::new(normal);
+        assert!(!backgrounds.needs_fill(0, normal));
+        assert!(backgrounds.needs_fill(0, 0xabcdef));
+        assert!(backgrounds.needs_fill(0, normal));
+        assert!(!backgrounds.needs_fill(1, normal));
+    }
+
+    #[test]
+    fn background_elision_removes_plain_syntax_fills_without_allocating() {
+        let mut backgrounds = BackgroundRows::new(0x102030);
+        let fills = (0..10000)
+            .filter(|index| backgrounds.needs_fill(index / 100, 0x102030))
+            .count();
+        assert_eq!(fills, 0);
+        assert_eq!(backgrounds.changed.capacity(), 0);
+    }
+
+    #[test]
+    #[ignore = "requires GTK display; checks blank-run shaping and decoration pixels"]
+    fn space_only_runs_skip_layouts_but_keep_decoration_pixels() {
+        gtk::init().expect("GTK display required");
+        let surface = BufferSurface::new();
+        let state = PaintState::default();
+        let rect = Vim9PixelRect {
+            x: 0.0,
+            y: 0.0,
+            width: 80.0,
+            height: 24.0,
+        };
+        for text in ["        ", "   x   ", "·", "\u{a0}", "界", "e\u{301}"] {
+            for decoration in 0..4 {
+                let run = Vim9RenderRun {
+                    text: text.into(),
+                    cells: 8,
+                    style: Vim9RenderStyle {
+                        foreground: Some(0xffffff),
+                        special: Some(0x00ff00),
+                        underline: decoration == 1,
+                        undercurl: decoration == 2,
+                        strikethrough: decoration == 3,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let snapshot = gtk::Snapshot::new();
+                snapshot.append_color(&rgb(0x102030), &graphene_rect(rect));
+                let mut layouts = LayoutCache::default();
+                paint_text_run(
+                    &surface,
+                    &snapshot,
+                    &state,
+                    &run,
+                    &Vim9RenderStyle::default(),
+                    rect,
+                    16.0,
+                    0.0,
+                    &mut layouts,
+                );
+                assert_eq!(
+                    layouts.len(),
+                    usize::from(text != "        "),
+                    "unexpected shaping for {text:?}"
+                );
+                let mut image =
+                    gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 80, 24).unwrap();
+                let cr = gtk::cairo::Context::new(&image).unwrap();
+                snapshot.to_node().unwrap().draw(&cr);
+                drop(cr);
+                let pixels = image.data().unwrap();
+                let special = pixels
+                    .chunks_exact(4)
+                    .filter(|pixel| {
+                        let rgb = u32::from_ne_bytes((*pixel).try_into().unwrap());
+                        let green = (rgb >> 8) & 255;
+                        // Cairo antialiases the diagonal undercurl; its green
+                        // ink still dominates both white glyphs and the backdrop.
+                        green > ((rgb >> 16) & 255) && green > (rgb & 255)
+                    })
+                    .count();
+                assert_eq!(
+                    special > 0,
+                    decoration != 0,
+                    "decoration lost for {text:?}, style {decoration}"
+                );
+                assert!(pixels.chunks_exact(4).any(|pixel| u32::from_ne_bytes(
+                    pixel.try_into().unwrap()
+                ) & 0xffffff
+                    == 0x102030));
+            }
+        }
     }
 
     #[test]
