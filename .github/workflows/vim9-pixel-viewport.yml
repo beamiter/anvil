@@ -56,6 +56,10 @@ jobs:
         run: dbus-run-session -- xvfb-run -a cargo test --quiet --locked native_completion_elevation_preserves_rows_and_clips_to_widget -- --ignored --test-threads=1
       - name: Exercise native popup layering and split gaps
         run: dbus-run-session -- xvfb-run -a cargo test --quiet --locked native_popups_cover_split_gaps_and_obey_vim_zindex -- --ignored --test-threads=1
+      - name: Skip invisible ink while preserving italic overhang
+        run: dbus-run-session -- xvfb-run -a cargo test --quiet --locked clipped_ink_skips_shaping_but_retains_italic_overhang -- --ignored --test-threads=1
+      - name: Retain overlays across cursor frames and refresh changed paint context
+        run: dbus-run-session -- xvfb-run -a cargo test --quiet --locked retained_overlays_reuse_blink_frames_then_refresh_theme_contents_and_pango -- --ignored --test-threads=1
       - name: Exercise native popup input ownership
         run: dbus-run-session -- xvfb-run -a cargo test --quiet --locked native_popup_input_never_targets_underlying_source -- --ignored --test-threads=1
 

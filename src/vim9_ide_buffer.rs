@@ -213,6 +213,41 @@ impl TextScene {
     }
 }
 
+/// Popup text and completion stay in screen space. Cursor/focus snapshots
+/// reuse this node independently of the buffer's scrolling text scene.
+struct OverlayScene {
+    frame: Arc<Vim9RenderFrame>,
+    metrics: Metrics,
+    font_generation: u64,
+    ligatures: bool,
+    scale_factor: i32,
+    size: (i32, i32),
+    node: Option<gtk::gsk::RenderNode>,
+}
+
+fn same_overlay_content(previous: &Vim9RenderFrame, next: &Vim9RenderFrame) -> bool {
+    previous.default_style == next.default_style
+        && previous.completion == next.completion
+        && previous.popups == next.popups
+}
+
+impl OverlayScene {
+    fn matches(
+        &self,
+        state: &PaintState,
+        frame: &Arc<Vim9RenderFrame>,
+        scale: i32,
+        size: (i32, i32),
+    ) -> bool {
+        self.metrics == state.metrics
+            && self.font_generation == state.font_generation
+            && self.ligatures == state.ligatures
+            && self.scale_factor == scale
+            && self.size == size
+            && (Arc::ptr_eq(&self.frame, frame) || same_overlay_content(&self.frame, frame))
+    }
+}
+
 /// Each retained scene supplies rows exposed at the edge while a new Vim
 /// viewport eases into place. Keeping the outgoing text prevents blank bands.
 #[derive(Clone)]
@@ -291,6 +326,7 @@ mod imp {
         pub(super) layouts: RefCell<LayoutCache>,
         pub(super) layout_context_serial: Cell<u32>,
         pub(super) text_scene: RefCell<Option<TextScene>>,
+        pub(super) overlay_scene: RefCell<Option<OverlayScene>>,
         pub(super) motions: RefCell<HashMap<i64, WindowMotion>>,
         pub(super) scroll_input: RefCell<ScrollInput>,
         pub(super) pointer: Cell<Option<(f64, f64)>>,
@@ -304,6 +340,8 @@ mod imp {
         pub(super) painted_revision: Cell<u64>,
         #[cfg(test)]
         pub(super) scene_builds: Cell<usize>,
+        #[cfg(test)]
+        pub(super) overlay_builds: Cell<usize>,
     }
 
     #[glib::object_subclass]
@@ -325,11 +363,13 @@ mod imp {
             if self.layout_context_serial.replace(serial) != serial {
                 self.layouts.borrow_mut().clear();
                 self.text_scene.borrow_mut().take();
+                self.overlay_scene.borrow_mut().take();
                 self.motions.borrow_mut().clear();
             }
             let state = self.state.borrow();
             let Some(frame) = state.frame.as_ref() else {
                 self.presented.borrow_mut().take();
+                self.overlay_scene.borrow_mut().take();
                 return;
             };
             let metrics = state.metrics;
@@ -454,12 +494,13 @@ mod imp {
                 snapshot.pop();
             }
             paint_active_split(&surface, snapshot, &state, frame);
-            paint_overlays(
+            paint_retained_overlays(
                 &surface,
                 snapshot,
                 &state,
                 frame,
                 &mut self.layouts.borrow_mut(),
+                &mut self.overlay_scene.borrow_mut(),
             );
             #[cfg(test)]
             self.painted_revision.set(frame.revision);
@@ -629,6 +670,7 @@ fn build_text_scene(
                 },
                 baseline,
                 decoration_phase_x(frame, run, metrics),
+                &view,
                 layouts,
             );
         }
@@ -678,6 +720,7 @@ fn paint_pixel_scene(
                 projected.rect,
                 baseline,
                 decoration_phase_x(frame, projected.run, metrics),
+                &graphene_rect(view.clip()),
                 layouts,
             );
         }
@@ -695,8 +738,24 @@ fn paint_text_run(
     rect: Vim9PixelRect,
     baseline: f32,
     decoration_phase: f32,
+    clip: &gtk::graphene::Rect,
     layouts: &mut LayoutCache,
 ) {
+    // Snapshot clips apply on the GPU. Reject invisible ink before Pango
+    // shaping or Cairo path construction, while retaining italic overhang.
+    let overhang = state.metrics.line_height * 0.25;
+    if clip_run_rect(
+        Vim9PixelRect {
+            x: rect.x - overhang,
+            width: rect.width + overhang * 2.0,
+            ..rect
+        },
+        clip,
+    )
+    .is_none()
+    {
+        return;
+    }
     let x = rect.x;
     let y = rect.y;
     let width = rect.width;
@@ -748,7 +807,59 @@ fn paint_text_run(
             snapshot.append_layout(&shaped.layout, &rgb(foreground));
             snapshot.restore();
         }
-        decorations(snapshot, &run.style, special, rect, decoration_phase);
+        if let Some(visible) = clip_run_rect(rect, clip) {
+            decorations(
+                snapshot,
+                &run.style,
+                special,
+                visible,
+                decoration_phase + visible.x - rect.x,
+            );
+        }
+    }
+}
+
+fn paint_retained_overlays(
+    surface: &BufferSurface,
+    snapshot: &gtk::Snapshot,
+    state: &PaintState,
+    frame: &Arc<Vim9RenderFrame>,
+    layouts: &mut LayoutCache,
+    cached: &mut Option<OverlayScene>,
+) {
+    if !frame.has_overlays() {
+        cached.take();
+        return;
+    }
+    let size = (surface.width(), surface.height());
+    let scale = surface.scale_factor();
+    if !cached
+        .as_ref()
+        .is_some_and(|scene| scene.matches(state, frame, scale, size))
+    {
+        let overlay = gtk::Snapshot::new();
+        paint_overlays(surface, &overlay, state, frame, layouts);
+        #[cfg(test)]
+        surface
+            .imp()
+            .overlay_builds
+            .set(surface.imp().overlay_builds.get() + 1);
+        *cached = Some(OverlayScene {
+            frame: frame.clone(),
+            metrics: state.metrics,
+            font_generation: state.font_generation,
+            ligatures: state.ligatures,
+            scale_factor: scale,
+            size,
+            node: overlay.to_node(),
+        });
+    }
+    if let Some(scene) = cached {
+        if let Some(node) = &scene.node {
+            snapshot.append_node(node);
+        }
+        // Keep repeated focus/blink snapshots on the O(1) Arc identity path.
+        scene.frame = frame.clone();
     }
 }
 
@@ -761,6 +872,7 @@ fn paint_overlays(
     frame: &Vim9RenderFrame,
     layouts: &mut LayoutCache,
 ) {
+    trim_layout_cache(frame, layouts);
     let mut popups: Vec<_> = frame.popups.iter().collect();
     // At the same z-index, Vim paints the older (lower-id) popup on top.
     popups.sort_by_key(|popup| (popup.zindex, std::cmp::Reverse(popup.id)));
@@ -825,7 +937,6 @@ fn paint_popup(
             ),
         );
     }
-    trim_layout_cache(frame, layouts);
     for run in &popup.runs {
         paint_text_run(
             surface,
@@ -841,6 +952,7 @@ fn paint_popup(
             },
             baseline,
             run.column.saturating_sub(popup.view.column) as f32 * metrics.cell_width,
+            &view,
             layouts,
         );
     }
@@ -908,7 +1020,6 @@ fn paint_completion(
             ),
         );
     }
-    trim_layout_cache(frame, layouts);
     for run in &completion.runs {
         paint_text_run(
             surface,
@@ -924,6 +1035,7 @@ fn paint_completion(
             },
             baseline,
             run.column.saturating_sub(completion.view.column) as f32 * metrics.cell_width,
+            &view,
             layouts,
         );
     }
@@ -1021,6 +1133,23 @@ fn undercurl_path(x: f32, y: f32, width: f32, phase: f32, mut point: impl FnMut(
         distance += 2.0;
     }
     point(x + width, y + undercurl_displacement(phase + width));
+}
+
+/// Limit horizontal decoration work to visible pixels. Keep the original
+/// row height and baseline when only part of a scrolled row is visible.
+fn clip_run_rect(rect: Vim9PixelRect, clip: &gtk::graphene::Rect) -> Option<Vim9PixelRect> {
+    let left = rect.x.max(clip.x());
+    let right = (rect.x + rect.width).min(clip.x() + clip.width());
+    (right > left
+        && clip.height() > 0.0
+        && rect.height > 0.0
+        && rect.y < clip.y() + clip.height()
+        && rect.y + rect.height > clip.y())
+    .then_some(Vim9PixelRect {
+        x: left,
+        width: right - left,
+        ..rect
+    })
 }
 
 fn decorations(
@@ -1192,18 +1321,23 @@ fn paint_native_cursor(
             }
             snapshot.append_layout(&shaped.layout, &rgb(fg));
             snapshot.restore();
-            decorations(
-                snapshot,
-                &run.style,
-                fg,
+            if let Some(visible) = clip_run_rect(
                 Vim9PixelRect {
                     x,
                     y: full_cell.y,
                     width,
                     height: state.metrics.line_height,
                 },
-                decoration_phase_x(frame, run, state.metrics),
-            );
+                &caret,
+            ) {
+                decorations(
+                    snapshot,
+                    &run.style,
+                    fg,
+                    visible,
+                    decoration_phase_x(frame, run, state.metrics) + visible.x - x,
+                );
+            }
         }
     }
     snapshot.pop();
@@ -1329,6 +1463,7 @@ impl BufferSurface {
             surface.cancel_scroll();
             surface.imp().layouts.borrow_mut().clear();
             surface.imp().text_scene.borrow_mut().take();
+            surface.imp().overlay_scene.borrow_mut().take();
             surface.queue_draw();
         });
         surface.update_property(&[gtk::accessible::Property::Label(
@@ -1349,6 +1484,7 @@ impl BufferSurface {
         drop(state);
         self.imp().layouts.borrow_mut().clear();
         self.imp().text_scene.borrow_mut().take();
+        self.imp().overlay_scene.borrow_mut().take();
         self.queue_draw();
     }
 
@@ -2769,6 +2905,230 @@ mod tests {
     use super::*;
 
     #[test]
+    fn overlay_identity_ignores_source_and_cursor_but_tracks_every_paint_key() {
+        use jterm_core::vim9::Vim9RenderCompletion;
+        let frame = Arc::new(Vim9RenderFrame {
+            completion: Some(Vim9RenderCompletion::default()),
+            ..Default::default()
+        });
+        let mut state = PaintState::default();
+        let cached = OverlayScene {
+            frame: frame.clone(),
+            metrics: state.metrics,
+            font_generation: state.font_generation,
+            ligatures: state.ligatures,
+            scale_factor: 1,
+            size: (320, 200),
+            node: None,
+        };
+        let mut next = (*frame).clone();
+        next.cursor.column += 1;
+        next.runs.push(Vim9RenderRun {
+            text: "source changed".into(),
+            ..Default::default()
+        });
+        assert!(cached.matches(&state, &Arc::new(next.clone()), 1, (320, 200)));
+        next.completion.as_mut().unwrap().view.column += 1;
+        assert!(!cached.matches(&state, &Arc::new(next), 1, (320, 200)));
+        let mut next = (*frame).clone();
+        next.default_style.background = Some(0x123456);
+        assert!(!cached.matches(&state, &Arc::new(next), 1, (320, 200)));
+        assert!(!cached.matches(&state, &frame, 2, (320, 200)));
+        assert!(!cached.matches(&state, &frame, 1, (321, 200)));
+        state.font_generation += 1;
+        assert!(!cached.matches(&state, &frame, 1, (320, 200)));
+        state.font_generation -= 1;
+        state.ligatures = !state.ligatures;
+        assert!(!cached.matches(&state, &frame, 1, (320, 200)));
+        state.ligatures = !state.ligatures;
+        state.metrics.origin_x += 1.0;
+        assert!(!cached.matches(&state, &frame, 1, (320, 200)));
+    }
+
+    #[test]
+    #[ignore = "requires GTK display; checks retained popup/completion nodes and font-context invalidation"]
+    fn retained_overlays_reuse_blink_frames_then_refresh_theme_contents_and_pango() {
+        use jterm_core::vim9::Vim9RenderCompletion;
+        gtk::init().expect("GTK display required");
+        let surface = BufferSurface::new();
+        surface.allocate(320, 200, -1, None);
+        let mut frame = Vim9RenderFrame {
+            completion: Some(Vim9RenderCompletion {
+                view: Vim9RenderRect {
+                    row: 1,
+                    column: 1,
+                    rows: 2,
+                    columns: 10,
+                },
+                runs: vec![Vim9RenderRun {
+                    row: 1,
+                    column: 1,
+                    cells: 4,
+                    text: "menu".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        {
+            let mut state = surface.imp().state.borrow_mut();
+            state.metrics = Metrics {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                cell_width: 10.0,
+                line_height: 20.0,
+            };
+            state.frame = Some(Arc::new(frame.clone()));
+        }
+        let draw = || {
+            let snapshot = gtk::Snapshot::new();
+            surface.imp().snapshot(&snapshot);
+            assert!(snapshot.to_node().is_some());
+        };
+        draw();
+        assert_eq!(surface.imp().overlay_builds.get(), 1);
+        for column in 0..20 {
+            frame.cursor.column = column;
+            surface.imp().state.borrow_mut().frame = Some(Arc::new(frame.clone()));
+            draw();
+        }
+        assert_eq!(
+            surface.imp().overlay_builds.get(),
+            1,
+            "cursor-only frames reuse the entire overlay scene"
+        );
+        frame.completion.as_mut().unwrap().runs[0].text = "next".into();
+        surface.imp().state.borrow_mut().frame = Some(Arc::new(frame.clone()));
+        draw();
+        assert_eq!(surface.imp().overlay_builds.get(), 2);
+        frame.default_style.background = Some(0x214365);
+        surface.imp().state.borrow_mut().frame = Some(Arc::new(frame.clone()));
+        draw();
+        assert_eq!(surface.imp().overlay_builds.get(), 3);
+        let context = surface.pango_context();
+        context.changed();
+        draw();
+        assert_eq!(
+            surface.imp().overlay_builds.get(),
+            4,
+            "Pango context generation must retire overlays"
+        );
+        surface.allocate(300, 200, -1, None);
+        draw();
+        assert_eq!(
+            surface.imp().overlay_builds.get(),
+            5,
+            "widget clipping changes require a new overlay node"
+        );
+        frame.completion = None;
+        surface.imp().state.borrow_mut().frame = Some(Arc::new(frame));
+        let snapshot = gtk::Snapshot::new();
+        surface.imp().snapshot(&snapshot);
+        assert!(
+            surface.imp().overlay_scene.borrow().is_none(),
+            "closing the last overlay releases its scene"
+        );
+    }
+
+    #[test]
+    fn clipping_limits_decoration_work_without_moving_scrolled_row_baselines() {
+        let rect = Vim9PixelRect {
+            x: -100000.25,
+            y: -7.5,
+            width: 200000.0,
+            height: 20.0,
+        };
+        let clip = gtk::graphene::Rect::new(10.25, 0.0, 80.0, 10.0);
+        let visible = clip_run_rect(rect, &clip).unwrap();
+        assert_eq!((visible.x, visible.width), (10.25, 80.0));
+        assert_eq!((visible.y, visible.height), (rect.y, rect.height));
+        let phase = 3.25 + visible.x - rect.x;
+        let mut points = Vec::new();
+        undercurl_path(
+            visible.x,
+            visible.y + visible.height - 2.0,
+            visible.width,
+            phase,
+            |x, y| points.push((x, y)),
+        );
+        assert!(
+            points.len() <= 42,
+            "hidden line width must not grow Cairo paths"
+        );
+        assert!(points.iter().all(|(x, _)| *x >= 10.25 && *x <= 90.25));
+        assert!(clip_run_rect(rect, &gtk::graphene::Rect::new(0.0, 20.0, 10.0, 10.0)).is_none());
+        assert!(clip_run_rect(rect, &gtk::graphene::Rect::new(0.0, 0.0, 0.0, 10.0)).is_none());
+        assert!(clip_run_rect(rect, &gtk::graphene::Rect::new(0.0, 0.0, 10.0, 0.0)).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires GTK display; verifies invisible runs never enter Pango cache"]
+    fn clipped_ink_skips_shaping_but_retains_italic_overhang() {
+        gtk::init().expect("GTK display required");
+        let surface = BufferSurface::new();
+        let state = PaintState {
+            metrics: Metrics {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                cell_width: 10.0,
+                line_height: 20.0,
+            },
+            ..Default::default()
+        };
+        let run = Vim9RenderRun {
+            text: "界e\u{301}".into(),
+            cells: 3,
+            style: Vim9RenderStyle {
+                italic: true,
+                undercurl: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let rect = Vim9PixelRect {
+            x: 0.0,
+            y: 0.0,
+            width: 30.0,
+            height: 20.0,
+        };
+        let mut layouts = LayoutCache::default();
+        let snapshot = gtk::Snapshot::new();
+        paint_text_run(
+            &surface,
+            &snapshot,
+            &state,
+            &run,
+            &Vim9RenderStyle::default(),
+            rect,
+            16.0,
+            0.0,
+            &gtk::graphene::Rect::new(40.0, 0.0, 10.0, 20.0),
+            &mut layouts,
+        );
+        assert_eq!(layouts.len(), 0);
+        assert!(snapshot.to_node().is_none());
+        let snapshot = gtk::Snapshot::new();
+        paint_text_run(
+            &surface,
+            &snapshot,
+            &state,
+            &run,
+            &Vim9RenderStyle::default(),
+            rect,
+            16.0,
+            0.0,
+            &gtk::graphene::Rect::new(32.0, 0.0, 10.0, 20.0),
+            &mut layouts,
+        );
+        assert_eq!(
+            layouts.len(),
+            1,
+            "nearby italic ink must still shape its whole Unicode run"
+        );
+    }
+
+    #[test]
     fn layout_pressure_keeps_visible_margin_and_overlay_shapes_warm() {
         use jterm_core::vim9::{Vim9RenderCompletion, Vim9RenderMarginRow, Vim9RenderWindow};
         let run = |text: &str| Vim9RenderRun {
@@ -2933,6 +3293,7 @@ mod tests {
                 },
                 row_baseline(&surface, &state),
                 0.0,
+                &gtk::graphene::Rect::new(0.0, 0.0, 8.0, 10.0),
                 &mut cache,
             );
             assert!(cache.get(marker, false, false).unwrap().width > 0.0);
@@ -4014,6 +4375,7 @@ mod tests {
                     rect,
                     16.0,
                     0.0,
+                    &graphene_rect(rect),
                     &mut layouts,
                 );
                 assert_eq!(

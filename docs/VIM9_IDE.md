@@ -111,6 +111,17 @@ those advanced content renderers are already implemented.
 
 ## Native buffer rendering
 
+Native paint rejects invisible ink before shaping it and builds diagnostic
+waves only for the visible horizontal span, including cursor inversion.
+Clipping keeps the original row baseline and wave phase during fractional
+scrolling; a partially visible row does not move its underline to the edge.
+
+Completion and popup render nodes are retained across unchanged cursor/focus
+frames. Their own contents, GUI theme, widget clip, font settings, scale or
+Pango context changes rebuild the overlay without invalidating unrelated text.
+Closing the final overlay releases the retained node.
+
+
 Native rendering is enabled by default for supported ordinary buffer views.
 The rendering menu reports **GUI · RGB / Pango** while the native surface is drawing;
 `status_bar = true` also enables the header badge.

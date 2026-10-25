@@ -75,6 +75,8 @@ tests=(
     dialogs::tasks_panel::tests::dashboard_filters_preserve_selection_without_retargeting
     dialogs::tasks_panel::tests::dashboard_search_activate_selects_current_visible_result_only
     dialogs::tasks_panel::tests::dashboard_filter_counts_follow_search_not_selected_view
+    dialogs::tasks_panel::tests::selected_project_focus_keeps_query_identity_and_rejects_hidden_selection
+    vim9_ide_buffer::tests::retained_overlays_reuse_blink_frames_then_refresh_theme_contents_and_pango
     dialogs::tasks_panel::tests::task_terminal_buttons_only_emit_focus_for_existing_bindings
     dialogs::tasks_panel::tests::task_reason_updates_and_disappears_without_retargeting
     dialogs::tasks_panel::control_tests::task_control_center_preserves_search_action_identity_and_rejected_drafts

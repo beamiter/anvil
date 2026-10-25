@@ -30,10 +30,24 @@ impl TaskFilters {
         query: &str,
         view: DashboardView,
     ) -> DashboardSnapshot {
-        let candidates = source
+        let mut result = self.scope(source, workspaces, query);
+        result
             .rows
-            .iter()
-            .filter(|row| {
+            .retain(|row| self.status.is_none_or(|status| row.status == status));
+        result.apply_view(view, None, Default::default());
+        result
+    }
+
+    /// Provider/project/query scope for both badges and the final list. State
+    /// and quick-view narrowing happen afterward without a second search.
+    pub fn scope(
+        &self,
+        source: &DashboardSnapshot,
+        workspaces: &HashMap<TaskId, PathBuf>,
+        query: &str,
+    ) -> DashboardSnapshot {
+        DashboardSnapshot::filter_iter_unsorted(
+            source.rows.iter().filter(|row| {
                 row.status != TaskStatus::Archived
                     && self
                         .provider
@@ -42,15 +56,22 @@ impl TaskFilters {
                         .workspace
                         .as_ref()
                         .is_none_or(|path| workspaces.get(&row.id) == Some(path))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        // Reuse shared text matching, counts, quick views and deterministic sort.
-        let mut result = DashboardSnapshot::filter_rows(&candidates, query, view);
-        result
-            .rows
-            .retain(|row| self.status.is_none_or(|status| row.status == status));
-        result
+            }),
+            query,
+            DashboardView::All,
+        )
+    }
+
+    /// Original, lossless project identity of a currently visible selection.
+    /// Hidden selections and missing workspace facts never broaden the scope.
+    pub fn selected_project(
+        visible: &DashboardSnapshot,
+        selected: Option<TaskId>,
+        workspaces: &HashMap<TaskId, PathBuf>,
+    ) -> Option<PathBuf> {
+        let id = selected?;
+        visible.selected_index(Some(id))?;
+        workspaces.get(&id).cloned()
     }
 
     pub fn workspace_choices(&self, workspaces: &HashMap<TaskId, PathBuf>) -> Vec<PathBuf> {
@@ -176,6 +197,38 @@ mod tests {
             .project(&source, &HashMap::new(), "", DashboardView::All)
             .rows
             .is_empty());
+    }
+
+    #[test]
+    fn selected_project_uses_original_identity_and_refuses_hidden_or_missing_sources() {
+        use std::os::unix::ffi::OsStringExt;
+        let a = PathBuf::from(std::ffi::OsString::from_vec(b"/repo/\xff".to_vec()));
+        let b = PathBuf::from(std::ffi::OsString::from_vec(b"/repo/\xfe".to_vec()));
+        assert_eq!(a.to_string_lossy(), b.to_string_lossy());
+        let rows = vec![
+            row(AgentProvider::Codex, TaskStatus::Working),
+            row(AgentProvider::Codex, TaskStatus::Failed),
+        ];
+        let selected = rows[0].id;
+        let paths = HashMap::from([(selected, a.clone()), (rows[1].id, b)]);
+        let mut visible = DashboardSnapshot {
+            rows,
+            ..Default::default()
+        };
+        assert_eq!(
+            TaskFilters::selected_project(&visible, Some(selected), &paths),
+            Some(a)
+        );
+        assert_eq!(TaskFilters::selected_project(&visible, None, &paths), None);
+        assert_eq!(
+            TaskFilters::selected_project(&visible, Some(selected), &HashMap::new()),
+            None
+        );
+        visible.rows.remove(0);
+        assert_eq!(
+            TaskFilters::selected_project(&visible, Some(selected), &paths),
+            None
+        );
     }
 
     #[test]

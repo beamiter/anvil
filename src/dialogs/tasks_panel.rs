@@ -200,6 +200,8 @@ pub(crate) enum TasksPanelMsg {
     ProjectFilter(Option<std::path::PathBuf>),
     StatusFilter(Option<crate::agent_task::TaskStatus>),
     NextAttention,
+    PreviousAttention,
+    FocusSelectedProject,
     /// Stable identity captured when the row gesture occurs. A later filter
     /// change may hide it, but must never retarget a queued gesture.
     SelectRow(TaskId),
@@ -375,38 +377,24 @@ pub(crate) struct TasksPanelModel {
 impl TasksPanelModel {
     fn apply_dashboard_filters(&mut self) {
         let mut sync = self.unfiltered_sync.clone();
-        let attention_scope = TaskFilters {
-            status: None,
-            ..self.filters.clone()
-        }
-        .project(
-            &sync.dashboard,
-            &sync.workspaces,
-            &self.dashboard_query,
-            crate::agent_task::DashboardView::All,
-        );
+        let mut dashboard =
+            self.filters
+                .scope(&sync.dashboard, &sync.workspaces, &self.dashboard_query);
+        let attention_counts = dashboard.attention_counts();
         self.attention_counts = crate::agent_task::DashboardAttentionKind::ALL
             .iter()
-            .map(|kind| {
-                attention_scope
-                    .rows
-                    .iter()
-                    .filter(|row| row.attention_kind() == Some(*kind))
-                    .count()
-            })
+            .map(|kind| attention_counts.get(*kind))
             .collect();
-        let mut dashboard = self.filters.project(
-            &sync.dashboard,
-            &sync.workspaces,
-            &self.dashboard_query,
+        dashboard.rows.retain(|row| {
+            self.filters
+                .status
+                .is_none_or(|status| row.status == status)
+        });
+        dashboard.apply_view(
             self.dashboard_view,
+            self.attention_kind,
+            self.dashboard_sort,
         );
-        if let Some(kind) = self.attention_kind {
-            dashboard
-                .rows
-                .retain(|row| row.attention_kind() == Some(kind));
-        }
-        dashboard.sort_rows(self.dashboard_sort);
         let mut by_id: HashMap<_, _> = sync.rows.into_iter().map(|row| (row.id, row)).collect();
         sync.rows = dashboard
             .rows
@@ -748,7 +736,7 @@ impl Component for TasksPanelModel {
             },
 
             gtk::Box {
-                set_orientation: gtk::Orientation::Horizontal,
+                set_orientation: gtk::Orientation::Vertical,
                 set_spacing: 6,
                 #[name(dashboard_sort)]
                 gtk::DropDown {
@@ -765,12 +753,29 @@ impl Component for TasksPanelModel {
                         }
                     },
                 },
-                #[name(next_attention)]
-                gtk::Button {
-                    set_label: "Next needs you",
-                    set_tooltip_text: Some("Select the next visible task needing attention"),
-                    connect_clicked => TasksPanelMsg::NextAttention,
+                gtk::Box {
+                    set_orientation: gtk::Orientation::Horizontal,
+                    set_spacing: 6,
+                    #[name(previous_attention)]
+                    gtk::Button {
+                        set_label: "Previous needs you",
+                        set_tooltip_text: Some("Select the previous visible task needing attention"),
+                        connect_clicked => TasksPanelMsg::PreviousAttention,
+                    },
+                    #[name(next_attention)]
+                    gtk::Button {
+                        set_label: "Next needs you",
+                        set_tooltip_text: Some("Select the next visible task needing attention"),
+                        connect_clicked => TasksPanelMsg::NextAttention,
+                    },
                 },
+            },
+
+            #[name(dashboard_focus_project)]
+            gtk::Button {
+                set_label: "Selected project",
+                set_tooltip_text: Some("Narrow to the selected task's exact project; keep the current search and provider"),
+                connect_clicked => TasksPanelMsg::FocusSelectedProject,
             },
 
             #[name(dashboard_clear)]
@@ -1422,6 +1427,25 @@ impl Component for TasksPanelModel {
                 self.filters.status = status;
                 self.apply_dashboard_filters();
             }
+            TasksPanelMsg::FocusSelectedProject => {
+                self.apply_dashboard_filters();
+                if let Some(project) = TaskFilters::selected_project(
+                    &self.sync.dashboard,
+                    self.sync.selected,
+                    &self.sync.workspaces,
+                ) {
+                    self.filters.workspace = Some(project);
+                    self.apply_dashboard_filters();
+                }
+            }
+            TasksPanelMsg::PreviousAttention => {
+                self.apply_dashboard_filters();
+                if let Some(id) = self.sync.dashboard.previous_attention(self.sync.selected) {
+                    if Some(id) != self.sync.selected {
+                        self.emit_action(TaskPanelAction::Select(id), &sender);
+                    }
+                }
+            }
             TasksPanelMsg::NextAttention => {
                 self.apply_dashboard_filters();
                 if let Some(id) = self.sync.dashboard.next_attention(self.sync.selected) {
@@ -1649,6 +1673,20 @@ impl TasksPanelModel {
             widgets.dashboard_sort.set_selected(sort_index);
             self.dashboard_sort_guard.set(previous);
         }
+        widgets.dashboard_focus_project.set_sensitive(
+            TaskFilters::selected_project(
+                &self.sync.dashboard,
+                self.sync.selected,
+                &self.sync.workspaces,
+            )
+            .is_some(),
+        );
+        widgets.previous_attention.set_sensitive(
+            self.sync
+                .dashboard
+                .previous_attention(self.sync.selected)
+                .is_some(),
+        );
         widgets.next_attention.set_sensitive(
             self.sync
                 .dashboard
@@ -2413,6 +2451,83 @@ mod tests {
 
     #[test]
     #[ignore = "requires a native GTK display"]
+    fn selected_project_focus_keeps_query_identity_and_rejects_hidden_selection() {
+        gtk::init().expect("GTK display");
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let sink = actions.clone();
+        let controller =
+            TasksPanelModel::builder()
+                .launch(())
+                .connect_receiver(move |_, output| {
+                    let TasksPanelOutput::Action(action) = output;
+                    sink.borrow_mut().push(action);
+                });
+        let window = gtk::Window::new();
+        window.set_child(Some(controller.widget()));
+        let drain = || {
+            let main = gtk::glib::MainContext::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while main.pending() {
+                assert!(std::time::Instant::now() < deadline);
+                main.iteration(false);
+            }
+        };
+        let mut sync = dashboard_test_sync();
+        let selected = sync.selected.unwrap();
+        sync.workspaces = sync
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    row.id,
+                    std::path::PathBuf::from(if row.id == selected {
+                        "/repo/selected"
+                    } else {
+                        "/repo/other"
+                    }),
+                )
+            })
+            .collect();
+        controller.emit(TasksPanelMsg::Sync(Box::new(sync)));
+        controller.emit(TasksPanelMsg::DashboardQuery("provider:codex".into()));
+        controller.emit(TasksPanelMsg::ProviderFilter(Some(
+            crate::agent_task::AgentProvider::Codex,
+        )));
+        drain();
+        assert!(controller.widgets().dashboard_focus_project.is_sensitive());
+        controller.emit(TasksPanelMsg::FocusSelectedProject);
+        drain();
+        assert_eq!(
+            controller.model().filters.workspace.as_deref(),
+            Some(std::path::Path::new("/repo/selected"))
+        );
+        assert_eq!(controller.model().dashboard_query, "provider:codex");
+        assert_eq!(
+            controller.model().filters.provider,
+            Some(crate::agent_task::AgentProvider::Codex)
+        );
+        assert_eq!(controller.model().sync.selected, Some(selected));
+        assert_eq!(controller.model().sync.rows.len(), 1);
+        assert!(
+            actions.borrow().is_empty(),
+            "view focus cannot operate a task"
+        );
+        controller.emit(TasksPanelMsg::ClearDashboardFilters);
+        controller.emit(TasksPanelMsg::DashboardView(
+            crate::agent_task::DashboardView::Finished,
+        ));
+        drain();
+        assert!(!controller.widgets().dashboard_focus_project.is_sensitive());
+        controller.emit(TasksPanelMsg::FocusSelectedProject);
+        drain();
+        assert!(controller.model().filters.workspace.is_none());
+        assert_eq!(controller.model().sync.selected, Some(selected));
+        assert!(actions.borrow().is_empty());
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
     fn dashboard_filter_counts_follow_search_not_selected_view() {
         gtk::init().expect("GTK display");
         let actions = Rc::new(RefCell::new(Vec::new()));
@@ -2512,9 +2627,18 @@ mod tests {
             &[TaskPanelAction::Select(attention)]
         );
         actions.borrow_mut().clear();
+        controller.emit(TasksPanelMsg::PreviousAttention);
+        drain();
+        assert_eq!(
+            actions.borrow().as_slice(),
+            &[TaskPanelAction::Select(attention)]
+        );
+        actions.borrow_mut().clear();
         controller.widgets().dashboard_query_entry.set_text("First");
         drain();
         assert!(!controller.widgets().next_attention.is_sensitive());
+        assert!(!controller.widgets().previous_attention.is_sensitive());
+        controller.emit(TasksPanelMsg::PreviousAttention);
         controller.emit(TasksPanelMsg::NextAttention);
         drain();
         assert!(
