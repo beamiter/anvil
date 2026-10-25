@@ -135,6 +135,8 @@ pub(crate) enum TaskPanelAction {
     AcceptReviewed(TaskId),
     ReviewDiff(TaskId),
     Archive(TaskId),
+    /// Return a hidden task to the state it had when hidden.
+    Restore(TaskId),
     Select(TaskId),
     Close,
 }
@@ -439,8 +441,14 @@ pub(crate) fn order_task_rows(rows: &mut [TaskRowSnapshot], updated_at_ms: impl 
 
 /// One-line status summary for a row, bounded for display.
 pub(crate) fn row_status_line(row: &TaskRowSnapshot) -> String {
-    let base = if row.native_preparing {
-        "preparing native Codex".to_string()
+    // A pending approval or question outranks background preparation.
+    let base = if row.native_preparing
+        && !matches!(
+            row.status,
+            crate::agent_task::TaskStatus::WaitingForApproval
+                | crate::agent_task::TaskStatus::WaitingForHuman
+        ) {
+        format!("Preparing native {}", row.provider.display_name())
     } else {
         row.status.label().to_string()
     };
@@ -1079,7 +1087,11 @@ mod tests {
             "Ready for review · validation Passed"
         );
         row.native_preparing = true;
-        assert!(row_status_line(&row).starts_with("preparing native Codex"));
+        assert!(row_status_line(&row).starts_with("Preparing native Codex"));
+        row.provider = AgentProvider::Claude;
+        assert!(row_status_line(&row).starts_with("Preparing native Claude"));
+        row.status = TaskStatus::WaitingForApproval;
+        assert!(row_status_line(&row).starts_with("Waiting for approval"));
     }
 
     #[test]

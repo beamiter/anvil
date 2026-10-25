@@ -8,6 +8,9 @@ pub(super) struct TaskFilters {
     pub provider: Option<AgentProvider>,
     pub workspace: Option<PathBuf>,
     pub status: Option<TaskStatus>,
+    /// Show only hidden (archived) tasks, which can be restored. The normal
+    /// views never include them.
+    pub hidden: bool,
 }
 
 pub(super) const STATES: [TaskStatus; 9] = [
@@ -48,7 +51,7 @@ impl TaskFilters {
     ) -> DashboardSnapshot {
         DashboardSnapshot::filter_iter_unsorted(
             source.rows.iter().filter(|row| {
-                row.status != TaskStatus::Archived
+                (row.status == TaskStatus::Archived) == self.hidden
                     && self
                         .provider
                         .is_none_or(|provider| row.provider == provider)
@@ -111,6 +114,58 @@ mod tests {
     }
 
     #[test]
+    fn hidden_scope_is_exactly_the_archived_tasks_and_keeps_other_filters() {
+        let rows = vec![
+            row(AgentProvider::Codex, TaskStatus::Archived),
+            row(AgentProvider::Claude, TaskStatus::Archived),
+            row(AgentProvider::Codex, TaskStatus::Failed),
+        ];
+        let ids = rows.iter().map(|row| row.id).collect::<Vec<_>>();
+        let source = DashboardSnapshot {
+            rows,
+            ..Default::default()
+        };
+        let workspaces = HashMap::new();
+        let visible = TaskFilters::default().scope(&source, &workspaces, "");
+        assert_eq!(
+            visible.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [ids[2]]
+        );
+        let hidden = TaskFilters {
+            hidden: true,
+            ..Default::default()
+        };
+        let mut scope = hidden.scope(&source, &workspaces, "");
+        scope.sort_rows(Default::default());
+        assert_eq!(scope.rows.len(), 2);
+        assert_eq!(scope.counts.archived, 2);
+        assert!(scope
+            .rows
+            .iter()
+            .all(|row| row.status == TaskStatus::Archived));
+        let codex = TaskFilters {
+            provider: Some(AgentProvider::Codex),
+            ..hidden.clone()
+        };
+        assert_eq!(
+            codex
+                .scope(&source, &workspaces, "")
+                .rows
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            [ids[0]]
+        );
+        assert!(
+            hidden
+                .scope(&source, &workspaces, "status:archived")
+                .rows
+                .len()
+                == 2
+        );
+    }
+
+    #[test]
     fn exact_workspace_provider_state_intersection_keeps_counts_before_state_view() {
         let rows = vec![
             row(AgentProvider::Codex, TaskStatus::Working),
@@ -140,6 +195,7 @@ mod tests {
             provider: Some(AgentProvider::Codex),
             workspace: Some("/one/same".into()),
             status: Some(TaskStatus::Failed),
+            hidden: false,
         };
         let result = filters.project(&source, &paths, "same", DashboardView::All);
         assert_eq!(result.rows.len(), 1);

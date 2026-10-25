@@ -11,6 +11,7 @@ const ACTIVATE_AGENT_LABEL: &str = "Activate Shell Agent";
 const CLOSE_AGENT_LABEL: &str = "Close Shell Agent";
 const AGENT_UNAVAILABLE_LABEL: &str = "Shell Agent unavailable";
 const NEW_TAB_LABEL: &str = "New tab";
+const TOGGLE_TASKS_LABEL: &str = "Toggle agent Tasks panel";
 const MINIMIZE_WINDOW_LABEL: &str = "Minimize window";
 const MAXIMIZE_WINDOW_LABEL: &str = "Maximize window";
 const RESTORE_WINDOW_LABEL: &str = "Restore window";
@@ -37,6 +38,21 @@ fn agent_presentation(available: bool, active: bool) -> (&'static str, &'static 
     }
 }
 
+/// Tooltip and accessible name for the Tasks button. Attention is counted
+/// by the shared dashboard rule; hidden tasks never count.
+fn tasks_presentation(count: usize, summary: Option<&str>) -> (String, String) {
+    let tooltip = match summary {
+        Some(summary) if count > 0 => format!("{summary} · Toggle Tasks (Ctrl+Alt+Shift+T)"),
+        _ => "Agent tasks · Toggle Tasks (Ctrl+Alt+Shift+T)".to_string(),
+    };
+    let label = if count > 0 {
+        format!("{TOGGLE_TASKS_LABEL}, {count} need you")
+    } else {
+        TOGGLE_TASKS_LABEL.to_string()
+    };
+    (tooltip, label)
+}
+
 #[derive(Debug)]
 pub(crate) enum TopBarOutput {
     OpenPalette,
@@ -45,6 +61,7 @@ pub(crate) enum TopBarOutput {
     ToggleTabPlacement,
     ToggleAgent,
     OpenAgentSessions,
+    ToggleTasks,
     NewTab,
     MinimizeWindow,
     ToggleMaximizedWindow,
@@ -54,7 +71,17 @@ pub(crate) enum TopBarOutput {
 #[derive(Debug)]
 pub(crate) enum TopBarMsg {
     SetMaximized(bool),
-    SetAgentState { available: bool, active: bool },
+    SetAgentState {
+        available: bool,
+        active: bool,
+    },
+    /// Show the Tasks button only where tasks can be used, with the number
+    /// of visible tasks needing a person and the shared explanation.
+    TaskAttention {
+        visible: bool,
+        count: usize,
+        summary: Option<String>,
+    },
 }
 
 pub(crate) struct TopBarModel {
@@ -158,6 +185,37 @@ impl Component for TopBarModel {
                     add_css_class: "flat",
                     connect_clicked[sender] => move |_| {
                         let _ = sender.output(TopBarOutput::OpenAgentSessions);
+                    },
+                },
+
+                #[name(tasks_button)]
+                gtk::Button {
+                    set_visible: false,
+                    set_focus_on_click: false,
+                    set_tooltip_text: Some("Agent tasks · Toggle Tasks (Ctrl+Alt+Shift+T)"),
+                    update_property: &[
+                        gtk::accessible::Property::Label(TOGGLE_TASKS_LABEL),
+                        gtk::accessible::Property::KeyShortcuts("Control+Alt+Shift+T"),
+                    ],
+                    add_css_class: "flat",
+                    connect_clicked[sender] => move |_| {
+                        let _ = sender.output(TopBarOutput::ToggleTasks);
+                    },
+
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Horizontal,
+                        set_spacing: 4,
+
+                        gtk::Image {
+                            set_icon_name: Some("view-list-bullet-symbolic"),
+                        },
+
+                        #[name(tasks_badge)]
+                        gtk::Label {
+                            set_visible: false,
+                            add_css_class: "caption-heading",
+                            add_css_class: "accent",
+                        },
                     },
                 },
 
@@ -265,6 +323,20 @@ impl Component for TopBarModel {
                     .maximize_button
                     .update_property(&[gtk::accessible::Property::Label(label)]);
             }
+            TopBarMsg::TaskAttention {
+                visible,
+                count,
+                summary,
+            } => {
+                widgets.tasks_button.set_visible(visible);
+                widgets.tasks_badge.set_visible(visible && count > 0);
+                widgets.tasks_badge.set_label(&count.to_string());
+                let (tooltip, label) = tasks_presentation(count, summary.as_deref());
+                widgets.tasks_button.set_tooltip_text(Some(&tooltip));
+                widgets
+                    .tasks_button
+                    .update_property(&[gtk::accessible::Property::Label(&label)]);
+            }
             TopBarMsg::SetAgentState { available, active } => {
                 widgets.agent_toggle.set_sensitive(available);
                 widgets.agent_toggle.set_active(available && active);
@@ -289,6 +361,7 @@ mod tests {
             TOGGLE_SIDEBAR_LABEL,
             TOGGLE_TAB_PLACEMENT_LABEL,
             ACTIVATE_AGENT_LABEL,
+            TOGGLE_TASKS_LABEL,
             NEW_TAB_LABEL,
             MINIMIZE_WINDOW_LABEL,
             MAXIMIZE_WINDOW_LABEL,
@@ -313,5 +386,19 @@ mod tests {
         assert_eq!(agent_presentation(true, false).1, ACTIVATE_AGENT_LABEL);
         assert_eq!(agent_presentation(true, true).1, CLOSE_AGENT_LABEL);
         assert_eq!(agent_presentation(false, true).1, AGENT_UNAVAILABLE_LABEL);
+    }
+
+    #[test]
+    fn tasks_button_names_the_attention_count_and_shared_summary() {
+        let (tooltip, label) = tasks_presentation(0, None);
+        assert_eq!(label, TOGGLE_TASKS_LABEL);
+        assert!(tooltip.contains("Ctrl+Alt+Shift+T"));
+        let (tooltip, label) = tasks_presentation(2, Some("2 tasks need you: 1 approval, 1 reply"));
+        assert_eq!(label, "Toggle agent Tasks panel, 2 need you");
+        assert!(tooltip.starts_with("2 tasks need you: 1 approval, 1 reply"));
+        // A stale summary without a count never claims attention.
+        assert!(!tasks_presentation(0, Some("1 task needs you: 1 reply"))
+            .0
+            .contains("need you"));
     }
 }

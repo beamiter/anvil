@@ -1304,8 +1304,12 @@ impl AppModel {
     }
 
     pub(crate) fn show_toast(&self, message: impl AsRef<str>) {
-        self.toast_overlay
-            .add_toast(adw::Toast::new(message.as_ref()));
+        // Messages carry paths, Git output and provider errors; libadwaita
+        // would otherwise parse them as Pango markup and drop the title.
+        let toast = adw::Toast::new("");
+        toast.set_use_markup(false);
+        toast.set_title(message.as_ref());
+        self.toast_overlay.add_toast(toast);
     }
 
     /// A toast that offers to take back what it reports.

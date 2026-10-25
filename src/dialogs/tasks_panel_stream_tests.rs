@@ -65,7 +65,7 @@ fn fixture() -> TasksPanelSync {
             .into(),
         ..Default::default()
     };
-    sync.detail.as_mut().unwrap().stream = Some(Box::new(snapshot));
+    sync.detail.as_mut().unwrap().stream = Some(std::sync::Arc::new(snapshot));
     sync
 }
 
@@ -137,7 +137,7 @@ fn stream_paging_preserves_current_and_copies_only_visible_history() {
     assert!(history_buffer.selection_bounds().is_some());
     // Live Sync changes current output while the selected old history remains stable.
     let previous_history = text(&history);
-    let live = sync.detail.as_mut().unwrap().stream.as_mut().unwrap();
+    let live = std::sync::Arc::make_mut(sync.detail.as_mut().unwrap().stream.as_mut().unwrap());
     live.agent_text = "NEW CURRENT PROGRESS".into();
     live.last_error = Some("NEW LATEST ERROR".into());
     controller.emit(TasksPanelMsg::Sync(Box::new(sync.clone())));
@@ -149,12 +149,7 @@ fn stream_paging_preserves_current_and_copies_only_visible_history() {
     // A changed current buffer clears its selection, without paging history.
     current_buffer.select_range(&current_buffer.start_iter(), &current_buffer.end_iter());
     assert!(current_buffer.selection_bounds().is_some());
-    sync.detail
-        .as_mut()
-        .unwrap()
-        .stream
-        .as_mut()
-        .unwrap()
+    std::sync::Arc::make_mut(sync.detail.as_mut().unwrap().stream.as_mut().unwrap())
         .agent_text
         .push_str(" AGAIN");
     controller.emit(TasksPanelMsg::Sync(Box::new(sync.clone())));
@@ -163,7 +158,7 @@ fn stream_paging_preserves_current_and_copies_only_visible_history() {
     assert_eq!(controller.model().history_ordinal, Some(1));
     // Appending retained history preserves the old page and its selection.
     history_buffer.select_range(&history_buffer.start_iter(), &history_buffer.end_iter());
-    let live = sync.detail.as_mut().unwrap().stream.as_mut().unwrap();
+    let live = std::sync::Arc::make_mut(sync.detail.as_mut().unwrap().stream.as_mut().unwrap());
     let mut turns = live.turn_history.to_vec();
     let mut added = turns[2].clone();
     added.ordinal = 4;
@@ -177,7 +172,7 @@ fn stream_paging_preserves_current_and_copies_only_visible_history() {
     assert!(history_buffer.selection_bounds().is_some());
     assert_eq!(controller.model().history_ordinal, Some(1));
     // Eviction moves the cursor to the first surviving turn, with an explicit loss notice.
-    let live = sync.detail.as_mut().unwrap().stream.as_mut().unwrap();
+    let live = std::sync::Arc::make_mut(sync.detail.as_mut().unwrap().stream.as_mut().unwrap());
     live.turn_history = live.turn_history[1..].to_vec().into();
     live.dropped_turns = 1;
     controller.emit(TasksPanelMsg::Sync(Box::new(sync.clone())));

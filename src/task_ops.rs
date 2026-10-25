@@ -6,7 +6,7 @@
 //! pruned tabs, and pushes composed snapshots back to the panel. The flow
 //! mirrors ember's `app/tasks.rs` action executor and poll loop.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
@@ -17,9 +17,7 @@ use crate::agent_task::{
     AgentProvider, ApprovalDecision, CodexAppServerPhase, NativePromptPolicy, NewTask, TaskId,
     TaskRuntimeKind, TaskStatus, TaskTerminalRole, TaskValidationStatus,
 };
-use crate::agent_task_ui::{
-    self, order_task_rows, row_status_line, TaskPanelAction, TaskRowSnapshot,
-};
+use crate::agent_task_ui::{self, row_status_line, TaskPanelAction, TaskRowSnapshot};
 use crate::app_msg::AppMsg;
 use crate::dialogs::tasks_panel::{DiffSync, TaskDetailSync, TasksPanelMsg, TasksPanelSync};
 use crate::workspace::Pane;
@@ -120,12 +118,23 @@ fn task_action_allowed(enabled: bool, action: &TaskPanelAction) -> bool {
                 | TaskPanelAction::FocusValidation(_)
                 | TaskPanelAction::ReviewDiff(_)
                 | TaskPanelAction::Archive(_)
+                | TaskPanelAction::Restore(_)
                 | TaskPanelAction::Complete(_)
                 | TaskPanelAction::AcceptReviewed(_)
         )
 }
 
+/// Why Hide is unavailable. The manager's own error names a raw task ID.
+const ARCHIVE_BLOCKED: &str =
+    "Stop the Agent and wait for any running validation before hiding this task.";
+
 impl AppModel {
+    fn task_provider_name(&self, task_id: TaskId) -> &'static str {
+        self.task_manager
+            .get(task_id)
+            .map_or("the Agent", |task| task.provider.display_name())
+    }
+
     /// Observe authoritative task state, independent of panel visibility/selection.
     /// Keep the announcer on the persistent window, never a transient toast.
     fn announce_task_transitions(&mut self) {
@@ -169,6 +178,25 @@ impl AppModel {
         self.task_announcements.retain_issue_details(details);
     }
 
+    /// Keep the top-bar Tasks button in step with the domain. It is shown
+    /// only where tasks can be used and counts attention by the shared rule.
+    pub(crate) fn sync_task_badge(&self) {
+        let visible = !self.safe_mode
+            && (self.config.borrow().agent_tasks_enabled || !self.task_manager.tasks().is_empty());
+        let counts = self.task_manager.attention_counts();
+        let state = (visible, counts.total(), counts.summary());
+        if self.task_badge.borrow().as_ref() == Some(&state) {
+            return;
+        }
+        *self.task_badge.borrow_mut() = Some(state.clone());
+        let (visible, count, summary) = state;
+        self.top_bar.emit(crate::top_bar::TopBarMsg::TaskAttention {
+            visible,
+            count,
+            summary,
+        });
+    }
+
     pub(crate) fn toggle_tasks_panel(&mut self, sender: &ComponentSender<AppModel>) {
         if self.safe_mode {
             self.show_toast("Agent tasks are unavailable in safe mode.");
@@ -184,6 +212,9 @@ impl AppModel {
         self.tasks_panel_visible.set(visible);
         self.sync_side_panel();
         if visible {
+            // Opening the panel (for example from the attention badge) shows
+            // the ordinary views, never a hidden-tasks list left from before.
+            self.tasks_panel.emit(TasksPanelMsg::LeaveHidden);
             self.sync_tasks_panel();
         }
         self.ensure_agent_tasks_timer(sender);
@@ -261,6 +292,7 @@ impl AppModel {
         }
 
         self.announce_task_transitions();
+        self.sync_task_badge();
         let has_tasks = self.task_manager.tasks().iter().next().is_some();
         if keep_fast
             || has_tasks
@@ -439,12 +471,15 @@ impl AppModel {
             }
             TaskPanelAction::StopCodex(task_id) => match self.agent_runtime.cancel(task_id) {
                 Ok(()) => {
+                    let provider = self.task_provider_name(task_id);
                     if self.agent_runtime.has_running(task_id) {
-                        self.show_toast("Stopping Codex and waiting for process cleanup…");
+                        self.show_toast(format!(
+                            "Stopping {provider} and waiting for process cleanup…"
+                        ));
                     } else {
-                        self.show_toast(
-                            "Native Codex preparation cancelled; finishing background cleanup…",
-                        );
+                        self.show_toast(format!(
+                            "Native {provider} preparation cancelled; finishing background cleanup…"
+                        ));
                     }
                 }
                 Err(error) => self.show_toast(error.to_string()),
@@ -456,7 +491,10 @@ impl AppModel {
                     .prompt_codex(&self.task_manager, request.task_id, &request.text, policy)
                     .map_err(|error| error.to_string());
                 match &result {
-                    Ok(()) => self.show_toast("Follow-up queued on the existing Codex thread…"),
+                    Ok(()) => self.show_toast(format!(
+                        "Follow-up queued on the existing {} session…",
+                        self.task_provider_name(request.task_id)
+                    )),
                     Err(error) => self.show_toast(error.clone()),
                 }
                 self.tasks_panel
@@ -464,9 +502,10 @@ impl AppModel {
             }
             TaskPanelAction::FinishCodex(task_id) => {
                 match self.agent_runtime.finish_codex(&self.task_manager, task_id) {
-                    Ok(()) => self.show_toast(
-                        "Finishing Codex and waiting for containment cleanup before validation…",
-                    ),
+                    Ok(()) => self.show_toast(format!(
+                        "Finishing {} and waiting for containment cleanup before validation…",
+                        self.task_provider_name(task_id)
+                    )),
                     Err(error) => self.show_toast(error.to_string()),
                 }
             }
@@ -508,16 +547,32 @@ impl AppModel {
             }
             TaskPanelAction::Archive(task_id) => match self.task_manager.archive(task_id) {
                 Ok(()) => {
-                    self.agent_runtime.clear_retained(task_id);
+                    // Keep any retained native view: Restore brings the task
+                    // back with its transcript and recovery evidence.
                     if self.selected_task == Some(task_id) {
                         self.selected_task = None;
                     }
-                    self.show_toast("Task hidden; worktree left in place");
+                    self.show_toast(
+                        "Task hidden; its worktree is unchanged. Restore it from Hidden tasks.",
+                    );
+                }
+                Err(_) => self.show_toast(ARCHIVE_BLOCKED),
+            },
+            TaskPanelAction::Restore(task_id) => match self.task_manager.restore(task_id) {
+                Ok(()) => {
+                    // Keep it selected so the restored task is easy to find.
+                    self.selected_task = Some(task_id);
+                    let state = self
+                        .task_manager
+                        .get(task_id)
+                        .map_or("restored", |task| task.status.label());
+                    self.show_toast(format!("Task restored · {state}"));
                 }
                 Err(error) => self.show_toast(error.to_string()),
             },
         }
         self.announce_task_transitions();
+        self.sync_task_badge();
         self.ensure_agent_tasks_timer(sender);
         if self.tasks_panel_visible.get() {
             self.sync_tasks_panel();
@@ -731,7 +786,10 @@ impl AppModel {
     /// containment is the worktree plus the exact audited launcher argv.
     fn start_task_agent_terminal(&mut self, task_id: TaskId, sender: &ComponentSender<AppModel>) {
         if self.agent_runtime.has_preparing(task_id) {
-            self.show_toast("Cancel native Codex preparation before starting a terminal");
+            self.show_toast(format!(
+                "Cancel native {} preparation before starting a terminal",
+                self.task_provider_name(task_id)
+            ));
             return;
         }
         let failed_terminal_retry = self
@@ -1062,7 +1120,7 @@ impl AppModel {
             }
         }
 
-        let mut rows: Vec<TaskRowSnapshot> = self
+        let rows: Vec<TaskRowSnapshot> = self
             .task_manager
             .tasks()
             .iter()
@@ -1095,13 +1153,6 @@ impl AppModel {
                     .map(|detail| jterm_core::review_input::safe_inline_display(detail, 1024)),
             })
             .collect();
-        let updated: HashMap<TaskId, u64> = self
-            .task_manager
-            .tasks()
-            .iter()
-            .map(|task| (task.id, task.updated_at_ms))
-            .collect();
-        order_task_rows(&mut rows, |id| updated.get(&id).copied().unwrap_or(0));
 
         let selected = self
             .selected_task
@@ -1123,16 +1174,16 @@ impl AppModel {
         let create_hint = if self.pending_task_creation.is_some() {
             "Creating the isolated task worktree…".to_string()
         } else if !native_ai_enabled {
-            "Start Codex needs AI enabled plus command-context sharing consent (config: ai_enabled, ai_share_command_context)"
+            "Native Agents need AI enabled plus command-context sharing consent (config: ai_enabled, ai_share_command_context)"
                 .to_string()
         } else {
             String::new()
         };
-        let dashboard = crate::agent_task::DashboardSnapshot::project(
-            self.task_manager
-                .tasks()
-                .iter()
-                .filter(|task| task.status != crate::agent_task::TaskStatus::Archived),
+        // Hidden tasks stay in the projection so the panel can offer them for
+        // restore; its scope excludes them from every ordinary view. The
+        // panel chooses the final order, so no intermediate sort happens here.
+        let dashboard = crate::agent_task::DashboardSnapshot::project_unsorted(
+            self.task_manager.tasks(),
             |id| crate::agent_task::DashboardActivity {
                 has_active_agent_stream: self.task_manager.has_active_agent_event_stream(id),
                 native_preparing: self.agent_runtime.has_preparing(id),
@@ -1166,7 +1217,8 @@ impl AppModel {
         can_focus_validation: bool,
     ) -> Option<TaskDetailSync> {
         let task = self.task_manager.get(task_id)?;
-        let view = self.agent_runtime.snapshot(task_id);
+        // One shared view per provider change; idle ticks reuse it.
+        let view = self.agent_runtime.shared_snapshot(task_id);
         let has_stream = self.task_manager.has_active_agent_event_stream(task_id);
         let native_idle = task.status == TaskStatus::ReadyForReview
             && has_stream
@@ -1232,8 +1284,10 @@ impl AppModel {
         let follow_up_hint = if native_idle && !native_ai_enabled {
             "Enable AI features and command-context sharing before sending another turn".to_string()
         } else if native_idle {
-            "Send another turn on this loaded Codex thread, or finish the session to unlock validation"
-                .to_string()
+            format!(
+                "Send another turn on this loaded {} session, or finish the session to unlock validation",
+                task.provider.display_name()
+            )
         } else {
             String::new()
         };
@@ -1262,8 +1316,16 @@ impl AppModel {
                 text: self.agent_diff.state().text.clone(),
             });
 
+        let archived = task.status == TaskStatus::Archived;
+        let archive_check = self.task_manager.can_archive(task_id);
         Some(TaskDetailSync {
             id: task.id,
+            provider: task.provider,
+            archived,
+            can_archive: !archived && archive_check.is_ok(),
+            archive_note: (!archived && archive_check.is_err())
+                .then(|| ARCHIVE_BLOCKED.to_string()),
+            can_restore: archived && task.archived_from.is_some(),
             title: task.title.clone(),
             status_line,
             branch: task.branch.clone(),
@@ -1284,16 +1346,12 @@ impl AppModel {
                 && task.status == TaskStatus::ReadyForReview
                 && task.validation.status == TaskValidationStatus::NotRun
                 && !has_stream,
-            stream: view.map(Box::new),
-            approvals: self
-                .agent_runtime
-                .snapshot(task_id)
+            approvals: view
+                .as_ref()
                 .map(|snapshot| snapshot.pending_approvals.clone())
                 .unwrap_or_default(),
-            completed_turns: self
-                .agent_runtime
-                .snapshot(task_id)
-                .map_or(0, |snapshot| snapshot.completed_turns),
+            completed_turns: view.as_ref().map_or(0, |snapshot| snapshot.completed_turns),
+            stream: view,
             can_start_native: task.provider.supports_native_driver()
                 && (task.brief.is_some() || task.source_context.is_some())
                 && task.status == TaskStatus::Created

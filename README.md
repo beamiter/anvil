@@ -1624,6 +1624,12 @@ sessions: pin/unpin, archive/restore and add/remove one tag. The selected,
 visible and hidden counts make filtered selections explicit. Failed writes
 retain the selection and drafts, and organization never starts a provider.
 
+Resuming a conversation that another CLI is still running asks for **Resume
+anyway** before a second process is started. Background refreshes never move
+your selection, and **Copy command** copies the exact resume command. In the
+Tasks panel, **Hide** keeps the worktree and **Hidden tasks (N)** restores a task
+to its previous state; the top-bar Tasks button shows how many tasks need you.
+
 Development builds use the sibling `../jterm_core` checkout. Isolated Nix
 builds unpack the deterministic `packaging/jterm-core-src.tar.gz` snapshot
 beside this application. After shared-core changes, refresh it with

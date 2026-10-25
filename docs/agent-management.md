@@ -187,6 +187,77 @@ or retry. Successful acknowledgement clears only the submitted text; a newer edi
 a draft on another task, or a newer retry is never removed by an old receipt.
 These in-memory drafts are not written into terminal recovery journals.
 
+## Safer resume, steadier refresh and hidden tasks
+
+**Selecting is not resuming.** A single click only selects and inspects a
+conversation. Resume with Enter, a double click or **Resume in New Tab**. Space on
+a focused row toggles its batch checkbox and never resumes it.
+
+**A conversation that is already running elsewhere asks first.** When the latest
+scan observed a Codex or Claude process already holding the selected
+conversation, and it is not open in this window, the first Resume only explains
+that a second CLI would write to the same history. **Resume anyway** for the same
+conversation proceeds. A second press within about half a second of the warning
+is ignored, so a double-click or a quick double Enter cannot confirm it unread.
+The confirmation covers that one attempt: if its launch check fails, or Esc
+cancels it while the check runs, the next Resume warns again. Selecting another
+row, a refresh that removes the conversation, or Esc withdraws the warning. A
+conversation open in this window still switches to its tab.
+
+**Refresh never moves your selection.** If a background refresh removes the
+conversation you were inspecting (for example, another terminal archived it),
+nothing else is selected in its place: the detail pane says it left the view and
+Resume stays disabled until you pick again. It is restored if a later refresh
+shows it again. When your own change moves it out of the view (archiving it,
+restoring it from the Archived view, unpinning it in Pinned, or a name or tags
+that no longer match the filters), the pane says so and which view finds it.
+Searching or changing filters yourself still selects the first match.
+
+**Exact commands.** The detail pane shows, and **Copy command** copies, the exact
+resume command, including an `env CODEX_HOME=…` or `env CLAUDE_CONFIG_DIR=…`
+prefix when the conversation belongs to another provider home. The background
+readiness check computes it, so it appears a moment after you select a
+conversation (Copy command waits for it) and selecting never touches the
+project directory or history file on the window's thread. A missing CLI still
+leaves the command copyable; a missing project or history explains why there is
+none.
+
+**Saving is distinct from refreshing.** The shared library is reloaded in the
+background to pick up other terminals' changes; that no longer disables Save,
+Pin, Archive or the batch buttons or flashes "Saving". A save that fails stays
+reported even if a reload finishes first. Names, tags and the batch tag are
+checked against the shared byte limits while you type, and Save or Add/Remove tag
+stays disabled with the reason shown.
+
+**Refresh cadence.** Background rescans start five seconds after the previous
+scan finished, so a large history never triggers back-to-back rescans. Opening
+the manager, **Refresh** and F5 all rescan history, reload shared organization
+and recheck the selected conversation's launch.
+
+**Esc** first leaves a name, tag or batch-tag field, then withdraws a pending
+"Resume anyway" warning, then warns once about unsaved name/tag drafts; only then
+does it close the manager. Archive views, sort orders and recorded states use the
+shared labels; the provider's own archive appears as **Archived by provider**.
+The overview counts live CLI conversations rather than process IDs.
+
+**Hidden tasks can be restored.** **Hide** (formerly Archive) removes a finished
+or idle task from every task view without touching its worktree. It is disabled,
+with the reason in its tooltip, while the Agent or a validation is still running.
+When tasks are hidden, **Hidden tasks (N)** lists them; select one and choose
+**Restore task** to return it to the state it had when hidden. The hidden view
+offers only Restore and read-only inspection. It gives way to the ordinary views
+when you open the panel, create a task or restore one, and once nothing is
+hidden, so the task you are working with is never invisible. Hiding keeps a
+native Agent's transcript and recovery evidence, so a restored task shows them
+again.
+
+**Attention at a glance.** A Tasks button in the top bar shows how many visible
+tasks need you, with the shared summary (for example `2 tasks need you:
+1 approval, 1 reply`) in its tooltip, and toggles the panel like
+Ctrl+Alt+Shift+T. It appears when agent tasks are enabled or tasks exist. Task
+messages name the actual provider (Codex, Claude, OpenCode or Kimi), and
+notifications show paths and errors literally.
+
 ## Shared metadata compatibility
 
 Organization lives in the private shared session-library JSON, separately from

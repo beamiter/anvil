@@ -79,6 +79,7 @@ tests=(
     vim9_ide_buffer::tests::retained_overlays_reuse_blink_frames_then_refresh_theme_contents_and_pango
     dialogs::tasks_panel::tests::task_terminal_buttons_only_emit_focus_for_existing_bindings
     dialogs::tasks_panel::tests::task_reason_updates_and_disappears_without_retargeting
+    dialogs::tasks_panel::tests::hidden_tasks_offer_only_restore_and_hide_follows_manager_gates
     dialogs::tasks_panel::control_tests::task_control_center_preserves_search_action_identity_and_rejected_drafts
     dialogs::tasks_panel::stream_tests::stream_paging_preserves_current_and_copies_only_visible_history
     dialogs::tasks_panel::keyed_tests::keyed_rows_update_only_changed_widgets_and_prune_archives
@@ -86,6 +87,9 @@ tests=(
     dialogs::tasks_panel::keyed_tests::keyed_selection_guard_survives_synchronous_callbacks
     dialogs::tasks_panel::keyed_tests::keyed_task_list_mixed_update_benchmark
     dialogs::tasks_panel::keyed_tests::keyed_tasks_keep_focus_and_route_real_keyboard
+    agent_sessions::native_tests::session_manager_filters_preserves_selection_and_resumes_exact_argv
+    agent_sessions::native_tests::agent_management_v4_refresh_never_retargets_and_guards_live_resume
+    agent_sessions::session_bulk::native_tests::agent_management_v3_batch_controls_keep_exact_targets_and_drafts
     terminal::vte::tests::explicit_focus_return_respects_reopened_search
     block_view::fold_geometry_tests::fold_actions_update_visible_and_parked_geometry
     block_view::search_navigation_tests::block_output_search_unfolds_only_target

@@ -1,7 +1,9 @@
 //! Checked session identities are independent from the currently inspected row.
 use super::{gtk, Manager, SessionIdentity, SessionRow};
 use gtk::prelude::*;
-use jterm_core::agent_sessions::{SessionBatchAction, SESSION_BATCH_LIMIT};
+use jterm_core::agent_sessions::{
+    validate_session_batch_tag, SessionBatchAction, SESSION_BATCH_LIMIT,
+};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::{Rc, Weak};
@@ -32,6 +34,10 @@ struct SelectionRequest {
     identity: SelectionIdentity,
 }
 
+/// Default help for the batch tag entry; replaced by a validation message.
+const BATCH_TAG_TOOLTIP: &str =
+    "One tag (no commas) to add to or remove from every checked session";
+
 pub(super) struct SessionBulk {
     pub owner: RefCell<Weak<Manager>>,
     checked: RefCell<HashSet<SessionIdentity>>,
@@ -51,6 +57,11 @@ pub(super) struct SessionBulk {
 }
 
 impl SessionBulk {
+    /// A batch write from this window is waiting for its completion notice.
+    pub fn is_settling(&self) -> bool {
+        self.pending.get().is_some()
+    }
+
     pub fn new() -> Self {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
         let selection = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -71,6 +82,7 @@ impl SessionBulk {
         tag.set_max_length(128);
         tag.set_width_chars(12);
         tag.set_placeholder_text(Some("One tag"));
+        tag.set_tooltip_text(Some(BATCH_TAG_TOOLTIP));
         tag.update_property(&[gtk::accessible::Property::Label("Batch session tag")]);
         action_row.append(&actions);
         action_row.append(&tag);
@@ -329,7 +341,8 @@ impl Manager {
             .select_visible
             .set_sensitive(!self.visible.borrow().is_empty());
         let library = self.library.borrow();
-        if !library.is_busy() {
+        // Only the batch write itself matters; a periodic reload is not a save.
+        if !library.is_saving() {
             if let Some(count) = self.bulk.pending.take() {
                 self.bulk.notice.set_text(&match library.error() {
                     Some(error) => format!("Batch was not saved: {error}. Selection and drafts are retained."),
@@ -339,7 +352,7 @@ impl Manager {
         }
         let enabled = !keys.is_empty()
             && library.is_loaded()
-            && !library.is_busy()
+            && !library.is_saving()
             && library.error().is_none();
         drop(library);
         let state = ControlsIdentity {
@@ -359,6 +372,19 @@ impl Manager {
         while let Some(child) = self.bulk.actions.first_child() {
             self.bulk.actions.remove(&child);
         }
+        // Explain an unusable tag while typing, exactly as the batch store
+        // would refuse it, instead of only after Add/Remove is pressed.
+        let tag_error = (!state.tag.trim().is_empty())
+            .then(|| validate_session_batch_tag(&state.tag).err())
+            .flatten();
+        self.bulk
+            .tag
+            .set_tooltip_text(Some(tag_error.as_deref().unwrap_or(BATCH_TAG_TOOLTIP)));
+        if tag_error.is_some() {
+            self.bulk.tag.add_css_class("error");
+        } else {
+            self.bulk.tag.remove_css_class("error");
+        }
         let actions = [
             ("Pin", SessionBatchAction::Pin(true)),
             ("Unpin", SessionBatchAction::Pin(false)),
@@ -376,7 +402,9 @@ impl Manager {
                 action,
                 SessionBatchAction::AddTag(_) | SessionBatchAction::RemoveTag(_)
             );
-            button.set_sensitive(enabled && (!tag_action || !state.tag.trim().is_empty()));
+            button.set_sensitive(
+                enabled && (!tag_action || (!state.tag.trim().is_empty() && tag_error.is_none())),
+            );
             let rendered = BatchRequest {
                 generation,
                 keys: state.keys.clone(),

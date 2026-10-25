@@ -473,6 +473,8 @@ struct AppModel {
     pending_validation_pins:
         std::collections::HashMap<u64, crate::agent_task::PreparedTaskValidation>,
     agent_tasks_timer_armed: std::cell::Cell<bool>,
+    /// Last Tasks button state sent to the top bar, to skip redundant updates.
+    task_badge: std::cell::RefCell<Option<(bool, usize, Option<String>)>>,
     ai_conversation: Option<String>,
     /// One pane-bound natural-language command draft. Keeping the request
     /// handle here makes Stop/Dismiss real transport cancellation.
@@ -940,6 +942,7 @@ impl SimpleComponent for AppModel {
                 top_bar::TopBarOutput::OpenAgentSessions => {
                     AppMsg::Action(Action::OpenAgentSessions)
                 }
+                top_bar::TopBarOutput::ToggleTasks => AppMsg::Action(Action::ToggleTasksPanel),
                 top_bar::TopBarOutput::NewTab => AppMsg::NewTab,
                 top_bar::TopBarOutput::MinimizeWindow => AppMsg::MinimizeWindow,
                 top_bar::TopBarOutput::ToggleMaximizedWindow => AppMsg::ToggleMaximizedWindow,
@@ -1431,6 +1434,7 @@ impl SimpleComponent for AppModel {
             pending_task_creation: None,
             pending_validation_pins: std::collections::HashMap::new(),
             agent_tasks_timer_armed: std::cell::Cell::new(false),
+            task_badge: std::cell::RefCell::new(None),
             ai_conversation: None,
             command_suggestion: Rc::new(RefCell::new(None)),
             command_suggestion_generation: Rc::new(std::cell::Cell::new(0)),
@@ -1445,6 +1449,7 @@ impl SimpleComponent for AppModel {
             agent_panel,
         };
         model.sync_agent_toggle();
+        model.sync_task_badge();
 
         // Populate the palette cache opportunistically without adding startup
         // latency. Safe mode avoids reading user workflow directories until an

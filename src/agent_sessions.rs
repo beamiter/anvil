@@ -1,9 +1,11 @@
 //! Native session switcher for provider-owned CLI conversations.
 use gtk::prelude::*;
 use jterm_core::agent_sessions::{
-    AgentSession, SessionArchiveFilter, SessionCatalog, SessionLaunch, SessionLibraryFilter,
-    SessionLibrarySnapshot, SessionLibraryStore, SessionPreflight, SessionPreflightState,
-    SessionProvider, SessionQuery, SessionScanner, SessionSearchIndex, SessionSort, SessionStatus,
+    validate_session_details, AgentSession, SessionArchiveFilter, SessionCatalog, SessionLaunch,
+    SessionLibraryFilter, SessionLibrarySnapshot, SessionLibraryStore, SessionPreflight,
+    SessionPreflightState, SessionProvider, SessionQuery, SessionScanner, SessionSearchIndex,
+    SessionSort, SessionStatus, SESSION_ALIAS_MAX_BYTES, SESSION_RESUME_ANYWAY_DELAY,
+    SESSION_TAG_LIMIT, SESSION_TAG_MAX_BYTES,
 };
 use relm4::gtk;
 use std::cell::{Cell, RefCell};
@@ -145,9 +147,53 @@ struct Manager {
     resume: gtk::Button,
     refresh: gtk::Button,
     selected: RefCell<Option<String>>,
-    last_refresh: RefCell<Instant>,
+    /// Identity the user had selected when a background refresh (or their
+    /// own organization change) removed it from the view. Nothing else is
+    /// selected in its place; it is restored if a later refresh shows it again.
+    hidden_selection: RefCell<Option<String>>,
+    /// The user's own latest organization change and the sentence explaining
+    /// it, kept only while it explains why that identity left the view.
+    own_change: RefCell<Option<(String, &'static str)>>,
+    /// A live-elsewhere warning the user has seen. The next explicit Resume
+    /// starts another CLI, for that one attempt only.
+    conflict_ack: RefCell<Option<ConflictAck>>,
+    copy_command: gtk::Button,
+    /// A first Escape with unsaved name/tag drafts only warns.
+    escape_armed: Cell<bool>,
+    library_ui: RefCell<Option<LibraryUiState>>,
     launch: Box<dyn Fn(ResumeRequest)>,
 }
+
+/// A shown "already running elsewhere" warning.
+#[derive(Clone, Debug)]
+struct ConflictAck {
+    key: SessionIdentity,
+    /// The Enter press that showed the warning is still held, so key repeat
+    /// cannot confirm it.
+    held: bool,
+    /// A repeat sooner than `SESSION_RESUME_ANYWAY_DELAY` (a double-click or
+    /// a quick double Enter) is ignored, so the warning is never confirmed
+    /// unread.
+    armed_at: Instant,
+}
+
+const ARCHIVED_OUT_OF_VIEW: &str = "You archived this session locally, so it left this view. Choose the Archived quick view or All conversations to find or restore it.";
+const RESTORED_OUT_OF_VIEW: &str = "You restored this session to the active library, so it left this view. Choose Active or All conversations to find it.";
+const UNPINNED_OUT_OF_VIEW: &str =
+    "You unpinned this session, so it left this view. Choose Active to find it.";
+const DETAILS_OUT_OF_VIEW: &str = "Its new name or tags no longer match the search or filters, so it left this view. Clear filters to find it.";
+
+/// Library facts that change controls; the 100 ms tick redraws only on change.
+#[derive(Clone, PartialEq, Eq)]
+struct LibraryUiState {
+    loaded: bool,
+    saving: bool,
+    error: Option<String>,
+    pinned: usize,
+}
+
+/// Background rescans start this long after the previous scan finished.
+const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 fn identity(session: &AgentSession) -> String {
     format!("{}:{}", session.provider.label(), session.id)
@@ -240,16 +286,13 @@ impl SessionRow {
         catalog: &SessionCatalog,
         library: &SessionLibrarySnapshot,
     ) {
+        let facts = library.facts(session.provider, &session.id);
         set_label(
             &self.title,
             &format!(
                 "{}{}",
-                if library.is_pinned(session.provider, &session.id) {
-                    "★ "
-                } else {
-                    ""
-                },
-                library.display_title(session.provider, &session.id, &session.title)
+                if facts.pinned { "★ " } else { "" },
+                facts.display_title(&session.title)
             ),
         );
         let pids = catalog.live_pids(session);
@@ -264,17 +307,16 @@ impl SessionRow {
                     .join(", ")
             )
         };
-        let resumed = library
-            .last_resumed(session.provider, &session.id)
+        let resumed = facts
+            .last_resumed_ms
             .map(|time| format!(" · Resumed {}", age(time)))
             .unwrap_or_default();
-        let tags = library.tags(session.provider, &session.id);
-        let tags = if tags.is_empty() {
+        let tags = if facts.tags.is_empty() {
             String::new()
         } else {
-            format!("  ·  #{}", tags.join("  #"))
+            format!("  ·  #{}", facts.tags.join("  #"))
         };
-        let archive = if library.is_archived(session.provider, &session.id) {
+        let archive = if facts.archived {
             "  ·  Locally archived"
         } else {
             ""
@@ -296,13 +338,28 @@ impl SessionRow {
 }
 
 impl Manager {
+    /// Explicit refresh (open, F5 or the Refresh button): rescan history,
+    /// reload shared organization and recheck the selected launch.
     fn refresh(&self) {
+        self.preflight.borrow_mut().refresh();
+        self.library.borrow_mut().refresh();
         if self.scanner.borrow_mut().refresh() {
             self.refresh.set_sensitive(false);
             *self.refresh_notice.borrow_mut() = Some(self.notice.text().to_string());
             self.notice
                 .set_text("Reading local Codex and Claude sessions…");
-            *self.last_refresh.borrow_mut() = Instant::now();
+        }
+    }
+
+    /// Quiet background refresh, measured from the end of the previous scan
+    /// so a slow history never causes back-to-back rescans or lock churn.
+    fn refresh_in_background(&self) {
+        if self
+            .scanner
+            .borrow_mut()
+            .refresh_if_idle_for(AUTO_REFRESH_INTERVAL)
+        {
+            self.library.borrow_mut().refresh();
         }
     }
 
@@ -333,6 +390,7 @@ impl Manager {
         }
         self.page.set(0);
         self.selected.borrow_mut().take();
+        self.hidden_selection.borrow_mut().take();
         self.render();
     }
 
@@ -352,6 +410,7 @@ impl Manager {
         self.updating.set(false);
         self.page.set(0);
         self.selected.borrow_mut().take();
+        self.hidden_selection.borrow_mut().take();
         self.render();
         self.search.grab_focus();
     }
@@ -433,7 +492,13 @@ impl Manager {
         if self.updating.replace(true) {
             return;
         }
-        let selected = self.selected.borrow().clone();
+        // A background refresh keeps the user's chosen identity, including one
+        // an earlier refresh hid; explicit filter changes start from the top.
+        let selected = self.selected.borrow().clone().or_else(|| {
+            preserve_view
+                .then(|| self.hidden_selection.borrow().clone())
+                .flatten()
+        });
         let offset = self.list_scroll.vadjustment().value();
         self.update_projects();
         let query_text = self.search.text();
@@ -500,30 +565,28 @@ impl Manager {
                 .iter()
                 .map(|process| (process.provider, process.id.as_str()))
                 .collect::<HashSet<_>>();
+            // One library lookup per matching row feeds all five counts.
+            let mut counts = [0usize; 5];
+            for index in &summary_matches {
+                let session = &catalog.sessions[*index];
+                let facts = library.snapshot().facts(session.provider, &session.id);
+                if facts.archived {
+                    counts[4] += 1;
+                    continue;
+                }
+                counts[0] += 1;
+                counts[1] += usize::from(session.status == SessionStatus::Waiting);
+                counts[2] += usize::from(live.contains(&(session.provider, session.id.as_str())));
+                counts[3] += usize::from(facts.pinned);
+            }
             for (view, button) in &self.quick_views {
-                let count = summary_matches
-                    .iter()
-                    .filter(|index| {
-                        let session = &catalog.sessions[**index];
-                        let archived = library
-                            .snapshot()
-                            .is_archived(session.provider, &session.id);
-                        match view {
-                            SessionQuickView::All => !archived,
-                            SessionQuickView::NeedsInput => {
-                                !archived && session.status == SessionStatus::Waiting
-                            }
-                            SessionQuickView::Live => {
-                                !archived && live.contains(&(session.provider, session.id.as_str()))
-                            }
-                            SessionQuickView::Pinned => {
-                                !archived
-                                    && library.snapshot().is_pinned(session.provider, &session.id)
-                            }
-                            SessionQuickView::Archived => archived,
-                        }
-                    })
-                    .count();
+                let count = counts[match view {
+                    SessionQuickView::All => 0,
+                    SessionQuickView::NeedsInput => 1,
+                    SessionQuickView::Live => 2,
+                    SessionQuickView::Pinned => 3,
+                    SessionQuickView::Archived => 4,
+                }];
                 button.set_label(&format!("{}  {count}", view.label()));
                 let active = match view {
                     SessionQuickView::All => {
@@ -579,19 +642,34 @@ impl Manager {
             .iter()
             .map(|index| catalog.sessions[*index].clone())
             .collect();
-        let attention = catalog
-            .sessions
-            .iter()
-            .filter(|session| session.status == SessionStatus::Waiting)
-            .count();
+        let (attention, live_conversations) = {
+            let library = self.library.borrow();
+            let live = catalog
+                .live_processes
+                .iter()
+                .map(|process| (process.provider, process.id.as_str()))
+                .collect::<HashSet<_>>();
+            let attention = catalog
+                .sessions
+                .iter()
+                .filter(|session| {
+                    session.status == SessionStatus::Waiting
+                        && !library
+                            .snapshot()
+                            .facts(session.provider, &session.id)
+                            .archived
+                })
+                .count();
+            (attention, live.len())
+        };
         set_label(
             &self.overview,
             &format!(
-                "{} sessions  ·  {} match  ·  {} last needed input  ·  {} observed CLI processes",
+                "{} sessions  ·  {} match  ·  {} last needed input  ·  {} live CLI conversations",
                 catalog.sessions.len(),
                 matches.len(),
                 attention,
-                catalog.live_processes.len()
+                live_conversations
             ),
         );
         set_label(
@@ -655,14 +733,41 @@ impl Manager {
         self.update_rows();
         self.sync_batch_checks();
         self.update_batch_controls();
-        let selected_index = self
+        let visible_index = self
             .visible
             .borrow()
             .iter()
-            .position(|session| selected.as_deref() == Some(identity(session).as_str()))
-            .unwrap_or(0);
-        if let Some(row) = self.list.row_at_index(selected_index as i32) {
-            self.list.select_row(Some(&row));
+            .position(|session| selected.as_deref() == Some(identity(session).as_str()));
+        let selected_index = match (visible_index, preserve_view, selected) {
+            (Some(index), _, _) => {
+                self.hidden_selection.borrow_mut().take();
+                Some(index)
+            }
+            // A background refresh removed the chosen conversation. Never
+            // substitute another row: a later Enter must not resume a session
+            // the user did not pick.
+            (None, true, Some(hidden)) => {
+                *self.hidden_selection.borrow_mut() = Some(hidden);
+                None
+            }
+            (None, _, _) => {
+                self.hidden_selection.borrow_mut().take();
+                Some(0)
+            }
+        };
+        match selected_index.and_then(|index| self.list.row_at_index(index as i32)) {
+            Some(row) => self.list.select_row(Some(&row)),
+            None => self.list.select_row(None::<&gtk::ListBoxRow>),
+        }
+        // Once the user's own change has settled, it explains a detached
+        // selection only for that identity; otherwise forget it.
+        if !self.library.borrow().is_saving() {
+            let stale = self.own_change.borrow().as_ref().is_some_and(|(key, _)| {
+                self.hidden_selection.borrow().as_deref() != Some(key.as_str())
+            });
+            if stale {
+                self.own_change.borrow_mut().take();
+            }
         }
         self.updating.set(false);
         self.show_selection(self.list.selected_row().map(|row| row.index() as usize));
@@ -694,13 +799,12 @@ impl Manager {
 
     fn navigate(&self, key: gtk::gdk::Key) -> bool {
         let count = self.matched.borrow().len();
-        let current = self.page.get() * PAGE_SIZE
-            + self
-                .list
-                .selected_row()
-                .map(|row| row.index() as usize)
-                .unwrap_or(0);
+        let selected = self.list.selected_row().map(|row| row.index() as usize);
+        let current = self.page.get() * PAGE_SIZE + selected.unwrap_or(0);
         let next = match key {
+            // With nothing selected (for example after a refresh hid the
+            // chosen session), the first arrow press selects this page's top.
+            gtk::gdk::Key::Up | gtk::gdk::Key::Down if selected.is_none() => current,
             gtk::gdk::Key::Up => current.saturating_sub(1),
             gtk::gdk::Key::Down => current.saturating_add(1),
             gtk::gdk::Key::Page_Up => current.saturating_sub(PAGE_SIZE),
@@ -780,10 +884,34 @@ impl Manager {
             self.selected.borrow_mut().take();
             self.preflight.borrow_mut().select(None);
             self.confirmation.borrow_mut().take();
-            set_label(&self.readiness, "Select a session to check readiness");
+            self.conflict_ack.borrow_mut().take();
+            self.copy_command.set_sensitive(false);
+            let hidden = self.hidden_selection.borrow().clone();
+            let own_change = hidden.as_ref().and_then(|hidden| {
+                self.own_change
+                    .borrow()
+                    .as_ref()
+                    .filter(|(key, _)| key == hidden)
+                    .map(|(_, explanation)| *explanation)
+            });
+            set_label(
+                &self.readiness,
+                match (&hidden, own_change) {
+                    (Some(_), Some(_)) => "Your change moved the selected session out of this view",
+                    (Some(_), None) => "The selected session left this view after a refresh",
+                    (None, _) => "Select a session to check readiness",
+                },
+            );
             self.pin.set_sensitive(false);
             self.pin.set_label("☆ Pin session");
-            set_label(&self.detail, "Select a session to inspect its project and recent conversation.\n\nSearch by title, project, branch, session ID or conversation text.");
+            let detail = match (&hidden, own_change) {
+                (Some(_), Some(explanation)) => format!(
+                    "{explanation}\n\nSelect a session to continue; nothing was selected in its place."
+                ),
+                (Some(_), None) => "The session you selected is no longer in this view. Another window may have archived it, or its latest state no longer matches the filters.\n\nSelect a session to continue; nothing was selected in its place.".into(),
+                (None, _) => "Select a session to inspect its project and recent conversation.\n\nSearch by title, project, branch, session ID or conversation text.".into(),
+            };
+            set_label(&self.detail, &detail);
             self.resume.set_sensitive(false);
             self.organization_key.borrow_mut().take();
             self.organization_dirty.set(false);
@@ -802,6 +930,16 @@ impl Manager {
             return;
         };
         *self.selected.borrow_mut() = Some(identity(session));
+        self.hidden_selection.borrow_mut().take();
+        let key = (session.provider, session.id.clone());
+        if self
+            .conflict_ack
+            .borrow()
+            .as_ref()
+            .is_some_and(|ack| ack.key != key)
+        {
+            self.conflict_ack.borrow_mut().take();
+        }
         self.sync_organization(session);
         let existing = self
             .existing
@@ -816,12 +954,28 @@ impl Manager {
         }
         let preflight = self.preflight.borrow();
         let ready = preflight.ready_launch(session).is_some();
+        let conflict = if existing {
+            None
+        } else {
+            self.catalog.borrow().resume_conflict(session)
+        };
+        let acknowledged = conflict.is_some()
+            && self
+                .conflict_ack
+                .borrow()
+                .as_ref()
+                .is_some_and(|ack| ack.key == key);
+        if conflict.is_none() {
+            self.conflict_ack.borrow_mut().take();
+        }
         let readiness = if self.completed_activation.get() {
             "Session opened — release Enter to switch".into()
         } else if self.activation.borrow().is_some() {
             "Opening session…".into()
         } else if existing {
             "Already open in this window — switch to its terminal".into()
+        } else if let (Some(warning), false) = (&conflict, acknowledged) {
+            format!("⚠ {warning}")
         } else {
             match preflight.state() {
                 SessionPreflightState::Idle => "Select a session to check readiness".into(),
@@ -840,21 +994,30 @@ impl Manager {
         set_label(&self.readiness, &readiness);
         self.resume.set_label(if existing {
             "Switch to Session"
+        } else if acknowledged {
+            "Resume anyway"
         } else {
             "Resume in New Tab"
         });
-        let command = format!(
-            "{} {} {}",
-            session.provider.label().to_lowercase(),
-            if session.provider == SessionProvider::Codex {
-                "resume"
-            } else {
-                "--resume"
-            },
-            session.id
-        );
+        // The background check computes the exact command, so inspecting a
+        // conversation never touches its directory or history on this thread.
+        let exact = (!existing)
+            .then(|| preflight.command(session).map(str::to_owned))
+            .flatten();
+        self.copy_command.set_sensitive(exact.is_some());
+        let command = match (exact, preflight.state()) {
+            (Some(command), _) => format!("Resume command: {command}"),
+            (None, _) if existing => {
+                "Open in this window; Switch to Session focuses its terminal".into()
+            }
+            (None, SessionPreflightState::Unavailable(error)) => {
+                format!("Resume unavailable: {error}")
+            }
+            (None, _) => "Checking the resume command…".into(),
+        };
         let library = self.library.borrow();
-        let pinned = library.snapshot().is_pinned(session.provider, &session.id);
+        let facts = library.snapshot().facts(session.provider, &session.id);
+        let pinned = facts.pinned;
         self.updating.set(true);
         self.pin.set_active(pinned);
         self.updating.set(false);
@@ -863,9 +1026,8 @@ impl Manager {
         } else {
             "☆ Pin session"
         });
-        let saved = library
-            .snapshot()
-            .last_resumed(session.provider, &session.id)
+        let saved = facts
+            .last_resumed_ms
             .map(|time| format!("Last resumed {}", age(time)))
             .unwrap_or_else(|| "Not resumed from a terminal manager yet".into());
         let pids = self.catalog.borrow().live_pids(session);
@@ -884,7 +1046,7 @@ impl Manager {
             &self.detail,
             &format!(
                 "{}\n\n{} · {} · {}\nSession {}\nProject {}\nBranch {}\n{}\n\n{}\n\n{saved}\n\n{command}",
-                if let Some(alias) = library.snapshot().alias(session.provider, &session.id) {
+                if let Some(alias) = facts.alias {
                     format!("{alias}\nProvider title: {}", session.title)
                 } else {
                     session.title.clone()
@@ -895,7 +1057,10 @@ impl Manager {
                 session.id,
                 session.cwd.display(),
                 session.branch.as_deref().unwrap_or("—"),
-                process,
+                match &conflict {
+                    Some(warning) => format!("{process}\n⚠ {warning}"),
+                    None => process,
+                },
                 session.preview
             ),
         );
@@ -979,18 +1144,29 @@ impl Manager {
         let loaded = library.is_loaded() && library.error().is_none();
         let saving = self.organization_is_saving();
         let editable = loaded && selected.is_some() && !saving;
+        // A periodic read-only reload is not a save; only pending writes
+        // lock the editor, so controls no longer flicker every refresh.
+        let writing = library.is_saving();
+        // Validate exactly as the store will, while typing.
+        let invalid = self
+            .organization_dirty
+            .get()
+            .then(|| validate_session_details(&self.alias.text(), &self.tags.text()).err())
+            .flatten();
         self.alias.set_sensitive(editable);
         self.tags.set_sensitive(editable);
-        self.save_details
-            .set_sensitive(editable && self.organization_dirty.get() && !library.is_busy());
+        self.save_details.set_sensitive(
+            editable && self.organization_dirty.get() && !writing && invalid.is_none(),
+        );
         self.revert_details
             .set_sensitive(selected.is_some() && self.organization_dirty.get() && !saving);
         self.archive
-            .set_sensitive(editable && !library.is_busy() && !self.organization_dirty.get());
+            .set_sensitive(editable && !writing && !self.organization_dirty.get());
         let archived = selected.as_ref().is_some_and(|session| {
             library
                 .snapshot()
-                .is_archived(session.provider, &session.id)
+                .facts(session.provider, &session.id)
+                .archived
         });
         self.archive.set_label(if archived {
             "Restore to active"
@@ -1005,6 +1181,8 @@ impl Manager {
             "Names, tags and archive are shared across all four terminals"
         };
         if let Some(error) = library.error() {
+            self.organization_notice.set_text(error);
+        } else if let Some(error) = invalid.as_ref() {
             self.organization_notice.set_text(error);
         } else if let Some(error) = self.organization_error.borrow().as_ref() {
             self.organization_notice.set_text(error);
@@ -1032,6 +1210,7 @@ impl Manager {
         match result {
             Ok(()) => {
                 *self.organization_saving.borrow_mut() = Some(identity(&session));
+                self.record_own_change(&session, DETAILS_OUT_OF_VIEW);
                 self.update_organization_controls();
             }
             Err(error) => {
@@ -1043,7 +1222,8 @@ impl Manager {
     }
 
     fn finish_organization_save(&self) {
-        if self.library.borrow().is_busy() {
+        // A failed write stays in `error()` even if a reload finished first.
+        if self.library.borrow().is_saving() {
             return;
         }
         let Some(key) = self.organization_saving.borrow_mut().take() else {
@@ -1091,16 +1271,52 @@ impl Manager {
             .library
             .borrow()
             .snapshot()
-            .is_archived(session.provider, &session.id);
+            .facts(session.provider, &session.id)
+            .archived;
         let result =
             self.library
                 .borrow_mut()
                 .set_archived(session.provider, &session.id, !archived);
-        if let Err(error) = result {
-            *self.organization_error.borrow_mut() = Some(error);
+        match result {
+            Ok(()) => self.record_own_change(
+                &session,
+                if archived {
+                    RESTORED_OUT_OF_VIEW
+                } else {
+                    ARCHIVED_OUT_OF_VIEW
+                },
+            ),
+            Err(error) => *self.organization_error.borrow_mut() = Some(error),
         }
         self.update_library_status();
     }
+
+    /// Remember why the user's own change may move `session` out of the
+    /// view, so the detail pane can say so instead of blaming a refresh.
+    fn record_own_change(&self, session: &AgentSession, explanation: &'static str) {
+        *self.own_change.borrow_mut() = Some((identity(session), explanation));
+    }
+    /// Redraw library-dependent controls only when their inputs changed. The
+    /// tick polls every 100 ms; an idle manager does no widget work.
+    fn sync_library_status(&self) {
+        let state = {
+            let library = self.library.borrow();
+            LibraryUiState {
+                loaded: library.is_loaded(),
+                saving: library.is_saving(),
+                error: library.error().map(str::to_owned),
+                pinned: library.snapshot().pinned_count(),
+            }
+        };
+        // A save started here must be settled even when it leaves every
+        // displayed fact unchanged (for example, re-saving the same name).
+        let settling = self.organization_saving.borrow().is_some() || self.bulk.is_settling();
+        if settling || self.library_ui.borrow().as_ref() != Some(&state) {
+            *self.library_ui.borrow_mut() = Some(state);
+            self.update_library_status();
+        }
+    }
+
     fn update_library_status(&self) {
         // An acknowledged save can leave the snapshot unchanged (for example,
         // editing a name and then restoring its original text). Such a poll
@@ -1108,7 +1324,7 @@ impl Manager {
         self.finish_organization_save();
         let library = self.library.borrow();
         let loaded = library.is_loaded();
-        let busy = library.is_busy();
+        let busy = library.is_saving();
         let message = if let Some(error) = library.error() {
             format!("Saved sessions unavailable: {error}")
         } else if !loaded {
@@ -1151,8 +1367,80 @@ impl Manager {
         if let Err(error) = result {
             set_label(&self.library_status, &error);
         } else {
+            if !pinned {
+                self.record_own_change(&session, UNPINNED_OUT_OF_VIEW);
+            }
             self.update_library_status();
         }
+    }
+
+    /// Copy the exact command a resume runs, including a provider-home
+    /// override. It comes from the background readiness check.
+    fn copy_resume_command(&self) {
+        let Some(session) = self.selected_session() else {
+            return;
+        };
+        let command = self.preflight.borrow().command(&session).map(str::to_owned);
+        match command {
+            Some(command) => {
+                self.copy_command.clipboard().set_text(&command);
+                self.notice.set_text("Copied the resume command.");
+            }
+            None => self
+                .notice
+                .set_text("The resume command is still being checked."),
+        }
+    }
+
+    /// Escape leaves an editor, then cancels a pending live-session warning,
+    /// then warns once about unsaved name/tag drafts. Only otherwise does it
+    /// close the manager. Returns whether the manager should stay open.
+    fn escape_keeps_open(&self) -> bool {
+        let focus = self
+            .window
+            .upgrade()
+            .and_then(|window| gtk::prelude::GtkWindowExt::focus(&window));
+        let editing = focus.is_some_and(|focus| {
+            [
+                self.alias.upcast_ref::<gtk::Widget>(),
+                self.tags.upcast_ref(),
+                self.bulk.tag.upcast_ref(),
+            ]
+            .iter()
+            .any(|editor| focus == **editor || focus.is_ancestor(*editor))
+        });
+        if editing {
+            self.search.grab_focus();
+            return true;
+        }
+        if self.conflict_ack.borrow_mut().take().is_some() {
+            // A "Resume anyway" may already be waiting for its launch check.
+            self.confirmation.borrow_mut().take();
+            self.notice.set_text("Resume cancelled.");
+            self.show_selection(self.list.selected_row().map(|row| row.index() as usize));
+            return true;
+        }
+        if !self.organization_drafts.borrow().is_empty() && !self.escape_armed.replace(true) {
+            self.notice.set_text(
+                "Unsaved session names or tags. Press Esc again to close and discard them.",
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Space on a focused session row toggles its batch checkbox. It never
+    /// activates (resumes) the row.
+    fn toggle_focused_batch_check(&self) -> bool {
+        let Some(index) = self.list.selected_row().map(|row| row.index() as usize) else {
+            return false;
+        };
+        let rows = self.rows.borrow();
+        let Some(row) = rows.get(index) else {
+            return false;
+        };
+        row.checked.set_active(!row.checked.is_active());
+        true
     }
 
     fn selected_session(&self) -> Option<AgentSession> {
@@ -1184,7 +1472,9 @@ impl Manager {
             existing: launch.is_none(),
             result,
         });
+        // A "Resume anyway" covered exactly this attempt.
         self.confirmation.borrow_mut().take();
+        self.conflict_ack.borrow_mut().take();
         self.resume.set_sensitive(false);
         set_label(&self.readiness, "Opening session…");
         (self.launch)(ResumeRequest {
@@ -1246,6 +1536,13 @@ impl Manager {
         });
     }
 
+    /// End a pending resume that did not launch. A "Resume anyway" covered
+    /// only that attempt, so the next Resume shows the warning again.
+    fn abandon_confirmation(&self) {
+        self.confirmation.borrow_mut().take();
+        self.conflict_ack.borrow_mut().take();
+    }
+
     fn poll_confirmation(&self) {
         if self.activation.borrow().is_some() {
             return;
@@ -1254,11 +1551,11 @@ impl Manager {
             return;
         };
         let Some(session) = self.selected_session() else {
-            self.confirmation.borrow_mut().take();
+            self.abandon_confirmation();
             return;
         };
         if key != (session.provider, session.id.clone()) {
-            self.confirmation.borrow_mut().take();
+            self.abandon_confirmation();
             return;
         }
         let ready = self.preflight.borrow().ready_launch(&session).cloned();
@@ -1266,7 +1563,7 @@ impl Manager {
             self.dispatch_activation(session, Some(launch));
         } else if let SessionPreflightState::Unavailable(error) = self.preflight.borrow().state() {
             self.notice.set_text(error);
-            self.confirmation.borrow_mut().take();
+            self.abandon_confirmation();
         }
     }
 
@@ -1280,9 +1577,41 @@ impl Manager {
         let Some(session) = self.selected_session() else {
             return;
         };
-        crate::enter_ownership::claim_held();
         let key = (session.provider, session.id.clone());
-        if self.existing.borrow().contains(&key) {
+        let existing = self.existing.borrow().contains(&key);
+        if !existing {
+            if let Some(warning) = self.catalog.borrow().resume_conflict(&session) {
+                let state = self.conflict_ack.borrow().clone();
+                match state {
+                    // Key repeat from the press that showed the warning, or
+                    // the second click of a double-click: not yet read.
+                    Some(ack)
+                        if ack.key == key
+                            && (ack.held
+                                || ack.armed_at.elapsed() < SESSION_RESUME_ANYWAY_DELAY) =>
+                    {
+                        return
+                    }
+                    Some(ack) if ack.key == key => {}
+                    _ => {
+                        *self.conflict_ack.borrow_mut() = Some(ConflictAck {
+                            key,
+                            held: self.enter_down.get(),
+                            armed_at: Instant::now(),
+                        });
+                        self.notice.set_text(&format!(
+                            "{warning} Choose Resume anyway to start another CLI, or switch to the running one."
+                        ));
+                        self.show_selection(
+                            self.list.selected_row().map(|row| row.index() as usize),
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+        crate::enter_ownership::claim_held();
+        if existing {
             self.dispatch_activation(session, None);
         } else {
             *self.confirmation.borrow_mut() = Some(key);
@@ -1371,11 +1700,12 @@ fn show_inner(
     provider.set_tooltip_text(Some("Filter by agent provider"));
     let status = gtk::DropDown::from_strings(&[
         "All states",
-        "Last recorded: working",
-        "Last recorded: needs input",
-        "Ready to resume",
-        "State unknown",
-        "Archived",
+        SessionStatus::Working.label(),
+        SessionStatus::Waiting.label(),
+        SessionStatus::Idle.label(),
+        SessionStatus::Unknown.label(),
+        // Provider-owned archive, distinct from the local Archived view.
+        "Archived by provider",
     ]);
     status.set_tooltip_text(Some("Filter by the latest recorded session state"));
     let live_only = gtk::CheckButton::with_label("Live CLI");
@@ -1391,12 +1721,9 @@ fn show_inner(
                 "No local working directory is available for the active pane".into()
             }),
     ));
-    let sort = gtk::DropDown::from_strings(&[
-        "Best match",
-        "Most recent",
-        "Live first",
-        "Recently resumed",
-    ]);
+    // Index order matches `render_view`'s mapping and the shared labels.
+    let sort_labels = SessionSort::ALL.map(SessionSort::label);
+    let sort = gtk::DropDown::from_strings(&sort_labels);
     sort.set_tooltip_text(Some("Order matching sessions"));
     let clear = gtk::Button::with_label("Clear filters");
     clear.add_css_class("flat");
@@ -1434,8 +1761,8 @@ fn show_inner(
     });
     project.set_factory(Some(&project_factory));
     project.set_list_factory(Some(&project_factory));
-    let archive_view =
-        gtk::DropDown::from_strings(&["Active sessions", "Locally archived", "Active + archived"]);
+    let archive_labels = SessionArchiveFilter::ALL.map(SessionArchiveFilter::label);
+    let archive_view = gtk::DropDown::from_strings(&archive_labels);
     archive_view.set_tooltip_text(Some("Local organization shared across terminals"));
     archive_view.update_property(&[gtk::accessible::Property::Label("Session archive view")]);
     project_row.append(&project_label);
@@ -1464,6 +1791,9 @@ fn show_inner(
     root.append(&bulk.root);
     let list = gtk::ListBox::new();
     list.set_selection_mode(gtk::SelectionMode::Single);
+    // A click only selects and inspects. Resuming needs Enter, a double
+    // click or the Resume button, never a single click on a row.
+    list.set_activate_on_single_click(false);
     list.add_css_class("navigation-sidebar");
     let list_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -1499,26 +1829,27 @@ fn show_inner(
     alias_label.add_css_class("dim-label");
     organization_fields.attach(&alias_label, 0, 0, 1, 1);
     let alias = gtk::Entry::new();
-    alias.set_max_length(512);
+    // Characters cap the field; the byte limit is checked while typing.
+    alias.set_max_length(SESSION_ALIAS_MAX_BYTES as i32);
     alias.set_hexpand(true);
     alias.update_property(&[gtk::accessible::Property::Label("Session display name")]);
     alias.set_placeholder_text(Some("Use the original title when empty"));
-    alias.set_tooltip_text(Some(
-        "A local display name shared across your four terminals; up to 160 UTF-8 bytes",
-    ));
+    alias.set_tooltip_text(Some(&format!(
+        "A local display name shared across your four terminals; up to {SESSION_ALIAS_MAX_BYTES} UTF-8 bytes"
+    )));
     organization_fields.attach(&alias, 0, 1, 1, 1);
     let tags_label = gtk::Label::new(Some("Tags"));
     tags_label.set_xalign(0.0);
     tags_label.add_css_class("dim-label");
     organization_fields.attach(&tags_label, 1, 0, 1, 1);
     let tags = gtk::Entry::new();
-    tags.set_max_length(1024);
+    tags.set_max_length(((SESSION_TAG_MAX_BYTES + 2) * SESSION_TAG_LIMIT) as i32);
     tags.set_hexpand(true);
     tags.update_property(&[gtk::accessible::Property::Label("Session tags")]);
     tags.set_placeholder_text(Some("frontend, review, urgent"));
-    tags.set_tooltip_text(Some(
-        "Separate up to 12 tags with commas; search with tag:review",
-    ));
+    tags.set_tooltip_text(Some(&format!(
+        "Separate up to {SESSION_TAG_LIMIT} tags of {SESSION_TAG_MAX_BYTES} UTF-8 bytes with commas; search with tag:review"
+    )));
     organization_fields.attach(&tags, 1, 1, 1, 1);
     inspector.append(&organization_fields);
     let organization_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -1578,6 +1909,11 @@ fn show_inner(
     root.append(&notice);
     let resume = gtk::Button::with_label("Resume in New Tab");
     resume.add_css_class("suggested-action");
+    let copy_command = gtk::Button::with_label("Copy command");
+    copy_command.set_tooltip_text(Some(
+        "Copy the exact resume command, including a provider home override",
+    ));
+    copy_command.set_sensitive(false);
     let pin = gtk::ToggleButton::with_label("☆ Pin session");
     let readiness = gtk::Label::new(Some("Select a session to check readiness"));
     readiness.set_hexpand(true);
@@ -1588,6 +1924,7 @@ fn show_inner(
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     actions.append(&pin);
     actions.append(&readiness);
+    actions.append(&copy_command);
     actions.append(&resume);
     root.append(&actions);
     window.set_child(Some(&root));
@@ -1656,7 +1993,12 @@ fn show_inner(
         resume,
         refresh,
         selected: RefCell::new(None),
-        last_refresh: RefCell::new(Instant::now()),
+        hidden_selection: RefCell::new(None),
+        own_change: RefCell::new(None),
+        conflict_ack: RefCell::new(None),
+        copy_command,
+        escape_armed: Cell::new(false),
+        library_ui: RefCell::new(None),
         launch: Box::new(launch),
     });
     manager.bulk.connect(&manager);
@@ -1845,6 +2187,17 @@ fn show_inner(
         if !(modifiers - gtk::gdk::ModifierType::LOCK_MASK).is_empty() {
             return gtk::glib::Propagation::Proceed;
         }
+        if matches!(key, gtk::gdk::Key::space | gtk::gdk::Key::KP_Space) {
+            // GtkListBox binds Space to row activation; here it only toggles
+            // the batch checkbox, as the checkbox tooltip promises.
+            if weak
+                .upgrade()
+                .is_some_and(|manager| manager.toggle_focused_batch_check())
+            {
+                return gtk::glib::Propagation::Stop;
+            }
+            return gtk::glib::Propagation::Proceed;
+        }
         if weak.upgrade().is_some_and(|manager| manager.navigate(key)) {
             gtk::glib::Propagation::Stop
         } else {
@@ -1862,9 +2215,13 @@ fn show_inner(
     let weak = Rc::downgrade(&manager);
     manager.refresh.connect_clicked(move |_| {
         if let Some(manager) = weak.upgrade() {
-            manager.preflight.borrow_mut().refresh();
-            manager.library.borrow_mut().refresh();
             manager.refresh();
+        }
+    });
+    let weak = Rc::downgrade(&manager);
+    manager.copy_command.connect_clicked(move |_| {
+        if let Some(manager) = weak.upgrade() {
+            manager.copy_resume_command();
         }
     });
     let window_weak = window.downgrade();
@@ -1924,6 +2281,10 @@ fn show_inner(
         ) {
             if let Some(manager) = weak.upgrade() {
                 manager.enter_down.set(false);
+                // A later, distinct press may confirm a live-session warning.
+                if let Some(ack) = manager.conflict_ack.borrow_mut().as_mut() {
+                    ack.held = false;
+                }
                 if manager.completed_activation.get() {
                     manager.close_when_released();
                 }
@@ -1951,11 +2312,20 @@ fn show_inner(
             return gtk::glib::Propagation::Stop;
         }
         if key == gtk::gdk::Key::Escape {
+            if weak
+                .upgrade()
+                .is_some_and(|manager| manager.escape_keeps_open())
+            {
+                return gtk::glib::Propagation::Stop;
+            }
             if let Some(window) = window_weak.upgrade() {
                 window.close();
             }
             gtk::glib::Propagation::Stop
         } else {
+            if let Some(manager) = weak.upgrade() {
+                manager.escape_armed.set(false);
+            }
             gtk::glib::Propagation::Proceed
         }
     });
@@ -1979,7 +2349,7 @@ fn show_inner(
         if library_changed {
             manager.render_view(true);
         }
-        manager.update_library_status();
+        manager.sync_library_status();
         let ready_changed = manager.preflight.borrow_mut().poll();
         if ready_changed {
             manager.show_selection(manager.list.selected_row().map(|row| row.index() as usize));
@@ -1990,9 +2360,8 @@ fn show_inner(
         if let Some(catalog) = catalog {
             manager.accept_catalog(catalog);
         }
-        if auto_scan && manager.last_refresh.borrow().elapsed() >= Duration::from_secs(5) {
-            manager.library.borrow_mut().refresh();
-            manager.refresh();
+        if auto_scan {
+            manager.refresh_in_background();
         }
         gtk::glib::ControlFlow::Continue
     });
@@ -2316,16 +2685,21 @@ mod native_tests {
         assert_eq!(manager.visible.borrow().len(), 1);
         assert_eq!(manager.selected_session().unwrap().id, organized.id);
         manager.clear_filters();
-        manager.alias.set_text(&"x".repeat(161));
+        // 54 characters fit the field but exceed the 160-byte name limit.
+        let oversized = "名".repeat(54);
+        manager.alias.set_text(&oversized);
+        assert_eq!(manager.alias.text().as_str(), oversized);
+        let expected =
+            validate_session_details(&oversized, manager.tags.text().as_str()).unwrap_err();
+        assert!(
+            !manager.save_details.is_sensitive(),
+            "an invalid draft is explained before Save"
+        );
+        assert_eq!(manager.organization_notice.text().as_str(), expected);
         manager.save_organization();
         assert!(manager.organization_saving.borrow().is_none());
-        assert!(manager.organization_error.borrow().is_some());
         manager.update_library_status();
-        assert!(manager
-            .organization_error
-            .borrow()
-            .as_ref()
-            .is_some_and(|error| manager.organization_notice.text().as_str() == error));
+        assert_eq!(manager.organization_notice.text().as_str(), expected);
         manager.revert_organization();
         assert_eq!(manager.alias.text().as_str(), "Renderer command center");
         manager.archive_selected();
@@ -2580,6 +2954,26 @@ mod native_tests {
         };
         wait_ready(&manager);
         std::fs::remove_file(&source).unwrap();
+        // The fixture observed this conversation's CLI (PID 42): the first
+        // Resume only explains that another CLI would share its history.
+        manager.resume_selected();
+        assert!(
+            manager
+                .notice
+                .text()
+                .contains("already running this conversation (PID 42)"),
+            "{}",
+            manager.notice.text()
+        );
+        assert!(manager.confirmation.borrow().is_none());
+        assert_eq!(manager.resume.label().as_deref(), Some("Resume anyway"));
+        assert!(received.borrow().is_none());
+        // Reading the warning takes longer than a double-click.
+        if let Some(ack) = manager.conflict_ack.borrow_mut().as_mut() {
+            ack.armed_at = Instant::now()
+                .checked_sub(SESSION_RESUME_ANYWAY_DELAY)
+                .unwrap_or(ack.armed_at);
+        }
         manager.resume_selected();
         wait_ready(&manager);
         manager.poll_confirmation();
@@ -2611,6 +3005,262 @@ mod native_tests {
             opened_title.borrow().as_deref(),
             Some("Codex · Renderer command center")
         );
+        parent.close();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Run in an isolated Xvfb session. A background refresh that hides the
+    /// inspected conversation must not select another one, a live CLI needs
+    /// a second, deliberate Resume for one attempt only, Space only toggles
+    /// the batch checkbox, Escape leaves an editor before it can close the
+    /// manager, and the user's own archive explains why its row left.
+    #[test]
+    #[ignore = "requires a native GTK display; run under Xvfb"]
+    fn agent_management_v4_refresh_never_retargets_and_guards_live_resume() {
+        gtk::init().expect("GTK display");
+        let directory = std::env::temp_dir().join(format!(
+            "agent-manager-v4-{}",
+            gtk::glib::uuid_string_random()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let source = directory.join("session.jsonl");
+        std::fs::write(&source, "{}\n").unwrap();
+        let library = Rc::new(RefCell::new(SessionLibraryStore::with_path(
+            directory.join("library.json"),
+        )));
+        let launched = Rc::new(RefCell::new(Vec::<String>::new()));
+        let captured = launched.clone();
+        let parent = gtk::Window::new();
+        show_inner(
+            &parent,
+            Some(directory.clone()),
+            library.clone(),
+            HashSet::new(),
+            move |request| {
+                captured.borrow_mut().push(request.id.clone());
+                let _ = request.completion.send(Ok(()));
+            },
+            false,
+        );
+        let manager = TEST_MANAGER.with(|slot| slot.borrow().upgrade()).unwrap();
+        let pump = || {
+            let context = gtk::glib::MainContext::default();
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < deadline {
+                while context.pending() {
+                    context.iteration(false);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let end = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < end {
+            library.borrow_mut().poll();
+            if library.borrow().is_loaded() && !library.borrow().is_busy() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let session = |id: &str, title: &str, updated_at_ms| AgentSession {
+            provider: SessionProvider::Codex,
+            id: id.into(),
+            title: title.into(),
+            cwd: directory.clone(),
+            updated_at_ms,
+            status: SessionStatus::Idle,
+            preview: String::new(),
+            branch: None,
+            source: source.clone(),
+            archived: false,
+        };
+        let live = "01912345-1234-7123-8123-000000000001";
+        let quiet = "01912345-1234-7123-8123-000000000002";
+        let full = SessionCatalog {
+            sessions: vec![
+                session(live, "Live renderer", 2),
+                session(quiet, "Quiet editor", 1),
+            ],
+            live_processes: vec![LiveSessionProcess {
+                provider: SessionProvider::Codex,
+                id: live.into(),
+                pid: 4242,
+            }],
+            ..Default::default()
+        };
+        manager.accept_catalog(full.clone());
+        assert!(!manager.list.activates_on_single_click());
+
+        // Inspect the second row, then let a refresh remove it.
+        manager
+            .list
+            .select_row(manager.list.row_at_index(1).as_ref());
+        assert_eq!(manager.selected_session().unwrap().id, quiet);
+        let mut without_quiet = full.clone();
+        without_quiet.sessions.retain(|session| session.id != quiet);
+        manager.accept_catalog(without_quiet);
+        assert!(manager.list.selected_row().is_none(), "no substitute row");
+        assert!(manager.selected_session().is_none());
+        assert!(!manager.resume.is_sensitive());
+        assert!(manager
+            .detail
+            .text()
+            .contains("nothing was selected in its place"));
+        manager.resume_selected();
+        assert!(launched.borrow().is_empty());
+        // When the refresh shows it again, the same identity is restored.
+        manager.accept_catalog(full.clone());
+        assert_eq!(manager.selected_session().unwrap().id, quiet);
+
+        // A conversation already running elsewhere needs a second Resume.
+        manager
+            .list
+            .select_row(manager.list.row_at_index(0).as_ref());
+        assert_eq!(manager.selected_session().unwrap().id, live);
+        // The exact command arrives with the background readiness check.
+        let expected = full.sessions[0].resume_launch().unwrap().display_command();
+        let end = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < end && !manager.detail.text().contains(&expected) {
+            pump();
+        }
+        assert!(manager.detail.text().contains(&expected));
+        assert!(manager.copy_command.is_sensitive());
+        manager.copy_resume_command();
+        assert_eq!(manager.notice.text().as_str(), "Copied the resume command.");
+        manager.resume_selected();
+        assert!(manager.notice.text().contains("PID 4242"));
+        assert_eq!(manager.resume.label().as_deref(), Some("Resume anyway"));
+        assert!(manager.confirmation.borrow().is_none());
+        // Selecting another conversation forgets the acknowledgement.
+        manager
+            .list
+            .select_row(manager.list.row_at_index(1).as_ref());
+        manager
+            .list
+            .select_row(manager.list.row_at_index(0).as_ref());
+        assert_eq!(manager.resume.label().as_deref(), Some("Resume in New Tab"));
+        manager.resume_selected();
+        assert!(
+            manager.confirmation.borrow().is_none(),
+            "warning shown again"
+        );
+        // Escape cancels the pending warning without closing the manager.
+        assert!(manager.escape_keeps_open());
+        assert_eq!(manager.notice.text().as_str(), "Resume cancelled.");
+        assert!(manager.conflict_ack.borrow().is_none());
+        let read_warning = || {
+            if let Some(ack) = manager.conflict_ack.borrow_mut().as_mut() {
+                ack.armed_at = Instant::now()
+                    .checked_sub(SESSION_RESUME_ANYWAY_DELAY)
+                    .unwrap_or(ack.armed_at);
+            }
+        };
+        manager.resume_selected();
+        // The second click of a double-click cannot confirm it unread.
+        manager.resume_selected();
+        assert!(manager.confirmation.borrow().is_none(), "too soon");
+        read_warning();
+        manager.resume_selected();
+        assert_eq!(
+            manager.confirmation.borrow().as_ref(),
+            Some(&(SessionProvider::Codex, live.to_string())),
+            "the explicit second Resume proceeds to the launch check"
+        );
+        // Escape also cancels a confirmed launch that is still being checked.
+        assert!(manager.escape_keeps_open());
+        assert!(manager.confirmation.borrow().is_none());
+        assert_eq!(manager.notice.text().as_str(), "Resume cancelled.");
+        // A confirmation covers one attempt: when its launch check fails,
+        // the next Resume warns again.
+        manager.resume_selected();
+        read_warning();
+        std::fs::remove_file(&source).unwrap();
+        manager.resume_selected();
+        assert!(manager.confirmation.borrow().is_some());
+        let end = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < end && manager.confirmation.borrow().is_some() {
+            pump();
+        }
+        assert!(manager.confirmation.borrow().is_none());
+        assert!(manager.conflict_ack.borrow().is_none(), "attempt abandoned");
+        assert!(manager.notice.text().contains("no longer exists"));
+        assert!(launched.borrow().is_empty());
+        std::fs::write(&source, "{}\n").unwrap();
+        manager.resume_selected();
+        assert!(manager.notice.text().contains("PID 4242"), "warns again");
+        assert!(manager.confirmation.borrow().is_none());
+
+        // Space toggles the focused row's batch checkbox instead of resuming.
+        manager.show_selection(Some(0));
+        let checked = manager.rows.borrow()[0].checked.is_active();
+        assert!(manager.toggle_focused_batch_check());
+        assert_ne!(manager.rows.borrow()[0].checked.is_active(), checked);
+        assert!(launched.borrow().is_empty());
+
+        // Escape inside an editor surrenders focus to search first.
+        manager.conflict_ack.borrow_mut().take();
+        pump();
+        let window = manager.window.upgrade().unwrap();
+        assert!(manager.alias.is_sensitive());
+        assert!(manager.alias.grab_focus(), "alias focus");
+        pump();
+        let focus = gtk::prelude::GtkWindowExt::focus(&window);
+        assert!(
+            focus
+                .as_ref()
+                .is_some_and(|focus| focus.is_ancestor(&manager.alias)
+                    || *focus == *manager.alias.upcast_ref::<gtk::Widget>()),
+            "focus is {focus:?}"
+        );
+        assert!(manager.escape_keeps_open());
+        pump();
+        let focus = gtk::prelude::GtkWindowExt::focus(&window);
+        assert!(
+            focus
+                .as_ref()
+                .is_some_and(|focus| focus.is_ancestor(&manager.search)),
+            "focus is {focus:?}"
+        );
+        assert!(manager.window.upgrade().is_some(), "manager stays open");
+        // With unsaved drafts the first Escape warns; the next one closes.
+        manager.alias.set_text("Unsaved draft");
+        manager.search.grab_focus();
+        assert!(manager.escape_keeps_open());
+        assert!(manager.notice.text().contains("Press Esc again"));
+        assert!(!manager.escape_keeps_open());
+
+        // The user's own archive moves the conversation out of the Active
+        // view: nothing else is selected, and the pane says why. (Archive
+        // waits for the unsaved draft to be saved or reverted.)
+        manager
+            .list
+            .select_row(manager.list.row_at_index(0).as_ref());
+        manager.revert_organization();
+        let archived = manager.selected_session().unwrap().id;
+        assert!(manager.archive.is_sensitive());
+        manager.archive_selected();
+        let end = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < end && manager.selected_session().is_some() {
+            pump();
+        }
+        assert!(manager.selected_session().is_none(), "no substitute row");
+        assert!(
+            library
+                .borrow()
+                .snapshot()
+                .facts(SessionProvider::Codex, &archived)
+                .archived
+        );
+        assert!(
+            manager.detail.text().contains(ARCHIVED_OUT_OF_VIEW),
+            "{}",
+            manager.detail.text()
+        );
+
+        if let Some(window) = manager.window.upgrade() {
+            window.close();
+        }
         parent.close();
         std::fs::remove_dir_all(directory).unwrap();
     }

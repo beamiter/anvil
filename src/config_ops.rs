@@ -99,6 +99,8 @@ impl AppModel {
             self.sync_agent_toggle();
             self.refresh_agent_panel();
         }
+        // `agent_tasks_enabled` decides whether the Tasks button is offered.
+        self.sync_task_badge();
         if new_config.ai_enabled && new_config.ai_panel_visible {
             self.show_ai_session_panel();
         } else {
