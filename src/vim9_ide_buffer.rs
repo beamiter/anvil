@@ -4389,10 +4389,11 @@ mod tests {
                 snapshot.to_node().unwrap().draw(&cr);
                 drop(cr);
                 let pixels = image.data().unwrap();
+                let (pixels, _) = pixels.as_chunks::<4>();
                 let special = pixels
-                    .chunks_exact(4)
+                    .iter()
                     .filter(|pixel| {
-                        let rgb = u32::from_ne_bytes((*pixel).try_into().unwrap());
+                        let rgb = u32::from_ne_bytes(**pixel);
                         let green = (rgb >> 8) & 255;
                         // Cairo antialiases the diagonal undercurl; its green
                         // ink still dominates both white glyphs and the backdrop.
@@ -4404,10 +4405,9 @@ mod tests {
                     decoration != 0,
                     "decoration lost for {text:?}, style {decoration}"
                 );
-                assert!(pixels.chunks_exact(4).any(|pixel| u32::from_ne_bytes(
-                    pixel.try_into().unwrap()
-                ) & 0xffffff
-                    == 0x102030));
+                assert!(pixels
+                    .iter()
+                    .any(|pixel| u32::from_ne_bytes(*pixel) & 0xffffff == 0x102030));
             }
         }
     }
