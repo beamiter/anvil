@@ -1,30 +1,22 @@
 name: Native Block interaction smoke
 
+# A reviewed-source gate: it measures only a candidate whose parent a source
+# review has approved. On push it failed by design for every later commit, so
+# it runs on demand instead. The reviewer dispatches it on the reviewed
+# candidate and names that candidate's reviewed parent; nothing is discovered
+# or accepted at runtime, and every identity check below still applies.
 on:
-  push:
-    branches: [master]
-    paths:
-      - '.github/workflows/interaction-smoke.yml'
-      - 'scripts/*interaction*'
-      - 'scripts/qa-cross-selection-pointer.py'
-      - 'docs/interaction-budget.md'
-      # Product, build and embedded/runtime resources used by the paired binaries.
-      - 'src/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'build.rs'
-      - '.cargo/**'
-      - 'rust-toolchain'
-      - 'rust-toolchain.toml'
-      - 'config.toml.example'
-      - 'scripts/completions/**'
-      - 'scripts/shell-integration/**'
-      - 'scripts/notebooks/**'
-      - 'scripts/workflows/**'
-      - 'data/**'
-      # Post-processing-only changes have an independent pure Python CI job.
-      - '!scripts/compare-interaction-budget.py'
-      - '!scripts/test-interaction-budget.py'
+  workflow_dispatch:
+    inputs:
+      candidate_parent_sha:
+        description: Reviewed parent of the dispatched candidate commit (full SHA)
+        required: true
+        type: string
+      baseline_sha:
+        description: Immutable baseline commit (full SHA)
+        required: true
+        type: string
+        default: 88c3f4c565cb5b9f8d47d22eb3ad07f47a822ae4
 
 permissions:
   contents: read
@@ -43,9 +35,10 @@ jobs:
       CARGO_INCREMENTAL: '0'
       CARGO_BUILD_JOBS: '1'
       RUST_BACKTRACE: '1'
-      BASELINE_SHA: 88c3f4c565cb5b9f8d47d22eb3ad07f47a822ae4
-      # Reviewed inline Vim successor parent; later changes require a new source review.
-      CANDIDATE_PARENT_SHA: 5a5c465db6fedbe6b5f79f7faff7f2d8941f9a58
+      BASELINE_SHA: ${{ inputs.baseline_sha }}
+      # The reviewed parent named by the dispatching reviewer; a later change
+      # still requires a new source review before it is dispatched.
+      CANDIDATE_PARENT_SHA: ${{ inputs.candidate_parent_sha }}
     steps:
       - name: Check out immutable candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1

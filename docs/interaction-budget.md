@@ -678,6 +678,19 @@ complete source hashes, separate fresh locked builds, actual compiler and binary
 identities, rejection of identical binaries, clean original checkouts, the
 existing pixel thresholds and owned-process cleanup remain required. This source
 review permits only the existing short 1/8/32-total correctness/control scenarios.
+
+### Dispatch-only paired gate (2026-10-26)
+
+The paired short gate no longer runs on every push to `master`. Its pinned
+parent made each unreviewed successor fail by design, so a red result carried
+no information. It now runs only through `workflow_dispatch`: after a source
+review, the reviewer dispatches the workflow on the reviewed candidate and
+supplies `candidate_parent_sha` (the reviewed parent) and, if it changes,
+`baseline_sha` (default `88c3f4c565cb5b9f8d47d22eb3ad07f47a822ae4`). The
+workflow still never discovers a parent: candidate/event identity, exact
+single-parent equality with the supplied parent, byte-identical overlays,
+source hashes, separate locked builds, binary identities, pixel thresholds and
+owned-process cleanup are unchanged.
 Local preparation and provenance validation do not establish a successful hosted
 pixel result, a Vim GUI acceptance result or the full 1200-second performance
 matrix.
