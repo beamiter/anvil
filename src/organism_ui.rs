@@ -4921,7 +4921,8 @@ mod tests {
         assert_eq!(snapshot.context.behavior, Behavior::WatchAgent);
         assert_eq!(snapshot.context.watch_rhythm, WatchRhythm::Waiting);
         assert_eq!(snapshot.growth, growth);
-        assert!(snapshot.activity.contains("42s elapsed"));
+        // The live label is quantized to ten-second steps: 42 s reads "40s".
+        assert!(snapshot.activity.contains("40s elapsed"));
         assert_eq!(snapshot.latest, "Watching the local Shell Agent work");
         assert!(context_explanation(snapshot.context).contains("has not finished"));
         assert_eq!(state_summary(life.get()), state);

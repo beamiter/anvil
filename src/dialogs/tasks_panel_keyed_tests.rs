@@ -2,6 +2,11 @@
 use super::*;
 use std::time::{Duration, Instant};
 
+/// Shows only the fixture rows titled "Task 0". Free-text search also matches
+/// each task's random UUID, so a bare `Task 0` would keep any "Task 1" row
+/// whose id happens to contain a `0`; the title filter is deterministic.
+const TASK_0_ONLY: &str = "title:\"Task 0\"";
+
 fn drain() {
     let context = gtk::glib::MainContext::default();
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -114,7 +119,7 @@ fn keyed_rows_update_only_changed_widgets_and_prune_archives() {
             }
         }
         // Search hides rows but does not remove them from domain snapshots.
-        controller.emit(TasksPanelMsg::DashboardQuery("Task 0".into()));
+        controller.emit(TasksPanelMsg::DashboardQuery(TASK_0_ONLY.into()));
         drain();
         let hidden = sync.rows.iter().find(|r| r.title == "Task 1").unwrap().id;
         let hidden_widget = controller.model().row_widgets[&hidden].row.clone();
@@ -144,7 +149,7 @@ fn keyed_rows_update_only_changed_widgets_and_prune_archives() {
                 .native_preparing
         );
         // Archive remains in raw rows, but leaves the unfiltered dashboard.
-        controller.emit(TasksPanelMsg::DashboardQuery("Task 0".into()));
+        controller.emit(TasksPanelMsg::DashboardQuery(TASK_0_ONLY.into()));
         drain();
         sync.rows
             .iter_mut()
@@ -177,7 +182,7 @@ fn keyed_selected_row_survives_move_hide_and_reveal() {
     assert_eq!(row.index(), 0);
     assert_eq!(list.selected_row(), Some(row.clone()));
     assert!(row.is_selected());
-    controller.emit(TasksPanelMsg::DashboardQuery("Task 0".into()));
+    controller.emit(TasksPanelMsg::DashboardQuery(TASK_0_ONLY.into()));
     drain();
     assert!(row.parent().is_none());
     assert!(
@@ -361,7 +366,7 @@ fn keyed_task_list_mixed_update_benchmark() {
             let pulse = pulses.clone();
             gtk::glib::idle_add_local_once(move || pulse.set(pulse.get() + 1));
             let start = Instant::now();
-            controller.emit(TasksPanelMsg::DashboardQuery("Task 0".into()));
+            controller.emit(TasksPanelMsg::DashboardQuery(TASK_0_ONLY.into()));
             drain();
             controller.emit(TasksPanelMsg::ClearDashboardFilters);
             drain();
@@ -494,7 +499,7 @@ fn keyed_tasks_keep_focus_and_route_real_keyboard() {
         assert!(controller.model().row_widgets[&expected].row.has_focus());
     }
     // Native navigation resolves the filtered table, not the original index.
-    controller.emit(TasksPanelMsg::DashboardQuery("Task 0".into()));
+    controller.emit(TasksPanelMsg::DashboardQuery(TASK_0_ONLY.into()));
     drain();
     sync.selected = Some(controller.model().sync.rows[0].id);
     set_sync(&controller, sync.clone());
