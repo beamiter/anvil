@@ -1585,7 +1585,7 @@ impl BufferSurface {
                     && previous
                         .windows
                         .iter()
-                        .any(|old| old.window == window.window && old.topline != window.topline)
+                        .any(|old| old.window == window.window && !old.same_first_row(window))
             });
             if requested_movement {
                 // Precision snapshots paint directly and do not update the
@@ -1626,11 +1626,12 @@ impl BufferSurface {
                 motions.remove(&window.window);
                 continue;
             };
-            if old.topline == window.topline {
+            if old.same_first_row(window) {
                 continue;
             }
             // Across a closed fold, Vim moves topline by many lines for one
-            // row. An unsampled distance snaps rather than animating a guess.
+            // row, and 'smoothscroll' moves within a wrapped topline. An
+            // unsampled distance snaps rather than animating a guess.
             let Some(shift) = old.topline_shift(window) else {
                 motions.remove(&window.window);
                 continue;
@@ -5328,6 +5329,8 @@ mod tests {
                         line: 9,
                         byte_length: 3,
                         fold_end: 0,
+                        part: 0,
+                        parts: 1,
                         runs: vec![run(0, 9, "pre")],
                     },
                     Vim9RenderMarginRow {
@@ -5335,6 +5338,8 @@ mod tests {
                         line: 14,
                         byte_length: 4,
                         fold_end: 0,
+                        part: 0,
+                        parts: 1,
                         runs: vec![run(0, 14, "post")],
                     },
                 ],
@@ -5559,6 +5564,8 @@ mod tests {
                 line: 10,
                 byte_length: 2,
                 fold_end: 0,
+                part: 0,
+                parts: 1,
                 runs: vec![run(0, 10, "AB")],
             },
             Vim9RenderMarginRow {
@@ -5566,6 +5573,8 @@ mod tests {
                 line: 15,
                 byte_length: 4,
                 fold_end: 0,
+                part: 0,
+                parts: 1,
                 runs: vec![run(0, 15, "next")],
             },
         ];

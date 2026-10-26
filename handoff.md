@@ -1,5 +1,19 @@
 # Engineering handoff
 
+## 2026-10-26 — native soft wrap (shared core render protocol 9)
+
+- The shared core now negotiates render protocol 9: wrapped continuation rows
+  are painted natively with Vim's exact layout (`showbreak`, `breakindent`,
+  `linebreak`, wide-glyph `>` fillers, `smoothscroll` `<<<` rows), and
+  source-bound touchpad/wheel scrolling moves one wrapped row at a time. The
+  `scroll_view` request names Vim's `skipcol`. Wrapped splits route clicks to
+  Vim's own mouse handling. Contract: `jterm_core/docs/vim9-native-wrap.md`.
+- `src/vim9_ide_buffer.rs` wheel transitions compare `Vim9RenderWindow::same_first_row()` (topline
+  and `skipcol`) instead of `topline`, so a one-row `smoothscroll` move inside a
+  wrapped line animates instead of being ignored. Test margin-row literals gained `part`/`parts`.
+- `packaging/jterm-core-src.tar.gz` is regenerated from the matching
+  `jterm_core` commit with `scripts/package-shared-core.sh`.
+
 ## 2026-10-25 — native closed folds (shared core render protocol 8)
 
 - The shared core now negotiates render protocol 8: closed Vim folds are
