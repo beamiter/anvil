@@ -424,8 +424,7 @@ impl Component for PaletteModel {
             }
             PaletteMsg::WorkflowsChanged => {
                 if root.parent().is_some() && query_uses_workflows(&self.query, self.mode) {
-                    self.rebuild_rows();
-                    self.select_first(widgets);
+                    self.rebuild_preserving_selection(widgets);
                 }
             }
             PaletteMsg::HistorySnapshotReady { generation, result } => {
@@ -441,8 +440,7 @@ impl Component for PaletteModel {
                         Ok(snapshot) => {
                             self.history_snapshot = snapshot;
                             widgets.history_status.set_visible(false);
-                            self.rebuild_rows();
-                            self.select_first(widgets);
+                            self.rebuild_preserving_selection(widgets);
                         }
                         Err(error) => {
                             log::error!("palette history worker failed: {error}");
@@ -500,6 +498,15 @@ impl Component for PaletteModel {
     }
 }
 
+fn preserved_selection_index<'a>(
+    selected: Option<&Accept>,
+    rows: impl Iterator<Item = &'a Accept>,
+) -> Option<usize> {
+    let selected = selected?;
+    rows.enumerate()
+        .find_map(|(index, accept)| (accept == selected).then_some(index))
+}
+
 impl PaletteModel {
     fn spawn_admitted_history_load(
         &mut self,
@@ -537,6 +544,22 @@ impl PaletteModel {
         rows.clear();
         for entry in entries {
             rows.push_back(PaletteRowInit { entry, generation });
+        }
+    }
+
+    fn rebuild_preserving_selection(&mut self, widgets: &PaletteModelWidgets) {
+        let selected = widgets.list_box.selected_row().and_then(|row| {
+            self.rows
+                .get(row.index() as usize)
+                .map(|row| row.accept.clone())
+        });
+        self.rebuild_rows();
+        let index =
+            preserved_selection_index(selected.as_ref(), self.rows.iter().map(|row| &row.accept));
+        if let Some(row) = index.and_then(|index| widgets.list_box.row_at_index(index as i32)) {
+            widgets.list_box.select_row(Some(&row));
+        } else {
+            self.select_first(widgets);
         }
     }
 
@@ -986,5 +1009,28 @@ mod tests {
         assert_eq!(completion.next.unwrap().generation, 12);
         assert_eq!(loads.in_flight, Some(12));
         assert!(loads.pending.is_none());
+    }
+    #[test]
+    fn async_palette_refresh_preserves_action_identity_instead_of_row_position() {
+        use super::{preserved_selection_index, Accept};
+        let selected = Accept::TypeCommand("cargo test".into());
+        let reordered = [Accept::TypeCommand("git status".into()), selected.clone()];
+        assert_eq!(
+            preserved_selection_index(Some(&selected), reordered.iter()),
+            Some(1)
+        );
+        assert_eq!(
+            preserved_selection_index(Some(&selected), reordered[..1].iter()),
+            None
+        );
+        assert_eq!(preserved_selection_index(None, reordered.iter()), None);
+        let workflow = Accept::RunWorkflow(std::path::PathBuf::from("/a/build.toml"));
+        let replaced = [Accept::RunWorkflow(std::path::PathBuf::from(
+            "/b/build.toml",
+        ))];
+        assert_eq!(
+            preserved_selection_index(Some(&workflow), replaced.iter()),
+            None
+        );
     }
 }

@@ -5,8 +5,7 @@
 //! lifecycle. Reading and parsing belong to `jterm_core::workflows` (see
 //! `crate::workflows`); what is anvil's is the decision to do it off the GTK
 //! thread, behind one reservation, keeping the previous cache when a scan
-//! fails — the only refresh strategy of the four that does not stall a UI on a
-//! cold or networked home directory.
+//! fails, without stalling the UI on a cold or networked home directory.
 
 use super::*;
 
@@ -14,8 +13,8 @@ use super::*;
 ///
 /// The invariant — at most one scan in flight, and a completed scan re-arms —
 /// is `jterm_core::workflows::RefreshLatch`; the thread, the panic containment
-/// and the keep-the-old-cache policy below stay here, because they are GTK's
-/// and the other three terminals are single-threaded immediate-mode.
+/// and the keep-the-old-cache policy below stay here alongside anvil's
+/// refused-file notifications and Relm4 message routing.
 pub(crate) use jterm_core::workflows::RefreshLatch as WorkflowRefreshState;
 
 fn available_workflow_target(
@@ -83,9 +82,10 @@ impl AppModel {
         match result {
             Ok(scan) => {
                 self.report_refused_workflows(&scan.refused);
-                *self.workflows.borrow_mut() = scan.workflows;
-                self.command_palette
-                    .emit(dialogs::command_palette::PaletteMsg::WorkflowsChanged);
+                if replace_workflow_cache(&mut self.workflows.borrow_mut(), scan.workflows) {
+                    self.command_palette
+                        .emit(dialogs::command_palette::PaletteMsg::WorkflowsChanged);
+                }
             }
             Err(error) => {
                 log::error!("workflow refresh failed: {error}");
@@ -162,6 +162,18 @@ impl AppModel {
         self.workflow_dialog
             .emit(dialogs::workflow::WorkflowMsg::Open { workflow, pane_id });
     }
+}
+
+/// A no-op background scan must not reset the user's palette selection.
+fn replace_workflow_cache(
+    current: &mut Vec<workflows::Workflow>,
+    next: Vec<workflows::Workflow>,
+) -> bool {
+    if *current == next {
+        return false;
+    }
+    *current = next;
+    true
 }
 
 /// Whether this scan's refusals differ from the ones already reported.
@@ -278,6 +290,34 @@ mod tests {
         assert!(run.contains("WorkflowMsg::Open { workflow, pane_id }"));
         assert!(!run.contains("PaletteTypeCommand"));
         assert!(!run.contains("self.active"));
+    }
+
+    #[test]
+    fn identical_workflow_refresh_keeps_palette_rows_and_changed_command_replaces_them() {
+        let workflow = workflows::Workflow {
+            name: "Deploy".into(),
+            description: String::new(),
+            command: "echo first".into(),
+            tags: Vec::new(),
+            shell: None,
+            args: Vec::new(),
+            source_path: Some(PathBuf::from("/w/deploy.toml")),
+        };
+        let mut cache = vec![workflow];
+        let allocation = cache.as_ptr();
+        let identical = cache.clone();
+        assert!(!replace_workflow_cache(&mut cache, identical));
+        assert_eq!(
+            allocation,
+            cache.as_ptr(),
+            "no-op refresh must retain existing rows"
+        );
+        let mut changed = cache.clone();
+        changed[0].command = "echo second".into();
+        assert!(replace_workflow_cache(&mut cache, changed));
+        assert_eq!(cache[0].command, "echo second");
+        assert!(replace_workflow_cache(&mut cache, Vec::new()));
+        assert!(cache.is_empty());
     }
 
     fn refusal(path: &str, reason: &str) -> (PathBuf, String) {

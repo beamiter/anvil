@@ -81,7 +81,7 @@ impl Query {
 }
 
 /// What happens when the user activates an entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Accept {
     /// Dispatch a built-in action.
     Action(Action),
@@ -295,7 +295,13 @@ pub(crate) fn gather(
     workflows: &[Workflow],
     limit: usize,
 ) -> Vec<Entry> {
-    let matcher = SkimMatcherV2::default().smart_case();
+    // Skim's score-only matrix has two rows regardless of query length.
+    // Scale its column limit by the query too, bounding quadratic scoring work
+    // while its linear fallback still finds matches in the complete command.
+    let max_columns = (64 * 1024 / query.text.len().max(1)).max(1);
+    let matcher = SkimMatcherV2::default()
+        .smart_case()
+        .element_limit(max_columns * 2);
     let mut out: Vec<Entry> = Vec::new();
 
     if matches!(query.mode, PaletteMode::All | PaletteMode::Commands) {
@@ -428,7 +434,13 @@ fn push_if_match(matcher: &SkimMatcherV2, needle: &str, mut e: Entry, out: &mut 
     // and to `search_extra` for a workflow's tags. Both fallbacks score at half
     // weight, so an entry named for the query still outranks one merely tagged
     // with it.
-    let primary = matcher.fuzzy_match(&e.label, needle);
+    // Labels are deliberately clipped for display. Search the validated
+    // original history command so a flag/path past the label limit is findable.
+    let primary_text = match &e.accept {
+        Accept::TypeCommand(command) => command.as_str(),
+        _ => e.label.as_str(),
+    };
+    let primary = matcher.fuzzy_match(primary_text, needle);
     let secondary = [e.sublabel.as_deref(), e.search_extra.as_deref()]
         .into_iter()
         .flatten()
@@ -857,5 +869,64 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(read_history_checked(&link, 10).is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn history_search_reaches_past_clipped_labels_without_changing_inserted_text() {
+        for prefix in ["x".repeat(8192), "界".repeat(4096), "x".repeat(40_000)] {
+            let command = format!("echo {prefix} --needle-after-preview");
+            let history = vec![command_history::CommandHistoryRecord {
+                command: command.clone(),
+                cwd: None,
+                exit_code: 0,
+                end_time_ms: None,
+            }];
+            let entries = gather(
+                &Query::parse("@needle-after-preview", PaletteMode::All),
+                &KeybindingMap::from_defaults(),
+                &history,
+                &[],
+                10,
+            );
+            assert_eq!(entries.len(), 1);
+            assert!(!entries[0].label.contains("needle-after-preview"));
+            assert!(matches!(&entries[0].accept, Accept::TypeCommand(value) if value == &command));
+            // A pasted full command must also avoid a quadratic score pass.
+            let exact = gather(
+                &Query {
+                    mode: PaletteMode::History,
+                    text: command.clone(),
+                },
+                &KeybindingMap::from_defaults(),
+                &history,
+                &[],
+                10,
+            );
+            assert_eq!(exact.len(), 1);
+            let missing = gather(
+                &Query::parse("@definitely-absent", PaletteMode::All),
+                &KeybindingMap::from_defaults(),
+                &history,
+                &[],
+                10,
+            );
+            assert!(missing.is_empty());
+        }
+    }
+    #[test]
+    fn bounded_matcher_preserves_short_query_scores() {
+        let original = SkimMatcherV2::default().smart_case();
+        for needle in ["nt", "cargo", "ct", "部署", "missing", ""] {
+            let max_columns = (64 * 1024 / needle.len().max(1)).max(1);
+            let bounded = SkimMatcherV2::default()
+                .smart_case()
+                .element_limit(max_columns * 2);
+            for text in ["New tab", "cargo test --release", "cargo build", "部署检查"] {
+                assert_eq!(
+                    bounded.fuzzy_match(text, needle),
+                    original.fuzzy_match(text, needle)
+                );
+            }
+        }
     }
 }

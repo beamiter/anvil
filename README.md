@@ -32,7 +32,8 @@ restoration as the only copy of work in progress.
   files are safely shell-quoted before being inserted at the prompt, while a
   non-UTF-8 path is shown unambiguously and never rewritten into another name
 - Command palette, command-history picker, parameterized TOML/YAML workflows, and
-  fuzzy search
+  fuzzy search. History search includes the complete retained command even when
+  its preview is shortened; insertion retains the exact original command
 - Search within terminal output with match counts (inexact VTE totals marked
   `+`), previous/next, a regex badge for `/pattern/`, an `Aa` match-case
   toggle, visible regex errors, plus block selection, output filtering,
@@ -770,7 +771,9 @@ the same name take precedence. `ANVIL_WORKFLOW_DIR` adds higher-priority search
 paths after the user config directory and before user/system data examples.
 Workflow names are deduplicated in that directory-precedence order. Tags,
 optional `shell`, and source-file metadata are retained. Workflows are reloaded
-whenever the palette opens.
+whenever the palette opens. An unchanged background refresh preserves the
+current palette selection. When history or workflows arrive asynchronously,
+the selected action is retained by identity if it still exists.
 
 The format is not anvil's. Discovery, both parsers, validation and the template
 engine are `jterm_core::workflows`, shared with the sibling jterm terminals,
