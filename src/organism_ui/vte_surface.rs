@@ -502,7 +502,6 @@ impl VteCompanion {
             return false;
         };
         root.is_mapped()
-            && self.card.is_mapped()
             && window.is_active()
             && gtk::prelude::GtkWindowExt::focus(&window)
                 .is_some_and(|focus| focus == root || focus.is_ancestor(&root))
@@ -674,12 +673,19 @@ impl VteCompanion {
             }
         });
         self.motion.set(motion);
+        let focused = enabled && self.local.get() && self.focused_and_mapped();
+        // Keep the existing measurement envelope across focus transfers so
+        // the terminal grid never reflows. A non-owner paints neither the
+        // companion nor its title; only this row's opacity changes on focus.
         self.card
             .set_visible(enabled && self.local.get() && !self.closed.get());
         if self.revision.get() != revision {
             return;
         }
-        let focused = self.focused_and_mapped();
+        self.card.set_opacity(if focused { 1.0 } else { 0.0 });
+        if self.revision.get() != revision {
+            return;
+        }
         self.sync_paint_observer(focused);
         let geometry = self.glyph_has_visible_area();
         self.geometry_eligible.set(geometry);
@@ -729,7 +735,7 @@ impl VteCompanion {
         // GTK property notifications can synchronously re-enter settings or
         // lifecycle code. Only the most recent refresh may own the next wake.
         if self.revision.get() != revision
-            || !self.focused_and_mapped()
+            || !focused
             || !self.glyph_has_visible_area()
             || self.current_presentation() == Presentation::Hidden
         {
@@ -980,6 +986,11 @@ pub(super) fn exercise_existing_fixture(
     assert_eq!(allocation(), settled_allocation);
     assert!(entry.grab_focus());
     settle(Duration::from_millis(40));
+    assert_eq!(
+        surface.card.opacity(),
+        0.0,
+        "non-owner title also disappears"
+    );
     assert_eq!(surface.glyph.opacity(), 0.0);
     assert!(surface.source.borrow().is_none());
     assert!(surface.geometry_idle.borrow().is_none());
@@ -1252,6 +1263,55 @@ fn exercise_production_grid_fixture(
     );
     assert_eq!(requisition(), compact_req);
     assert!(terminal.pty().is_none());
+    // Focus migration clears the whole old companion without reallocating
+    // either real VTE grid. Neither terminal has a PTY or child process.
+    overlay.set_child(None::<&gtk::Widget>);
+    let sibling = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let sibling_terminal = crate::terminal::vte::create_terminal(&config.borrow());
+    crate::terminal::vte::mount_terminal_grid(&sibling, &sibling_terminal);
+    let sibling_surface = VteCompanion::new(&sibling, &sibling_terminal, config.clone(), true);
+    let split = gtk::Paned::new(gtk::Orientation::Horizontal);
+    split.set_start_child(Some(&root));
+    split.set_end_child(Some(&sibling));
+    overlay.set_child(Some(&split));
+    split.set_position(window.width() / 2);
+    surface.last_input.set(None);
+    assert!(terminal.grab_focus());
+    settle(Duration::from_millis(100));
+    let grids = || {
+        [&terminal, &sibling_terminal].map(|terminal| {
+            (
+                terminal.width(),
+                terminal.height(),
+                terminal.column_count(),
+                terminal.row_count(),
+            )
+        })
+    };
+    let initial_grids = grids();
+    for sibling_owns in [true, false, true, false] {
+        assert!(if sibling_owns {
+            sibling_terminal.grab_focus()
+        } else {
+            terminal.grab_focus()
+        });
+        settle(Duration::from_millis(60));
+        assert_eq!(surface.card.opacity(), if sibling_owns { 0.0 } else { 1.0 });
+        assert_eq!(
+            sibling_surface.card.opacity(),
+            if sibling_owns { 1.0 } else { 0.0 }
+        );
+        assert_eq!(
+            grids(),
+            initial_grids,
+            "focus cannot resize or reflow either VTE grid"
+        );
+        assert!(surface.source.borrow().is_none());
+        assert!(sibling_surface.source.borrow().is_none());
+    }
+    assert!(sibling_terminal.pty().is_none());
+    sibling_surface.close();
+    drop(sibling_surface);
     surface.close();
     assert!(surface.source.borrow().is_none());
     assert!(surface.geometry_idle.borrow().is_none());
@@ -1331,7 +1391,7 @@ fn exercise_shared_adapter_trace(
         );
         Observed {
             primary_painted: surface.glyph.is_mapped() && surface.glyph.opacity() == 1.0,
-            card_visible: surface.card.is_visible(),
+            card_visible: surface.card.is_visible() && surface.card.opacity() > 0.0,
             wake_pending: surface.source.borrow().is_some(),
         }
     });

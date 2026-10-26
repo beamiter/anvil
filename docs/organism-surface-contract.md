@@ -1,4 +1,19 @@
-# Organism surface contract: time boundary (A09, first slice)
+# Organism surface contract
+
+## 2026-10-26: one companion per GUI
+
+All visible forms now share window ownership. The old inline organism card is
+not mounted; the inspector exposes its text on demand without a second sprite.
+Full, Calm and Static all use one live body (Static paints frame zero), or its
+compact running-history substitute. Focus transfer hides every old form before
+claiming the next pane. Ambient state and voice belong to the window.
+
+The adapter trace below has been updated to expect no Block/Chat card, a Static
+body when geometry permits, and no painted VTE row on a background split.
+VTE retains its existing measurement envelope while clearing the entire row's
+opacity, so focus changes do not resize or reflow either terminal grid.
+
+## Time boundary (A09, first slice)
 
 The private `organism_ui::surface_time` module is a display-only contract shared
 by the Block/Chat runtime and the neutral VTE companion. It is not a new shared
@@ -25,7 +40,7 @@ routing evidence, not a claim that native Chat geometry has been validated here.
 ## Intentional host differences
 
 Block retains its semantic maintenance heartbeat when backgrounded or Static;
-its Static representation is the inline card. VTE retains its existing
+Static uses its same unique body at frame zero. VTE retains its existing
 Static/background no-animation-source policy and neutral card. The existing
 Block boundary catch-up remains one millisecond when a paint crosses the input
 expiry. None of these differences is flattened into a new universal timer.
@@ -62,7 +77,7 @@ input is supplied at the timestamp evidence seam, without emitting a terminal
 commit or inventing a command outcome.
 
 Each step checks primary paint, card visibility and the actual pending wake.
-Expected differences are explicit: Static leaves Block's inline card and its
+Expected differences are explicit: Static keeps Block's one body and its
 semantic maintenance wake, while VTE keeps a neutral fixed glyph with no wake.
 Background retains Block's maintenance wake but retires VTE's source. Disabling
 from Full must destroy the captured source and remain retired after draining
@@ -98,8 +113,9 @@ Both local layouts run the original ten-step trace, 120ms drains, and zero-PTY
 assertions before and after every drain. The ordinary Block control still must
 paint in every eligible step. Default Chat additionally reports actual terminal
 and sprite measurements: if its native compact prompt cannot fit the full idle
-body plus grid-aligned margins/gutter, the expected body is hidden while card and
-wake assertions remain intact. A separate Chat constructor uses the actual
+body plus grid-aligned margins/gutter, the same label tries its measured compact
+glyph. If neither fits, it hides; there is no extra card and the maintenance wake
+assertion remains intact. A separate Chat constructor uses the actual
 `monospace 32` terminal font configuration and must both measure larger cells and
 paint in every eligible step. No widget allocation or body size is overridden.
 The fit oracle uses measured dimensions and simple aligned legal intervals,

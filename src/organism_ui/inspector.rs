@@ -1,12 +1,15 @@
 //! On-demand inspection of one real native companion. The dialog owns values,
-//! not a runtime or pane: opening and reading it cannot dispatch a command,
+//! and the window voice, not a runtime or pane. It cannot dispatch a command,
 //! grant attention, age the organism, write memory, or create a frame source.
 
 use adw::prelude::*;
-use jterm_core::organism::{sprite_frame_with_context, LifeState, RenderContext, RepoVigil};
+use jterm_core::organism::{LifeState, RenderContext, RepoVigil};
+use jterm_core::organism_companion::{CompanionCare, CompanionIntent, CompanionVoice};
 use jterm_core::organism_daily::{behavior_label, context_explanation, life_description};
 use jterm_core::organism_memory::{GrowthProgress, GrowthStage};
 use relm4::{adw, gtk};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Snapshot {
@@ -129,7 +132,14 @@ fn detail(body: &gtk::Box, heading: &str, text: &str) {
     body.append(&content);
 }
 
-pub(crate) fn present(window: &adw::ApplicationWindow, snapshot: Snapshot) -> adw::Dialog {
+pub(crate) fn present(
+    window: &adw::ApplicationWindow,
+    snapshot: Snapshot,
+    voice: Rc<RefCell<CompanionVoice>>,
+    care: Rc<RefCell<CompanionCare>>,
+    epoch: std::time::Instant,
+    care_changed: Option<super::CareSettingsHandler>,
+) -> adw::Dialog {
     let dialog = adw::Dialog::builder()
         .title("ASCII companion")
         .content_width(480)
@@ -148,12 +158,8 @@ pub(crate) fn present(window: &adw::ApplicationWindow, snapshot: Snapshot) -> ad
     body.set_margin_bottom(20);
 
     let portrait = gtk::Box::new(gtk::Orientation::Horizontal, 16);
-    let sprite = gtk::Label::new(Some(
-        sprite_frame_with_context(snapshot.context, 0).as_ref(),
-    ));
-    sprite.add_css_class("monospace");
-    sprite.set_accessible_role(gtk::AccessibleRole::Presentation);
-    portrait.append(&sprite);
+    // Details describe the same companion. No portrait is rendered here: a
+    // second ASCII sprite would make inspection look like another organism.
     let caption = gtk::Box::new(gtk::Orientation::Vertical, 4);
     caption.set_hexpand(true);
     let title = text_label(behavior_label(snapshot.context.behavior));
@@ -166,6 +172,66 @@ pub(crate) fn present(window: &adw::ApplicationWindow, snapshot: Snapshot) -> ad
     disposition.add_css_class("dim-label");
     body.append(&disposition);
     body.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    let temperament = voice.borrow().temperament();
+    detail(&body, temperament.label(), temperament.description());
+    let reply = text_label(
+        voice
+            .borrow()
+            .last_reply()
+            .unwrap_or("I'm here. We can share a moment, a story, or a little break."),
+    );
+    reply.set_widget_name("companion-reply");
+    reply.set_accessible_role(gtk::AccessibleRole::Status);
+    reply.set_selectable(true);
+    body.append(&reply);
+    let context_hint = text_label("Replies use the activity observed when this panel opened.");
+    context_hint.add_css_class("dim-label");
+    body.append(&context_hint);
+    let actions = gtk::FlowBox::new();
+    actions.set_selection_mode(gtk::SelectionMode::None);
+    actions.set_row_spacing(6);
+    actions.set_column_spacing(6);
+    actions.set_max_children_per_line(2);
+    for (label, intent) in [
+        ("Say hello", CompanionIntent::Hello),
+        ("Keep me company", CompanionIntent::Company),
+        ("Tell a story", CompanionIntent::Story),
+        ("Take a break", CompanionIntent::Rest),
+    ] {
+        let button = gtk::Button::with_label(label);
+        let voice = voice.clone();
+        let care = care.clone();
+        let reply = reply.downgrade();
+        let context = snapshot.context;
+        button.connect_clicked(move |_| {
+            if let Some(reply) = reply.upgrade() {
+                if intent == CompanionIntent::Rest {
+                    care.borrow_mut().rested(epoch.elapsed());
+                }
+                reply.set_text(voice.borrow_mut().respond(intent, context));
+            }
+        });
+        actions.insert(&button, -1);
+    }
+    body.append(&actions);
+    let reminders = gtk::CheckButton::with_label("Gentle break reminders");
+    reminders.set_active(care.borrow().enabled());
+    reminders.set_tooltip_text(Some("Occasional water, stretching or screen-break prompts after sustained foreground work. Silent during typing and running commands."));
+    reminders.connect_toggled({
+        let care = care.clone();
+        move |button| {
+            let enabled = button.is_active();
+            care.borrow_mut().set_enabled(enabled);
+            if let Some(changed) = &care_changed {
+                changed(enabled);
+            }
+        }
+    });
+    body.append(&reminders);
+    let later = gtk::Button::with_label("Remind me in 20 minutes");
+    later.set_halign(gtk::Align::Start);
+    later.connect_clicked(move |_| care.borrow_mut().snooze(epoch.elapsed()));
+    body.append(&later);
 
     detail(&body, "This pane", &snapshot.activity);
     detail(&body, "Recent activity", &snapshot.latest);
@@ -273,7 +339,18 @@ mod tests {
             motion: "Calm",
             vigil: RepoVigil::Failure,
         };
-        let dialog = present(&window, snapshot);
+        let voice = Rc::new(RefCell::new(CompanionVoice::new(7)));
+        let care = Rc::new(RefCell::new(CompanionCare::default()));
+        let preference = Rc::new(std::cell::Cell::new(None));
+        let recorded = preference.clone();
+        let dialog = present(
+            &window,
+            snapshot,
+            voice.clone(),
+            care.clone(),
+            std::time::Instant::now(),
+            Some(Rc::new(move |enabled| recorded.set(Some(enabled)))),
+        );
         let main = gtk::glib::MainContext::default();
         let start = std::time::Instant::now();
         while (!dialog.is_mapped() || dialog.width() <= 0)
@@ -304,6 +381,41 @@ mod tests {
             Some(scrolled.upcast_ref::<gtk::Widget>())
         );
         assert!(dialog.width() <= window.width());
+        fn descendants(widget: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+            out.push(widget.clone());
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                descendants(&widget, out);
+            }
+        }
+        let mut widgets = Vec::new();
+        descendants(dialog.upcast_ref(), &mut widgets);
+        let story = widgets
+            .iter()
+            .find_map(|widget| {
+                let button = widget.clone().downcast::<gtk::Button>().ok()?;
+                (button.label().as_deref() == Some("Tell a story")).then_some(button)
+            })
+            .expect("story action is reachable in the real inspector");
+        story.emit_clicked();
+        let first = voice.borrow().last_reply().unwrap();
+        story.emit_clicked();
+        assert_ne!(voice.borrow().last_reply(), Some(first));
+        let reminders = widgets
+            .iter()
+            .find_map(|widget| {
+                let button = widget.clone().downcast::<gtk::CheckButton>().ok()?;
+                (button.label().as_deref() == Some("Gentle break reminders")).then_some(button)
+            })
+            .expect("care preference is reachable");
+        assert!(!care.borrow().enabled());
+        reminders.set_active(true);
+        assert!(care.borrow().enabled());
+        assert_eq!(preference.get(), Some(true));
+        reminders.set_active(false);
+        assert!(!care.borrow().enabled());
+        assert_eq!(preference.get(), Some(false));
         let closed = std::rc::Rc::new(std::cell::Cell::new(false));
         dialog.connect_closed({
             let closed = closed.clone();

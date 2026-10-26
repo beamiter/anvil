@@ -133,6 +133,7 @@ pub(crate) enum AppMsg {
     SettingsBlockCompact(bool),
     SettingsCommandHistory(bool),
     SettingsAsciiOrganism(bool),
+    SettingsAsciiOrganismCare(bool),
     SettingsAsciiOrganismMotion(u32),
     SettingsAiEnabled(bool),
     SettingsAiPanelVisible(bool),

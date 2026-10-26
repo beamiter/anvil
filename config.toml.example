@@ -67,6 +67,8 @@ block_compact = false
 # Native ASCII organism, enabled by default. Motion: "full", "calm", "static", or
 # omit the motion key to follow the desktop animation preference.
 ascii_organism_enabled = true
+# Optional quiet break prompts after sustained foreground use; off by default.
+ascii_organism_care_enabled = false
 # ascii_organism_motion = "calm"
 max_visible_blocks = 200
 lazy_load_threshold = 1000

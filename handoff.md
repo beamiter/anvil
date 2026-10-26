@@ -1,5 +1,68 @@
 # Engineering handoff
 
+## 2026-10-26 — one window companion, continuous habits and optional care
+
+- Removed the permanently mounted organism card. One window owner chooses the
+  live body or running-history compact substitute through shared
+  `CompanionSurface`; every other pane is hidden synchronously on transfer.
+  Static uses the same body at frame zero. Traditional VTE hides its complete
+  neutral row's paint when another split owns focus, preserving its existing
+  geometry envelope so neither VTE grid resizes or reflows.
+- Ambient disposition and the offline voice belong to the window. Background
+  pane reducers keep their command evidence but cannot reset the shared mind;
+  entering a new pane does not replay elapsed ambient time. A stable local
+  identity key selects temperament; the source path is not retained by core.
+- Inspect companion shows text, without a second ASCII portrait. Hello,
+  company, story and break interactions use bounded authored replies and a
+  shared story cursor; context is explicitly a snapshot from panel opening.
+- `ascii_organism_care_enabled` defaults false and is saved through the existing
+  configuration path. One foreground care clock offers ordinary text toasts
+  after sustained observed human activity, only at an idle visible body. Later
+  snoozes 20 minutes; Take a break resets the interval. No additional timer,
+  terminal input, network provider or computer observation is introduced.
+- Added a native two-split ownership/Static/typing/zero-PTY regression and
+  registered it with the display runner; config roundtrip covers care opt-in.
+  Both native bodies and compact substitutes use their actual GTK/Pango
+  measurements. Enlarging the body past its available space chooses a compact
+  form on the same label; restoring the font restores the full pose.
+- VTE admission explicitly includes enabled/local state when retiring paint
+  observers and wakes. Refresh revision checks separate visibility and opacity
+  changes, so synchronous GTK notifications cannot repaint an obsolete owner.
+- Bundled shared core: `90eec597ab93450f7d5ef7a2d8ae392552c59c84`.
+
+### Validation for this change
+
+- `cargo test --locked --bin anvil organism`: **179 passed, 0 failed,
+  10 ignored** (display-required fixtures are run separately below).
+- `bash scripts/clippy.sh`: **passed**, including all targets and all features
+  with `-D warnings`; no new lint allowance was introduced.
+- `cargo fmt -- --check`, `git diff --check` and
+  `bash -n scripts/test-gtk-display.sh`: **passed**.
+- `python3 scripts/test-gtk-display-contract.py`: **134 base cases and
+  11 variants passed**. This checks fake-command runner control flow, not GTK.
+- The following **3 native tests passed individually** under fresh Xvfb/D-Bus
+  sessions with `GTK_A11Y=test GDK_BACKEND=x11 GSK_RENDERER=cairo` and
+  `--exact --ignored --nocapture`:
+  - `organism_ui::inspector::tests::snapshot_dialog_is_scrollable_and_closes_without_an_animation_source`
+    — 1 passed; story rotation and care-setting callback included.
+  - `organism_ui::tests::one_companion_crosses_splits_without_cloning_its_body_or_mind`
+    — 1 passed; Full/Calm/Static split transfers, shared ambient state, typing
+    retreat, actual Pango full/compact/full recovery and zero PTY writes.
+  - `organism_ui::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers`
+    — 1 passed in 52.64 seconds; complete Block/Chat/VTE adapter traces, input
+    preservation, tooltip lifetime, disabled/closed observer retirement, and
+    two VTE panes retaining both pixel allocations and row/column counts during
+    four focus transfers. Static is checked at frame zero for its current
+    observed context; an idle-to-sleep semantic change remains valid.
+
+Builds used `CARGO_TARGET_DIR=/tmp/organism-target`,
+`CARGO_PROFILE_TEST_DEBUG=0`, `CARGO_PROFILE_DEV_DEBUG=0`,
+`CARGO_INCREMENTAL=0`, and `CARGO_BUILD_JOBS=4`.
+Native validation covers X11/Cairo, not GPU rendering or Wayland fractional
+scaling. Session evidence is in `validation/anvil-organism-tests.log`,
+`anvil-clippy.log`, `anvil-inspector-native.log`, `anvil-unique-native.log`,
+`anvil-surface-native.log`, and `anvil-final-static-checks.log`.
+
 ## 2026-10-26 — native pointer and guides on wrapped rows (shared core)
 
 - The bundled core keeps `native_pointer` in wrapped splits, so clicks and

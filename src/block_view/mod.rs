@@ -14801,6 +14801,16 @@ impl TermView {
         }
     }
 
+    /// Reading a running block's scrollback gives the one companion a compact
+    /// home in the sticky header, never a second body beside the live surface.
+    pub(crate) fn organism_uses_running_header(&self) -> bool {
+        self.user_scrolled_up.get()
+            && self
+                .sticky_organism_slot
+                .parent()
+                .is_some_and(|header| header.is_mapped())
+    }
+
     pub(crate) fn put_sticky_organism_avatar(&self, avatar: &gtk::Widget) -> bool {
         let slot_widget: gtk::Widget = self.sticky_organism_slot.clone().upcast();
         match avatar.parent() {

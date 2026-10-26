@@ -107,12 +107,9 @@ fn run_with_geometry(host: Host, mut apply: impl FnMut(Step) -> (Observed, bool)
         let (observed, idle_space) = apply(step);
         let common_visible = step.enabled && step.focused && !step.retreat;
         let (primary_painted, wake_pending) = match host {
-            // Static keeps only Block's inline card. Its existing maintenance
-            // heartbeat remains legitimate even without a spatial body.
-            Host::Block | Host::Chat => (
-                common_visible && step.motion != OrganismMotion::Static && idle_space,
-                step.enabled,
-            ),
+            // Static uses the same single surface at frame zero. Semantic
+            // maintenance remains separate from presentation ownership.
+            Host::Block | Host::Chat => (common_visible && idle_space, step.enabled),
             // VTE has no semantic maintenance heartbeat or command reaction.
             Host::NeutralVte => (
                 common_visible,
@@ -126,7 +123,8 @@ fn run_with_geometry(host: Host, mut apply: impl FnMut(Step) -> (Observed, bool)
             "{host:?} {step:?}: {observed:?}"
         );
         assert_eq!(
-            observed.card_visible, step.enabled,
+            observed.card_visible,
+            matches!(host, Host::NeutralVte) && step.enabled && step.focused,
             "{host:?} {step:?}: {observed:?}"
         );
         assert_eq!(
@@ -239,8 +237,7 @@ pub(super) fn exercise_block(
             cursor_row: metrics.cursor_row,
         };
         let idle_space = idle_space_available(measured);
-        let eligible =
-            step.enabled && step.focused && !step.retreat && step.motion != OrganismMotion::Static;
+        let eligible = step.enabled && step.focused && !step.retreat;
         if eligible {
             assert!(measured_surface_allocation(
                 measured,
@@ -325,12 +322,12 @@ fn idle_fit_oracle_checks_native_size_and_grid_margins() {
 }
 
 #[test]
-fn constrained_chat_retains_card_and_wake_oracles() {
+fn constrained_chat_preserves_single_surface_and_wake_oracles() {
     run_with_geometry(Host::Chat, |step| {
         (
             Observed {
                 primary_painted: false,
-                card_visible: step.enabled,
+                card_visible: false,
                 wake_pending: step.enabled,
             },
             false,
@@ -340,7 +337,7 @@ fn constrained_chat_retains_card_and_wake_oracles() {
         std::panic::catch_unwind(|| run_with_geometry(Host::Chat, |step| (
             Observed {
                 primary_painted: false,
-                card_visible: false,
+                card_visible: step.enabled,
                 wake_pending: step.enabled,
             },
             false
@@ -348,10 +345,10 @@ fn constrained_chat_retains_card_and_wake_oracles() {
         .is_err()
     );
     assert!(
-        std::panic::catch_unwind(|| run_with_geometry(Host::Chat, |step| (
+        std::panic::catch_unwind(|| run_with_geometry(Host::Chat, |_| (
             Observed {
                 primary_painted: false,
-                card_visible: step.enabled,
+                card_visible: false,
                 wake_pending: false,
             },
             false
@@ -470,7 +467,10 @@ pub(super) fn exercise_mounted_modes(
                     .expect("local attachment");
                 assert_eq!(hub.organism_presence.eligible_views().len(), 1);
                 settle(Duration::from_millis(120));
-                assert!(runtime.card.is_mapped(), "{host:?}: actual inline card");
+                assert!(
+                    runtime.card.parent().is_none(),
+                    "{host:?}: no duplicate inline card"
+                );
                 exercise_block(host, allow_constrained, &runtime, &view, settle);
                 // Drop a live Full source, not the already disabled trace tail.
                 // Hidden-but-owned panes intentionally retain maintenance; this

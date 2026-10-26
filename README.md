@@ -1334,6 +1334,11 @@ Forge's GTK4 frontend is recorded in
 
 The local ASCII organism is enabled by default in open and new local
 Block/Unified panes. Set `ascii_organism_enabled = false` to disable it.
+There is one companion per GUI. Switching blocks, splits or tabs transfers its
+single visible body; inactive panes never keep another card or avatar. Its
+ambient habits, continuous state, greeting cooldown and conversation voice
+belong to the window. The old always-present organism card is removed; details
+are available through **Inspect ASCII companion**.
 It reacts only to content-free command lifecycle facts,
 focused-pane presence, elapsed time, exit status/duration, and Agent state; it
 does not run commands, use an LLM, or persist command/output text. Its bounded
@@ -1361,7 +1366,8 @@ Full uses the shared renderer's animation; Calm and Static hold a still frame.
 Expanded presentation reserves the native font's three-line envelope. In a
 narrow or clipped pane it shows the complete compact glyph when that fits,
 otherwise hides the decoration without collapsing its reserved space.
-Sent input and focus loss hide the decoration while preserving its layout slot.
+Sent input briefly hides the decoration; focus loss hides the entire companion
+row so inactive splits do not retain duplicate labels or empty companion slots.
 Fully clipped, hidden, inactive, closed, and disabled panes stop their animation
 source. A passive observer of existing native paints checks clipping changes;
 it does not request additional frames, and recovery may wait for the next paint.
@@ -1375,20 +1381,33 @@ Pause the pointer near a visible resting body for 600 ms for a quiet two-second
 hello. Split panes share an eight-second cooldown. This passive observer never
 consumes clicks, selection, or keyboard focus; typing, real work, focus transfer,
 fullscreen apps, or changed geometry cancel a pending greeting. Busy/reaction
-poses stay undisturbed. Calm uses a still acknowledgment; Static has no spatial
-body. Greetings do not change physiology or durable memory.
+poses stay undisturbed. Calm uses a still acknowledgment; Static displays the
+same unique body at frame zero without hover gestures. Greetings do not change
+physiology or durable memory.
 
 Settings also offers eight explained poses and a preview-only Say hello button,
 even while the live companion is off. Previewing never runs terminal commands or
 changes its memory. Hiding/closing settings stops every preview frame source.
 
 The command palette's **Inspect ASCII companion** action opens a snapshot of
-this pane's actual companion: its pose and reason, current command activity,
+the window's companion and this pane's observed context: its pose explanation, command activity,
 last reaction, unresolved work, growth, and eight named state levels. These
 levels describe the simulated companion, not the user. The snapshot uses no
 polling or animation source, changes no life or memory state, and remains
 readable without retaining a closed pane. Reopen it to refresh. The optional
 `[keybindings] inspect_ascii_organism = "F10"` binding has no default chord.
+The inspector is text-only and offers **Say hello**, **Keep me company**,
+**Tell a story**, and **Take a break**. These use authored local replies with a
+stable temperament and a window-wide story cursor; they never send terminal
+input or call an agent. Replies use the activity snapshot taken when opened.
+
+**Gentle break reminders** is an optional saved preference
+(`ascii_organism_care_enabled = false` by default). It counts recent human input
+in the foreground window, waits for an idle visible body, then offers an
+occasional water, stretch or screen break through an ordinary toast. **Later**
+snoozes for 20 minutes; **Take a break** resets the work interval. Background
+splits, typing, running commands, fullscreen applications and modal UI do not
+receive prompts. Static motion still supports explicitly enabled text reminders.
 Traditional VTE explains its neutral-display capability instead of inventing
 command outcomes. Live watch captions now explain output rhythm for both human
 commands and Shell Agent work; quiet output explicitly remains unfinished work.

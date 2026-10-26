@@ -842,6 +842,10 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         "ascii_organism_enabled".into(),
         toml::Value::Boolean(config.ascii_organism_enabled),
     );
+    table.insert(
+        "ascii_organism_care_enabled".into(),
+        toml::Value::Boolean(config.ascii_organism_care_enabled),
+    );
     if let Some(motion) = config.ascii_organism_motion {
         table.insert(
             "ascii_organism_motion".into(),
@@ -1641,6 +1645,7 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "ui_font_size_absolute",
         "block_compact",
         "ascii_organism_enabled",
+        "ascii_organism_care_enabled",
         "ascii_organism_motion",
         "allow_remote_clipboard_write",
         "ai_enabled",
@@ -1732,6 +1737,7 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "ai_enabled",
         "ai_panel_visible",
         "ascii_organism_enabled",
+        "ascii_organism_care_enabled",
         "ai_redact_secrets",
         "ai_stream",
         "agent_enabled",
@@ -2509,12 +2515,20 @@ mod tests {
         let path = directory.join("config.toml");
         let mut config = config::load_safe_config().0;
         config.ascii_organism_enabled = true;
+        assert!(!config.ascii_organism_care_enabled);
+        config.ascii_organism_care_enabled = true;
         config.ascii_organism_motion = Some(config::OrganismMotion::Calm);
         save_config_to_path(&path, &config, Some(&ConfigRevision::Missing)).unwrap();
         let table = fs::read_to_string(&path)
             .unwrap()
             .parse::<toml::Table>()
             .unwrap();
+        assert_eq!(
+            table
+                .get("ascii_organism_care_enabled")
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
         assert_eq!(
             table
                 .get("ascii_organism_enabled")

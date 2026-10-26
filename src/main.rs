@@ -859,6 +859,10 @@ impl SimpleComponent for AppModel {
         let font_scale = config.default_font_scale;
         let config = Rc::new(RefCell::new(config));
         let organism_hub = organism_ui::OrganismHub::new(config.clone());
+        let care_sender = sender.clone();
+        organism_hub.set_care_settings_handler(Rc::new(move |enabled| {
+            care_sender.input(AppMsg::SettingsAsciiOrganismCare(enabled));
+        }));
         let kbmap = Rc::new(RefCell::new(kbmap));
         let workflows = Rc::new(RefCell::new(Vec::new()));
 
@@ -1306,6 +1310,7 @@ impl SimpleComponent for AppModel {
         }
 
         let toast_overlay = adw::ToastOverlay::new();
+        organism_hub.set_care_overlay(&toast_overlay);
         let task_feedback = agent_task_ui::build_task_feedback();
         let quit_allowed = Rc::new(std::cell::Cell::new(false));
         let tab_drag_coordinator = Rc::new(tab_strip::TabDragCoordinator::default());
@@ -2382,6 +2387,13 @@ impl SimpleComponent for AppModel {
             AppMsg::SettingsBlockCompact(enabled) => self.apply_settings_block_compact(enabled),
             AppMsg::SettingsCommandHistory(enabled) => self.apply_settings_command_history(enabled),
             AppMsg::SettingsAsciiOrganism(enabled) => self.apply_settings_ascii_organism(enabled),
+            AppMsg::SettingsAsciiOrganismCare(enabled) => {
+                if !self.safe_mode {
+                    self.config.borrow_mut().ascii_organism_care_enabled = enabled;
+                    self.organism_hub.sync_ascii_organism_settings();
+                    self.persist_config();
+                }
+            }
             AppMsg::SettingsAsciiOrganismMotion(motion) => {
                 self.apply_settings_ascii_organism_motion(motion)
             }

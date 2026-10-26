@@ -33,6 +33,7 @@ use jterm_core::organism::{
 };
 use jterm_core::organism_attention::{AttentionArbiter, AttentionCue};
 use jterm_core::organism_clock::{InputActivity, MAX_TICK};
+use jterm_core::organism_companion::{CompanionCare, CompanionSurface, CompanionVoice};
 #[cfg(test)]
 use jterm_core::organism_daily::behavior_explanation;
 use jterm_core::organism_daily::context_explanation;
@@ -47,6 +48,9 @@ use jterm_core::organism_memory::{
     local_circadian_time_at_ms, unix_ms, CircadianProfile, GrowthProgress, GrowthStage,
     LocalCircadianTime, MemoryEvent, MemoryInsight, RepoContext,
 };
+
+/// Routes an explicit care preference through the window's normal settings path.
+pub(crate) type CareSettingsHandler = Rc<dyn Fn(bool)>;
 
 /// An accepted correction only vouches for a command that starts promptly.
 const CORRECTION_ASSIST_WINDOW: Duration = Duration::from_secs(30);
@@ -158,7 +162,7 @@ fn card_tooltip_at(
 
 /// Installed once with the pane's runtime, never from rendering. Both hooks
 /// retain only weak widgets; a retired/reparented card cannot serve old text.
-/// Pane-local cards remain readable even when another pane owns the live body.
+/// Legacy card labels remain snapshot metadata; production does not mount them.
 fn install_card_tooltip_proxy(root: &gtk::Widget, card: &gtk::Widget, labels: &[Label]) {
     let card_weak = card.downgrade();
     let labels_weak: Vec<_> = labels.iter().map(|label| label.downgrade()).collect();
@@ -1636,13 +1640,19 @@ struct PresenceState {
     eligible: Vec<std::rc::Weak<TermView>>,
 }
 
-/// Window-shared arbiter for the one spatial body. Every pane keeps its own
-/// reducer and inline/sticky representations, but only the genuinely focused
-/// local Block pane may opt its live overlay into visibility.
+/// Window-shared identity and arbiter for every companion representation.
+/// Pane reducers retain command context, but only the focused local pane may
+/// show the body or its compact substitute. Ambient habits follow the window.
 pub(crate) struct OrganismPresence {
     state: RefCell<PresenceState>,
     live_attention: RefCell<LiveAttention<OrganismPaneToken>>,
     attention_epoch: Instant,
+    ambient: Rc<RefCell<AmbientMind>>,
+    ambient_display: Rc<Cell<AmbientBehavior>>,
+    voice: Rc<RefCell<CompanionVoice>>,
+    care: Rc<RefCell<CompanionCare>>,
+    care_overlay: RefCell<Option<gtk::glib::WeakRef<relm4::adw::ToastOverlay>>>,
+    care_changed: RefCell<Option<CareSettingsHandler>>,
 }
 
 impl OrganismPresence {
@@ -1651,6 +1661,18 @@ impl OrganismPresence {
             state: RefCell::new(PresenceState::default()),
             live_attention: RefCell::new(LiveAttention::default()),
             attention_epoch: Instant::now(),
+            ambient: Rc::new(RefCell::new(AmbientMind::seeded(
+                CompanionVoice::seed_for_key(
+                    &crate::config::default_ascii_organism_memory_path().to_string_lossy(),
+                ),
+            ))),
+            ambient_display: Rc::new(Cell::new(AmbientBehavior::Idle)),
+            care: Rc::new(RefCell::new(CompanionCare::default())),
+            care_overlay: RefCell::new(None),
+            care_changed: RefCell::new(None),
+            voice: Rc::new(RefCell::new(CompanionVoice::from_key(
+                &crate::config::default_ascii_organism_memory_path().to_string_lossy(),
+            ))),
         })
     }
 
@@ -1748,6 +1770,10 @@ impl OrganismPresence {
         // can cancel only their own token, never a successor's interaction.
         self.live_attention.borrow_mut().set_owner(None);
 
+        self.care
+            .borrow_mut()
+            .observe(self.attention_epoch.elapsed(), false, false);
+
         for (_, view, runtime) in &live_entries {
             runtime.hide_live_body(view);
         }
@@ -1760,6 +1786,13 @@ impl OrganismPresence {
         for (token, view, runtime) in &live_entries {
             if Some(*token) == new_owner {
                 let now = Instant::now();
+                // This mind already lived the elapsed interval in the old
+                // pane; changing its seat must not age ambient holds twice.
+                runtime.surface_last_frame.set(Some(now));
+                runtime
+                    .organism
+                    .borrow_mut()
+                    .sync_state(runtime.shared_life.get());
                 runtime.refresh_surface(view, now);
                 runtime.reconcile_sleeping_claim(view, now);
             }
@@ -1947,10 +1980,9 @@ struct OrganismRuntime {
     presence_cue: Cell<Option<PresenceCue>>,
     presence_cue_frame_origin: Cell<u64>,
     presence_cue_timer: RefCell<Option<gtk::glib::SourceId>>,
-    /// Pane-local utility disposition; stepped only while this body is
-    /// genuinely idle, interrupted the moment anything else claims it.
-    ambient: RefCell<AmbientMind>,
-    ambient_display: Cell<AmbientBehavior>,
+    /// One ambient mind for the window; background panes cannot advance it.
+    ambient: Rc<RefCell<AmbientMind>>,
+    ambient_display: Rc<Cell<AmbientBehavior>>,
     sleeping: Cell<bool>,
     active_memory_kind: Cell<Option<CommandKind>>,
     active_context_key: RefCell<Option<String>>,
@@ -2024,6 +2056,35 @@ struct OrganismRuntime {
 }
 
 impl OrganismRuntime {
+    /// Command reducers are pane-local; only the window owner steers the one
+    /// ambient mind. Background completion and maintenance cannot reset it.
+    fn step_ambient(
+        &self,
+        state: LifeState,
+        idle_for: f32,
+        dt: f32,
+        vigil: RepoVigil,
+    ) -> AmbientBehavior {
+        if self.presence.is_owner(self.presence_token) {
+            self.ambient.borrow_mut().step(state, idle_for, dt, vigil)
+        } else {
+            self.ambient_display.get()
+        }
+    }
+
+    fn record_ambient(&self, behavior: AmbientBehavior) {
+        if self.presence.is_owner(self.presence_token) {
+            self.ambient_display.set(behavior);
+        }
+    }
+
+    fn interrupt_ambient(&self) {
+        if self.presence.is_owner(self.presence_token) {
+            self.ambient.borrow_mut().interrupt();
+            self.ambient_display.set(AmbientBehavior::Idle);
+        }
+    }
+
     fn new(
         shared_life: Rc<Cell<LifeState>>,
         activity: Rc<OrganismActivity>,
@@ -2044,6 +2105,8 @@ impl OrganismRuntime {
         outer.set_margin_end(8);
         outer.set_can_target(false);
         outer.set_focusable(false);
+        // Status data is inspected on demand; it is never another body.
+        outer.set_visible(false);
 
         let content = GBox::new(Orientation::Horizontal, 12);
         content.set_margin_start(12);
@@ -2147,13 +2210,13 @@ impl OrganismRuntime {
             }),
             shared_life,
             activity,
-            presence,
+            presence: presence.clone(),
             presence_token,
             presence_cue: Cell::new(None),
             presence_cue_frame_origin: Cell::new(0),
             presence_cue_timer: RefCell::new(None),
-            ambient: RefCell::new(AmbientMind::default()),
-            ambient_display: Cell::new(AmbientBehavior::Idle),
+            ambient: presence.ambient.clone(),
+            ambient_display: presence.ambient_display.clone(),
             sleeping: Cell::new(false),
             active_memory_kind: Cell::new(None),
             active_context_key: RefCell::new(None),
@@ -2359,22 +2422,21 @@ impl OrganismRuntime {
         // Derive from the reducer after its defensive normalization instead
         // of trusting a future internal caller to construct the snapshot.
         let ambient = if vigil.is_active() {
-            runtime.ambient.borrow_mut().step(
+            runtime.step_ambient(
                 runtime.shared_life.get(),
                 runtime.activity.idle_for_secs(now),
                 0.0,
                 vigil,
             )
         } else {
-            runtime.ambient.borrow_mut().interrupt();
+            runtime.interrupt_ambient();
             AmbientBehavior::Idle
         };
-        runtime.ambient_display.set(ambient);
+        runtime.record_ambient(ambient);
         let idle = runtime.organism.borrow().idle_reaction();
         runtime.render(&idle);
         runtime.refresh_surface(view, now);
         runtime.reconcile_sleeping_claim(view, now);
-        view.insert_inline_notice(&runtime.card);
     }
 
     fn cancel_territory_intro(&self) {
@@ -2848,6 +2910,8 @@ impl OrganismRuntime {
     }
 
     fn hide_live_body(&self, view: &TermView) {
+        self.card.set_visible(false);
+        self.sticky_avatar.set_visible(false);
         self.cancel_pointer_greeting();
         self.reset_watch_rhythm_at_boundary(Instant::now());
         self.clear_presence_cue();
@@ -3046,7 +3110,7 @@ impl OrganismRuntime {
             motion: match self.motion.get() {
                 OrganismMotion::Full => "Full · movement and animated poses",
                 OrganismMotion::Calm => "Calm · still poses that follow observed events",
-                OrganismMotion::Static => "Static · inline companion only",
+                OrganismMotion::Static => "Static · one still companion",
             },
             vigil: self.organism.borrow().repo_vigil(),
         }
@@ -3069,8 +3133,8 @@ impl OrganismRuntime {
         let mut organism = self.organism.borrow_mut();
         organism.sync_state(self.shared_life.get());
         organism.roll_over_day();
-        self.ambient.borrow_mut().interrupt();
-        self.ambient_display.set(AmbientBehavior::Idle);
+        self.interrupt_ambient();
+        self.record_ambient(AmbientBehavior::Idle);
         self.set_sleeping(false);
         true
     }
@@ -3106,8 +3170,8 @@ impl OrganismRuntime {
         self.territory_intro_pending.set(false);
         self.territory_intro_until.set(None);
         if released_vigil {
-            self.ambient.borrow_mut().interrupt();
-            self.ambient_display.set(AmbientBehavior::Idle);
+            self.interrupt_ambient();
+            self.record_ambient(AmbientBehavior::Idle);
             self.set_sleeping(false);
         }
         released_vigil
@@ -3169,13 +3233,8 @@ impl OrganismRuntime {
         self.refresh_growth_badge();
         self.refresh_inline_sprite();
         if self.motion.get() == OrganismMotion::Static {
-            self.hide_live_body(view);
-            self.sticky_avatar.set_visible(false);
-            // The inline card is the whole visual surface; the live body and
-            // sticky avatar were never attached. Consume a first-look rather
-            // than carrying it behind an unavailable surface.
+            // Static keeps the same unique surface at frame zero.
             self.cancel_territory_intro();
-            return;
         }
         let behavior = self.surface_behavior.get();
         let mode = surface_mode(
@@ -3280,8 +3339,8 @@ impl OrganismRuntime {
         self.last_live_behavior.set(display_behavior);
         // The sticky one-line form mirrors the same displayed behavior with a
         // fixed-width micro-pose, so scrollback readers see the mood too.
-        // Cross-pane cues belong only to the one spatial body. The focused
-        // pane's sticky and inline forms retain their own local semantics.
+        // This compact form is an alternate seat for the same companion;
+        // arbitration below admits either the running header or spatial body.
         let glyph = sticky_glyph_with_context(
             RenderContext::new(baseline_behavior, language, false)
                 .with_growth_stage(growth)
@@ -3294,13 +3353,11 @@ impl OrganismRuntime {
 
         if !self.presence.is_owner(self.presence_token) {
             self.hide_live_body(view);
-            // Sticky and inline forms remain pane-local evidence; only the
-            // spatial overlay participates in one-body focus arbitration.
-            self.sticky_avatar.set_visible(mode != SurfaceMode::Typing);
+            self.sticky_avatar.set_visible(false);
             return;
         }
 
-        // Reconciliation and pane-local forms above still run for non-owners.
+        // Pane-local command reconciliation still runs for non-owners.
         // Render spatial pixels only after arbitration, including the first
         // refresh when focus returns (there is no stale sprite cache).
         #[cfg(test)]
@@ -3330,6 +3387,22 @@ impl OrganismRuntime {
             self.sticky_avatar.set_visible(false);
             return;
         }
+        let compact = view.organism_uses_running_header() && self.command_running.get();
+        let seat = CompanionSurface::choose(
+            self.enabled.get(),
+            self.presence.is_owner(self.presence_token),
+            view.widget().is_mapped() && !metrics.alt_screen,
+            suppress_live_body_for_focus(mode),
+            !compact,
+            compact,
+        );
+        if seat != CompanionSurface::Body {
+            self.hide_live_body(view);
+            self.sticky_avatar
+                .set_visible(seat == CompanionSurface::Compact);
+            return;
+        }
+        self.sticky_avatar.set_visible(false);
         // Keep the child measurable while the non-measuring overlay is hidden.
         // GTK reports zero requisition for an explicitly invisible Label,
         // which would otherwise make a tiny initial allocation self-locking.
@@ -3339,7 +3412,7 @@ impl OrganismRuntime {
         // A size change can tighten the legal x/y band even when the terminal
         // itself did not resize. Snap before interpolating so a wider reaction
         // pose never spends intermediate frames inside the scrollbar gutter.
-        let surface = SurfaceBox {
+        let mut surface = SurfaceBox {
             width: metrics.width,
             height: metrics.height,
             right_gutter: metrics.right_gutter,
@@ -3349,6 +3422,48 @@ impl OrganismRuntime {
             body_height,
             cursor_row: metrics.cursor_row,
         };
+        let vigil = self.organism.borrow().repo_vigil();
+        let mut point = surface_point_for_territory(
+            surface,
+            mode,
+            tempo,
+            ambient,
+            vigil,
+            geometry_frame,
+            self.territory.get(),
+        );
+        let full_fits = point.is_some();
+        if !full_fits {
+            // Reuse this exact label as a single-line body when the three-line
+            // pose cannot fit. Measure its actual font, growth and current pose;
+            // never reserve another row or guess a fixed pixel width.
+            let compact = sticky_glyph_with_context(context, sprite_frame);
+            self.live_body.set_text(compact.as_ref());
+            let (_, width, _, _) = self.live_body.measure(Orientation::Horizontal, -1);
+            let (_, height, _, _) = self.live_body.measure(Orientation::Vertical, width);
+            surface.body_width = width;
+            surface.body_height = height;
+            point = surface_point_for_territory(
+                surface,
+                mode,
+                tempo,
+                ambient,
+                vigil,
+                geometry_frame,
+                self.territory.get(),
+            );
+        }
+        let presentation = CompanionSurface::choose(
+            self.enabled.get(),
+            self.presence.is_owner(self.presence_token),
+            view.widget().is_mapped() && !metrics.alt_screen,
+            suppress_live_body_for_focus(mode),
+            full_fits,
+            point.is_some(),
+        );
+        if presentation == CompanionSurface::Hidden {
+            point = None;
+        }
         let signature = surface_signature(surface);
         let previous_signature = self.surface_signature.replace(signature);
         if previous_signature != signature {
@@ -3370,16 +3485,6 @@ impl OrganismRuntime {
             self.body_position.set(None);
             self.body_in_transit.set(false);
         }
-        let vigil = self.organism.borrow().repo_vigil();
-        let point = surface_point_for_territory(
-            surface,
-            mode,
-            tempo,
-            ambient,
-            vigil,
-            geometry_frame,
-            self.territory.get(),
-        );
 
         if let Some(target) = point {
             let previous = self.body_position.get();
@@ -3422,7 +3527,7 @@ impl OrganismRuntime {
         }
         // The Block layer decides whether the sticky running header is active;
         // this child only follows the same accepted-input retreat window.
-        self.sticky_avatar.set_visible(mode != SurfaceMode::Typing);
+        self.sticky_avatar.set_visible(false);
     }
 
     fn apply_settings(
@@ -3449,7 +3554,7 @@ impl OrganismRuntime {
             runtime.hide_live_body(view);
             runtime.sticky_avatar.set_visible(false);
         }
-        runtime.card.set_visible(enabled);
+        runtime.card.set_visible(false);
         if let Some(source) = runtime.surface_timer.borrow_mut().take() {
             source.remove();
         }
@@ -3481,10 +3586,61 @@ impl OrganismRuntime {
                 .sync_state(runtime.shared_life.get());
             let idle = runtime.organism.borrow().idle_reaction();
             runtime.render(&idle);
-            view.insert_inline_notice(&runtime.card);
         }
         runtime.refresh_surface(view, Instant::now());
         Self::start_surface_tick(runtime, view);
+    }
+
+    /// One clock and one toast belong to the window. Only observed recent
+    /// human input counts; output, hidden panes and modal UI never imply work.
+    fn observe_care(&self, view: &TermView, now: Instant) {
+        if !self.presence.is_owner(self.presence_token) {
+            return;
+        }
+        let root = view.widget();
+        let focused = root
+            .root()
+            .and_downcast::<gtk::Window>()
+            .is_some_and(|window| {
+                window.is_active()
+                    && gtk::prelude::GtkWindowExt::focus(&window)
+                        .is_some_and(|focus| focus == root || focus.is_ancestor(&root))
+            });
+        let age = self.human_input_age(now);
+        let engaged = self.enabled.get()
+            && focused
+            && !view.live_organism_surface_metrics().alt_screen
+            && age.is_some_and(|age| age < Duration::from_secs(5 * 60));
+        let can_offer = engaged
+            && age.is_some_and(|age| age >= HUMAN_INPUT_RETREAT)
+            && self.activity.no_commands_running()
+            && view.organism_activity_settled()
+            && self.surface_behavior.get() == Behavior::Idle
+            && !self.organism.borrow().repo_vigil().is_active()
+            && self.live_body.is_mapped()
+            && !pointer_buttons_down(view);
+        let overlay = self
+            .presence
+            .care_overlay
+            .borrow()
+            .as_ref()
+            .and_then(|overlay| overlay.upgrade());
+        let prompt = self.presence.care.borrow_mut().observe(
+            now.saturating_duration_since(self.presence.attention_epoch),
+            engaged,
+            can_offer && overlay.is_some(),
+        );
+        if let (Some(prompt), Some(overlay)) = (prompt, overlay) {
+            let toast = relm4::adw::Toast::builder()
+                .title(prompt.text())
+                .button_label("Later")
+                .timeout(8)
+                .build();
+            let care = self.presence.care.clone();
+            let epoch = self.presence.attention_epoch;
+            toast.connect_button_clicked(move |_| care.borrow_mut().snooze(epoch.elapsed()));
+            overlay.add_toast(toast);
+        }
     }
 
     fn start_surface_tick(runtime: &Rc<Self>, view: &Rc<TermView>) {
@@ -3650,16 +3806,16 @@ impl OrganismRuntime {
                 let pane_dt = previous_frame
                     .map(|last| now.saturating_duration_since(last).as_secs_f32())
                     .unwrap_or(0.0);
-                let ambient = runtime.ambient.borrow_mut().step(
+                let ambient = runtime.step_ambient(
                     runtime.shared_life.get(),
                     runtime.activity.idle_for_secs(now),
                     pane_dt,
                     runtime.organism.borrow().repo_vigil(),
                 );
-                runtime.ambient_display.set(ambient);
+                runtime.record_ambient(ambient);
             } else {
-                runtime.ambient.borrow_mut().interrupt();
-                runtime.ambient_display.set(AmbientBehavior::Idle);
+                runtime.interrupt_ambient();
+                runtime.record_ambient(AmbientBehavior::Idle);
             }
             let watch_eligible = runtime.watch_context_eligible(&view, now);
             let watch_reader = view.watch_observation_snapshot();
@@ -3700,6 +3856,7 @@ impl OrganismRuntime {
                 .surface_frame
                 .set(runtime.surface_frame.get().wrapping_add(1 + pulse));
             runtime.refresh_surface(&view, now);
+            runtime.observe_care(&view, now);
 
             // Geometry and GTK mapping are known only after the neutral frame
             // has performed its fail-closed placement. Spend shared attention
@@ -3857,7 +4014,6 @@ impl OrganismRuntime {
             };
             runtime.render(&reaction);
             runtime.refresh_surface(&view, Instant::now());
-            view.insert_inline_notice(&runtime.card);
             OrganismRuntime::settle_later(
                 &runtime,
                 view_weak,
@@ -3896,13 +4052,13 @@ impl OrganismRuntime {
             // Do not leave a one-heartbeat flash of generic idle between the
             // reaction and its durable repo intention, especially in Calm or
             // Static mode where that heartbeat is deliberately slow.
-            let ambient = runtime.ambient.borrow_mut().step(
+            let ambient = runtime.step_ambient(
                 runtime.shared_life.get(),
                 runtime.activity.idle_for_secs(Instant::now()),
                 0.0,
                 vigil,
             );
-            runtime.ambient_display.set(ambient);
+            runtime.record_ambient(ambient);
             if should_begin_territory_intro(
                 runtime.territory_intro_pending.replace(false),
                 runtime.territory.get(),
@@ -3917,7 +4073,6 @@ impl OrganismRuntime {
                 let now = Instant::now();
                 runtime.refresh_surface(&view, now);
                 runtime.reconcile_sleeping_claim(&view, now);
-                view.insert_inline_notice(&runtime.card);
             }
         });
         *runtime.settle_timer.borrow_mut() = Some(source);
@@ -4093,6 +4248,18 @@ impl OrganismHub {
         hub
     }
 
+    pub(crate) fn set_care_overlay(&self, overlay: &relm4::adw::ToastOverlay) {
+        *self.organism_presence.care_overlay.borrow_mut() = Some(overlay.downgrade());
+        self.organism_presence
+            .care
+            .borrow_mut()
+            .set_enabled(self.config.borrow().ascii_organism_care_enabled);
+    }
+
+    pub(crate) fn set_care_settings_handler(&self, handler: CareSettingsHandler) {
+        *self.organism_presence.care_changed.borrow_mut() = Some(handler);
+    }
+
     pub(crate) fn say_hello(&self, view: &Rc<TermView>) -> Result<(), &'static str> {
         if !self.config.borrow().ascii_organism_enabled {
             return Err("ASCII companion is off.");
@@ -4119,7 +4286,14 @@ impl OrganismHub {
             return Err("No local ASCII companion is available in the original pane.");
         };
         let snapshot = runtime.inspection_snapshot(view);
-        inspector::present(window, snapshot);
+        inspector::present(
+            window,
+            snapshot,
+            self.organism_presence.voice.clone(),
+            self.organism_presence.care.clone(),
+            self.organism_presence.attention_epoch,
+            self.organism_presence.care_changed.borrow().clone(),
+        );
         Ok(())
     }
 
@@ -4147,6 +4321,10 @@ impl OrganismHub {
     }
 
     pub(crate) fn sync_ascii_organism_settings(&self) {
+        self.organism_presence
+            .care
+            .borrow_mut()
+            .set_enabled(self.config.borrow().ascii_organism_care_enabled);
         let (enabled, motion) = {
             let config = self.config.borrow();
             let motion = config.ascii_organism_motion.unwrap_or_else(|| {
@@ -4218,16 +4396,8 @@ impl OrganismHub {
             &runtime.card,
             &[runtime.state.clone(), runtime.status.clone()],
         );
-        // Two surfaces, deliberately: the card is the organism's home in the
-        // block conversation, the live body below is its home on the terminal
-        // surface itself. A pane that cannot host inline cards keeps only the
-        // overlay — which is also why that overlay must be suppressed for
-        // alt-screen apps there.
-        if !view.insert_inline_notice(&runtime.card) {
-            log::debug!(
-                "organism card not mounted in this pane; the live-surface body is its only home"
-            );
-        }
+        // A single body lives on the active terminal surface. Status and
+        // physiology remain available through Inspect companion.
         {
             if !view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0) {
                 log::warn!("could not attach ASCII organism to the live terminal surface");
@@ -4236,9 +4406,6 @@ impl OrganismHub {
                 log::warn!("could not attach ASCII organism to the sticky running header");
             }
         }
-        // Per-body seeding keeps split-window bodies from napping and pacing
-        // in perfect lockstep.
-        *runtime.ambient.borrow_mut() = AmbientMind::seeded(pane_token(view) as u64);
         runtime.refresh_surface(view, Instant::now());
         OrganismRuntime::start_surface_tick(&runtime, view);
         OrganismRuntime::install_prompt_evidence_observer(&runtime, view);
@@ -4572,7 +4739,6 @@ impl OrganismHub {
                 runtime.render(&reaction);
                 if let Some(view) = view_weak.upgrade() {
                     runtime.refresh_surface(&view, Instant::now());
-                    view.insert_inline_notice(&runtime.card);
                 }
             });
         }
@@ -4806,7 +4972,6 @@ impl OrganismHub {
                 runtime.render(&reaction);
                 if let Some(view) = view_weak.upgrade() {
                     runtime.refresh_surface(&view, Instant::now());
-                    view.insert_inline_notice(&runtime.card);
                 }
                 OrganismRuntime::settle_later(
                     &runtime,
@@ -4834,24 +4999,6 @@ impl OrganismHub {
             // cleared here, the correct agent attribution.
             OrganismRuntime::install_agent_execution_lost_observer(&runtime, view);
         }
-
-        {
-            // CommandEnd arrives before the finished GTK block is committed at
-            // the next PromptStart. Re-pin only; the reducer already consumed
-            // the authoritative lifecycle event above.
-            let runtime = runtime.clone();
-            let view_weak = Rc::downgrade(view);
-            view.connect_block_finished(
-                move |_command, _exit_code, _agent_generation, _duration_ms| {
-                    if !runtime.enabled.get() {
-                        return;
-                    }
-                    if let Some(view) = view_weak.upgrade() {
-                        view.insert_inline_notice(&runtime.card);
-                    }
-                },
-            );
-        }
     }
 }
 
@@ -4866,6 +5013,157 @@ impl Drop for OrganismHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires DISPLAY"]
+    fn one_companion_crosses_splits_without_cloning_its_body_or_mind() {
+        gtk::init().expect("gtk display");
+        let presence = OrganismPresence::new();
+        let life = Rc::new(Cell::new(LifeState::default()));
+        let activity = OrganismActivity::new(None, GrowthProgress::default());
+        let views = [
+            crate::block_view::organism_settings_test_view(),
+            crate::block_view::organism_settings_test_view(),
+        ];
+        let runtimes: Vec<_> = views
+            .iter()
+            .map(|view| {
+                let token = presence.reserve();
+                let runtime = OrganismRuntime::new(
+                    life.clone(),
+                    activity.clone(),
+                    presence.clone(),
+                    token,
+                    OrganismMotion::Calm,
+                    false,
+                );
+                presence.bind(token, view, &runtime);
+                view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0);
+                view.put_sticky_organism_avatar(runtime.sticky_avatar.upcast_ref());
+                runtime
+            })
+            .collect();
+        assert!(Rc::ptr_eq(&runtimes[0].ambient, &runtimes[1].ambient));
+        assert!(Rc::ptr_eq(
+            &runtimes[0].ambient_display,
+            &runtimes[1].ambient_display
+        ));
+        let split = gtk::Paned::new(Orientation::Horizontal);
+        split.set_start_child(Some(&views[0].widget()));
+        split.set_end_child(Some(&views[1].widget()));
+        split.set_position(600);
+        let window = gtk::Window::builder()
+            .default_width(1200)
+            .default_height(500)
+            .build();
+        window.set_child(Some(&split));
+        window.present();
+        let main = gtk::glib::MainContext::default();
+        let settle = || {
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(120) {
+                while main.iteration(false) {}
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        settle();
+        for view in &views {
+            crate::block_view::organism_settings_test_clean_prompt(view);
+        }
+        for motion in [
+            OrganismMotion::Full,
+            OrganismMotion::Calm,
+            OrganismMotion::Static,
+        ] {
+            for (runtime, view) in runtimes.iter().zip(&views) {
+                OrganismRuntime::apply_settings(runtime, view, true, motion);
+            }
+            for owner in [0usize, 1, 0, 1] {
+                presence.focus_view(Some(&views[owner]));
+                settle();
+                for (runtime, view) in runtimes.iter().zip(&views) {
+                    runtime.refresh_surface(view, Instant::now());
+                    assert!(!runtime.card.is_visible());
+                    assert!(runtime.card.parent().is_none(), "no inline or split clone");
+                }
+                assert!(
+                    runtimes[owner].body_position.get().is_some(),
+                    "eligible owner must paint: {motion:?}"
+                );
+                assert!(runtimes[owner].live_body.is_mapped());
+                assert!(runtimes[1 - owner].body_position.get().is_none());
+                assert!(!runtimes[1 - owner].sticky_avatar.is_visible());
+                assert_eq!(
+                    runtimes
+                        .iter()
+                        .filter(|runtime| runtime.live_body.is_mapped())
+                        .count(),
+                    1
+                );
+
+                let disposition =
+                    runtimes[owner].step_ambient(life.get(), 180.0, 0.0, RepoVigil::Failure);
+                runtimes[owner].record_ambient(disposition);
+                runtimes[1 - owner].interrupt_ambient();
+                runtimes[1 - owner].record_ambient(AmbientBehavior::Idle);
+                assert_eq!(
+                    runtimes[owner].ambient.borrow().current(),
+                    disposition,
+                    "background panes cannot reset the companion's ambient mind"
+                );
+                assert_eq!(runtimes[owner].ambient_display.get(), disposition);
+                runtimes[owner].last_human_input.set(Some(Instant::now()));
+                runtimes[owner].refresh_surface(&views[owner], Instant::now());
+                assert!(runtimes
+                    .iter()
+                    .all(|runtime| !runtime.live_body.is_mapped()));
+                runtimes[owner].last_human_input.set(None);
+            }
+        }
+        // Actual native font metrics force a compact fallback, then removing
+        // the style restores the full pose in the very same overlay label.
+        let owner = &runtimes[1];
+        owner.surface_behavior.set(Behavior::Idle);
+        owner.interrupt_ambient();
+        // Pango attributes override theme CSS deterministically. Find the
+        // actual native full/compact boundary rather than assuming a font's
+        // pixel size or the window manager's allocated viewport height.
+        let mut compact_bounds = None;
+        for pixels in 8..=256 {
+            let attributes = gtk::pango::AttrList::new();
+            attributes.insert(gtk::pango::AttrSize::new_size_absolute(
+                pixels * gtk::pango::SCALE,
+            ));
+            owner.live_body.set_attributes(Some(&attributes));
+            owner.refresh_surface(&views[1], Instant::now());
+            if owner.body_position.get().is_some() && owner.live_body.text().lines().count() == 1 {
+                compact_bounds = Some(owner.surface_signature.get());
+                break;
+            }
+        }
+        let compact_bounds = compact_bounds
+            .expect("a measured compact glyph fits after the full pose outgrows its surface");
+        settle();
+        assert!(owner.live_body.is_mapped());
+        assert_eq!(owner.live_body.text().lines().count(), 1);
+        owner.live_body.set_attributes(None);
+        owner.refresh_surface(&views[1], Instant::now());
+        settle();
+        assert!(owner.body_position.get().is_some());
+        assert!(
+            owner.live_body.text().lines().count() > 1,
+            "full pose restored on the same label"
+        );
+        assert_ne!(owner.surface_signature.get(), compact_bounds);
+        presence.focus_view(None);
+        for (runtime, view) in runtimes.iter().zip(&views) {
+            assert!(!runtime.live_body.is_mapped());
+            assert!(!runtime.sticky_avatar.is_visible());
+            OrganismRuntime::apply_settings(runtime, view, false, OrganismMotion::Static);
+            assert!(crate::block_view::organism_settings_test_pty_bytes(view).is_empty());
+        }
+        window.close();
+    }
 
     #[test]
     fn idle_explanation_reflects_life_but_never_relabels_an_outcome() {
@@ -5378,7 +5676,7 @@ mod tests {
             .split("fn apply_settings(")
             .next()
             .unwrap();
-        assert!(refresh.contains("self.sticky_avatar.set_visible(mode != SurfaceMode::Typing);"));
+        assert!(refresh.contains(".set_visible(seat == CompanionSurface::Compact)"));
         let still = refresh
             .split("if self.motion.get() == OrganismMotion::Static {")
             .nth(1)
@@ -5386,7 +5684,7 @@ mod tests {
             .split("let behavior =")
             .next()
             .unwrap();
-        assert!(still.contains("self.sticky_avatar.set_visible(false);"));
+        assert!(still.contains("self.cancel_territory_intro();"));
     }
 
     #[test]
@@ -5897,6 +6195,9 @@ mod tests {
         assert_eq!(runtime.state.accessible_role(), gtk::AccessibleRole::Label);
         assert!(!runtime.status.text().is_empty());
         assert!(!runtime.state.text().is_empty());
+        // Exercise the old passive metadata widget in isolation, then detach
+        // it: production attachment no longer mounts an organism card.
+        runtime.card.set_visible(true);
         view.insert_inline_notice(&runtime.card);
         view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0);
         view.put_sticky_organism_avatar(runtime.sticky_avatar.upcast_ref());
@@ -6049,6 +6350,8 @@ mod tests {
         runtime.card.set_visible(true);
         while main.iteration(false) {}
         assert!(query(state_point, false));
+        view.remove_inline_notice(&runtime.card);
+        runtime.card.set_visible(false);
         presence.focus_view(Some(&view));
         let before = life.get();
         for _ in 0..4 {
@@ -6073,16 +6376,19 @@ mod tests {
             assert!(!runtime.organism.borrow().repo_vigil().is_active());
             assert!(runtime.last_repo_root.borrow().is_none());
             assert!(runtime.surface_timer.borrow().is_some());
-            assert!(runtime.card.is_visible());
-            assert!(!crate::block_view::organism_settings_test_onboarding(&view));
+            assert!(!runtime.card.is_visible());
+            assert!(crate::block_view::organism_settings_test_onboarding(&view));
             OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Static);
-            assert!(runtime.body_position.get().is_none());
+            assert!(
+                runtime.body_position.get().is_some(),
+                "Static retains the unique body"
+            );
             assert!(!runtime.sticky_avatar.is_visible());
             assert_eq!(presence.state.borrow().entries.len(), 1);
         }
         window.set_default_size(380, 500);
         while main.iteration(false) {}
-        assert!(!crate::block_view::organism_settings_test_onboarding(&view));
+        assert!(crate::block_view::organism_settings_test_onboarding(&view));
         crate::block_view::organism_settings_test_first_command(&view);
         OrganismRuntime::apply_settings(&runtime, &view, false, OrganismMotion::Static);
         assert!(!crate::block_view::organism_settings_test_onboarding(&view));
@@ -6478,18 +6784,21 @@ mod tests {
         }
         OrganismRuntime::apply_settings(&runtime, &view, true, OrganismMotion::Static);
         assert!(runtime.say_hello(&view).is_err());
-        let still_sprite = runtime.sprite.text();
+        let still_body = runtime.live_body.clone();
         let start = Instant::now();
         while start.elapsed() < Duration::from_millis(1_000) {
             while main.iteration(false) {}
             std::thread::sleep(Duration::from_millis(2));
         }
-        assert_eq!(
-            runtime.sprite.text(),
-            still_sprite,
-            "Static keeps its pose across the dormant heartbeat"
+        assert_eq!(runtime.live_body, still_body, "Static reuses the same body");
+        let context = runtime.live_context.get();
+        let text = runtime.live_body.text();
+        assert!(
+            text.as_str() == sprite_frame_with_context(context, 0).as_ref()
+                || text.as_str() == sticky_glyph_with_context(context, 0).as_ref(),
+            "Static keeps frame zero while observed ambient state may change"
         );
-        assert!(runtime.body_position.get().is_none());
+        assert!(runtime.body_position.get().is_some());
         OrganismRuntime::apply_settings(&runtime, &view, false, OrganismMotion::Static);
         assert!(runtime.surface_timer.borrow().is_none());
         assert!(runtime.pointer_timer.borrow().is_none());
@@ -7093,7 +7402,7 @@ mod tests {
             root_weak.upgrade().is_none(),
             "mapped proxy root releases after native host cleanup"
         );
-        println!("DAILY_RUNTIME_COUNTS disabled_frame_timers=0 disabled_hover_timers=0 static_pose_unchanged=true");
+        println!("DAILY_RUNTIME_COUNTS disabled_frame_timers=0 disabled_hover_timers=0 static_frame_zero=true");
     }
 
     #[test]
@@ -7141,7 +7450,7 @@ mod tests {
             .next()
             .unwrap();
         assert!(
-            settings.contains("runtime.card.set_visible(enabled)"),
+            settings.contains("runtime.card.set_visible(false)"),
             "disabled descriptions must unmap before another tooltip query"
         );
         let pick = source

@@ -760,6 +760,8 @@ pub struct Config {
     /// Compact (denser) block-mode spacing, matching Warp's compact density.
     pub(crate) block_compact: bool,
     pub(crate) ascii_organism_enabled: bool,
+    /// Optional gentle breaks; one foreground clock for the whole window.
+    pub(crate) ascii_organism_care_enabled: bool,
     pub(crate) ascii_organism_motion: Option<OrganismMotion>,
     /// Allow OSC 52 SET (`\e]52;c;<base64>\e\\`) from remote/local apps to
     /// overwrite the system clipboard. Off by default — a malicious or buggy
@@ -886,6 +888,7 @@ impl Config {
             block_history_compress: true,
             block_compact: false,
             ascii_organism_enabled: false,
+            ascii_organism_care_enabled: false,
             ascii_organism_motion: None,
             allow_remote_clipboard_write: false,
             mouse_reporting_enabled: true,
@@ -1351,6 +1354,7 @@ struct FileConfig {
     block_history_compress: Option<bool>,
     block_compact: Option<bool>,
     ascii_organism_enabled: Option<bool>,
+    ascii_organism_care_enabled: Option<bool>,
     ascii_organism_motion: Option<String>,
     allow_remote_clipboard_write: Option<bool>,
     ai_enabled: Option<bool>,
@@ -1543,6 +1547,9 @@ fn file_config_from_table(table: &toml::Table) -> FileConfig {
         block_compact: table.get("block_compact").and_then(|v| v.as_bool()),
         ascii_organism_enabled: table
             .get("ascii_organism_enabled")
+            .and_then(|v| v.as_bool()),
+        ascii_organism_care_enabled: table
+            .get("ascii_organism_care_enabled")
             .and_then(|v| v.as_bool()),
         ascii_organism_motion: table
             .get("ascii_organism_motion")
@@ -2133,6 +2140,9 @@ fn resolve_file_config(fc: FileConfig) -> (Config, Vec<Theme>, KeybindingMap) {
     let ascii_organism_enabled = env_bool("ANVIL_ASCII_ORGANISM_ENABLED")
         .or(fc.ascii_organism_enabled)
         .unwrap_or(true);
+    let ascii_organism_care_enabled = env_bool("ANVIL_ASCII_ORGANISM_CARE_ENABLED")
+        .or(fc.ascii_organism_care_enabled)
+        .unwrap_or(false);
     let ascii_organism_motion = resolve_setting_text(
         env_string("ANVIL_ASCII_ORGANISM_MOTION"),
         fc.ascii_organism_motion,
@@ -2222,6 +2232,7 @@ fn resolve_file_config(fc: FileConfig) -> (Config, Vec<Theme>, KeybindingMap) {
         block_history_compress,
         block_compact,
         ascii_organism_enabled,
+        ascii_organism_care_enabled,
         ascii_organism_motion,
         allow_remote_clipboard_write: fc.allow_remote_clipboard_write.unwrap_or(false),
         mouse_reporting_enabled: fc.mouse_reporting_enabled.unwrap_or(true),
