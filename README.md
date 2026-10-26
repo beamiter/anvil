@@ -1586,11 +1586,20 @@ dual terms.
 directory. Existing binaries are replaced atomically.
 
 The configuration is installed to `${XDG_CONFIG_HOME:-$HOME/.config}/anvil/config.toml`.
-An existing regular config is backed up as `config.toml.backup.<unique suffix>`
-before replacing it with the bundled defaults. Identical configs do not create
-extra backups. Use `--no-config` to retain all custom settings, or copy selected
-settings back from the private backup after installation. Symlinked configs are
-left unchanged. `--dry-run` does not write binaries, configs, or backups.
+On first installation, the bundled defaults are installed. For an existing
+regular config, the installer compares its TOML field structure with the bundled
+config, including nested tables. Changes only to values, comments, or ordering
+keep the existing file and do not create a backup. Added, removed, or renamed
+fields trigger a private `config.toml.backup.<unique suffix>` copy followed by
+atomic replacement with the bundled defaults. Array lengths and element values
+are ignored; fields within table elements are compared when both arrays contain
+tables. Copy selected custom settings back from the backup after a field change,
+or use `--no-config` to always retain your current settings.
+
+Comparison uses Python 3.11+ `tomllib`, or `tomli` on older Python 3 versions.
+If the parser is unavailable or either file cannot be parsed, the installer
+reports the reason and keeps the existing config. Symlinked configs are left
+unchanged. `--dry-run` does not write binaries, configs, or backups.
 
 An already-running terminal keeps its current process; restart it to use the new
 binary and configuration. If an older copy comes first in PATH, the installer

@@ -18,7 +18,7 @@ for option in "$@"; do
     case "${option}" in
         --no-config) INSTALL_CONFIG=0 ;;
         -h|--help)
-            printf 'Usage: ./install.sh [--no-config]\nDefault: install to ~/.local/bin; back up and replace config.toml.\n'
+            printf 'Usage: ./install.sh [--no-config]\nDefault: install to ~/.local/bin; keep config values unless fields change.\nChanged fields: save config.toml.backup.* before replacing with bundled defaults.\nIf TOML comparison is unavailable, keep the old config.\n'
             exit 0 ;;
         *) printf 'Unknown option: %s\n' "${option}" >&2; exit 1 ;;
     esac

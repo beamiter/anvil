@@ -69,20 +69,30 @@ desktop="${applications}/io.github.beamiter.anvil.desktop"
     || fail "release installer wrote to the dangling config link target"
 assert_no_staging_files "${root}"
 
-# First-run publication creates a private file, while later installs preserve
-# the user's exact bytes in a backup. Directory symlinks are existing choices too.
+# First-run publication creates a private file; same-field custom values stay
+# intact, while changed fields are backed up before replacement.
 root="${TEST_ROOT}/fresh"
 run_install "${root}" >"${TEST_ROOT}/fresh.log" 2>&1
 config="${root}/config/anvil/config.toml"
 [[ -f "${config}" && ! -L "${config}" ]] || fail "initial config is not a regular file"
 [[ "$(stat -c '%a' -- "${config}")" == 600 ]] || fail "initial config mode is not 0600"
-printf 'keep user configuration\n' >"${config}"
+sed 's/^opacity = .*/opacity = 0.5 # custom value/' "${config}" >"${root}/custom.toml"
+cp "${root}/custom.toml" "${config}"
+config_identity="$(stat -c '%d:%i:%s:%y:%z' -- "${config}")"
+run_install "${root}" >>"${TEST_ROOT}/fresh.log" 2>&1
+cmp "${root}/custom.toml" "${config}" || fail "same-field reinstall reset custom values"
+[[ "$(stat -c '%d:%i:%s:%y:%z' -- "${config}")" == "${config_identity}" ]] \
+    || fail "same-field reinstall rewrote the config"
+shopt -s nullglob
+config_backups=("${config}".backup.*)
+((${#config_backups[@]} == 0)) || fail "same-field reinstall created a backup"
+printf 'custom = true\n' >"${config}"
 run_install "${root}" >>"${TEST_ROOT}/fresh.log" 2>&1
 cmp "${bundle}/share/doc/anvil/config.toml.example" "${config}" || fail "reinstall did not update config"
 shopt -s nullglob
 config_backups=("${config}".backup.*)
 ((${#config_backups[@]} == 1)) || fail "reinstall did not save one config backup"
-[[ "$(<"${config_backups[0]}")" == 'keep user configuration' ]] || fail "backup lost user config"
+[[ "$(<"${config_backups[0]}")" == 'custom = true' ]] || fail "backup lost user config"
 assert_no_staging_files "${root}"
 
 # A valid configuration symlink is also preserved byte-for-byte.
