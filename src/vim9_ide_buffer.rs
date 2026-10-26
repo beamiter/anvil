@@ -252,7 +252,9 @@ impl OverlayScene {
 /// viewport eases into place. Keeping the outgoing text prevents blank bands.
 #[derive(Clone)]
 struct ScrollScene {
-    topline: u64,
+    /// Display rows from this outgoing viewport to the current one. A closed
+    /// fold is one row, so this is not a topline difference.
+    rows: i64,
     node: gtk::gsk::RenderNode,
 }
 
@@ -424,7 +426,7 @@ mod imp {
                             if let Some(motion) = motions.get(&window.window) {
                                 let offset = motion.animation.offset(state.time) as f32;
                                 if let Some(outgoing) = motion.history.first() {
-                                    let delta = window.topline as f64 - outgoing.topline as f64;
+                                    let delta = outgoing.rows as f64;
                                     paint_shifted_scene(
                                         snapshot,
                                         &outgoing.node,
@@ -1627,8 +1629,13 @@ impl BufferSurface {
             if old.topline == window.topline {
                 continue;
             }
-            let delta =
-                (window.topline as f64 - old.topline as f64) * f64::from(metrics.line_height);
+            // Across a closed fold, Vim moves topline by many lines for one
+            // row. An unsampled distance snaps rather than animating a guess.
+            let Some(shift) = old.topline_shift(window) else {
+                motions.remove(&window.window);
+                continue;
+            };
+            let delta = shift as f64 * f64::from(metrics.line_height);
             let recent = input
                 .requested
                 .get(&window.window)
@@ -1639,8 +1646,11 @@ impl BufferSurface {
             }
             let motion = motions.entry(window.window).or_default();
             motion.animation.retarget(delta, now);
+            for scene in &mut motion.history {
+                scene.rows += shift;
+            }
             motion.history.push(ScrollScene {
-                topline: old.topline,
+                rows: shift,
                 node: scene.node.clone(),
             });
             // Paint the newest outgoing viewport that covers the exposed
@@ -1650,8 +1660,7 @@ impl BufferSurface {
             let offset = motion.animation.offset(now);
             let height = window.view.rows as f64 * f64::from(metrics.line_height);
             let outgoing = motion.history.iter().rposition(|scene| {
-                let distance =
-                    (window.topline as f64 - scene.topline as f64) * f64::from(metrics.line_height);
+                let distance = scene.rows as f64 * f64::from(metrics.line_height);
                 if offset >= 0.0 {
                     distance >= offset && distance <= height
                 } else {
@@ -5318,12 +5327,14 @@ mod tests {
                         row: -1,
                         line: 9,
                         byte_length: 3,
+                        fold_end: 0,
                         runs: vec![run(0, 9, "pre")],
                     },
                     Vim9RenderMarginRow {
                         row: 4,
                         line: 14,
                         byte_length: 4,
+                        fold_end: 0,
                         runs: vec![run(0, 14, "post")],
                     },
                 ],
@@ -5547,12 +5558,14 @@ mod tests {
                 row: -1,
                 line: 10,
                 byte_length: 2,
+                fold_end: 0,
                 runs: vec![run(0, 10, "AB")],
             },
             Vim9RenderMarginRow {
                 row: 4,
                 line: 15,
                 byte_length: 4,
+                fold_end: 0,
                 runs: vec![run(0, 15, "next")],
             },
         ];

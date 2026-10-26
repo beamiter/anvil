@@ -146,14 +146,17 @@ horizontal, vertical and nested Vim splits. Vim's status lines, split dividers
 and command area remain live in the compatibility display. Every pane uses its
 own buffer text, syntax and viewport; the active Vim window alone owns the
 native cursor and IME preedit. The bridge explicitly falls back for display
-features it cannot yet reproduce faithfully, including closed folds, wrapped
-continuation rows, diff, general popup windows and complex/scrolling completion menus,
+features it cannot yet reproduce faithfully, including wrapped
+continuation rows, blockwise selections over closed folds, diff, general popup windows and complex/scrolling completion menus,
 complex signs or fold columns, virtual text, complex match patterns, concealment,
 and complex bidirectional text. The default single sign column, ordinary
 diagnostic text-property highlights and simple search matches use their GUI
 styles. If any pane needs compatibility, the whole editor shows live Vim until
 all panes can be sampled faithfully. The rendering menu gives the reason; native
-rendering then resumes automatically. Resize transitions also
+rendering then resumes automatically. Closed folds are native rows (render
+protocol 8): Pango paints the fold text and filler in Vim's `Folded` colors,
+rows below keep Vim's positions, touchpad and wheel scrolling move across a
+fold as one row, and clicks in a folded split go to Vim's own mouse handling. Resize transitions also
 retain the compatibility view until Vim publishes matching geometry, so a stale
 frame cannot cover a differently sized input grid. Selecting terminal text
 with Shift-drag temporarily reveals the compatibility display so selection

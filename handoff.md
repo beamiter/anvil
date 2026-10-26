@@ -1,5 +1,21 @@
 # Engineering handoff
 
+## 2026-10-25 — native closed folds (shared core render protocol 8)
+
+- The shared core now negotiates render protocol 8: closed Vim folds are
+  painted as native rows (fold text and filler in `Folded` colors), rows below
+  keep Vim's positions, and source-bound touchpad/wheel scrolling crosses a
+  fold as one row via the bridge's `scroll_rows` acknowledgement. Folded
+  splits route clicks to Vim's own mouse handling. Contract:
+  `jterm_core/docs/vim9-native-folds.md`.
+- `src/vim9_ide_buffer.rs` wheel-transition history now stores display-row
+  distances (`ScrollScene::rows`) computed with `Vim9RenderWindow::topline_shift()`,
+  so a compatibility-route transition across a closed fold moves by one row
+  and an unsampled distance snaps. Pango already stretches the fold filler run
+  to its exact cells.
+- `packaging/jterm-core-src.tar.gz` is regenerated from the matching
+  `jterm_core` commit with `scripts/package-shared-core.sh`.
+
 Updated: 2026-10-04 (move-tab edge toast — round 256)
 
 ## 2026-10-04 (move tab at strip edge — round 256)

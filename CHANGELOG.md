@@ -7,6 +7,12 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- Closed Vim folds are painted natively in the Vim9 editor instead of
+  switching the buffer to the compatibility view: fold text and its filler use
+  Vim's `Folded` colors, rows below keep Vim's positions, and touchpad or wheel
+  scrolling moves across a fold as one smooth row. Clicks in a folded split
+  use Vim's own mouse handling (shared core render protocol 8).
+
 - Failed and waiting task rows show a bounded reason preview without requiring
   selection; validation failure details take priority when available.
 
