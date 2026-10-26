@@ -1332,14 +1332,6 @@ fn settle_vte_to_top(vte: &vte4::Terminal) {
     });
 }
 
-pub(crate) fn forward_outer_scroll(outer: &gtk::ScrolledWindow, dy: f64) {
-    let outer_adj = outer.vadjustment();
-    let step = outer_adj.step_increment().max(outer_adj.page_size() * 0.1);
-    let max_value = (outer_adj.upper() - outer_adj.page_size()).max(outer_adj.lower());
-    let target = (outer_adj.value() + dy * step).clamp(outer_adj.lower(), max_value);
-    outer_adj.set_value(target);
-}
-
 /// Convert a block's viewport-relative geometry into an absolute outer-scroll
 /// target. All entry points (button, shortcut, context menu, sticky header) use
 /// this one calculation so long-block navigation lands identically.
@@ -1365,6 +1357,31 @@ fn block_edge_scroll_target(
 /// Move one adjustment for a wheel/trackpad delta. Returns true when that
 /// adjustment consumed movement, allowing nested scroll surfaces to hand off
 /// only at their actual top/bottom boundary.
+/// A capped terminal's adjustment is measured in rows. Precision input is
+/// converted using this terminal's actual row height, without page scaling.
+/// A fit-to-content terminal has no range and immediately yields to the canvas.
+pub(crate) fn scroll_adjustment_by_input(
+    adjustment: &gtk::Adjustment,
+    delta: f64,
+    surface: bool,
+    row_height: f64,
+) -> bool {
+    if !surface {
+        return scroll_adjustment_by_wheel(adjustment, delta);
+    }
+    if !delta.is_finite() || delta == 0.0 {
+        return false;
+    }
+    let upper = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+    let target =
+        (adjustment.value() + delta / row_height.max(1.0)).clamp(adjustment.lower(), upper);
+    if (target - adjustment.value()).abs() < f64::EPSILON {
+        return false;
+    }
+    adjustment.set_value(target);
+    true
+}
+
 pub(crate) fn scroll_adjustment_by_wheel(adj: &gtk::Adjustment, dy: f64) -> bool {
     let Some(target) = scroll_target(
         adj.value(),
@@ -5769,6 +5786,25 @@ impl FinishedBlock {
             FinishedBlock::scroll_finished_widget_to_edge(&widget, &outer, true);
         });
 
+        let command_scroll =
+            gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        command_scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+        debouncer.watch_gesture(&command_scroll, outer);
+        let outer_for_command = outer.downgrade();
+        let controller_for_command = debouncer.clone();
+        command_scroll.connect_scroll(move |controller, _, dy| {
+            let Some(outer) = outer_for_command.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            controller_for_command.scroll_wheel(
+                &outer,
+                dy,
+                controller.unit() == gtk::gdk::ScrollUnit::Surface,
+            );
+            glib::Propagation::Stop
+        });
+        self.command_vte.add_controller(command_scroll);
+
         let targets: [gtk::Widget; 2] = [
             self.output_vte.clone().upcast(),
             self.output_scrollbar.clone().upcast(),
@@ -5783,20 +5819,27 @@ impl FinishedBlock {
             let vte = self.output_vte.downgrade();
             let outer_for_vte = outer.downgrade();
             let debouncer = debouncer.clone();
+            debouncer.watch_gesture(&scroll_ctrl, outer);
             scroll_ctrl.connect_scroll(move |controller, _dx, dy| {
                 let (Some(vte), Some(outer_for_vte)) = (vte.upgrade(), outer_for_vte.upgrade())
                 else {
                     return glib::Propagation::Proceed;
                 };
-                // Pixel deltas (Wayland touchpads) scroll by notches, like a wheel.
-                let dy = super::wheel_notches(dy, controller.unit());
                 if let Some(inner_adj) = vte.vadjustment() {
-                    if scroll_adjustment_by_wheel(&inner_adj, dy) {
+                    if scroll_adjustment_by_input(
+                        &inner_adj,
+                        dy,
+                        controller.unit() == gtk::gdk::ScrollUnit::Surface,
+                        vte.char_height() as f64,
+                    ) {
                         return glib::Propagation::Stop;
                     }
                 }
-                forward_outer_scroll(&outer_for_vte, dy);
-                debouncer.record_wheel_intent(&outer_for_vte);
+                debouncer.scroll_wheel(
+                    &outer_for_vte,
+                    dy,
+                    controller.unit() == gtk::gdk::ScrollUnit::Surface,
+                );
                 glib::Propagation::Stop
             });
             target.add_controller(scroll_ctrl);

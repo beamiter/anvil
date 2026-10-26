@@ -53,6 +53,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::scroll::canvas_native_tests::retained_canvas_scrolls_through_frames_and_yields_to_reading
     organism_ui::inspector::tests::snapshot_dialog_is_scrollable_and_closes_without_an_animation_source
     organism_ui::tests::inspection_captures_real_state_without_attention_or_lifecycle_changes
     organism_ui::tests::one_companion_crosses_splits_without_cloning_its_body_or_mind

@@ -1,5 +1,52 @@
 # Engineering handoff
 
+## 2026-10-26 — continuous Block/Chat canvas motion
+
+- The retained transcript now uses the shared `CanvasMotion` with the GTK frame
+  clock. Stream updates retarget one moving live edge instead of synchronously
+  jumping the adjustment and repeatedly pinning it from a 16 ms timer.
+- Wheel distance is independent of viewport size; precision deltas remain
+  exact pixels on the canvas. GTK gesture-end velocity supplies bounded coast.
+  Native scrollbar/search moves interrupt motion, and reading locks prevent
+  new output from pulling the viewport away.
+- Prefix retention rebases real measured geometry. Initial/remapped live views
+  establish their baseline immediately; visible Jump to latest remains smooth.
+  Hidden and settled canvases stop their callbacks, and desktop reduced-motion
+  preferences are respected.
+- Existing completed-card identities, height-preserving virtualization, memory
+  budgets, organism ownership and alternate-screen/Unified behavior remain in
+  their existing owners. Explicitly capped long-output VTEs retain their inner
+  overflow; ordinary fitted output moves the outer document.
+- Added a mapped GTK regression to `scripts/test-gtk-display.sh`; full contract
+  and platform scope are in `docs/transcript-canvas.md`.
+
+### Validation for continuous canvas
+
+- `cargo clippy --all-targets --all-features --locked -- -D warnings`: passed.
+- `cargo build --locked --bin anvil`: passed.
+- Focused scroll tests: 5 passed; 2 display-only tests ignored in the headless
+  invocation. The new mapped GTK/frame-clock test passed separately under
+  Xvfb/D-Bus with `GTK_A11Y=test GDK_BACKEND=x11 GSK_RENDERER=cairo`, including
+  measured prefix rebasing and exact fractional input.
+- `python3 scripts/test-gtk-display-contract.py`: 135 base cases and 11 variants
+  passed; this is runner control-flow coverage, separate from native GTK.
+- Functional real-application checks with Xvfb/software rendering via shared
+  `jterm_core/scripts/native-transcript-canvas-smoke.py` passed on binary SHA-256
+  `3abe9dc5fea1d359cf4e91d976e1ad9853ce99b800cc6217d522adfe55c52aaa`.
+  Adding the second short block kept the first output at the same screen Y:
+  Chat 205 → 205 px; Block 167 → 167 px. Actual X11 wheel events aimed at
+  rendered output text produced 6 distinct painted marker positions in Chat
+  and 7 in Block, followed by stable settled images. These are observed
+  positions in functional software-rendering checks, not refresh-rate or FPS
+  measurements. Exact results, screenshots and recordings are in
+  `/tmp/canvas-ui-qa/anvil-chat-final` and
+  `/tmp/canvas-ui-qa/anvil-block-final`.
+- Format, diff whitespace, and display-runner shell syntax checks passed.
+
+Acceptance here uses X11/software rendering. Physical touchpad tuning, hardware
+GPU/Wayland and fractional-scale pacing remain desktop acceptance work.
+
+
 ## 2026-10-26 — one window companion, continuous habits and optional care
 
 - Removed the permanently mounted organism card. One window owner chooses the

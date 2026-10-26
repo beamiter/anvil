@@ -2815,6 +2815,7 @@ fn evict_finished_block_prefix(
     block_list: &gtk::Box,
     widget_pool: &Rc<RefCell<WidgetPool>>,
     refs: BlockRemovalRefs<'_>,
+    scroll_controller: &ScrollDebouncer,
 ) -> usize {
     let (total_before, evicted): (usize, Vec<_>) = {
         let mut finished = finished_blocks.borrow_mut();
@@ -2826,6 +2827,17 @@ fn evict_finished_block_prefix(
         return 0;
     }
 
+    let rebase = evicted
+        .iter()
+        .find(|block| block.widget().is_visible())
+        .and_then(|first| {
+            let last = evicted.last()?;
+            scroll::PrefixRebase::capture(
+                first.widget().upcast_ref(),
+                last.widget().upcast_ref(),
+                scroll_controller,
+            )
+        });
     let evicted_count = evicted.len();
     let unread = unread_after_prefix_eviction(total_before, refs.unread_count.get(), evicted_count);
     refs.unread_count.set(unread);
@@ -2889,6 +2901,9 @@ fn evict_finished_block_prefix(
         widget_pool.borrow_mut().release(widget);
     }
     block_list.queue_allocate();
+    if let Some(rebase) = rebase {
+        rebase.apply();
+    }
     evicted_count
 }
 
@@ -9332,6 +9347,7 @@ impl RenderBackend for BlockBackend {
                 unread_count: &self.unread_count_rc,
                 jump_fab: &self.jump_fab,
             },
+            &self.scroll_debouncer,
         );
 
         mutate_block_data_and_redraw(
@@ -9488,6 +9504,7 @@ impl RenderBackend for BlockBackend {
                 unread_count: &self.unread_count_rc,
                 jump_fab: &self.jump_fab,
             },
+            &self.scroll_debouncer,
         );
 
         let preserve = self.config_for_cb.borrow().preserve_live_scrollback;
@@ -12241,6 +12258,9 @@ impl TermView {
             user_scrolled_up.clone(),
             programmatic_scroll.clone(),
         );
+        if !unified {
+            scroll_debouncer.install(&block_scroll, &block_list);
+        }
         let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> =
             Rc::new(RefCell::new(VecDeque::new()));
         let reserved_history_block_ids: Rc<RefCell<HashSet<u64>>> =
@@ -13348,7 +13368,6 @@ impl TermView {
         // ── Jump-to-bottom FAB click: return to the live prompt ───────────
         if !unified {
             let scroll = block_scroll.downgrade();
-            let programmatic = programmatic_scroll.clone();
             let user_scrolled = user_scrolled_up.clone();
             let unread = unread_count.clone();
             let live_vte = active_vte.downgrade();
@@ -13372,10 +13391,6 @@ impl TermView {
                         (adjustment.upper() - adjustment.page_size()).max(adjustment.lower()),
                     );
                 }
-                let adj = scroll.vadjustment();
-                programmatic.set(true);
-                adj.set_value((adj.upper() - adj.page_size()).max(adj.lower()));
-                programmatic.set(false);
 
                 // Settle on the frame clock, not on an idle. An idle source
                 // that returns Continue re-runs inside the same main-loop turn,
@@ -14217,6 +14232,9 @@ impl TermView {
                     .borrow_mut()
                     .push(Box::new(move |_| accumulator.set(WheelAccumulator::new())));
             }
+            if !unified {
+                scroll_debouncer.watch_gesture(&scroll_ctrl, &block_scroll);
+            }
             scroll_ctrl.connect_scroll(move |controller, _dx, dy| {
                 let unit = controller.unit();
                 let in_mouse_app = (fullscreen_for_scroll.get()
@@ -14240,9 +14258,6 @@ impl TermView {
                     }
                     return glib::Propagation::Stop;
                 }
-                // Every other consumer scrolls by notches too: a Wayland
-                // touchpad's pixel delta is not ten wheel clicks.
-                let dy = wheel_notches(dy, unit);
                 // Unified's VTE owns all scrollback, including at the idle
                 // prompt. Let its native wheel handler move that adjustment.
                 if unified_for_scroll {
@@ -14262,20 +14277,27 @@ impl TermView {
                         | BlockState::PostCommand
                         | BlockState::RawFallback
                 ) {
-                    if let Some(adjustment) = vte_for_scroll
-                        .upgrade()
-                        .and_then(|terminal| terminal.vadjustment())
-                    {
-                        if scroll_adjustment_by_wheel(&adjustment, dy) {
-                            return glib::Propagation::Stop;
+                    if let Some(terminal) = vte_for_scroll.upgrade() {
+                        if let Some(adjustment) = terminal.vadjustment() {
+                            if scroll_adjustment_by_input(
+                                &adjustment,
+                                dy,
+                                unit == gtk::gdk::ScrollUnit::Surface,
+                                terminal.char_height() as f64,
+                            ) {
+                                return glib::Propagation::Stop;
+                            }
                         }
                     }
                 }
                 let Some(outer) = outer_for_scroll.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                forward_outer_scroll(&outer, dy);
-                debouncer_for_scroll.record_wheel_intent(&outer);
+                debouncer_for_scroll.scroll_wheel(
+                    &outer,
+                    dy,
+                    unit == gtk::gdk::ScrollUnit::Surface,
+                );
                 glib::Propagation::Stop
             });
             active_vte.add_controller(scroll_ctrl);
@@ -14289,21 +14311,30 @@ impl TermView {
             let vte_for_scrollbar = active_vte.downgrade();
             let outer_for_scrollbar = block_scroll.downgrade();
             let debouncer_for_scrollbar = scroll_debouncer.clone();
+            if !unified {
+                scroll_debouncer.watch_gesture(&scrollbar_scroll, &block_scroll);
+            }
             scrollbar_scroll.connect_scroll(move |controller, _dx, dy| {
-                let dy = wheel_notches(dy, controller.unit());
-                if let Some(adjustment) = vte_for_scrollbar
-                    .upgrade()
-                    .and_then(|terminal| terminal.vadjustment())
-                {
-                    if scroll_adjustment_by_wheel(&adjustment, dy) {
-                        return glib::Propagation::Stop;
+                if let Some(terminal) = vte_for_scrollbar.upgrade() {
+                    if let Some(adjustment) = terminal.vadjustment() {
+                        if scroll_adjustment_by_input(
+                            &adjustment,
+                            dy,
+                            controller.unit() == gtk::gdk::ScrollUnit::Surface,
+                            terminal.char_height() as f64,
+                        ) {
+                            return glib::Propagation::Stop;
+                        }
                     }
                 }
                 let Some(outer) = outer_for_scrollbar.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                forward_outer_scroll(&outer, dy);
-                debouncer_for_scrollbar.record_wheel_intent(&outer);
+                debouncer_for_scrollbar.scroll_wheel(
+                    &outer,
+                    dy,
+                    controller.unit() == gtk::gdk::ScrollUnit::Surface,
+                );
                 glib::Propagation::Stop
             });
             live_scrollbar.add_controller(scrollbar_scroll);
@@ -15902,6 +15933,7 @@ impl TermView {
                 unread_count: &self.unread_count,
                 jump_fab: &self.jump_fab,
             },
+            &self.scroll_debouncer,
         );
         let restored_count = stash.len();
 
@@ -16153,6 +16185,7 @@ impl TermView {
                 unread_count: &self.unread_count,
                 jump_fab: &self.jump_fab,
             },
+            &self.scroll_debouncer,
         );
         let restored_count = plan.restored_positions.len();
         let mut stash: Vec<_> = stash.into_iter().map(|(_, block)| Some(block)).collect();
