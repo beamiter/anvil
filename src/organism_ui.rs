@@ -6502,10 +6502,21 @@ mod tests {
         let handler = runtime
             .state
             .connect_label_notify(move |_| updates.set(updates.get() + 1));
+        // Each rhythm has its own shared observation (`context_explanation`),
+        // which replaces the generic "Watching a running command." wording.
         for (index, (rhythm, words)) in [
-            (WatchRhythm::Busy, "Recent output activity."),
-            (WatchRhythm::Waiting, "No new output observed recently."),
-            (WatchRhythm::Resumed, "Output activity resumed."),
+            (
+                WatchRhythm::Busy,
+                "Following an active stream of command output.",
+            ),
+            (
+                WatchRhythm::Waiting,
+                "Keeping watch while output is quiet; the command has not finished.",
+            ),
+            (
+                WatchRhythm::Resumed,
+                "Perking up as command output resumes.",
+            ),
         ]
         .into_iter()
         .enumerate()
@@ -6515,8 +6526,8 @@ mod tests {
                     .with_watch_rhythm(rhythm);
             runtime.explain_body(Some(context));
             let caption = runtime.state.text();
-            assert!(caption.contains(words));
-            assert!(caption.starts_with(behavior_explanation(Behavior::WatchCommand)));
+            assert!(caption.starts_with(words), "{caption}");
+            assert_eq!(context_explanation(context), words);
             assert!(runtime
                 .state
                 .tooltip_text()
