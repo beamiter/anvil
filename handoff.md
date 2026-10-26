@@ -1,5 +1,19 @@
 # Engineering handoff
 
+## 2026-10-26 — native pointer and guides on wrapped rows (shared core)
+
+- The bundled core keeps `native_pointer` in wrapped splits, so clicks and
+  drags on continuation rows (also mid touchpad scroll) stay native; only a
+  split showing a closed fold hands clicks to Vim. `colorcolumn` and
+  `cursorcolumn` on wrapped lines are painted natively instead of switching
+  to the compatibility view, and end-of-buffer rows are filled in
+  `EndOfBuffer` across the full width. No frontend code change: the frame
+  contract is unchanged. Contract: `jterm_core/docs/vim9-native-wrap.md`.
+- The bridge now encodes each screen row once per frame (keyframes list runs
+  in row order), cutting Vim CPU per scroll by roughly 5–15%.
+- `packaging/jterm-core-src.tar.gz` is regenerated from the matching
+  `jterm_core` commit with `scripts/package-shared-core.sh`.
+
 ## 2026-10-26 — native soft wrap (shared core render protocol 9)
 
 - The shared core now negotiates render protocol 9: wrapped continuation rows
