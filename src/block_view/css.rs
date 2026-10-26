@@ -962,8 +962,8 @@ fn block_css(config: &Config) -> String {
         .chat-command-terminal {{ background-color: transparent; }}
         .chat-result-card {{
             padding: 8px 1px 12px 0;
-            border-radius: 5px 16px 16px 16px;
-            background-color: {block_bg_hex};
+            border-radius: 0;
+            background-color: transparent;
         }}
         .chat-composer {{
             margin: 4px 8px;
@@ -1438,6 +1438,39 @@ fn block_css(config: &Config) -> String {
             font-size: 0.92em;
             padding: 6px 10px;
         }}
+
+        /* The transcript is one surface, not a stack of elevated panels.
+           Keep every box metric unchanged: native terminal columns, alternate
+           screen winsize, retained measurements and pointer mapping depend on
+           them. Outcome stripes/washes and bookmark images remain independent;
+           only selection gets a ring, never a pointer-driven drop shadow. */
+        .block-list .block-finished {{
+            border-radius: 0;
+        }}
+        .block-list .block-active {{
+            border-radius: 0;
+            outline-color: transparent;
+            box-shadow: none;
+        }}
+        .block-list .block-finished:not(.block-selected) {{
+            box-shadow: none;
+        }}
+        .block-list .block-finished:not(.block-selected):not(.block-hovered):not(.cross-block-text-selected) {{
+            outline-color: transparent;
+        }}
+        .block-list .block-finished:not(.block-failed):not(.block-background):not(.block-selected):not(.block-hovered) {{
+            background-color: transparent;
+        }}
+        .block-list .block-finished.block-selected {{
+            box-shadow: inset 0 0 0 2px rgba({acc_r},{acc_g},{acc_b},0.65);
+        }}
+        .block-list .block-finished.block-selected.block-selection-active {{
+            box-shadow: inset 0 0 0 3px {accent};
+        }}
+        .chat-mode .chat-composer:focus-within {{
+            outline: 2px solid {accent};
+            outline-offset: -2px;
+        }}
         "#,
     );
 
@@ -1477,12 +1510,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chat_capsule_corners_match_native_reference_without_changing_padding() {
+    fn continuous_surface_preserves_geometry_outcomes_and_selection() {
+        let css = block_css(&crate::config::Config::safe_defaults());
+        for selector in [
+            ".block-list .block-finished",
+            ".block-list .block-active",
+            ".block-list .block-finished:not(.block-selected)",
+            ".block-list .block-finished.block-selected",
+            ".block-list .block-finished.block-selected.block-selection-active",
+        ] {
+            let rule = rule_body(&css, selector);
+            for property in ["margin:", "padding:", "border-width:", "min-height:"] {
+                assert!(!rule.contains(property), "{selector} changed {property}");
+            }
+            assert!(
+                !rule.contains("0 4px 14px"),
+                "no hover elevation: {selector}"
+            );
+        }
+        assert!(rule_body(&css, ".block-list .block-finished").contains("border-radius: 0;"));
+        assert!(rule_body(&css, ".block-list .block-finished:not(.block-failed):not(.block-background):not(.block-selected):not(.block-hovered)")
+            .contains("background-color: transparent;"));
+        assert!(
+            rule_body(&css, ".block-list .block-finished.block-selected")
+                .contains("box-shadow: inset 0 0 0 2px")
+        );
+        assert!(rule_body(
+            &css,
+            ".block-list .block-finished.block-selected.block-selection-active"
+        )
+        .contains("box-shadow: inset 0 0 0 3px"));
+        assert!(rule_body(&css, ".chat-mode .chat-composer:focus-within")
+            .contains("outline: 2px solid"));
+    }
+
+    #[test]
+    fn chat_command_stays_distinct_while_output_joins_the_canvas() {
         let css = block_css(&Config::safe_defaults());
         let command = rule_body(&css, ".chat-command-capsule");
         let result = rule_body(&css, ".chat-result-card");
         assert!(command.contains("border-radius: 18px 18px 5px 18px;"));
-        assert!(result.contains("border-radius: 5px 16px 16px 16px;"));
+        assert!(result.contains("border-radius: 0;"));
+        assert!(result.contains("background-color: transparent;"));
         assert!(rule_body(&css, ".chat-composer").contains("border-radius: 18px;"));
         assert!(command.contains("padding: 10px 16px;"));
         assert!(command.contains("margin: 0 0 10px 36px;"));

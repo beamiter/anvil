@@ -366,6 +366,8 @@ impl ScrollDebouncer {
 pub(crate) struct PrefixRebase {
     adjustment: gtk::Adjustment,
     removed_height: f64,
+    motion: CanvasMotion,
+    previous_programmatic: bool,
     controller: ScrollDebouncer,
 }
 
@@ -392,26 +394,43 @@ impl PrefixRebase {
         if !removed_height.is_finite() || removed_height <= 0.0 {
             return None;
         }
+        // Capture before GTK can clamp the adjustment while the prefix is
+        // detached. Rebasing an already-clamped coordinate subtracts the
+        // removed height twice near the old live edge.
+        let adjustment = scroll.vadjustment();
+        let mut motion = controller.motion.borrow().clone();
+        motion.set_bounds(adjustment.lower(), bottom_value(&adjustment));
+        if scroll_value_changed(motion.position(), adjustment.value()) {
+            motion.jump_to(adjustment.value());
+        }
         Some(Self {
-            adjustment: scroll.vadjustment(),
+            adjustment,
             removed_height,
+            motion,
+            // Layout-triggered adjustment clamps are not reader input. Keep
+            // their synchronous/idle observers inside the same transaction.
+            previous_programmatic: controller.programmatic_scroll.replace(true),
             controller: controller.clone(),
         })
     }
 
-    pub(crate) fn apply(self) {
-        let current = self.adjustment.value();
-        {
-            let mut motion = self.controller.motion.borrow_mut();
-            motion.set_bounds(self.adjustment.lower(), bottom_value(&self.adjustment));
-            if scroll_value_changed(motion.position(), current) {
-                motion.jump_to(current);
-            }
-            motion.shift(-self.removed_height);
-        }
-        self.controller.programmatic_scroll.set(true);
-        self.adjustment.set_value(current - self.removed_height);
-        self.controller.programmatic_scroll.set(false);
+    pub(crate) fn apply(mut self) {
+        self.motion.rebase(
+            self.adjustment.lower(),
+            bottom_value(&self.adjustment),
+            -self.removed_height,
+        );
+        let position = self.motion.position();
+        *self.controller.motion.borrow_mut() = self.motion.clone();
+        self.adjustment.set_value(position);
+    }
+}
+
+impl Drop for PrefixRebase {
+    fn drop(&mut self) {
+        self.controller
+            .programmatic_scroll
+            .set(self.previous_programmatic);
     }
 }
 
@@ -545,6 +564,10 @@ mod canvas_native_tests {
         assert!((adjustment.value() - manual).abs() < 0.0001);
         assert!(controller.tick.borrow().is_none());
 
+        // Read near the old end: a synchronous layout clamp on prefix
+        // retirement must not subtract that height a second time.
+        adjustment.set_value((bottom_value(&adjustment) - 20.0).max(0.0));
+        spin_for(20);
         let retained_y = retained
             .compute_bounds(&scroll)
             .expect("retained card bounds")
@@ -555,8 +578,19 @@ mod canvas_native_tests {
             &controller,
         )
         .expect("measured prefix");
+        let shortened_upper = adjustment.upper() - rebase.removed_height;
         content.remove(&retired_prefix);
+        // Force the GTK layout ordering that exposed the bug: the adjustment
+        // publishes its shorter range before our preservation transaction.
+        assert!(controller.user_scrolled_up.get());
+        assert!(controller.programmatic_scroll.get());
+        adjustment.set_upper(shortened_upper);
+        assert!(
+            controller.user_scrolled_up.get(),
+            "layout clamp is not user input"
+        );
         rebase.apply();
+        assert!(!controller.programmatic_scroll.get());
         spin_for(80);
         assert!(
             (retained.compute_bounds(&scroll).unwrap().y() - retained_y).abs() < 0.5,

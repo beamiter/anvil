@@ -55,3 +55,22 @@ These automated checks cover X11/Cairo here. Hardware touchpad feel, Wayland,
 fractional scaling and physical high-refresh display pacing require a native
 desktop acceptance pass; the mathematical frame-rate tests are not a substitute
 for that observation.
+
+## Continuous surface and trim stability
+
+The native transcript now removes raised-card shadows and rounded outer panels.
+Neutral finished output shares the canvas background; command capsules, outcome
+stripes/washes, bookmark markings and keyboard selection remain distinguishable.
+Chat output also uses the flat canvas, while the docked composer gains an inset
+focus ring. These are decoration-only changes: existing padding, margins, border
+widths, terminal columns and alternate-screen allocation remain unchanged.
+
+Prefix retirement snapshots motion before GTK can clamp its adjustment to the
+shorter document, then rebases the snapshot and bounds atomically. The native
+canvas regression explicitly publishes the shorter adjustment range before the
+rebase while reading near the old bottom. This covers the layout ordering that
+previously could subtract the retired height twice and jump away from the reader.
+
+CSS contract tests check decoration/geometry separation and retained selection
+cues. They do not establish visual acceptance: theme, scale and actual rendered
+pixels still require a native display run.
