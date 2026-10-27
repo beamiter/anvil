@@ -18,16 +18,23 @@ fn scroll_value_changed(current: f64, target: f64) -> bool {
     (current - target).abs() > SCROLL_EPSILON_PX
 }
 
+/// Animation settling tolerates half a pixel; reader input must not. Reusing
+/// that tolerance here lets a small precision gesture be reclaimed by output,
+/// or lets an active wheel animation overwrite a fractional scrollbar move.
+fn reader_position_changed(current: f64, target: f64) -> bool {
+    (current - target).abs() > 1.0e-7
+}
+
 fn bottom_value(adjustment: &gtk::Adjustment) -> f64 {
     (adjustment.upper() - adjustment.page_size()).max(adjustment.lower())
 }
 
 pub(crate) fn scrolled_away_from_bottom(adjustment: &gtk::Adjustment) -> bool {
-    scroll_value_changed(adjustment.value(), bottom_value(adjustment))
+    reader_position_changed(adjustment.value(), bottom_value(adjustment))
 }
 
 pub(crate) fn next_scroll_lock(prev: bool, holder_visible: bool, value: f64, bottom: f64) -> bool {
-    !holder_visible || (prev && scroll_value_changed(value, bottom))
+    !holder_visible || (prev && reader_position_changed(value, bottom))
 }
 
 fn next_stable_frame_count(last_target: Option<f64>, target: f64, current: u8) -> u8 {
@@ -209,7 +216,7 @@ impl ScrollDebouncer {
             motion.set_bounds(adjustment.lower(), bottom_value(&adjustment));
             motion.set_reduced_motion(!animations_enabled(scroll));
             if self.drive.get() != CanvasDrive::Wheel
-                || scroll_value_changed(motion.position(), adjustment.value())
+                || reader_position_changed(motion.position(), adjustment.value())
             {
                 motion.jump_to(adjustment.value());
             }
@@ -225,7 +232,7 @@ impl ScrollDebouncer {
         self.precision_forwarded.set(surface);
         // Claim reading intent before an output batch can ask to follow again.
         self.user_scrolled_up
-            .set(scroll_value_changed(target, bottom_value(&adjustment)));
+            .set(reader_position_changed(target, bottom_value(&adjustment)));
         if surface || !animations_enabled(scroll) {
             adjustment.set_value(position);
             self.record_wheel_intent(scroll);
@@ -279,7 +286,7 @@ impl ScrollDebouncer {
                 motion.set_bounds(adjustment.lower(), bottom_value(&adjustment));
                 // Scrollbar drag, keyboard navigation, selection autoscroll and
                 // native searches own their actual adjustment immediately.
-                if scroll_value_changed(motion.position(), adjustment.value()) {
+                if reader_position_changed(motion.position(), adjustment.value()) {
                     drop(motion);
                     return finish();
                 }
@@ -349,7 +356,7 @@ impl ScrollDebouncer {
 
     pub(crate) fn record_wheel_intent(&self, scroll: &ScrolledWindow) {
         let adjustment = scroll.vadjustment();
-        self.user_scrolled_up.set(scroll_value_changed(
+        self.user_scrolled_up.set(reader_position_changed(
             adjustment.value(),
             bottom_value(&adjustment),
         ));
@@ -400,7 +407,7 @@ impl PrefixRebase {
         let adjustment = scroll.vadjustment();
         let mut motion = controller.motion.borrow().clone();
         motion.set_bounds(adjustment.lower(), bottom_value(&adjustment));
-        if scroll_value_changed(motion.position(), adjustment.value()) {
+        if reader_position_changed(motion.position(), adjustment.value()) {
             motion.jump_to(adjustment.value());
         }
         Some(Self {
@@ -559,7 +566,7 @@ mod canvas_native_tests {
             .connect_value_changed(move |adjustment| {
                 values.borrow_mut().push(adjustment.value());
                 if !programmatic.get() {
-                    user.set(scroll_value_changed(
+                    user.set(reader_position_changed(
                         adjustment.value(),
                         bottom_value(adjustment),
                     ));
@@ -610,8 +617,14 @@ mod canvas_native_tests {
         // immediately revokes follow even while output continues below it.
         controller.scroll_wheel(&scroll, -0.375, true);
         assert!((adjustment.value() - (target - 0.375)).abs() < 0.0001);
-        // Leave the visual-edge epsilon so the reader owns the viewport.
-        controller.scroll_wheel(&scroll, -12.5, true);
+        assert!(
+            controller.user_scrolled_up.get(),
+            "fractional input owns the viewport"
+        );
+        assert!(
+            next_scroll_lock(true, true, adjustment.value(), target),
+            "the deferred geometry probe must not discard fractional reading intent"
+        );
         let reading = adjustment.value();
         stream.set_height_request(700);
         controller.mark_dirty(&scroll);
@@ -628,7 +641,7 @@ mod canvas_native_tests {
         assert_eq!(adjustment.value(), reading);
         spin_for(35);
         assert!(adjustment.value() < reading);
-        let manual = adjustment.value() - 30.0;
+        let manual = adjustment.value() - 0.375;
         adjustment.set_value(manual);
         spin_for(150);
         assert!((adjustment.value() - manual).abs() < 0.0001);
@@ -792,6 +805,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fractional_reader_input_is_not_animation_settling_noise() {
+        for bottom in [0.0, 100.0, 5000.0, 1_000_000.0] {
+            for delta in [0.001, 0.125, 0.375, 0.5] {
+                assert!(reader_position_changed(bottom - delta, bottom));
+                assert!(next_scroll_lock(true, true, bottom - delta, bottom));
+                assert!(!next_scroll_lock(false, true, bottom - delta, bottom));
+            }
+            assert!(!reader_position_changed(bottom, bottom));
+            assert!(!next_scroll_lock(true, true, bottom, bottom));
+        }
+        // Keep the existing animation/layout coalescing tolerance independent.
+        assert!(!scroll_value_changed(100.0, 100.375));
+    }
+
+    #[test]
     fn ignores_subpixel_scroll_churn() {
         assert!(!scroll_value_changed(100.0, 100.4));
         assert!(scroll_value_changed(100.0, 100.6));
@@ -807,7 +835,7 @@ mod tests {
         assert!(!next_scroll_lock(false, true, bottom - 200.0, bottom));
         // Back at the bottom the lock clears, whoever set it.
         assert!(!next_scroll_lock(true, true, bottom, bottom));
-        assert!(!next_scroll_lock(true, true, bottom - 0.3, bottom));
+        assert!(next_scroll_lock(true, true, bottom - 0.3, bottom));
         // The live card has left the viewport: scrolled up, as before.
         assert!(next_scroll_lock(false, false, bottom - 2000.0, bottom));
         assert!(next_scroll_lock(true, false, bottom - 2000.0, bottom));

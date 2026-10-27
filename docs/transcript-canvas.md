@@ -74,3 +74,18 @@ previously could subtract the retired height twice and jump away from the reader
 CSS contract tests check decoration/geometry separation and retained selection
 cues. They do not establish visual acceptance: theme, scale and actual rendered
 pixels still require a native display run.
+
+## Fractional reading ownership
+
+Reading ownership is independent of the half-pixel animation/layout settling
+threshold. A precision movement of 0.375 logical pixels away from the live edge
+now holds the reader's position during subsequent output, including the deferred
+geometry probe. Returning exactly to the live edge resumes follow; geometry drift
+alone still does not create reading intent. An external fractional adjustment also
+interrupts an active wheel animation rather than being overwritten on its next
+frame. Existing motion settling and stable-layout thresholds are unchanged.
+
+The registered retained-canvas native regression now tests output arrival after
+that fractional gesture without a second, larger wheel movement, and uses a
+fractional scrollbar interruption. Pure intent regressions cover the policy but
+do not substitute for running that mapped GTK test.
