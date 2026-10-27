@@ -67,7 +67,6 @@ mod startup_ui;
 mod tab_strip;
 mod task_ops;
 mod terminal;
-mod title_bar_ui;
 mod top_bar;
 mod vim9_buffer_labels;
 mod vim9_ide;
@@ -285,10 +284,8 @@ fn bell_attention_body(command: Option<&str>) -> String {
 fn tab_label_for_osc_title(title: &str, default: &str, custom: bool) -> Option<String> {
     if custom {
         None
-    } else if title.is_empty() {
-        Some(default.to_string())
     } else {
-        Some(title.to_string())
+        Some(jterm_core::title_bar::tab_label(title, default))
     }
 }
 
@@ -2143,7 +2140,10 @@ impl SimpleComponent for AppModel {
                     let connection_changed = self.mark_remote_connected(ti, pane_id);
                     if self.tabs[ti].active_pane == pi && !self.tabs[ti].custom_title {
                         let number = ti as u32 + 1;
-                        self.tabs[ti].title = default_tab_title(number, Some(&path));
+                        self.tabs[ti].title = jterm_core::title_bar::tab_label(
+                            self.tabs[ti].panes[pi].title.as_deref().unwrap_or_default(),
+                            &default_tab_title(number, Some(&path)),
+                        );
                         self.rebuild_tab_strip(&sender);
                     } else if connection_changed {
                         self.sync_tab_strip();

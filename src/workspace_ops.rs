@@ -625,12 +625,10 @@ fn automatic_tab_title(tab: &Tab, index: usize) -> Option<String> {
         return None;
     }
     let pane = tab.panes.get(tab.active_pane)?;
-    Some(
-        pane.title
-            .clone()
-            .filter(|title| !title.is_empty())
-            .unwrap_or_else(|| default_tab_title(index as u32 + 1, pane.cwd.as_deref())),
-    )
+    Some(jterm_core::title_bar::tab_label(
+        pane.title.as_deref().unwrap_or_default(),
+        &default_tab_title(index as u32 + 1, pane.cwd.as_deref()),
+    ))
 }
 
 fn restored_leaf_mode(configured: TerminalMode, remote_integrated: bool) -> TerminalMode {
@@ -2037,11 +2035,10 @@ impl AppModel {
         let Some(pane) = tab.panes.get(tab.active_pane) else {
             return;
         };
-        let title = pane
-            .title
-            .clone()
-            .filter(|title| !title.is_empty())
-            .unwrap_or_else(|| default_tab_title(ti as u32 + 1, pane.cwd.as_deref()));
+        let title = jterm_core::title_bar::tab_label(
+            pane.title.as_deref().unwrap_or_default(),
+            &default_tab_title(ti as u32 + 1, pane.cwd.as_deref()),
+        );
         if tab.title == title {
             return;
         }

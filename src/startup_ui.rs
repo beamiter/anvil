@@ -75,9 +75,6 @@ pub(crate) fn install_static_css() {
          .file-tree { padding: 2px; }
          .sidebar-toggle { color: #ffffff; }
          .top-bar { padding: 2px 4px; }
-         .workspace-title-bar { padding: 0 4px; border-bottom: 1px solid alpha(currentColor, 0.10); }
-         .workspace-title-bar .window-control { min-width: 32px; min-height: 30px; border-radius: 4px; }
-         .workspace-title-bar .window-control:last-child:hover { background-color: #be3737; color: white; }
  .window-controls { margin-left: 2px; }
          .window-control { min-width: 24px; min-height: 24px; padding: 0; border-radius: 999px; }
          .terminal-box scrollbar slider { min-width: 6px; border-radius: 3px; }

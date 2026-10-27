@@ -62,7 +62,6 @@ impl AppModel {
             private: tab.is_some_and(|tab| tab.private_title),
         });
         self.window.set_title(Some(&title.window_title));
-        self.top_bar.emit(crate::top_bar::TopBarMsg::Context(title));
         // The own visible property, not effective visibility: the initial
         // refresh runs before the window is mapped.
         if !self.bottom_bar.get_visible() {
