@@ -46,17 +46,28 @@ impl AppModel {
     /// for the 1 Hz tick: git metadata comes from the worker-backed cache in
     /// `jterm_core::git_meta`, everything else is state already in hand.
     pub(crate) fn refresh_bottom_bar(&self) {
+        let tab = self.tabs.get(self.active);
+        let pane = tab.and_then(|tab| tab.panes.get(tab.active_pane));
+        let cwd = pane.and_then(Pane::local_cwd).map(std::path::PathBuf::from);
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let title = jterm_core::title_bar::compose(&jterm_core::title_bar::Snapshot {
+            app: "Anvil",
+            title: tab.map(|tab| tab.display_title()).unwrap_or_default(),
+            cwd: cwd.as_deref(),
+            home: home.as_deref(),
+            mode: self.config.borrow().terminal_mode.as_str(),
+            tab_index: self.active,
+            tab_count: self.tabs.len(),
+            pane_count: tab.map_or(0, |tab| tab.panes.len()),
+            private: tab.is_some_and(|tab| tab.private_title),
+        });
+        self.window.set_title(Some(&title.window_title));
+        self.top_bar.emit(crate::top_bar::TopBarMsg::Context(title));
         // The own visible property, not effective visibility: the initial
         // refresh runs before the window is mapped.
         if !self.bottom_bar.get_visible() {
             return;
         }
-        let pane = self
-            .tabs
-            .get(self.active)
-            .and_then(|tab| tab.panes.get(tab.active_pane));
-        let cwd = pane.and_then(Pane::local_cwd).map(std::path::PathBuf::from);
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let git = cwd
             .as_deref()
             .and_then(crate::git_meta_ui::read_cached_and_refresh);

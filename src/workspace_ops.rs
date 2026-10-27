@@ -1446,7 +1446,11 @@ impl AppModel {
             return;
         }
         if !self.safe_mode {
-            let width = self.content_paned.position().clamp(120, 800) as u32;
+            let width = if self.sidebar_visible {
+                self.content_paned.position().clamp(120, 800) as u32
+            } else {
+                self.sidebar_last_width.get()
+            };
             let ai_width = self
                 .ai_panel_visible
                 .get()

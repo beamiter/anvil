@@ -67,6 +67,7 @@ mod startup_ui;
 mod tab_strip;
 mod task_ops;
 mod terminal;
+mod title_bar_ui;
 mod top_bar;
 mod vim9_buffer_labels;
 mod vim9_ide;
@@ -334,6 +335,7 @@ struct AppModel {
     /// authority back to `(source tab id, source pane id)`.
     pending_split_spawns: std::collections::HashMap<u64, (u64, u64)>,
     sidebar_visible: bool,
+    sidebar_last_width: Rc<std::cell::Cell<u32>>,
     font_scale: f64,
     /// Generation token for the debounced font-scale config write. Ctrl+wheel
     /// emits a step per notch, so only the last step in a burst reaches disk.
@@ -982,7 +984,7 @@ impl SimpleComponent for AppModel {
         sidebar_stack.set_vexpand(true);
 
         let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        sidebar_box.set_width_request(sidebar_width);
+        sidebar_box.set_width_request(120);
         sidebar_box.set_hexpand(false);
         sidebar_box.add_css_class("tab-strip");
         sidebar_box.add_css_class("anvil-ui-font");
@@ -1008,9 +1010,22 @@ impl SimpleComponent for AppModel {
         content_paned.set_end_child(Some(&ai_paned));
         content_paned.set_resize_start_child(false);
         content_paned.set_resize_end_child(true);
-        content_paned.set_shrink_start_child(false);
+        content_paned.set_shrink_start_child(true);
         content_paned.set_shrink_end_child(true);
         content_paned.set_position(sidebar_width);
+        let sidebar_last_width =
+            Rc::new(std::cell::Cell::new(sidebar_width.clamp(120, 800) as u32));
+        let measured_sidebar_width = sidebar_last_width.clone();
+        content_paned.connect_position_notify(move |paned| {
+            if paned.width() > 0 && paned.start_child().is_some_and(|child| child.is_visible()) {
+                let position =
+                    jterm_core::title_bar::sidebar_position(paned.position(), paned.width());
+                if position != paned.position() {
+                    paned.set_position(position);
+                }
+                measured_sidebar_width.set(position as u32);
+            }
+        });
 
         // Bottom status bar: left segments pack from the left edge, right
         // segments against the right edge, an expanding spacer between them.
@@ -1352,6 +1367,7 @@ impl SimpleComponent for AppModel {
             // With tabs in the top bar, keep the optional file sidebar closed
             // until the user explicitly opens it.
             sidebar_visible,
+            sidebar_last_width,
             font_scale,
             font_persist_generation: Rc::new(std::cell::Cell::new(0)),
             window_opacity,

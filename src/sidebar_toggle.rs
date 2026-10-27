@@ -33,6 +33,7 @@ impl Component for SidebarToggleModel {
         root = gtk::Box {
             set_orientation: gtk::Orientation::Horizontal,
             add_css_class: "sidebar-toggle-row",
+            set_homogeneous: true,
 
             #[name(tabs_button)]
             gtk::ToggleButton {

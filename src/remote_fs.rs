@@ -4090,7 +4090,11 @@ fn upload_integrity(
     file.seek(SeekFrom::Start(0))?;
     Ok(UploadIntegrity {
         size,
-        sha256: format!("{:x}", digest.finalize()),
+        sha256: digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
     })
 }
 

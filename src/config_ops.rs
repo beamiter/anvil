@@ -110,7 +110,7 @@ impl AppModel {
         self.set_window_opacity(new_config.window_opacity);
         self.tab_placement.set(tab_placement);
         self.sidebar_view.set(sidebar_view);
-        self.sidebar_box.set_width_request(sidebar_width);
+        self.sidebar_box.set_width_request(120);
         self.content_paned.set_position(sidebar_width);
         self.apply_tab_placement();
         self.set_sidebar_visible(sidebar_visible, false);

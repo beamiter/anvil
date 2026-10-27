@@ -75,6 +75,7 @@ pub(crate) enum TopBarMsg {
         available: bool,
         active: bool,
     },
+    Context(jterm_core::title_bar::Content),
     /// Show the Tasks button only where tasks can be used, with the number
     /// of visible tasks needing a person and the shared explanation.
     TaskAttention {
@@ -86,6 +87,7 @@ pub(crate) enum TopBarMsg {
 
 pub(crate) struct TopBarModel {
     tab_scroll: gtk::ScrolledWindow,
+    title_bar: crate::title_bar_ui::TitleBar,
 }
 
 #[relm4::component(pub(crate))]
@@ -96,156 +98,10 @@ impl Component for TopBarModel {
     type CommandOutput = ();
 
     view! {
-        root = gtk::Overlay {
-            add_css_class: "top-bar",
-            set_hexpand: true,
-            set_height_request: 40,
-
-            #[wrap(Some)]
-            set_child = &gtk::Box {
-                set_orientation: gtk::Orientation::Horizontal,
-            },
-
-            add_overlay = &gtk::Box {
-                set_orientation: gtk::Orientation::Horizontal,
-                set_spacing: 4,
-                set_halign: gtk::Align::Start,
-                set_valign: gtk::Align::Center,
-
-                gtk::Button {
-                    set_icon_name: "system-search-symbolic",
-                    set_focus_on_click: false,
-                    set_tooltip_text: Some("Open command center (Ctrl+Shift+P)"),
-                    update_property: &[
-                        gtk::accessible::Property::Label(OPEN_COMMAND_CENTER_LABEL),
-                    ],
-                    add_css_class: "flat",
-                    connect_clicked[sender] => move |_| {
-                        let _ = sender.output(TopBarOutput::OpenPalette);
-                    },
-                },
-
-                gtk::Button {
-                    set_icon_name: "sidebar-show-symbolic",
-                    set_focus_on_click: false,
-                    set_tooltip_text: Some("Toggle sidebar (Ctrl+\\)"),
-                    update_property: &[
-                        gtk::accessible::Property::Label(TOGGLE_SIDEBAR_LABEL),
-                    ],
-                    add_css_class: "flat",
-                    connect_clicked[sender] => move |_| {
-                        let _ = sender.output(TopBarOutput::ToggleSidebar);
-                    },
-                },
-
-                gtk::Button {
-                    set_icon_name: "view-list-symbolic",
-                    set_focus_on_click: false,
-                    set_tooltip_text: Some("Toggle tabs: sidebar / top bar"),
-                    update_property: &[
-                        gtk::accessible::Property::Label(TOGGLE_TAB_PLACEMENT_LABEL),
-                    ],
-                    add_css_class: "flat",
-                    connect_clicked[sender] => move |_| {
-                        let _ = sender.output(TopBarOutput::ToggleTabPlacement);
-                    },
-                },
-
-                gtk::Button {
-                    set_icon_name: "text-editor-symbolic",
-                    set_focus_on_click: false,
-                    set_tooltip_text: Some("Open Vim9 IDE (Ctrl+Alt+I)"),
-                    update_property: &[
-                        gtk::accessible::Property::Label("Open Vim9 IDE"),
-                        gtk::accessible::Property::KeyShortcuts("Control+Alt+I"),
-                    ],
-                    add_css_class: "flat",
-                    connect_clicked[sender] => move |_| {
-                        let _ = sender.output(TopBarOutput::OpenVim9Ide);
-                    },
-                },
-            },
-
+        root = gtk::Box {
+            set_orientation: gtk::Orientation::Vertical,
             #[local_ref]
-            add_overlay = tab_scroll -> gtk::ScrolledWindow {},
-
-            add_overlay = &gtk::Box {
-                set_orientation: gtk::Orientation::Horizontal,
-                set_spacing: 4,
-                set_halign: gtk::Align::End,
-                set_valign: gtk::Align::Center,
-                add_css_class: "top-bar-actions",
-                add_css_class: "window-controls",
-
-                gtk::Button {
-                    set_icon_name: "view-grid-symbolic",
-                    set_focus_on_click: false,
-                    set_tooltip_text: Some("Agent Sessions: resume Codex / Claude (Ctrl+Alt+Shift+G)"),
-                    update_property: &[gtk::accessible::Property::Label("Agent Sessions")],
-                    add_css_class: "flat",
-                    connect_clicked[sender] => move |_| {
-                        let _ = sender.output(TopBarOutput::OpenAgentSessions);
-                    },
-                },
-
-                #[name(tasks_button)]
-                gtk::Button {
-                    set_visible: false,
-                    set_focus_on_click: false,
-                    set_tooltip_text: Some("Agent tasks · Toggle Tasks (Ctrl+Alt+Shift+T)"),
-                    update_property: &[
-                        gtk::accessible::Property::Label(TOGGLE_TASKS_LABEL),
-                        gtk::accessible::Property::KeyShortcuts("Control+Alt+Shift+T"),
-                    ],
-                    add_css_class: "flat",
-                    connect_clicked[sender] => move |_| {
-                        let _ = sender.output(TopBarOutput::ToggleTasks);
-                    },
-
-                    gtk::Box {
-                        set_orientation: gtk::Orientation::Horizontal,
-                        set_spacing: 4,
-
-                        gtk::Image {
-                            set_icon_name: Some("view-list-bullet-symbolic"),
-                        },
-
-                        #[name(tasks_badge)]
-                        gtk::Label {
-                            set_visible: false,
-                            add_css_class: "caption-heading",
-                            add_css_class: "accent",
-                        },
-                    },
-                },
-
-                #[name(agent_toggle)]
-                gtk::ToggleButton {
-                    set_icon_name: "system-run-symbolic",
-                    set_focus_on_click: false,
-                    set_tooltip_text: Some("Activate Shell Agent (Ctrl+Alt+G)"),
-                    update_property: &[
-                        gtk::accessible::Property::Label(ACTIVATE_AGENT_LABEL),
-                    ],
-                    add_css_class: "flat",
-                    connect_clicked[sender] => move |_| {
-                        let _ = sender.output(TopBarOutput::ToggleAgent);
-                    },
-                },
-
-                gtk::Button {
-                    set_icon_name: "list-add-symbolic",
-                    set_focus_on_click: false,
-                    set_tooltip_text: Some("New tab (Ctrl+Shift+T)"),
-                    update_property: &[
-                        gtk::accessible::Property::Label(NEW_TAB_LABEL),
-                    ],
-                    add_css_class: "flat",
-                    connect_clicked[sender] => move |_| {
-                        let _ = sender.output(TopBarOutput::NewTab);
-                    },
-                },
-
+            title_bar -> gtk::Box {
                 gtk::Button {
                     set_icon_name: "window-minimize-symbolic",
                     set_focus_on_click: false,
@@ -289,6 +145,160 @@ impl Component for TopBarModel {
                     },
                 },
             },
+            #[name(toolbar)]
+            gtk::Overlay {
+                add_css_class: "top-bar",
+                set_hexpand: true,
+                set_height_request: 40,
+
+                #[wrap(Some)]
+                set_child = &gtk::Box {
+                    set_orientation: gtk::Orientation::Horizontal,
+                },
+
+                add_overlay = &gtk::Box {
+                    set_orientation: gtk::Orientation::Horizontal,
+                    set_spacing: 4,
+                    set_halign: gtk::Align::Start,
+                    set_valign: gtk::Align::Center,
+
+                    gtk::Button {
+                        set_icon_name: "system-search-symbolic",
+                        set_focus_on_click: false,
+                        set_tooltip_text: Some("Open command center (Ctrl+Shift+P)"),
+                        update_property: &[
+                            gtk::accessible::Property::Label(OPEN_COMMAND_CENTER_LABEL),
+                        ],
+                        add_css_class: "flat",
+                        connect_clicked[sender] => move |_| {
+                            let _ = sender.output(TopBarOutput::OpenPalette);
+                        },
+                    },
+
+                    gtk::Button {
+                        set_icon_name: "sidebar-show-symbolic",
+                        set_focus_on_click: false,
+                        set_tooltip_text: Some("Toggle sidebar (Ctrl+\\)"),
+                        update_property: &[
+                            gtk::accessible::Property::Label(TOGGLE_SIDEBAR_LABEL),
+                        ],
+                        add_css_class: "flat",
+                        connect_clicked[sender] => move |_| {
+                            let _ = sender.output(TopBarOutput::ToggleSidebar);
+                        },
+                    },
+
+                    gtk::Button {
+                        set_icon_name: "view-list-symbolic",
+                        set_focus_on_click: false,
+                        set_tooltip_text: Some("Toggle tabs: sidebar / top bar"),
+                        update_property: &[
+                            gtk::accessible::Property::Label(TOGGLE_TAB_PLACEMENT_LABEL),
+                        ],
+                        add_css_class: "flat",
+                        connect_clicked[sender] => move |_| {
+                            let _ = sender.output(TopBarOutput::ToggleTabPlacement);
+                        },
+                    },
+
+                    gtk::Button {
+                        set_icon_name: "text-editor-symbolic",
+                        set_focus_on_click: false,
+                        set_tooltip_text: Some("Open Vim9 IDE (Ctrl+Alt+I)"),
+                        update_property: &[
+                            gtk::accessible::Property::Label("Open Vim9 IDE"),
+                            gtk::accessible::Property::KeyShortcuts("Control+Alt+I"),
+                        ],
+                        add_css_class: "flat",
+                        connect_clicked[sender] => move |_| {
+                            let _ = sender.output(TopBarOutput::OpenVim9Ide);
+                        },
+                    },
+                },
+
+                #[local_ref]
+                add_overlay = tab_scroll -> gtk::ScrolledWindow {},
+
+                add_overlay = &gtk::Box {
+                    set_orientation: gtk::Orientation::Horizontal,
+                    set_spacing: 4,
+                    set_halign: gtk::Align::End,
+                    set_valign: gtk::Align::Center,
+                    add_css_class: "top-bar-actions",
+                    add_css_class: "window-controls",
+
+                    gtk::Button {
+                        set_icon_name: "view-grid-symbolic",
+                        set_focus_on_click: false,
+                        set_tooltip_text: Some("Agent Sessions: resume Codex / Claude (Ctrl+Alt+Shift+G)"),
+                        update_property: &[gtk::accessible::Property::Label("Agent Sessions")],
+                        add_css_class: "flat",
+                        connect_clicked[sender] => move |_| {
+                            let _ = sender.output(TopBarOutput::OpenAgentSessions);
+                        },
+                    },
+
+                    #[name(tasks_button)]
+                    gtk::Button {
+                        set_visible: false,
+                        set_focus_on_click: false,
+                        set_tooltip_text: Some("Agent tasks · Toggle Tasks (Ctrl+Alt+Shift+T)"),
+                        update_property: &[
+                            gtk::accessible::Property::Label(TOGGLE_TASKS_LABEL),
+                            gtk::accessible::Property::KeyShortcuts("Control+Alt+Shift+T"),
+                        ],
+                        add_css_class: "flat",
+                        connect_clicked[sender] => move |_| {
+                            let _ = sender.output(TopBarOutput::ToggleTasks);
+                        },
+
+                        gtk::Box {
+                            set_orientation: gtk::Orientation::Horizontal,
+                            set_spacing: 4,
+
+                            gtk::Image {
+                                set_icon_name: Some("view-list-bullet-symbolic"),
+                            },
+
+                            #[name(tasks_badge)]
+                            gtk::Label {
+                                set_visible: false,
+                                add_css_class: "caption-heading",
+                                add_css_class: "accent",
+                            },
+                        },
+                    },
+
+                    #[name(agent_toggle)]
+                    gtk::ToggleButton {
+                        set_icon_name: "system-run-symbolic",
+                        set_focus_on_click: false,
+                        set_tooltip_text: Some("Activate Shell Agent (Ctrl+Alt+G)"),
+                        update_property: &[
+                            gtk::accessible::Property::Label(ACTIVATE_AGENT_LABEL),
+                        ],
+                        add_css_class: "flat",
+                        connect_clicked[sender] => move |_| {
+                            let _ = sender.output(TopBarOutput::ToggleAgent);
+                        },
+                    },
+
+                    gtk::Button {
+                        set_icon_name: "list-add-symbolic",
+                        set_focus_on_click: false,
+                        set_tooltip_text: Some("New tab (Ctrl+Shift+T)"),
+                        update_property: &[
+                            gtk::accessible::Property::Label(NEW_TAB_LABEL),
+                        ],
+                        add_css_class: "flat",
+                        connect_clicked[sender] => move |_| {
+                            let _ = sender.output(TopBarOutput::NewTab);
+                        },
+                    },
+
+
+                },
+            },
         }
     }
 
@@ -297,13 +307,16 @@ impl Component for TopBarModel {
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
-        let model = Self { tab_scroll };
+        let model = Self {
+            tab_scroll,
+            title_bar: crate::title_bar_ui::TitleBar::new(),
+        };
         let tab_scroll = &model.tab_scroll;
-        let overlay = root.clone();
+        let title_bar = &model.title_bar.root;
         let widgets = view_output!();
         // The tab row is an overlay: include its natural height so enlarged
         // text can grow the bar instead of being clipped to the old 40px floor.
-        overlay.set_measure_overlay(tab_scroll, true);
+        widgets.toolbar.set_measure_overlay(tab_scroll, true);
         ComponentParts { model, widgets }
     }
 
@@ -315,6 +328,7 @@ impl Component for TopBarModel {
         _root: &Self::Root,
     ) {
         match msg {
+            TopBarMsg::Context(content) => self.title_bar.update(content),
             TopBarMsg::SetMaximized(maximized) => {
                 let (icon_name, label) = maximize_presentation(maximized);
                 widgets.maximize_button.set_icon_name(icon_name);
