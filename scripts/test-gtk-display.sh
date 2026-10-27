@@ -53,6 +53,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::chat::tests::chat_completion_never_expands_between_shell_markers
     block_view::scroll::canvas_native_tests::capped_output_hands_remaining_pixels_to_retained_canvas
     block_view::scroll::canvas_native_tests::retained_canvas_scrolls_through_frames_and_yields_to_reading
     organism_ui::inspector::tests::snapshot_dialog_is_scrollable_and_closes_without_an_animation_source

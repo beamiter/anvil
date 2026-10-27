@@ -30,6 +30,21 @@ pub(super) fn surface(state: BlockState) -> ChatSurface {
     })
 }
 
+/// Presentation continuity never grants terminal input authority.
+fn presentation_surface(previous: ChatSurface, state: BlockState) -> ChatSurface {
+    // A confirmed prompt is sufficient: a fast C/D pair can be coalesced
+    // before any layout gets to display Running. Native ownership states
+    // always go through the real-state resolver and retire this continuity.
+    if matches!(previous, ChatSurface::Prompt | ChatSurface::Running) {
+        match state {
+            BlockState::PostCommand => return ChatSurface::Running,
+            BlockState::CollectingPrompt => return ChatSurface::Prompt,
+            _ => {}
+        }
+    }
+    surface(state)
+}
+
 /// A docked zero-height insertion anchor sits exactly at the history's bottom
 /// edge. The original Block test deliberately requires the top of a real live
 /// card inside the viewport; applying that strict inset to a point locks Chat
@@ -93,20 +108,37 @@ pub(super) fn canvas_height(scroll: &gtk::ScrolledWindow) -> Option<i32> {
 /// received in one held byte batch. This is deliberately independent of UI ticks.
 #[derive(Default)]
 pub(super) struct RunningCommand {
+    presentation: Cell<Option<ChatSurface>>,
     generation: Cell<u64>,
     displayed: Cell<Option<u64>>,
     started: Cell<Option<std::time::Instant>>,
 }
 
 impl RunningCommand {
+    fn presentation_surface(&self, state: BlockState) -> ChatSurface {
+        let target = presentation_surface(
+            self.presentation.get().unwrap_or(ChatSurface::Passthrough),
+            state,
+        );
+        self.presentation.set(Some(target));
+        target
+    }
+
+    pub(super) fn reset_presentation(&self) {
+        self.presentation.set(None);
+        self.displayed.set(None);
+    }
+
     pub(super) fn started(&self) {
         self.generation.set(self.generation.get().wrapping_add(1));
         self.started.set(Some(std::time::Instant::now()));
     }
 
     pub(super) fn update(&self, state: BlockState, hint: &gtk::Label) {
-        if surface(state) == ChatSurface::Running {
-            self.displayed.set(Some(self.generation.get()));
+        // Only a real running command can be the target of Stop.
+        self.displayed
+            .set((state == BlockState::CollectingOutput).then(|| self.generation.get()));
+        if self.presentation_surface(state) == ChatSurface::Running {
             let seconds = self
                 .started
                 .get()
@@ -179,7 +211,7 @@ pub(super) fn layout(
         else {
             return;
         };
-        let target = surface(state.get());
+        let target = running.presentation_surface(state.get());
         let (holder, clip, terminal) = {
             let active = active.borrow();
             (
@@ -246,6 +278,8 @@ pub(super) fn layout(
         controls.set_visible(prompt || in_transcript);
         send.set_visible(prompt);
         stop.set_visible(in_transcript);
+        send.set_sensitive(state.get() == BlockState::AwaitingCommand);
+        stop.set_sensitive(state.get() == BlockState::CollectingOutput);
         running.update(state.get(), &hint);
         if prompt {
             dock.add_css_class("chat-composer");
@@ -580,6 +614,108 @@ fn submit_allowed(state: BlockState, shell_foreground: Option<bool>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_presentation_survives_normal_and_coalesced_commands() {
+        use BlockState::*;
+        use ChatSurface::*;
+        for states in [
+            vec![
+                AwaitingCommand,
+                CollectingOutput,
+                PostCommand,
+                CollectingPrompt,
+                AwaitingCommand,
+            ],
+            // A fast command can start and end between two layout callbacks.
+            vec![
+                AwaitingCommand,
+                PostCommand,
+                CollectingPrompt,
+                AwaitingCommand,
+            ],
+            vec![AwaitingCommand, CollectingPrompt, AwaitingCommand],
+        ] {
+            let mut previous = Passthrough;
+            for state in states {
+                previous = presentation_surface(previous, state);
+                assert_eq!(
+                    previous,
+                    match state {
+                        CollectingOutput | PostCommand => Running,
+                        _ => Prompt,
+                    },
+                    "{state:?} must not hand the viewport to native VTE"
+                );
+                if matches!(state, PostCommand | CollectingPrompt) {
+                    assert!(!surface(state).allows_submit_affordance());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completion_presentation_starts_native_and_retires_on_takeover() {
+        use BlockState::*;
+        use ChatSurface::*;
+        let mut previous = Passthrough;
+        for state in [Idle, CollectingPrompt, CollectingPrompt, PostCommand] {
+            previous = presentation_surface(previous, state);
+            assert_eq!(
+                previous, Passthrough,
+                "no confirmed Chat interaction: {state:?}"
+            );
+        }
+        for held in [Prompt, Running] {
+            for state in [Idle, RawFallback, AltScreen] {
+                previous = held;
+                previous = presentation_surface(previous, state);
+                assert_eq!(
+                    previous,
+                    if state == AltScreen {
+                        Fullscreen
+                    } else {
+                        Passthrough
+                    }
+                );
+                let state = CollectingPrompt;
+                assert_eq!(
+                    presentation_surface(previous, state),
+                    Passthrough,
+                    "native takeover retires the presentation hold"
+                );
+            }
+        }
+    }
+    #[test]
+    fn completion_presentation_reset_clears_hold_without_granting_controls() {
+        let running = RunningCommand::default();
+        let pty = crate::pty::OwnedPty::from_openpty(Some(true)).unwrap();
+        pty.set_test_foreground_group(Some(101));
+        running.started();
+        running.displayed.set(Some(running.generation.get()));
+        assert_eq!(
+            running.presentation_surface(BlockState::AwaitingCommand),
+            ChatSurface::Prompt
+        );
+        assert_eq!(
+            running.presentation_surface(BlockState::PostCommand),
+            ChatSurface::Running
+        );
+        assert!(stop_intent(BlockState::PostCommand, &running, &pty).is_none());
+        assert_eq!(
+            running.presentation_surface(BlockState::CollectingPrompt),
+            ChatSurface::Prompt
+        );
+        assert!(!submit_allowed(BlockState::CollectingPrompt, Some(true)));
+        running.reset_presentation();
+        assert!(running.displayed.get().is_none());
+        assert_eq!(
+            running.presentation_surface(BlockState::CollectingPrompt),
+            ChatSurface::Passthrough
+        );
+    }
+
     #[test]
     fn native_stop_activation_keeps_first_target_and_rejects_unarmed_clicks() {
         let native = NativeActivation::default();
@@ -1008,6 +1144,164 @@ mod tests {
                     == 80
             },
         );
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; samples real GTK/VTE allocations after paint"]
+    fn chat_completion_never_expands_between_shell_markers() {
+        let (view, window, _) = fixture();
+        let clip = view.active.borrow().live_clip();
+        let dock = widget_with_class(&view.root, "chat-controls")
+            .parent()
+            .expect("input dock");
+        let dock_limit = Cell::new(i32::MAX);
+        let clock = view.root.frame_clock().expect("mapped frame clock");
+        // Ticks run before layout. Sampling after-paint sees the allocation
+        // the user actually saw, including the first frame after each marker.
+        let samples = Rc::new(RefCell::new(Vec::new()));
+        let captured = samples.clone();
+        let state = view.bstate.clone();
+        let sampled_clip = clip.clone();
+        let sampled_dock = dock.clone();
+        let handler = clock.connect_after_paint(move |_| {
+            captured.borrow_mut().push((
+                state.get(),
+                sampled_clip.height(),
+                if sampled_dock.is_mapped() {
+                    sampled_dock.height()
+                } else {
+                    0
+                },
+            ));
+        });
+        let redraw = view.root.downgrade();
+        let updater = clock.connect_update(move |_| {
+            if let Some(root) = redraw.upgrade() {
+                root.queue_draw();
+            }
+        });
+        clock.begin_updating();
+        let phase = |bytes: &[u8], expected: BlockState, cap: Option<i32>| {
+            samples.borrow_mut().clear();
+            view.pty.emit_test_output(bytes);
+            wait_for(
+                "eight allocated frames in the intermediate lifecycle state",
+                || {
+                    samples
+                        .borrow()
+                        .iter()
+                        .filter(|(state, _, _)| *state == expected)
+                        .count()
+                        >= 8
+                },
+            );
+            let samples = samples.borrow();
+            let heights: Vec<_> = samples
+                .iter()
+                .filter(|(state, _, _)| *state == expected)
+                .map(|(_, height, _)| *height)
+                .collect();
+            let max_dock = samples
+                .iter()
+                .filter(|(state, _, _)| *state == expected)
+                .map(|(_, _, height)| *height)
+                .max()
+                .unwrap();
+            let min = *heights.iter().min().unwrap();
+            let max = *heights.iter().max().unwrap();
+            eprintln!(
+                "{expected:?}: {} after-paint frames, clip={min}..{max}, cap={cap:?}",
+                heights.len()
+            );
+            eprintln!(
+                "input dock={max_dock}px, compact dock limit={}px",
+                dock_limit.get()
+            );
+            assert!(min > 0, "live terminal remains allocated");
+            if let Some(cap) = cap {
+                assert!(
+                    max_dock <= dock_limit.get(),
+                    "{expected:?} input dock expanded to {max_dock}px"
+                );
+                assert!(
+                    max <= cap,
+                    "{expected:?} expanded to {max}px (compact limit {cap}px)"
+                );
+            }
+            max
+        };
+        let prompt_start = b"\x1b]133;A\x07$ ";
+        let prompt_end = b"\x1b]133;B\x07";
+        let start = b"echo hello\r\n\x1b]133;C;cmdline_url=echo%20hello\x07hello\r\n";
+        let end = b"\x1b]133;D;0\x07";
+        let initial = phase(prompt_start, BlockState::CollectingPrompt, None);
+        phase(prompt_end, BlockState::AwaitingCommand, None);
+        pump_for(Duration::from_millis(250));
+        let compact = clip.height();
+        assert!(
+            initial > compact * 2,
+            "the first incomplete prompt retains native VTE"
+        );
+        for (width, scale) in [(640, 1.0), (320, 1.0), (320, 1.6)] {
+            window.set_default_size(width, 560);
+            view.set_font_scale(scale);
+            pump_for(Duration::from_millis(250));
+            assert!(
+                window.width() <= width,
+                "narrow window was not actually allocated: requested {width}, got {}",
+                window.width()
+            );
+            assert_eq!(view.active_vte.font_scale(), scale);
+            eprintln!(
+                "allocated window={}x{}, font scale={scale}",
+                window.width(),
+                window.height()
+            );
+            dock_limit.set(dock.height() + 2 * view.active_vte.char_height() as i32);
+            let cap = clip.height() + 2 * view.active_vte.char_height() as i32;
+            assert!(
+                cap < view.root.height() * 3 / 4,
+                "fixture must distinguish compact and native"
+            );
+            phase(start, BlockState::CollectingOutput, Some(cap));
+            // Never combine D/A/B: each intermediate state must survive at
+            // least eight painted frames, including in a narrow, zoomed pane.
+            phase(end, BlockState::PostCommand, Some(cap));
+            phase(prompt_start, BlockState::CollectingPrompt, Some(cap));
+            phase(prompt_end, BlockState::AwaitingCommand, Some(cap));
+            let mut fast = start.to_vec();
+            fast.extend_from_slice(end);
+            phase(&fast, BlockState::PostCommand, Some(cap));
+            assert!(
+                !samples
+                    .borrow()
+                    .iter()
+                    .any(|(state, _, _)| *state == BlockState::CollectingOutput),
+                "fast command completes before a Running frame is painted"
+            );
+            phase(prompt_start, BlockState::CollectingPrompt, Some(cap));
+            phase(prompt_end, BlockState::AwaitingCommand, Some(cap));
+            // RIS and A share a batch: no layout is guaranteed to observe Idle.
+            let reset = b"\x1bc\x1b]133;A\x07$ ";
+            assert!(
+                phase(reset, BlockState::CollectingPrompt, None) > cap,
+                "reset must retire continuity before the next unconfirmed prompt"
+            );
+            phase(prompt_end, BlockState::AwaitingCommand, Some(cap));
+            assert!(phase(b"\x1b[?1049h", BlockState::AltScreen, None) > cap);
+            phase(b"\x1b[?1049l", BlockState::AwaitingCommand, Some(cap));
+            assert!(phase(b"\x1bcraw\r\n", BlockState::RawFallback, None) > cap);
+            assert!(
+                phase(prompt_start, BlockState::CollectingPrompt, None) > cap,
+                "raw takeover cannot retain a prior compact prompt"
+            );
+            phase(prompt_end, BlockState::AwaitingCommand, Some(cap));
+        }
+        clock.end_updating();
+        clock.disconnect(updater);
+        clock.disconnect(handler);
+        window.close();
+        view.pty.kill();
     }
 
     #[test]

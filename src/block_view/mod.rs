@@ -5486,6 +5486,7 @@ fn command_reuse_menu_label(selected_count: usize) -> &'static str {
 /// `ReaderCtx` holds — finished-block actions and the context menu rebind
 /// them when the user re-runs a command from history.
 struct BlockBackend {
+    chat_running: Option<Rc<chat::RunningCommand>>,
     menu_keybindings: shortcut_hints::MenuKeybindings,
     active_rc: Rc<RefCell<ActiveBlock>>,
     /// The live VTE — every byte is fed here; alt-screen toggles feed it 1049h/l.
@@ -8041,6 +8042,14 @@ fn finished_command(vte_capture: &str, input_shadow: &str) -> String {
 /// helper functions they wrap stay module-level because non-reader paths
 /// (restore, resize, submit) share them.
 impl RenderBackend for BlockBackend {
+    fn hard_reset(&self) {
+        // Reset may be followed by PromptStart in the same PTY batch, before
+        // any layout observes Idle. Retire Chat continuity at the barrier.
+        if let Some(chat) = &self.chat_running {
+            chat.reset_presentation();
+        }
+    }
+
     /// Install the right-click context menu on a finished block.
     ///
     /// Part of the trait, not an inherent method, so every path that builds a
@@ -13085,6 +13094,7 @@ impl TermView {
                 })
             } else {
                 Rc::new(BlockBackend {
+                    chat_running: chat_mode.then(|| chat_running.clone()),
                     active_rc,
                     active_vte: active_vte_rc,
                     // Same construction-time policy passed to the submission
