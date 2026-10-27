@@ -1007,7 +1007,7 @@ impl SimpleComponent for AppModel {
         content_paned.set_end_child(Some(&ai_paned));
         content_paned.set_resize_start_child(false);
         content_paned.set_resize_end_child(true);
-        content_paned.set_shrink_start_child(true);
+        sidebar::configure_layout(&sidebar_stack, &content_paned);
         content_paned.set_shrink_end_child(true);
         content_paned.set_position(sidebar_width);
         let sidebar_last_width =

@@ -8,9 +8,13 @@ and running shell. A split inherits its source pane; managed remote panes
 continue to use Block.
 
 Chat presents completed shell commands as right-aligned accent capsules, with
-real output in separate, wide left-hand cards. At an integrated prompt, the
-same live terminal is docked below the independently scrolling transcript. Its
-cursor, completion, shell history, readline editing, IME and multiline input
+real output in separate, wide left-hand cards. Command capsules size to their
+text and remain at the right edge when the pane or font changes. Rounded
+output cards group compact directory, time and
+duration pills at the left, with actions and the collapse control at the right.
+At an integrated prompt, the same live terminal is docked below the
+independently scrolling transcript. Its cursor, completion, shell history,
+readline editing, IME and multiline input
 belong to the existing shell. The arrow sends one native Enter; it does not
 copy, clear, re-paste, or execute command text through another process.
 

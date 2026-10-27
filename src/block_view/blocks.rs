@@ -2870,14 +2870,18 @@ mod tests {
             Some("/a/very/long/project/path"),
             40,
         );
-        let row = chat
-            .header_row
-            .next_sibling()
-            .expect("chat context row")
-            .downcast::<gtk::Box>()
-            .expect("compact chat metadata");
+        let mut child = chat.header_row.first_child();
+        let row = loop {
+            let widget = child.expect("chat context row");
+            if widget.has_css_class("chat-context") {
+                break widget
+                    .downcast::<gtk::Box>()
+                    .expect("compact chat metadata");
+            }
+            child = widget.next_sibling();
+        };
         assert!(row.has_css_class("chat-context"));
-        assert_eq!(row.spacing(), 6);
+        assert_eq!(row.spacing(), 4);
         assert!(!row.is_homogeneous());
         let mut item = row.first_child();
         let mut count = 0;
@@ -2905,7 +2909,7 @@ mod tests {
                     .compute_bounds(&row)
                     .expect("metadata child bounds in its row");
                 if let Some(end) = previous_end {
-                    assert_eq!(bounds.x() - end, 6.0, "fixed metadata gap at {width}px");
+                    assert_eq!(bounds.x() - end, 4.0, "fixed metadata gap at {width}px");
                 }
                 assert!(bounds.x() + bounds.width() <= width as f32);
                 previous_end = Some(bounds.x() + bounds.width());
@@ -3552,9 +3556,14 @@ const fn finished_card_vchrome_px(compact: bool) -> i32 {
 
 pub(crate) fn estimated_finished_block_height(config: &Config, output_rows: i64) -> i32 {
     let cell = estimated_cell_height_px(config);
-    // Header + wrapping context + command + output + margins/filter slack.
+    // Chat combines context and status in one header; Block wraps separately.
     let rows = output_rows.clamp(1, i32::MAX as i64) as i32;
-    rows.saturating_add(3)
+    let header_and_command = if config.terminal_mode == crate::config::TerminalMode::Chat {
+        2
+    } else {
+        3
+    };
+    rows.saturating_add(header_and_command)
         .saturating_mul(cell)
         .saturating_add(finished_card_vchrome_px(config.block_compact))
         .saturating_add(
@@ -3804,6 +3813,9 @@ pub(crate) fn apply_finished_card_density(
 
 fn feed_snapshot_bytes(vte: &vte4::Terminal, bytes: &[u8]) {
     vte.feed(&snapshot_payload(bytes));
+    if vte.has_css_class("chat-command-terminal") || vte.has_css_class("chat-output-terminal") {
+        vte.feed(b"\x1b[?25l");
+    }
 }
 
 /// In-stream terminal reset carried at the head of every snapshot feed.
@@ -4288,12 +4300,15 @@ impl FinishedBlock {
             "Click to select · Shift-click range · Ctrl+Shift-click toggle · Enter recalls"
         }));
         apply_header_density(&header_row, config.block_compact);
+        if chat {
+            header_row.set_spacing(4);
+        }
 
         // Warp-style accent prompt chevron. Leads the header rather than the
         // command row; see the command-row comment below.
         let chevron = gtk::Label::new(Some("\u{276f}"));
         chevron.add_css_class("block-prompt-chevron");
-        chevron.set_visible(!is_background);
+        chevron.set_visible(!is_background && !chat);
         header_row.append(&chevron);
 
         // Bookmark marker (gutter marker), hidden until the block is bookmarked.
@@ -4337,7 +4352,7 @@ impl FinishedBlock {
         // Chat reads as a compact message: surplus width belongs after the
         // metadata, never between its chips. Block retains wrapping context.
         let metadata: gtk::Widget = if chat {
-            let row = gtk::Box::new(Orientation::Horizontal, 6);
+            let row = gtk::Box::new(Orientation::Horizontal, 4);
             row.add_css_class("chat-context");
             row.upcast()
         } else {
@@ -4351,9 +4366,10 @@ impl FinishedBlock {
         };
         metadata.add_css_class("block-context");
         metadata.set_halign(gtk::Align::Fill);
-        metadata.set_hexpand(true);
+        metadata.set_hexpand(!chat);
         let append_metadata = |label: &gtk::Label| {
             if let Some(row) = metadata.downcast_ref::<gtk::Box>() {
+                label.add_css_class("chat-meta-chip");
                 label.set_hexpand(false);
                 label.set_single_line_mode(true);
                 label.set_xalign(0.0);
@@ -4388,6 +4404,10 @@ impl FinishedBlock {
                 git_chip.set_tooltip_text(Some(&format!("Branch: {branch}")));
                 append_metadata(&git_chip);
             }
+        }
+
+        if chat {
+            header_row.append(&metadata);
         }
 
         // A selected card is a lightweight navigation mode. Put its actual
@@ -4453,7 +4473,11 @@ impl FinishedBlock {
             let badge = gtk::Label::new(Some(&text));
             badge.add_css_class(status.exit_badge_class());
             badge.set_tooltip_text(status.exit_badge_tooltip().as_deref());
-            header_row.append(&badge);
+            if chat {
+                header_row.insert_child_after(&badge, Some(&metadata));
+            } else {
+                header_row.append(&badge);
+            }
         }
 
         // Quick-action buttons (hidden until the block is hovered). Handlers are
@@ -4468,6 +4492,9 @@ impl FinishedBlock {
         reveal_block_actions(&action_box, false);
         // Keep status and primary actions visually distinct.
         action_box.set_margin_start(6);
+        if chat {
+            action_box.set_margin_start(0);
+        }
         // Three distinct glyphs. The two copy actions shared `edit-copy` and
         // were therefore separable only by hovering for a tooltip, which is the
         // one thing a quick-action row exists to avoid.
@@ -4570,7 +4597,7 @@ impl FinishedBlock {
         clear_review_btn.add_css_class("flat");
         review_shelf.append(&clear_review_btn);
         review_shelf.set_visible(false);
-        if metadata.first_child().is_some() {
+        if !chat && metadata.first_child().is_some() {
             let mut child = metadata.first_child();
             while let Some(item) = child {
                 item.set_focusable(false);
@@ -4843,9 +4870,10 @@ impl FinishedBlock {
         // align them, and it is not available: column count comes from the
         // terminal's pixel width, so the card would re-wrap `ls` differently
         // from the live pane the user watched it in.
-        let cmd_row = gtk::Box::new(Orientation::Horizontal, 0);
+        let cmd_row = super::command_row::CommandRow::new();
         cmd_row.append(&command_vte);
         if chat {
+            super::command_row::fit(&cmd_row, &command_vte, command_cols);
             cmd_row.add_css_class("chat-command-capsule");
             cmd_row.set_halign(gtk::Align::End);
             cmd_row.set_hexpand(false);
@@ -4874,7 +4902,8 @@ impl FinishedBlock {
         output_box.set_hexpand(true);
         output_box.set_child(Some(&output_vte));
         if chat {
-            output_box.add_css_class("chat-result-card");
+            output_vte.add_css_class("chat-output-terminal");
+            output_vte.set_color_background(&RGBA::new(0.0, 0.0, 0.0, 0.0));
         }
         let output_scrollbar =
             gtk::Scrollbar::new(Orientation::Vertical, output_vte.vadjustment().as_ref());
@@ -5120,7 +5149,7 @@ impl FinishedBlock {
                 glib::WeakRef<gtk::SearchEntry>,
                 Rc<dyn Fn()>,
             );
-            type FilterRowBuilder = dyn Fn(&gtk::Box, &gtk::Box) -> Option<FilterRowHandles>;
+            type FilterRowBuilder = dyn Fn(&gtk::Box, &gtk::Widget) -> Option<FilterRowHandles>;
             let output_vte = output_vte.downgrade();
             let expand_btn = expand_btn.downgrade();
             let output_scrollbar = output_scrollbar.downgrade();
@@ -5135,7 +5164,7 @@ impl FinishedBlock {
                 let render_stamp = render_stamp.clone();
                 let displayed_generation = displayed_generation.clone();
                 let visual_rows_cache = visual_rows_cache.clone();
-                Rc::new(move |content: &gtk::Box, cmd_row: &gtk::Box| {
+                Rc::new(move |content: &gtk::Box, cmd_row: &gtk::Widget| {
                     let filter_row = gtk::Box::new(Orientation::Horizontal, 4);
                     filter_row.add_css_class("block-filter-row");
                     filter_row.set_visible(false);
@@ -5416,7 +5445,16 @@ impl FinishedBlock {
                     return;
                 };
                 if built.borrow().is_none() {
-                    let handles = build_filter_row(&content, &cmd_row);
+                    let result = cmd_row
+                        .next_sibling()
+                        .and_downcast::<gtk::Box>()
+                        .filter(|row| row.has_css_class("chat-result-card"));
+                    let parent = result.as_ref().unwrap_or(&content);
+                    let anchor = result
+                        .as_ref()
+                        .and_then(|row| row.first_child())
+                        .unwrap_or_else(|| cmd_row.clone().upcast::<gtk::Widget>());
+                    let handles = build_filter_row(parent, &anchor);
                     *built.borrow_mut() = handles;
                 }
                 let built = built.borrow();
@@ -5441,6 +5479,22 @@ impl FinishedBlock {
             filter_btn.connect_clicked(move |_| toggle_for_button());
             toggle
         };
+
+        if chat {
+            // Keep status, output, fold previews and images inside one result
+            // bubble. Their existing widgets remain the action/find targets.
+            content.remove(&cmd_row);
+            let result = gtk::Box::new(Orientation::Vertical, 0);
+            result.add_css_class("chat-result-card");
+            result.set_hexpand(true);
+            result.set_overflow(gtk::Overflow::Hidden);
+            while let Some(child) = content.first_child() {
+                content.remove(&child);
+                result.append(&child);
+            }
+            content.append(&cmd_row);
+            content.append(&result);
+        }
 
         FinishedBlock {
             id,
@@ -5829,7 +5883,11 @@ impl FinishedBlock {
             bounded_command_rows
         };
         let rows_for_height = visible_rows
-            .saturating_add(3)
+            .saturating_add(if self.widget.has_css_class("chat-turn") {
+                2
+            } else {
+                3
+            })
             .saturating_add(command_height_rows.saturating_sub(1));
         Some(
             finished_card_refit_height(rows_for_height, cell_height, self.compact.get())

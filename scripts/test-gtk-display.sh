@@ -53,6 +53,8 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::chat_layout_tests::chat_bubbles_keep_alignment_through_resize_and_font_changes
+    sidebar::layout_tests::sidebar_resize_and_vertical_scroll_keep_the_leading_edge_visible
     block_view::chat::tests::chat_completion_never_expands_between_shell_markers
     block_view::scroll::canvas_native_tests::capped_output_hands_remaining_pixels_to_retained_canvas
     block_view::scroll::canvas_native_tests::retained_canvas_scrolls_through_frames_and_yields_to_reading

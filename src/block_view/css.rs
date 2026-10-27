@@ -959,13 +959,25 @@ fn block_css(config: &Config) -> String {
             margin: 0 0 10px 36px;
             padding: 10px 16px;
             border-radius: 18px 18px 5px 18px;
-            background-color: rgba({acc_r},{acc_g},{acc_b},0.75);
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.24);
         }}
         .chat-command-terminal {{ background-color: transparent; }}
+        .chat-mode .chat-output-terminal {{ background-color: transparent; }}
         .chat-result-card {{
-            padding: 8px 1px 12px 0;
-            border-radius: 0;
-            background-color: transparent;
+            padding: 8px 12px 12px;
+            border-radius: 18px 18px 18px 5px;
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.045);
+            outline: 1px solid rgba({fg_r},{fg_g},{fg_b},0.08);
+            outline-offset: -1px;
+        }}
+        .chat-turn .chat-context {{ margin: 0; }}
+        .chat-context .chat-meta-chip {{
+            color: {dim_fg};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.08);
+            border: none;
+            border-radius: 999px;
+            font-size: 0.78em;
+            padding: 1px 8px;
         }}
         .chat-composer {{
             margin: 4px 8px;
@@ -1592,17 +1604,17 @@ mod tests {
     }
 
     #[test]
-    fn chat_command_stays_distinct_while_output_joins_the_canvas() {
+    fn chat_command_and_output_have_distinct_rounded_surfaces() {
         let css = block_css(&Config::safe_defaults());
         let command = rule_body(&css, ".chat-command-capsule");
         let result = rule_body(&css, ".chat-result-card");
         assert!(command.contains("border-radius: 18px 18px 5px 18px;"));
-        assert!(result.contains("border-radius: 0;"));
-        assert!(result.contains("background-color: transparent;"));
+        assert!(result.contains("border-radius: 18px 18px 18px 5px;"));
+        assert!(result.contains("background-color: rgba("));
         assert!(rule_body(&css, ".chat-composer").contains("border-radius: 18px;"));
         assert!(command.contains("padding: 10px 16px;"));
         assert!(command.contains("margin: 0 0 10px 36px;"));
-        assert!(result.contains("padding: 8px 1px 12px 0;"));
+        assert!(result.contains("padding: 8px 12px 12px;"));
     }
 
     #[test]

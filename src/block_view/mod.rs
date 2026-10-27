@@ -34,6 +34,9 @@ mod ansi;
 mod blocks;
 mod bookmarks;
 mod chat;
+#[cfg(test)]
+mod chat_layout_tests;
+mod command_row;
 mod cross_selection;
 mod css;
 pub(crate) mod export;

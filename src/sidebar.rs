@@ -7,6 +7,17 @@ use relm4::gtk;
 use relm4::gtk::prelude::*;
 use relm4::prelude::*;
 
+/// A paned start child is otherwise positioned at a negative x when dragged
+/// below its minimum. Hidden Files controls must not set the Tabs minimum.
+pub(crate) fn configure_layout(stack: &gtk::Stack, split: &gtk::Paned) {
+    stack.set_hhomogeneous(false);
+    split.set_shrink_start_child(false);
+}
+
+#[cfg(test)]
+#[path = "sidebar_layout_tests.rs"]
+mod layout_tests;
+
 const PARENT_DIRECTORY_LABEL: &str = "Go to parent directory";
 const HOME_DIRECTORY_LABEL: &str = "Go to filesystem home directory";
 const BACK_DIRECTORY_LABEL: &str = "Go back in file-tree history";
