@@ -89,3 +89,10 @@ The registered retained-canvas native regression now tests output arrival after
 that fractional gesture without a second, larger wheel movement, and uses a
 fractional scrollbar interruption. Pure intent regressions cover the policy but
 do not substitute for running that mapped GTK test.
+
+### Wheel arrival and reading ownership
+
+A discrete wheel destination at the bottom does not release reading ownership
+until the displayed position arrives there. Output arriving during that motion
+cannot replace the user’s destination with a newer live edge. Precision input
+and reduced-motion input still arrive directly and release ownership at the edge.

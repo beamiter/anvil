@@ -230,9 +230,13 @@ impl ScrollDebouncer {
         self.drive.set(CanvasDrive::Wheel);
         self.coast_velocity.set(0.0);
         self.precision_forwarded.set(surface);
-        // Claim reading intent before an output batch can ask to follow again.
-        self.user_scrolled_up
-            .set(reader_position_changed(target, bottom_value(&adjustment)));
+        // Keep ownership until the presented position reaches the live edge,
+        // not merely until a wheel destination points there. Otherwise an
+        // output batch can replace an in-flight wheel target with a newer edge.
+        let bottom = bottom_value(&adjustment);
+        self.user_scrolled_up.set(
+            reader_position_changed(position, bottom) || reader_position_changed(target, bottom),
+        );
         if surface || !animations_enabled(scroll) {
             adjustment.set_value(position);
             self.record_wheel_intent(scroll);
@@ -646,6 +650,21 @@ mod canvas_native_tests {
         spin_for(150);
         assert!((adjustment.value() - manual).abs() < 0.0001);
         assert!(controller.tick.borrow().is_none());
+
+        // A wheel destination at the current edge is not arrival. New output
+        // while the wheel is still travelling must not seize its destination.
+        let old_edge = bottom_value(&adjustment);
+        adjustment.set_value(old_edge - 20.0);
+        controller.scroll_wheel(&scroll, 2.0, false);
+        assert_eq!(controller.motion.borrow().target(), old_edge);
+        assert!(controller.user_scrolled_up.get());
+        stream.set_height_request(900);
+        controller.mark_dirty(&scroll);
+        assert_eq!(controller.drive.get(), CanvasDrive::Wheel);
+        spin_for(650);
+        assert!((adjustment.value() - old_edge).abs() < 0.5);
+        assert!(bottom_value(&adjustment) > old_edge + 100.0);
+        assert!(controller.user_scrolled_up.get());
 
         // Read near the old end: a synchronous layout clamp on prefix
         // retirement must not subtract that height a second time.
