@@ -138,6 +138,12 @@ impl RunningCommand {
         // Only a real running command can be the target of Stop.
         self.displayed
             .set((state == BlockState::CollectingOutput).then(|| self.generation.get()));
+        // The compact footer may ellipsize in narrow panes. Keep its complete
+        // plain-text hint discoverable without adding another row or changing
+        // terminal allocation.
+        if hint.width_chars() != 1 {
+            hint.set_width_chars(1);
+        }
         if self.presentation_surface(state) == ChatSurface::Running {
             let seconds = self
                 .started
@@ -151,6 +157,9 @@ impl RunningCommand {
         } else {
             self.displayed.set(None);
             hint.set_text("Shell · Tab completes · ↑ history");
+        }
+        if hint.tooltip_text().as_deref() != Some(hint.text().as_str()) {
+            hint.set_tooltip_text(Some(hint.text().as_str()));
         }
     }
 }
@@ -1380,6 +1389,11 @@ mod tests {
         drive(&view, PROMPT, BlockState::AwaitingCommand);
         assert!(owns_focus(&other), "background prompt cannot steal focus");
         assert!(send.is_visible() && !stop.is_visible());
+        let hint = widget_with_class(&view.root, "chat-input-hint")
+            .downcast::<gtk::Label>()
+            .unwrap();
+        assert_eq!(hint.tooltip_text().as_deref(), Some(hint.text().as_str()));
+        assert_eq!(hint.width_chars(), 1);
         assert_ne!(
             view.active.borrow().live_clip().parent().as_ref(),
             Some(holder.upcast_ref())
@@ -1424,6 +1438,8 @@ mod tests {
         drive(&view, START, BlockState::CollectingOutput);
         assert!(owns_focus(&other), "background command cannot steal focus");
         assert!(!send.is_visible() && stop.is_visible());
+        assert_eq!(hint.tooltip_text().as_deref(), Some(hint.text().as_str()));
+        assert!(hint.text().starts_with("Running ·"));
         assert_eq!(
             view.active.borrow().live_clip().parent().as_ref(),
             Some(holder.upcast_ref())

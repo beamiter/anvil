@@ -1491,6 +1491,11 @@ fn block_css(config: &Config) -> String {
         .block-list .block-finished.block-selected.block-selection-active {{
             box-shadow: inset 0 0 0 3px {accent};
         }}
+        /* A focused editor and its actions read as one surface. This wash
+           changes paint only: terminal columns and footer height stay fixed. */
+        .chat-mode .chat-composer:focus-within .chat-controls {{
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.08);
+        }}
         .chat-mode .chat-composer:focus-within {{
             outline: 2px solid rgba({acc_r},{acc_g},{acc_b},0.55);
             outline-offset: -2px;
@@ -1532,6 +1537,24 @@ pub(crate) fn install_block_css(config: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_focus_wash_is_paint_only_and_preserves_the_focus_ring() {
+        let css = block_css(&Config::safe_defaults());
+        let wash = rule_body(
+            &css,
+            ".chat-mode .chat-composer:focus-within .chat-controls",
+        );
+        assert!(wash.contains("background-color: rgba("));
+        for geometry in ["margin", "padding", "border", "min-", "font-"] {
+            assert!(
+                !wash.contains(geometry),
+                "focus must not move the input: {wash}"
+            );
+        }
+        assert!(rule_body(&css, ".chat-mode .chat-composer:focus-within")
+            .contains("outline: 2px solid"));
+    }
 
     #[test]
     fn continuous_surface_preserves_geometry_outcomes_and_selection() {
