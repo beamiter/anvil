@@ -2881,7 +2881,7 @@ mod tests {
             child = widget.next_sibling();
         };
         assert!(row.has_css_class("chat-context"));
-        assert_eq!(row.spacing(), 4);
+        assert_eq!(row.spacing(), 6);
         assert!(!row.is_homogeneous());
         let mut item = row.first_child();
         let mut count = 0;
@@ -2909,7 +2909,7 @@ mod tests {
                     .compute_bounds(&row)
                     .expect("metadata child bounds in its row");
                 if let Some(end) = previous_end {
-                    assert_eq!(bounds.x() - end, 4.0, "fixed metadata gap at {width}px");
+                    assert_eq!(bounds.x() - end, 6.0, "fixed metadata gap at {width}px");
                 }
                 assert!(bounds.x() + bounds.width() <= width as f32);
                 previous_end = Some(bounds.x() + bounds.width());
@@ -3542,9 +3542,9 @@ pub(crate) fn estimated_cell_height_px(config: &Config) -> i32 {
 // header margins and 3px of bottom CSS padding, for an exact 9px reduction.
 const FINISHED_CARD_ROOMY_VCHROME_PX: i32 = 30;
 const FINISHED_CARD_COMPACT_VCHROME_PX: i32 = 21;
-// Capsule 20px padding + 10px gap, result 20px padding. Added exactly once
-// in both initial estimates and viewport refits; density keeps its old delta.
-const CHAT_CARD_EXTRA_VCHROME_PX: i32 = 50;
+// Capsule/result spacing plus the native 16px Shell role line. Added once
+// in initial estimates and viewport refits; density retains its old delta.
+const CHAT_CARD_EXTRA_VCHROME_PX: i32 = 66;
 
 const fn finished_card_vchrome_px(compact: bool) -> i32 {
     if compact {
@@ -3556,7 +3556,8 @@ const fn finished_card_vchrome_px(compact: bool) -> i32 {
 
 pub(crate) fn estimated_finished_block_height(config: &Config, output_rows: i64) -> i32 {
     let cell = estimated_cell_height_px(config);
-    // Chat combines context and status in one header; Block wraps separately.
+    // Chat combines context/status; its separate 16px role is pixel chrome.
+    // Block keeps separate command/context logical rows.
     let rows = output_rows.clamp(1, i32::MAX as i64) as i32;
     let header_and_command = if config.terminal_mode == crate::config::TerminalMode::Chat {
         2
@@ -4301,7 +4302,7 @@ impl FinishedBlock {
         }));
         apply_header_density(&header_row, config.block_compact);
         if chat {
-            header_row.set_spacing(4);
+            header_row.set_spacing(6);
         }
 
         // Warp-style accent prompt chevron. Leads the header rather than the
@@ -4352,7 +4353,7 @@ impl FinishedBlock {
         // Chat reads as a compact message: surplus width belongs after the
         // metadata, never between its chips. Block retains wrapping context.
         let metadata: gtk::Widget = if chat {
-            let row = gtk::Box::new(Orientation::Horizontal, 4);
+            let row = gtk::Box::new(Orientation::Horizontal, 6);
             row.add_css_class("chat-context");
             row.upcast()
         } else {
@@ -4873,7 +4874,7 @@ impl FinishedBlock {
         let cmd_row = super::command_row::CommandRow::new();
         cmd_row.append(&command_vte);
         if chat {
-            super::command_row::fit(&cmd_row, &command_vte, command_cols);
+            super::command_row::fit(&cmd_row, &command_vte, command_cols, cmd);
             cmd_row.add_css_class("chat-command-capsule");
             cmd_row.set_halign(gtk::Align::End);
             cmd_row.set_hexpand(false);
@@ -5492,6 +5493,13 @@ impl FinishedBlock {
                 content.remove(&child);
                 result.append(&child);
             }
+            // A real shell role is its own message header, not another
+            // nonshrinking item in the compact metadata/action row.
+            result.prepend(&crate::workspace_conversation::role_header(
+                jterm_core::reference_conversation::Role::Shell,
+                "Shell",
+                None,
+            ));
             content.append(&cmd_row);
             content.append(&result);
         }
@@ -5893,7 +5901,7 @@ impl FinishedBlock {
             finished_card_refit_height(rows_for_height, cell_height, self.compact.get())
                 .saturating_add(if self.widget.has_css_class("chat-turn") {
                     if self.is_background {
-                        20
+                        36
                     } else {
                         CHAT_CARD_EXTRA_VCHROME_PX
                     }

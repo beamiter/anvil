@@ -3449,8 +3449,51 @@ pub(crate) struct LiveOrganismSurfaceMetrics {
     pub(crate) cell_height: i32,
     pub(crate) right_gutter: i32,
     pub(crate) alt_screen: bool,
-    /// On-screen grid row of the cursor, i.e. the live output growth edge.
+    /// Last occupied target row: native cursor or measured Chat document edge.
     pub(crate) cursor_row: i32,
+}
+
+/// Read actual retained children/placeholders and native overlay controls.
+/// Non-measuring observers do not represent painted document occupancy.
+fn chat_canvas_occupied_bottom(list: &gtk::Box, scroll: &ScrolledWindow) -> f32 {
+    let mut bottom = 0.0f32;
+    let mut child = list.first_child();
+    while let Some(widget) = child {
+        if widget.is_visible() {
+            bottom = match widget.compute_bounds(scroll) {
+                Some(bounds) => bottom.max(bounds.y() + bounds.height()),
+                None => scroll.height() as f32,
+            };
+        }
+        child = widget.next_sibling();
+    }
+    if let Some(overlay) = scroll.parent() {
+        let mut child = overlay.first_child();
+        while let Some(widget) = child {
+            if widget.is_visible()
+                && widget.is_mapped()
+                && [
+                    "jump-bottom-fab",
+                    "running-pill",
+                    "sticky-running-header",
+                    "feed-hold-badge",
+                ]
+                .iter()
+                .any(|class| widget.has_css_class(class))
+            {
+                bottom = match widget.compute_bounds(scroll) {
+                    Some(bounds) => bottom.max(bounds.y() + bounds.height()),
+                    None => scroll.height() as f32,
+                };
+            }
+            child = widget.next_sibling();
+        }
+    }
+    let horizontal = scroll.hscrollbar();
+    if horizontal.is_visible() && horizontal.is_mapped() {
+        bottom = scroll.height() as f32;
+    }
+    bottom
 }
 
 /// Accepted direct-human input, intentionally containing no typed bytes.
@@ -4410,6 +4453,8 @@ pub struct TermView {
     menu_keybindings: shortcut_hints::MenuKeybindings,
     root: gtk::Box,
     block_scroll: ScrolledWindow,
+    /// Non-measuring safe seat for the same companion on a Chat document.
+    chat_organism_surface: Option<gtk::Fixed>,
     block_list: gtk::Box,
     /// Pane-local, one-shot guidance for an empty Block document. It is a
     /// non-measuring overlay and never participates in card/notice ownership.
@@ -4476,6 +4521,7 @@ pub struct TermView {
     cwd_callbacks: CwdCallbacks,
     remote_session_callbacks: StrCallbacks,
     exited_callbacks: IntCallbacks,
+    workspace_action_callbacks: Rc<RefCell<Vec<Box<dyn Fn(crate::keybindings::Action)>>>>,
     bell_callbacks: VoidCallbacks,
     title_callbacks: StrCallbacks,
     activity_callbacks: VoidCallbacks,
@@ -5714,6 +5760,7 @@ fn replace_runtime_config(current: &RefCell<Config>, next: &Config) -> bool {
     let pane_mode = current.borrow().terminal_mode;
     *current.borrow_mut() = next.clone();
     current.borrow_mut().terminal_mode = pane_mode;
+    crate::workspace_shell::apply_canvas_palette(&mut current.borrow_mut());
     density_changed
 }
 
@@ -11882,6 +11929,7 @@ impl TermView {
         // preference change. A managed remote Block pane must stay Block.
         let mut pane_config = config.clone();
         pane_config.terminal_mode = *mode;
+        crate::workspace_shell::apply_canvas_palette(&mut pane_config);
         let config = &pane_config;
         let chat_mode = *mode == crate::config::TerminalMode::Chat;
 
@@ -11949,6 +11997,11 @@ impl TermView {
         }
 
         block_list.append(active.borrow().widget());
+        if chat_mode && jterm_core::reference_conversation::fixture_enabled() {
+            block_list.add_css_class("reference-conversation-document");
+            let fixture = jterm_core::reference_conversation::acceptance_fixture();
+            block_list.prepend(&crate::workspace_conversation::render(&fixture));
+        }
 
         // The live VTE is visually compact at a prompt and expands to the full
         // viewport while a command or terminal app owns the surface. Its PTY
@@ -12085,6 +12138,86 @@ impl TermView {
         scroll_overlay.add_overlay(&sticky_bar);
         scroll_overlay.add_overlay(&jump_fab);
         scroll_overlay.add_overlay(&running_pill);
+        let chat_organism_surface = chat_mode.then(|| {
+            let surface = gtk::Fixed::new();
+            surface.set_can_target(false);
+            surface.set_focusable(false);
+            surface.set_visible(false);
+            scroll_overlay.add_overlay(&surface);
+            scroll_overlay.set_measure_overlay(&surface, false);
+            scroll_overlay.set_clip_overlay(&surface, true);
+            // Hide before a changed document/viewport can paint beneath an
+            // old standing position. The existing owner clock remeasures.
+            for adjustment in [block_scroll.vadjustment(), block_scroll.hadjustment()] {
+                let weak = surface.downgrade();
+                adjustment.connect_value_changed(move |_| {
+                    if let Some(surface) = weak.upgrade() {
+                        surface.set_visible(false);
+                    }
+                });
+                let weak = surface.downgrade();
+                adjustment.connect_upper_notify(move |_| {
+                    if let Some(surface) = weak.upgrade() {
+                        surface.set_visible(false);
+                    }
+                });
+                let weak = surface.downgrade();
+                adjustment.connect_page_size_notify(move |_| {
+                    if let Some(surface) = weak.upgrade() {
+                        surface.set_visible(false);
+                    }
+                });
+            }
+            let connection: Rc<
+                RefCell<Option<(glib::WeakRef<gtk::gdk::FrameClock>, glib::SignalHandlerId)>>,
+            > = Rc::new(RefCell::new(None));
+            let connected = connection.clone();
+            let weak_surface = surface.downgrade();
+            let weak_scroll = block_scroll.downgrade();
+            let weak_list = block_list.downgrade();
+            root.connect_map(move |root| {
+                let Some(clock) = root.frame_clock() else {
+                    return;
+                };
+                if connected.borrow().is_some() {
+                    return;
+                }
+                let surface = weak_surface.clone();
+                let scroll = weak_scroll.clone();
+                let list = weak_list.clone();
+                let id = clock.connect_local("layout", true, move |_| {
+                    let (Some(surface), Some(scroll), Some(list)) =
+                        (surface.upgrade(), scroll.upgrade(), list.upgrade())
+                    else {
+                        return None;
+                    };
+                    if surface.is_visible() {
+                        if let Some(body) = surface.first_child() {
+                            let safe = body.compute_bounds(&scroll).is_some_and(|bounds| {
+                                bounds.x() >= 0.0
+                                    && bounds.y() >= chat_canvas_occupied_bottom(&list, &scroll)
+                                    && bounds.x() + bounds.width()
+                                        <= (scroll.width() - LIVE_ORGANISM_RIGHT_GUTTER) as f32
+                                    && bounds.y() + bounds.height() <= scroll.height() as f32
+                            });
+                            if !safe {
+                                surface.set_visible(false);
+                            }
+                        }
+                    }
+                    None
+                });
+                *connected.borrow_mut() = Some((clock.downgrade(), id));
+            });
+            root.connect_unmap(move |_| {
+                if let Some((clock, id)) = connection.borrow_mut().take() {
+                    if let Some(clock) = clock.upgrade() {
+                        clock.disconnect(id);
+                    }
+                }
+            });
+            surface
+        });
         let block_onboarding = BlockOnboarding::attach(
             &scroll_overlay,
             matches!(mode, crate::config::TerminalMode::Block),
@@ -12128,30 +12261,34 @@ impl TermView {
         chat_canvas.set_vexpand(true);
         let chat_dock = gtk::Box::new(Orientation::Vertical, 0);
         chat_dock.set_hexpand(true);
-        let chat_controls = gtk::Box::new(Orientation::Horizontal, 6);
-        chat_controls.add_css_class("chat-controls");
-        chat_controls.set_height_request(chat::CONTROLS_HEIGHT);
-        chat_controls.set_visible(false);
-        let chat_shell_icon = gtk::Image::from_icon_name("utilities-terminal-symbolic");
-        chat_shell_icon.add_css_class("chat-shell-icon");
-        chat_shell_icon.set_pixel_size(14);
-        chat_controls.append(&chat_shell_icon);
-        let chat_hint = gtk::Label::new(Some("Shell · Tab completes · ↑ history"));
-        chat_hint.add_css_class("chat-input-hint");
-        chat_hint.set_hexpand(true);
-        chat_hint.set_xalign(0.0);
-        chat_hint.set_ellipsize(gtk::pango::EllipsizeMode::End);
         let chat_send = icon_button("go-up-symbolic", "Send Enter to the live shell");
-        chat_send.add_css_class("chat-send");
         chat_send.set_focusable(false);
-        chat_controls.append(&chat_hint);
-        chat_controls.append(&chat_send);
         let chat_stop = icon_button("process-stop-symbolic", "Interrupt this command (Ctrl+C)");
         chat_stop.add_css_class("chat-stop");
         chat_stop.add_css_class("destructive-action");
         chat_stop.set_focusable(false);
         chat_stop.set_visible(false);
-        chat_controls.append(&chat_stop);
+        let workspace_action_callbacks: Rc<RefCell<Vec<Box<dyn Fn(crate::keybindings::Action)>>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let focus_terminal = active_vte.downgrade();
+        let (chat_controls, chat_hint) = crate::workspace_shell::composer_tools(
+            &chat_send,
+            Some(&chat_stop),
+            Rc::new(move || {
+                if let Some(terminal) = focus_terminal.upgrade() {
+                    terminal.grab_focus();
+                }
+            }),
+            {
+                let callbacks = workspace_action_callbacks.clone();
+                Rc::new(move |action| {
+                    for callback in callbacks.borrow().iter() {
+                        callback(action);
+                    }
+                })
+            },
+        );
+        chat_controls.set_visible(false);
         let chat_running = Rc::new(chat::RunningCommand::default());
         let chat_prompt_scroll = gtk::ScrolledWindow::new();
         chat_prompt_scroll.add_css_class("chat-composer-viewport");
@@ -12160,7 +12297,28 @@ impl TermView {
         chat_prompt_scroll.set_min_content_height(0);
         chat_prompt_scroll.set_vexpand(false);
         chat_prompt_scroll.set_child(Some(&chat_dock));
+        let chat_running_status = gtk::Label::new(None);
+        chat_running_status.add_css_class("chat-running-status");
+        chat_running_status.set_xalign(0.0);
+        chat_running_status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        chat_running_status.set_visible(false);
+        chat_running_status.set_height_request(17);
+        chat_running_status
+            .set_tooltip_text(Some("The running command retains the terminal input"));
+        chat_dock.append(&chat_running_status);
         chat_dock.append(&chat_controls);
+        let weak_status = chat_running_status.downgrade();
+        chat_stop.connect_visible_notify(move |stop| {
+            if let Some(status) = weak_status.upgrade() {
+                status.set_visible(stop.is_visible());
+            }
+        });
+        let weak_status = chat_running_status.downgrade();
+        chat_hint.connect_label_notify(move |hint| {
+            if let Some(status) = weak_status.upgrade() {
+                status.set_label(hint.text().as_str());
+            }
+        });
         let chat_frame = gtk::Overlay::new();
         let chat_resize_observer = if chat_mode {
             root.add_css_class("chat-mode");
@@ -12278,6 +12436,10 @@ impl TermView {
         // marks our own adjustment writes so the value_changed detector doesn't
         // mistake them for a user drag.
         let user_scrolled_up: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        if chat_mode && jterm_core::reference_conversation::fixture_enabled() {
+            // Initial sample data is a document, not a new PTY output burst.
+            user_scrolled_up.set(true);
+        }
         let programmatic_scroll: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         // The one coalesced, frame-spaced follow-bottom controller. Shared by
         // the PTY reader and the stranded-focus key recovery below so their
@@ -12533,6 +12695,16 @@ impl TermView {
                         viewport_rows,
                         vte.row_count(),
                     );
+                    // Chat's composer can be a single native input row. The
+                    // legacy Block floor of six rows must not expand it at
+                    // CommandStart before any new output exists. Retain every
+                    // proven row and preserve full-screen/scrollback fallback.
+                    let visible_rows =
+                        if chat_mode && prompt_at_grid_top && !live_force_full_for_layout.get() {
+                            next_high_water.clamp(1, viewport_rows.max(1))
+                        } else {
+                            visible_rows
+                        };
                     live_rows_high_water.set(next_high_water);
                     holder.set_height_request(
                         (visible_rows as i32) * cell_h + blocks::terminal_vertical_insets(&vte),
@@ -14497,6 +14669,7 @@ impl TermView {
         let term_view = TermView {
             root,
             block_scroll,
+            chat_organism_surface,
             block_list,
             block_onboarding,
             unified_navigation,
@@ -14524,6 +14697,7 @@ impl TermView {
             cwd_callbacks,
             remote_session_callbacks,
             exited_callbacks,
+            workspace_action_callbacks,
             bell_callbacks,
             title_callbacks,
             activity_callbacks,
@@ -14804,7 +14978,10 @@ impl TermView {
         if !x.is_finite() || !y.is_finite() {
             return false;
         }
-        let surface = self.active.borrow().live_organism_surface.clone();
+        let surface = self
+            .chat_organism_surface
+            .clone()
+            .unwrap_or_else(|| self.active.borrow().live_organism_surface.clone());
         let surface_widget: gtk::Widget = surface.clone().upcast();
         match body.parent() {
             None => surface.put(body, x, y),
@@ -14818,7 +14995,10 @@ impl TermView {
         if !x.is_finite() || !y.is_finite() {
             return false;
         }
-        let surface = self.active.borrow().live_organism_surface.clone();
+        let surface = self
+            .chat_organism_surface
+            .clone()
+            .unwrap_or_else(|| self.active.borrow().live_organism_surface.clone());
         let surface_widget: gtk::Widget = surface.clone().upcast();
         if body.parent().as_ref() != Some(&surface_widget) {
             return false;
@@ -14828,10 +15008,32 @@ impl TermView {
     }
 
     pub(crate) fn set_live_organism_visible(&self, visible: bool) {
-        self.active.borrow().set_live_organism_visible(visible);
+        if let Some(surface) = &self.chat_organism_surface {
+            surface.set_visible(visible);
+        } else {
+            self.active.borrow().set_live_organism_visible(visible);
+        }
     }
 
     pub(crate) fn live_organism_surface_metrics(&self) -> LiveOrganismSurfaceMetrics {
+        if self.chat_organism_surface.is_some() {
+            let scroll = &self.block_scroll;
+            let cell_width = (self.active_vte.char_width() as i32).max(1);
+            let cell_height = (self.active_vte.char_height() as i32).max(1);
+            let occupied_bottom = chat_canvas_occupied_bottom(&self.block_list, scroll);
+            log::debug!(target: "anvil::organism_canvas", "canvas={}x{} occupied_bottom={} mapped={} fullscreen={}",scroll.width(),scroll.height(),occupied_bottom,scroll.is_mapped(),self.fullscreen.get());
+            return LiveOrganismSurfaceMetrics {
+                width: scroll.width().max(0),
+                height: scroll.height().max(0),
+                cell_width,
+                cell_height,
+                right_gutter: LIVE_ORGANISM_RIGHT_GUTTER,
+                alt_screen: self.fullscreen.get() || !scroll.is_mapped(),
+                // This target is the actual message canvas: occupied rows end
+                // at native children/placeholders, not at the input VTE cursor.
+                cursor_row: (occupied_bottom.max(0.0) / cell_height as f32).ceil() as i32 - 1,
+            };
+        }
         let active = self.active.borrow();
         let visible_height = active
             .live_visible_height_px()
@@ -15582,6 +15784,15 @@ impl TermView {
 
     pub fn connect_exited<F: Fn(i32) + 'static>(&self, f: F) {
         self.exited_callbacks.borrow_mut().push(Box::new(f));
+    }
+
+    pub(crate) fn connect_workspace_action<F: Fn(crate::keybindings::Action) + 'static>(
+        &self,
+        f: F,
+    ) {
+        self.workspace_action_callbacks
+            .borrow_mut()
+            .push(Box::new(f));
     }
 
     pub fn connect_bell<F: Fn() + 'static>(&self, f: F) {
@@ -17067,6 +17278,13 @@ pub(crate) fn organism_settings_test_view_for_mode(
 #[cfg(test)]
 pub(crate) fn organism_settings_test_recorder(view: &TermView) -> Rc<OwnedPty> {
     view.pty.clone()
+}
+
+#[cfg(test)]
+pub(crate) fn organism_settings_test_read_at(view: &TermView, value: f64) {
+    let current = view.block_scroll.vadjustment().value();
+    view.scroll_debouncer
+        .scroll_wheel(&view.block_scroll, value - current, true);
 }
 
 // The nonexecuting display fixture has no shell to emit PromptEnd. Seed its

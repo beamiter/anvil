@@ -75,7 +75,9 @@ mod vte_pty;
 mod workflow_ops;
 mod workflows;
 mod workspace;
+mod workspace_conversation;
 mod workspace_ops;
+mod workspace_shell;
 
 use adw::prelude::*;
 use gtk::gio::{self, Cancellable};
@@ -433,6 +435,7 @@ struct AppModel {
     sidebar_box: gtk::Box,
     content_paned: gtk::Paned,
     ai_paned: gtk::Paned,
+    shell: workspace_shell::Chrome,
     /// Family-wide bottom status bar (`jterm_core::bottom_bar`): the container
     /// plus its left/right segment holders.
     bottom_bar: gtk::Box,
@@ -520,6 +523,15 @@ fn create_pane(
     env_extra: Vec<(String, String)>,
     sender: &ComponentSender<AppModel>,
 ) -> Pane {
+    // Public Block uses the existing continuous native VTE backend. Keep the
+    // legacy Block renderer available internally for persisted/test contracts;
+    // this adapter is the single workspace presentation boundary for new,
+    // restored, split and managed-remote panes.
+    let mode = if mode == TerminalMode::Block && !cwd_external {
+        TerminalMode::Unified
+    } else {
+        mode
+    };
     // A restored or remote pane arrives with the identity it must keep, so jsh
     // reopens the same session. Every other pane mints one here rather than
     // launching without: `--session` is what makes jsh announce `session_id=`
@@ -575,6 +587,7 @@ fn create_pane(
         },
         VteOutput::SearchStatus(status) => AppMsg::SearchStatus(pane_id, status),
         VteOutput::FindRequested => AppMsg::FindInPane(pane_id),
+        VteOutput::CommandPaletteRequested => AppMsg::Action(Action::ToggleCommandPalette),
         VteOutput::BlockFinished {
             command,
             exit_code,
@@ -764,10 +777,11 @@ impl SimpleComponent for AppModel {
         adw::ApplicationWindow {
             add_css_class: "anvil-font-sync",
             set_title: Some("anvil"),
-            set_default_width: 800,
-            set_default_height: 600,
+            set_default_width: 1356,
+            set_default_height: 704,
             set_modal: false,
             set_resizable: true,
+            set_decorated: false,
 
             #[local_ref]
             toast_overlay -> adw::ToastOverlay {
@@ -785,7 +799,7 @@ impl SimpleComponent for AppModel {
                     search_bar -> gtk::SearchBar {},
 
                     #[local_ref]
-                    content_paned -> gtk::Paned {
+                    workspace_body -> gtk::Overlay {
                         set_vexpand: true,
                     },
 
@@ -837,6 +851,17 @@ impl SimpleComponent for AppModel {
                 };
             }
         }
+        // The reference workspace has one stable navigation shell. Legacy
+        // presentation values remain readable, but only Block and Chat are
+        // offered by the new GUI. Running pane identity is never recreated.
+        if !init.safe_mode && config.terminal_mode != TerminalMode::Chat {
+            config.terminal_mode = TerminalMode::Block;
+        }
+        config.tab_placement = config::TabPlacement::Sidebar;
+        config.sidebar_visible = true;
+        config.sidebar_width = jterm_core::reference_shell::NAVIGATION_WIDTH as u32;
+        config.ai_panel_width = jterm_core::reference_shell::INSPECTOR_WIDTH as u32;
+        config.bottom_bar = false;
         let shell_argv = if init.safe_mode {
             Rc::new(vec!["sh".to_string()])
         } else {
@@ -868,6 +893,7 @@ impl SimpleComponent for AppModel {
         root.set_opacity(window_opacity);
 
         startup_ui::install_static_css();
+        workspace_shell::install_css();
         let dyn_css = startup_ui::install_dynamic_css_provider();
 
         let stack = gtk::Stack::new();
@@ -953,6 +979,7 @@ impl SimpleComponent for AppModel {
             });
 
         let toggle_row = sidebar_toggle.widget();
+        toggle_row.set_visible(false);
 
         // "tabs" page: filter entry, the tab strip's sidebar holder, and the
         // mirror list. Exactly one of the two holders is visible at a time —
@@ -978,7 +1005,13 @@ impl SimpleComponent for AppModel {
         let sidebar_stack = gtk::Stack::new();
         sidebar_stack.add_named(&tabs_page, Some("tabs"));
         sidebar_stack.add_named(&files_page, Some("files"));
+        if jterm_core::reference_conversation::fixture_enabled() {
+            sidebar_stack.add_named(&workspace_shell::recent_fixture(), Some("reference-recent"));
+        }
         sidebar_stack.set_vexpand(true);
+        if jterm_core::reference_conversation::fixture_enabled() {
+            sidebar_stack.set_vexpand(false);
+        }
 
         let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         sidebar_box.set_width_request(120);
@@ -1070,12 +1103,8 @@ impl SimpleComponent for AppModel {
                     ui_font_scale: font_groups::ui_scale(font_scale, config.borrow().ui_font_scale),
                     opacity: window_opacity,
                     scrollback: config.borrow().terminal_scrollback_lines as f64,
-                    terminal_mode: match config.borrow().terminal_mode {
-                        TerminalMode::Block => 0,
-                        TerminalMode::Vte => 1,
-                        TerminalMode::Unified => 2,
-                        TerminalMode::Chat => 3,
-                    },
+                    terminal_mode: usize::from(config.borrow().terminal_mode == TerminalMode::Chat)
+                        as u32,
                     block_compact: config.borrow().block_compact,
                     command_history: config.borrow().command_history_enabled,
                     ascii_organism_enabled: config.borrow().ascii_organism_enabled,
@@ -1341,6 +1370,39 @@ impl SimpleComponent for AppModel {
                 retry_sender.input(AppMsg::RetryBlockHistory);
             });
         }
+        ai_paned.set_start_child(None::<&gtk::Widget>);
+        ai_paned.set_end_child(None::<&gtk::Widget>);
+        let shell = workspace_shell::Chrome::new(&sender, &stack, &sidebar_box, &side_stack);
+        content_paned.set_start_child(None::<&gtk::Widget>);
+        let navigation_scroll = gtk::ScrolledWindow::new();
+        navigation_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        navigation_scroll.set_propagate_natural_height(false);
+        navigation_scroll.set_child(Some(&sidebar_box));
+        navigation_scroll.set_width_request(jterm_core::reference_shell::NAVIGATION_WIDTH as i32);
+        navigation_scroll.set_vexpand(true);
+        let navigation_column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        navigation_column.set_width_request(jterm_core::reference_shell::NAVIGATION_WIDTH as i32);
+        navigation_column.append(&navigation_scroll);
+        navigation_column.append(&shell.status);
+        content_paned.set_start_child(Some(&navigation_column));
+        ai_paned.set_start_child(Some(&shell.center));
+        ai_paned.set_end_child(Some(&shell.inspector));
+        ai_paned.set_wide_handle(false);
+        content_paned.set_wide_handle(false);
+        let workspace_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        workspace_row.add_css_class("workspace-body");
+        workspace_row.append(&shell.rail);
+        workspace_row.append(&content_paned);
+        let workspace_body = gtk::Overlay::new();
+        workspace_body.set_child(Some(&workspace_row));
+        content_paned.set_hexpand(true);
+        workspace_shell::observe_layout(
+            &workspace_body,
+            navigation_column.upcast_ref(),
+            &shell.inspector,
+            &content_paned,
+            &ai_paned,
+        );
         let mut model = AppModel {
             config,
             organism_hub,
@@ -1424,6 +1486,7 @@ impl SimpleComponent for AppModel {
             sidebar_box: sidebar_box.clone(),
             content_paned: content_paned.clone(),
             ai_paned: ai_paned.clone(),
+            shell,
             bottom_bar: bottom_bar.clone(),
             bottom_bar_left: bottom_bar_left.clone(),
             bottom_bar_right: bottom_bar_right.clone(),
@@ -1505,10 +1568,9 @@ impl SimpleComponent for AppModel {
         // WindowHandle gives the custom Relm4 toolbar native titlebar move,
         // double-click, and context-menu behavior without stealing gestures
         // from its buttons or the draggable tab strip.
-        let top_bar = model.top_bar.widget();
         let top_bar_handle = gtk::WindowHandle::new();
         top_bar_handle.add_css_class("anvil-ui-font");
-        top_bar_handle.set_child(Some(top_bar));
+        top_bar_handle.set_child(Some(&model.shell.top));
         let toast_overlay = &model.toast_overlay;
         let task_feedback = &model.task_feedback;
         let block_history_notice = &model.block_history_notice;
@@ -1908,6 +1970,12 @@ impl SimpleComponent for AppModel {
 
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
         match msg {
+            AppMsg::FocusShell => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.emit(VteInput::GrabFocus);
+                }
+            }
+
             AppMsg::ResumeAgentSession(request) => self.add_agent_session_tab(*request, &sender),
             AppMsg::NewTab => {
                 let startup = self.config.borrow().startup_commands.clone();

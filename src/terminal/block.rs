@@ -731,6 +731,16 @@ fn connect_view_outputs(
     sender: &ComponentSender<BlockTerminal>,
     terminal_done: &Rc<Cell<bool>>,
 ) {
+    view.connect_workspace_action({
+        let sender = sender.clone();
+        move |action| {
+            let _ = sender.output(match action {
+                crate::keybindings::Action::ToggleSearch => VteOutput::FindRequested,
+                crate::keybindings::Action::ToggleCommandPalette => VteOutput::CommandPaletteRequested,
+                _ => return,
+            });
+        }
+    });
     view.connect_cwd_changed({
         let sender = sender.clone();
         move |cwd, external| {
@@ -1053,8 +1063,7 @@ impl Component for BlockTerminal {
                     });
                 } else if view.is_unified() {
                     let _ = sender.output(VteOutput::Notice(
-                        "Unified mode keeps no blocks to clear — use the shell's own clear."
-                            .to_string(),
+                        "Use the shell's clear command in Block mode.".to_string(),
                     ));
                 }
             }
@@ -1079,7 +1088,7 @@ impl Component for BlockTerminal {
                     });
                 } else if view.is_unified() {
                     let _ = sender.output(VteOutput::Notice(
-                        "Unified mode keeps no block cards to delete.".to_string(),
+                        "Block mode has no command cards to delete.".to_string(),
                     ));
                 } else {
                     let _ = sender.output(VteOutput::Notice(

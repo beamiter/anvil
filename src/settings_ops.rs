@@ -165,10 +165,8 @@ impl AppModel {
             return;
         }
         self.config.borrow_mut().terminal_mode = match mode {
-            0 => TerminalMode::Block,
-            2 => TerminalMode::Unified,
-            3 => TerminalMode::Chat,
-            _ => TerminalMode::Vte,
+            1 => TerminalMode::Chat,
+            _ => TerminalMode::Block,
         };
         self.persist_config();
         self.show_toast("Terminal backend will apply to new and restored local panes.");

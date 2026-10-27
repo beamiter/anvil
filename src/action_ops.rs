@@ -424,12 +424,7 @@ impl AppModel {
                         ),
                         opacity: self.window_opacity,
                         scrollback: config.terminal_scrollback_lines as f64,
-                        terminal_mode: match config.terminal_mode {
-                            TerminalMode::Block => 0,
-                            TerminalMode::Vte => 1,
-                            TerminalMode::Unified => 2,
-                            TerminalMode::Chat => 3,
-                        },
+                        terminal_mode: u32::from(config.terminal_mode == TerminalMode::Chat),
                         block_compact: config.block_compact,
                         command_history: config.command_history_enabled,
                         ascii_organism_enabled: config.ascii_organism_enabled,

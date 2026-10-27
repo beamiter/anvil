@@ -29,10 +29,10 @@ font_scale = 1.0
 opacity = 0.95
 scrollback = 5000
 
-# Backend and layout.
-# "block": structured command blocks; "vte": compatibility terminal;
-# "unified": experimental continuous OSC 133 surface without block chrome.
-# "chat": right command capsules, output cards, and a docked live shell.
+# Presentation and layout.
+# "block": continuous native terminal inside the shared workspace shell.
+# "chat": command capsules, output messages, and a docked live shell.
+# Existing older mode values remain readable for configuration compatibility.
 terminal_mode = "block"     # applies to new/restored local panes
 tab_placement = "sidebar"   # "sidebar" or "top"
 sidebar_view = "tabs"       # "tabs" or "files"

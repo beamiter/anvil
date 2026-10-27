@@ -1,7 +1,7 @@
 //! Keep command width independent of VTE's last allocated grid.
 use gtk::{glib, prelude::*, subclass::prelude::*};
 use relm4::gtk;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use vte4::{Terminal, TerminalExt};
 
 mod imp {
@@ -12,6 +12,8 @@ mod imp {
         pub content: gtk::Box,
         pub terminal: glib::WeakRef<Terminal>,
         pub columns: Cell<i64>,
+        pub command: RefCell<String>,
+        pub allocated_width: Cell<i32>,
     }
 
     #[glib::object_subclass]
@@ -43,6 +45,9 @@ mod imp {
     // The inner box still owns native child allocation, focus and hit testing.
     impl WidgetImpl for CommandRow {
         fn request_mode(&self) -> gtk::SizeRequestMode {
+            // VTE is a fixed-grid child. Advertising HFW while it still has
+            // the preceding grid makes GTK reverse-solve a window minimum
+            // from that stale height. Use the last real allocation instead.
             self.content.request_mode()
         }
 
@@ -53,8 +58,32 @@ mod imp {
             let Some(terminal) = self.terminal.upgrade() else {
                 return measured;
             };
-            if orientation != gtk::Orientation::Horizontal || self.columns.get() == 0 {
+            if self.columns.get() == 0 {
                 return measured;
+            }
+            if orientation == gtk::Orientation::Vertical {
+                let cell = terminal.char_width().max(1) as i32;
+                let allocated = self.allocated_width.get();
+                let width = if allocated > 0 { allocated } else { for_size };
+                let other = self
+                    .content
+                    .measure(gtk::Orientation::Horizontal, -1)
+                    .0
+                    .saturating_sub(terminal.measure(gtk::Orientation::Horizontal, -1).0);
+                let columns = if width > 0 {
+                    self.columns
+                        .get()
+                        .min(i64::from(((width - other).max(0) / cell).max(2)))
+                } else {
+                    self.columns.get()
+                };
+                let rows =
+                    super::super::blocks::output_visual_row_count(&self.command.borrow(), columns);
+                let height = super::super::alt_screen::finished_vte_height_px(
+                    rows,
+                    terminal.char_height().max(1) as i32,
+                ) + super::super::blocks::terminal_vertical_insets(&terminal);
+                return (height, height, -1, -1);
             }
             // Preserve the prompt chevron and CSS insets, replacing only the
             // terminal's grid-dependent width with the command's text width.
@@ -76,7 +105,38 @@ mod imp {
         }
 
         fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
+            let width_changed = self.allocated_width.replace(width) != width;
+            if width_changed {
+                if let Some(terminal) = self.terminal.upgrade() {
+                    let cell = terminal.char_width().max(1) as i32;
+                    let other = self
+                        .content
+                        .measure(gtk::Orientation::Horizontal, -1)
+                        .0
+                        .saturating_sub(terminal.measure(gtk::Orientation::Horizontal, -1).0);
+                    let columns = self
+                        .columns
+                        .get()
+                        .min(i64::from(((width - other).max(0) / cell).max(2)));
+                    let rows = super::super::blocks::output_visual_row_count(
+                        &self.command.borrow(),
+                        columns,
+                    );
+                    // This is a read-only snapshot. Reflow its native grid
+                    // before the child box queries the preceding narrow grid.
+                    terminal.set_size(columns, rows.max(1));
+                }
+            }
+            if width_changed {
+                // set_size invalidates GTK's cached measurement. Refresh it
+                // before allocation instead of allocating an unmeasured box.
+                self.content.measure(gtk::Orientation::Horizontal, height);
+                self.content.measure(gtk::Orientation::Vertical, width);
+            }
             self.content.allocate(width, height, baseline, None);
+            if width_changed {
+                self.obj().queue_resize();
+            }
         }
 
         fn snapshot(&self, snapshot: &gtk::Snapshot) {
@@ -105,9 +165,10 @@ impl CommandRow {
     }
 }
 
-pub(super) fn fit(row: &CommandRow, terminal: &Terminal, columns: i64) {
+pub(super) fn fit(row: &CommandRow, terminal: &Terminal, columns: i64, command: &str) {
     row.imp().terminal.set(Some(terminal));
     row.imp().columns.set(columns.max(2));
+    *row.imp().command.borrow_mut() = command.to_owned();
     row.set_halign(gtk::Align::End);
     row.set_hexpand(false);
     row.set_overflow(gtk::Overflow::Hidden);

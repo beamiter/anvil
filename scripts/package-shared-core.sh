@@ -7,7 +7,7 @@ archive="$repo_dir/packaging/jterm-core-src.tar.gz"
 stage=$(mktemp "$repo_dir/packaging/.jterm-core-src.XXXXXX")
 trap 'rm -f "$stage"' EXIT
 tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
-  -C "$core_dir" -cf - Cargo.toml Cargo.lock README.md src runtime scripts tests \
+  -C "$core_dir" -cf - Cargo.toml Cargo.lock README.md src runtime scripts tests assets \
   | gzip -n > "$stage"
 chmod 644 "$stage"
 mv -f "$stage" "$archive"

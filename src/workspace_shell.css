@@ -1,0 +1,245 @@
+.workspace-titlebar { min-height:41px; padding:0 10px 0 5px; background:#0f1726; color:#d7dfed; font-family:"DejaVu Sans",sans-serif; font-size:10px; border-bottom:1px solid #263347; }
+.workspace-titlebar button { min-height:26px; min-width:20px; border-radius:7px; padding:0 6px; color:#c0cbe0; }
+.workspace-titlebar .shell-window-control { min-height:24px; min-width:24px; padding:0; opacity:0.8; background:transparent; }
+.workspace-titlebar .shell-window-control:hover { background:#28364f; }
+.workspace-titlebar image { -gtk-icon-size:12px; }
+.shell-brand { font-size:13px; font-weight:700; margin-left:3px; }
+.shell-brand-icon { color:#8c9bff; margin-left:8px; }
+.shell-brand-badge { color:#7587a4; font-size:7px; margin-left:5px; }
+.shell-top-path { color:#8f9fb8; font-size:10px; margin-right:8px; }
+.shell-search { background:#1c2638; border:1px solid #2d3a50; margin:0; padding:0 9px; min-width:90px; min-height:26px; border-radius:7px; color:#9cabc2; }
+.shell-search label { font-family:"DejaVu Sans",sans-serif; font-size:10px; }
+.shell-search image { -gtk-icon-size:12px; }
+.shell-keycap { font-size:8px; padding:1px 4px; border:1px solid #3a465b; border-radius:3px; color:#8795ad; }
+.shell-modes { background:#141e30; border-radius:7px; }
+.shell-modes button:hover { background:#283d6f; color:#fff; }
+.shell-modes button.shell-current-mode { background:#6477ed; color:white; box-shadow:0 0 7px rgba(106,126,255,0.3); }
+.workspace-rail { background:#0d1522; padding:12px 0 10px; border-right:1px solid #263246; color:#8998b1; }
+.workspace-rail button { min-width:34px; min-height:34px; border-radius:8px; padding:0; margin:0 10px; color:#8795ad; }
+.workspace-rail image { -gtk-icon-size:16px; }
+.shell-selected { background:#283d6f; color:#dce7ff; }
+.shell-profile { background:#35496d; border:1px solid #62769a; color:#dbe7ff; border-radius:50%; min-width:25px; min-height:25px; font-size:10px; }
+.workspace-navigation.tab-strip { background:#162133; color:#b6c3d8; padding:12px 14px 8px; min-width:209px; font-family:"DejaVu Sans",sans-serif; font-size:10px; }
+.workspace-navigation .shell-section { font-size:8px; letter-spacing:1.1px; color:#8290aa; font-weight:600; margin:5px 0 3px; }
+.workspace-navigation .shell-navigation-row { padding:0 8px; min-height:25px; border-radius:6px; color:#b8c7dd; }
+.workspace-navigation .shell-navigation-row image { -gtk-icon-size:13px; color:#8f9db6; }
+.workspace-navigation .shell-workspace-selector { background:#1d2b41; border:1px solid #34415b; border-radius:8px; min-height:31px; }
+.workspace-navigation .shell-selected { background:#283d6f; border-right:2px solid #80a0ff; color:#eff4ff; }
+.workspace-navigation .sidebar-toggle-row { margin:4px 0; }
+.workspace-navigation .sidebar-toggle { font-size:9px; color:#98a9c5; min-height:22px; padding:0 6px; }
+.workspace-navigation .tab-strip-btn { color:#a4b4cc; border:none; padding:4px 6px; border-radius:6px; font-size:10px; }
+.workspace-navigation .tab-strip-btn:checked { color:#e8efff; background:#26395f; outline:none; }
+.workspace-navigation .tab-strip-close { color:#8f9db6; min-width:12px; min-height:12px; }
+.workspace-navigation searchentry { min-height:25px; padding:0 6px; font-size:9px; border:1px solid #2e3d56; background:#111d2e; border-radius:6px; color:#c6d2e6; }
+.shell-spaces { margin-top:5px; }
+.shell-space-icon { min-width:22px; min-height:22px; border-radius:6px; background:#2e3d61; color:#a9b9ff; }
+.shell-spaces .shell-muted { font-size:8px; }
+.shell-navigation-status { color:#8798b4; font-size:8px; margin-top:10px; padding-top:10px; border-top:1px solid #2a384d; }
+.workspace-center { background:linear-gradient(135deg,#fafbff,#e4f0fe); color:#24334d; }
+.workspace-canvas-header { background:rgba(250,251,255,0.85); padding:0 20px; border-bottom:1px solid #d8e1ef; color:#27364f; }
+.workspace-canvas-header button { min-width:24px; min-height:24px; padding:0; color:#6c7b92; border-radius:6px; }
+.workspace-canvas-header image { -gtk-icon-size:12px; }
+.shell-canvas-title { font-size:12px; font-weight:600; }
+.shell-canvas-subtitle { font-size:9px; color:#8290a7; }
+.workspace-center .pane-header { background:transparent; color:#66738a; min-height:0; }
+.workspace-center .term-view-root,.workspace-center .block-list,.workspace-center .chat-canvas,.workspace-center .chat-composer-viewport { background:transparent; }
+.workspace-center .term-view-root:not(.chat-mode) { margin:16px 28px 0; border-radius:12px; border:1px solid #cad5e6; }
+.workspace-center .chat-mode .block-list { padding:16px 28px 8px; }
+.workspace-center .chat-turn { padding:8px 0; margin:0; }
+.workspace-center .chat-result-card { border-radius:0; background:transparent; outline:none; box-shadow:none; padding:8px 12px 16px; }
+.workspace-center .chat-command-capsule { background:#d9e4fa; border-radius:12px; padding:10px 14px; }
+.workspace-center .chat-context .chat-meta-chip { font-size:9px; border-radius:5px; padding:2px 6px; background:#edf1fb; color:#6d7893; }
+.workspace-center .chat-composer { margin:4px 28px 11px; padding:8px 10px 1px; border-radius:14px; background:#fefefe; outline:1px solid #bdcce4; outline-offset:-1px; box-shadow:0 4px 12px rgba(57,80,135,0.08); }
+.workspace-center .chat-controls { background:transparent; min-height:28px; padding:0 2px; border-radius:0 0 12px 12px; }
+.workspace-center .chat-controls button { border-radius:7px; min-height:26px; min-width:24px; padding:0 5px; }
+.workspace-center .chat-send { background:#6678ef; color:white; }
+.workspace-center .chat-input-hint { color:#7e8ba1; font-size:9px; }
+.workspace-center .chat-mode .chat-composer:focus-within { outline:2px solid #8799f4; outline-offset:-2px; }
+.workspace-center .chat-mode .chat-composer:focus-within .chat-controls { background:transparent; }
+.shell-block-composer { margin:12px 28px 11px; padding:10px 12px; background:#fefefe; border:1px solid #bdcce4; border-radius:14px; box-shadow:0 4px 12px rgba(57,80,135,0.08); }
+.shell-block-input-hint { color:#8b98ac; font-size:11px; margin-bottom:4px; }
+.shell-block-composer button { color:#596a87; min-height:26px; padding:0 5px; border-radius:7px; font-size:10px; }
+.shell-block-composer button:disabled { opacity:1; color:#71829a; }
+.shell-block-composer menubutton button { min-height:26px; }
+.workspace-body > paned > scrolledwindow { background:#162133; }
+window.anvil-font-sync,window.anvil-font-sync decoration { padding:0; margin:0; border:0; border-radius:0; box-shadow:none; }
+.workspace-titlebar label,.workspace-navigation label,.workspace-navigation entry,.workspace-navigation text,.workspace-inspector label,.workspace-canvas-header label,.shell-block-composer label,.chat-controls label { font-family:"DejaVu Sans",sans-serif; font-size:10px; font-weight:400; }
+.workspace-titlebar label.shell-brand { font-size:13px; font-weight:700; }
+.workspace-titlebar label.shell-brand-badge { font-size:7px; }
+.workspace-titlebar label.shell-keycap { font-size:8px; }
+.workspace-navigation label.shell-section,.workspace-inspector label.shell-section { font-size:8px; font-weight:600; }
+.workspace-navigation label.shell-recent-heading { margin-top:10px; }
+.workspace-navigation label.shell-navigation-title { font-size:10px; font-weight:400; }
+.workspace-navigation label.shell-muted { font-size:8px; }
+.workspace-navigation label.shell-navigation-status { font-size:8px; }
+.workspace-navigation .sidebar-toggle label,.workspace-navigation searchentry text { font-size:9px; }
+.workspace-canvas-header label.shell-canvas-title { font-size:12px; font-weight:600; }
+.workspace-canvas-header label.shell-canvas-subtitle { font-size:9px; }
+.workspace-inspector label.shell-agent-title { font-size:11px; font-weight:600; }
+.workspace-inspector label.shell-muted { font-size:9px; }
+.workspace-inspector label.shell-neutral-badge { font-size:8px; }
+.workspace-inspector label.shell-inspector-terminal { font-family:"DejaVu Sans Mono",monospace; font-size:9px; }
+.shell-block-composer label.shell-block-input-hint { font-size:11px; }
+.workspace-center .chat-mode .reference-conversation-document { padding:0 39px 12px 28px; }
+.native-conversation label { font-family:"DejaVu Sans",sans-serif; font-size:12px; font-weight:400; color:#35445e; }
+.native-conversation label.conversation-author { font-size:11px; font-weight:700; color:#27364f; }
+.native-conversation label.conversation-timing { font-size:9px; color:#8b97ac; }
+.native-conversation label.conversation-heading { font-size:20px; font-weight:600; color:#24334c; }
+.native-conversation label.conversation-paragraph { font-size:12px; color:#4e5c74; }
+.conversation-avatar { min-width:20px; min-height:20px; border-radius:50%; background:#7282e8; color:white; }
+.native-conversation label.conversation-avatar { font-size:10px; color:white; font-weight:600; }
+.conversation-user-bubble { background:#d9e4fa; border-radius:12px; padding:10px 12px; }
+.native-conversation label.conversation-chip { font-size:9px; border:1px solid #d4deef; background:#edf2fc; border-radius:5px; padding:2px 6px; color:#728099; }
+.conversation-steps { border:1px solid #dce5f3; border-radius:7px; background:#eef3fc; }
+.conversation-step { padding:3px 7px; border-bottom:1px solid #e0e8f5; }
+.native-conversation label.conversation-step-title { font-size:10px; }
+.native-conversation label.conversation-step-time { font-size:9px; color:#8492aa; }
+.native-conversation label.conversation-step-icon { font-size:10px; color:#7b9f91; }
+.conversation-step-running { background:#e1eafb; }
+.conversation-diff { border:1px solid #cedaec; border-radius:10px; background:#f7faff; padding-bottom:6px; }
+.conversation-code-header { padding:3px 8px; border-bottom:1px solid #d6e0ef; background:#eef3fc; min-height:19px; }
+.native-conversation label.conversation-code-path,.native-conversation label.conversation-code-text { font-family:"DejaVu Sans Mono",monospace; font-size:10px; }
+.native-conversation label.conversation-diff-count { font-size:9px; color:#578d70; }
+.conversation-code-header button { min-height:18px; padding:0 5px; border-radius:4px; }
+.conversation-code-header button label { font-size:9px; }
+.conversation-code-header image { -gtk-icon-size:11px; color:#8d9bb3; }
+.conversation-code-line { min-height:13px; padding:0 8px; }
+.native-conversation label.conversation-line-number { font-family:"DejaVu Sans Mono",monospace; font-size:9px; color:#9aa7ba; }
+.conversation-line-added { background:#e4f2ea; }
+.conversation-line-removed { background:#fbeaec; }
+.conversation-inline-terminal { border:1px solid #cad6e8; border-radius:8px; padding:5px 8px; background:#f0f4fb; }
+.conversation-inline-terminal label { font-size:10px; color:#5f6d85; }
+.native-conversation label.conversation-terminal-text { background:#090c17; color:#c1cce0; font-family:"DejaVu Sans Mono",monospace; font-size:10px; padding:8px; border-radius:6px; }
+.workspace-inspector label.conversation-inspector-value { font-size:9px; color:#b7c7df; }
+.workspace-inspector label.conversation-inspector-fixture { font-size:8px; color:#a5b1ef; }
+.conversation-current-step { background:#27374e; border:1px solid #3d4f6a; border-radius:7px; padding:7px; }
+.workspace-inspector .conversation-step-running { background:#2d405e; }
+.workspace-inspector .conversation-step-running label { color:#d8e4f7; }
+.conversation-queue-row { padding:3px 2px; border-radius:4px; }
+.workspace-inspector .conversation-queue-row label { font-size:9px; }
+.workspace-inspector label.conversation-step-icon { color:#8fa3cf; }
+.workspace-inspector label.conversation-step-time { font-size:8px; color:#8297b6; }
+.workspace-navigation .shell-recent-row { min-height:31px; padding:2px 6px; }
+.workspace-navigation .shell-recent-row label.shell-muted { font-size:8px; }
+.workspace-center .chat-composer { min-height:69px; padding-bottom:3px; }
+.shell-block-composer { min-height:58px; }
+.workspace-center .chat-controls button:not(.chat-send):not(.chat-stop),.shell-block-composer button { border:1px solid #dbe3f1; background:#fbfcff; }
+.workspace-center .chat-controls .chat-tool-capsule { padding:0 7px; }
+.conversation-role-header label.conversation-author { font-size:11px; font-weight:600; }
+.conversation-role-header label.conversation-timing { font-size:9px; }
+.workspace-inspector { background:#0f1825; color:#bbc8db; border-left:1px solid #29374c; font-family:"DejaVu Sans",sans-serif; font-size:10px; }
+.shell-inspector-tabs { padding:0 13px; border-bottom:1px solid #29374c; }
+.shell-inspector-tabs button { min-height:25px; padding:0 12px; border-radius:6px; font-size:10px; color:#8e9fb9; }
+.shell-inspector-tabs .shell-selected { background:#263554; color:#cfddfa; }
+.shell-agent-card { margin:0 13px 13px; padding:13px 13px 8px; border:1px solid #344156; border-radius:12px; background:#1c293a; }
+.shell-agent-title { font-size:11px; font-weight:600; }
+.shell-neutral-badge { border:1px solid #46516a; border-radius:4px; padding:2px 5px; font-size:8px; color:#aab9d1; background:#263349; }
+.shell-muted { color:#8c9bb5; font-size:9px; }
+.shell-agent-card .shell-section { color:#8799b4; font-size:8px; letter-spacing:0.8px; margin-top:5px; }
+.shell-agent-card .shell-navigation-row { background:#263449; color:#becce0; border:1px solid #38455d; border-radius:7px; padding:0 7px; }
+.shell-inspector-path { color:#a6b7d0; font-size:10px; }
+.shell-current-step { background:#26364d; border:1px solid #3c4d68; border-radius:7px; color:#adbfdd; padding:10px; font-size:10px; }
+.shell-inspector-terminal { font-family:monospace; font-size:9px; background:#090c17; border:1px solid #2c3a50; border-radius:8px; padding:10px; color:#7c91ae; min-height:100px; }
+.shell-agent-card progressbar trough { min-height:4px; background:#101a29; border-radius:4px; }
+.shell-agent-card progressbar progress { background:#7e8ef8; min-height:4px; border-radius:4px; }
+.workspace-titlebar button:focus-visible,.workspace-rail button:focus-visible,.workspace-navigation button:focus-visible,.workspace-inspector button:focus-visible { outline:2px solid #8fa4ff; outline-offset:-2px; }
+.workspace-body > paned > separator,.workspace-body > paned > paned > separator { min-width:0; min-height:0; padding:0; margin:0; background:transparent; }
+
+.native-conversation label.conversation-date { font-size:9px; color:#9ca8ba; }
+.conversation-chip { border:1px solid #d4deef; background:#edf2fc; border-radius:5px; padding:0 5px; color:#728099; }
+.native-conversation label.conversation-chip-text { font-size:9px; color:#728099; }
+.conversation-chip drawingarea { min-width:12px; min-height:12px; }
+.conversation-chip-progress { background:#e4f1e8; border-color:#c8e0d0; color:#67977b; }
+.native-conversation .conversation-chip-progress label { color:#67977b; }
+.conversation-step { min-height:18px; }
+.conversation-code-line { min-height:15px; }
+.conversation-queue-row { padding:0 2px; }
+.conversation-current-step { padding:5px 7px; }
+.shell-agent-card .shell-section { margin-top:0; }
+
+.shell-space-brand-0 { background:#38416c; color:#b5bafa; }
+.shell-space-brand-1 { background:#52442d; color:#e9bd79; }
+.shell-space-brand-2 { background:#573c40; color:#e7a5ab; }
+.shell-space-brand-3 { background:#294b59; color:#90c4dc; }
+
+.workspace-center .chat-controls button:disabled,.workspace-center .chat-controls button:disabled label,.workspace-center .chat-controls button:disabled drawingarea,.shell-block-composer button:disabled label,.shell-block-composer button:disabled drawingarea { color:#71829a; opacity:1; }
+
+.reference-tools-popover contents { background:#fefefe; color:#596a87; border:1px solid #dbe3f1; border-radius:8px; padding:7px; }
+.reference-tools-popover button:disabled,.reference-tools-popover button:disabled label { color:#71829a; opacity:1; }
+
+.workspace-center .chat-controls .chat-send,.workspace-center .chat-controls .chat-stop { margin:0; }
+
+/* Libadwaita uses a render filter independently of widget opacity. */
+.workspace-center .chat-controls button:disabled *,.shell-block-composer button:disabled *,.reference-tools-popover button:disabled * { opacity:1; color:#71829a; }
+
+.workspace-center .chat-controls button:disabled,.workspace-center .chat-controls button:disabled *,.shell-block-composer button:disabled,.shell-block-composer button:disabled *,.reference-tools-popover button:disabled,.reference-tools-popover button:disabled * { filter:none; opacity:1; color:#71829a; }
+
+.shell-block-composer { min-height:65px; padding:10px 11px 3px; }
+.shell-block-composer .chat-controls { padding:0; }
+.workspace-center .chat-controls .chat-add,.workspace-center .chat-controls .chat-send,.workspace-center .chat-controls .chat-stop { padding:0; min-width:28px; min-height:28px; margin:0; }
+.chat-terminal-capsule { border:1px solid #dbe3f1; background:#fbfcff; padding:0 5px; border-radius:7px; min-height:26px; color:#596a87; }
+.chat-terminal-capsule label { font-size:10px; color:#596a87; }
+.shell-block-composer .chat-tool-capsule { padding:0 7px; }
+
+.workspace-center .chat-composer { min-height:64px; padding:8px 10px; }
+.shell-block-composer { min-height:61px; padding:10px 11px 7px; }
+.workspace-navigation-footer { background:#162133; border-top:1px solid #2a384d; padding:11px 14px 6px; }
+.workspace-navigation-footer label { font-family:"DejaVu Sans",sans-serif; font-size:8px; color:#8798b4; }
+.workspace-center .unified-navigation { min-height:28px; padding:0 8px; }
+.workspace-center .unified-navigation label,.workspace-center .unified-navigation button label { font-family:"DejaVu Sans",sans-serif; font-size:10px; }
+.workspace-center .unified-navigation button { min-height:24px; padding:0 4px; }
+
+.workspace-center .chat-composer { min-height:64px; padding:8px 10px; }
+.shell-block-composer { min-height:61px; padding:10px 11px 7px; }
+.workspace-navigation .shell-recent-row { min-height:28px; padding:2px 6px; }
+.shell-inspector-tabs button { min-width:24px; padding:0; }
+.native-conversation label.conversation-heading { font-weight:700; }
+.conversation-user-bubble { border-radius:10px; }
+.conversation-diff { padding-bottom:0; }
+
+.workspace-navigation-footer { padding-top:16px; }
+
+.conversation-current-step { padding:3px 7px; }
+
+/* The outlined add control includes its two border pixels in 28px. */
+.workspace-center .chat-controls .chat-add { min-width:26px; min-height:26px; }
+
+.workspace-center .chat-controls .chat-send,.workspace-center .chat-controls .chat-stop { border:0; }
+.workspace-center .chat-controls .chat-send:disabled { background:#edf1f8; color:#71829a; }
+
+/* Shared finite native component contract; accepted 80px footer geometry stays. */
+.workspace-titlebar .shell-brand-icon { -gtk-icon-size:24px; }
+.shell-workspace-branch { font-size:9px; color:#8b9db8; }
+.shell-inspector-tabs button { min-height:26px; padding:0; }
+.workspace-center .chat-controls button:not(.chat-add):not(.chat-send):not(.chat-stop) { padding-left:6px; padding-right:6px; }
+.workspace-center .chat-controls button label { font-family:"DejaVu Sans",sans-serif; font-size:10px; }
+.workspace-center .chat-controls .reference-tools-button arrow { -gtk-icon-size:0; min-width:0; min-height:0; opacity:0; }
+.reference-tools-popover contents { background:#162133; color:#e1e9f6; border:1px solid #394960; border-radius:12px; padding:8px; box-shadow:0 6px 20px rgba(4,10,20,0.24); }
+.reference-tools-popover .reference-tool-row { min-height:30px; min-width:0; padding:0 6px; border:0; border-radius:6px; background:transparent; box-shadow:none; color:#e1e9f6; }
+.reference-tools-popover .reference-tool-row:hover,.reference-tools-popover .reference-tool-row:focus { background:#283d6f; }
+.reference-tools-popover .reference-tool-row label { font-family:"DejaVu Sans",sans-serif; font-size:10px; color:#e1e9f6; }
+.reference-tools-popover .reference-tool-row label.reference-tool-description { font-size:9px; color:#91a2bb; }
+.reference-tools-popover .reference-tool-row:disabled,.reference-tools-popover .reference-tool-row:disabled * { color:#91a2bb; opacity:1; filter:none; }
+.reference-tools-popover separator { background:#394960; min-height:1px; }
+.native-conversation label.conversation-code-language { font-size:9px; color:#7b8ba4; }
+.conversation-code-header button.conversation-code-action { min-height:20px; padding:0 6px; border:1px solid #cdd8e8; border-radius:5px; background:#f8fbff; color:#63738b; }
+.conversation-code-header button.conversation-code-action:disabled,.conversation-code-header button.conversation-code-action:disabled * { color:#8292a8; opacity:1; filter:none; }
+
+/* Popovers inherit ancestry in GTK CSS: isolate them from footer button rules. */
+popover.reference-tools-popover { background:transparent; border:0; box-shadow:none; padding:0; }
+.workspace-center .chat-controls .reference-tools-popover .reference-tool-row { min-height:30px; padding:0 6px; border:0; background:transparent; box-shadow:none; color:#e1e9f6; }
+.workspace-center .chat-controls .reference-tools-popover .reference-tool-row:hover,.workspace-center .chat-controls .reference-tools-popover .reference-tool-row:focus { background:#283d6f; }
+.workspace-center .chat-controls .reference-tools-popover .reference-tool-row label,.workspace-center .chat-controls .reference-tools-popover .reference-tool-row drawingarea { color:#e1e9f6; }
+.workspace-center .chat-controls .reference-tools-popover .reference-tool-row label.reference-tool-description,.workspace-center .chat-controls .reference-tools-popover .reference-tool-row:disabled,.workspace-center .chat-controls .reference-tools-popover .reference-tool-row:disabled * { color:#91a2bb; opacity:1; filter:none; }
+
+.reference-organism-speech { background:rgba(22,33,51,0.97); border:1px solid #3f5377; border-radius:10px; padding:7px 8px; color:#dce7f8; }
+.reference-organism-speech label { font-family:"DejaVu Sans",sans-serif; font-size:10px; color:#dce7f8; }
+.reference-organism-speech button { min-width:20px; min-height:20px; padding:0; color:#91a2bb; }
+
+/* The menu has its own surface contract independent of footer ancestry. */
+#reference-tools-menu button.reference-tool-row { min-height:30px; min-width:0; padding:0 6px; border:0; border-radius:6px; background:transparent; box-shadow:none; color:#e1e9f6; }
+#reference-tools-menu button.reference-tool-row:hover,#reference-tools-menu button.reference-tool-row:focus { background:#283d6f; }
+#reference-tools-menu button.reference-tool-row label,#reference-tools-menu button.reference-tool-row drawingarea { color:#e1e9f6; }
+#reference-tools-menu button.reference-tool-row label.reference-tool-description,#reference-tools-menu button.reference-tool-row:disabled,#reference-tools-menu button.reference-tool-row:disabled * { color:#91a2bb; filter:none; opacity:1; }
+
+.workspace-center label.chat-running-status { font-family:"DejaVu Sans",sans-serif; font-size:11px; color:#8290a7; }

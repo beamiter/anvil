@@ -18,8 +18,10 @@ fn chat_bubbles_keep_alignment_through_resize_and_font_changes() {
     let mut config = crate::config::Config::safe_defaults();
     config.terminal_mode = crate::config::TerminalMode::Chat;
     super::install_block_css(&config);
+    crate::workspace_shell::install_css();
     let root = gtk::Box::new(Orientation::Vertical, 0);
     root.add_css_class("chat-mode");
+    root.add_css_class("workspace-center");
     let list = gtk::Box::new(Orientation::Vertical, 12);
     list.add_css_class("block-list");
     let long_command = format!("printf '%s\\n' {}", "some-long-value ".repeat(12));
@@ -58,7 +60,8 @@ fn chat_bubbles_keep_alignment_through_resize_and_font_changes() {
         settle();
         assert!(
             window.width() <= width + 1,
-            "chat content must allow the requested window width"
+            "chat content must allow the requested {width}px window width, got {}px",
+            window.width()
         );
         for card in &cards {
             card.refit_output_to_viewport();

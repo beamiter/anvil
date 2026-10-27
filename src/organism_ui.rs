@@ -395,6 +395,14 @@ struct SurfacePoint {
     y: f64,
 }
 
+/// Admission is stricter than wandering: even an idle companion may only
+/// occupy complete blank rows below the current output cursor.
+fn admit_below_output(surface: SurfaceBox, point: Option<SurfacePoint>) -> Option<SurfacePoint> {
+    let mut point = point?;
+    point.y = point.y.max(f64::from(below_output_y(surface)?));
+    Some(point)
+}
+
 /// How eagerly the idle body wanders its 80-second cycle, derived from body
 /// language: a drowsy mind stays put, a listless one paces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2049,10 +2057,89 @@ struct OrganismRuntime {
     card: gtk::Widget,
     sprite: Label,
     live_body: Label,
+    live_presentation: gtk::Overlay,
+    live_graphic: gtk::DrawingArea,
+    graphic_sleeping: Rc<Cell<bool>>,
+    graphic_frame: Rc<Cell<u64>>,
+    live_speech: Label,
+    live_speech_box: gtk::Box,
+    live_speech_dismissed: Rc<Cell<bool>>,
+    live_focus: gtk::Button,
     sticky_avatar: Label,
+    sticky_presentation: gtk::Overlay,
     badge: Label,
     status: Label,
     state: Label,
+}
+
+/// Native paths supplied by the shared reference contract. This is painted
+/// inside the existing owner; it creates neither a mind nor an animation clock.
+fn reference_organism_graphic(asleep: Rc<Cell<bool>>, frame: Rc<Cell<u64>>) -> gtk::DrawingArea {
+    let graphic = gtk::DrawingArea::new();
+    graphic.set_can_target(false);
+    graphic.set_accessible_role(gtk::AccessibleRole::Presentation);
+    graphic.set_draw_func(move |_, cr, width, height| {
+        use jterm_core::reference_organism::{Command, SHAPES, SIZE};
+        let size = f64::from(width.min(height)).min(f64::from(SIZE));
+        let scale = size / f64::from(SIZE);
+        let breathing = if asleep.get() {
+            0.0
+        } else {
+            (frame.get() as f64 * 0.16).sin() * 0.35
+        };
+        cr.translate(
+            (width as f64 - size).max(0.0),
+            (height as f64 - size).max(0.0) + breathing,
+        );
+        cr.scale(scale, scale);
+        cr.set_line_cap(gtk::cairo::LineCap::Round);
+        cr.set_line_join(gtk::cairo::LineJoin::Round);
+        for shape in SHAPES {
+            cr.new_path();
+            for command in shape.path {
+                match *command {
+                    Command::Move(x, y) => cr.move_to(x as f64, y as f64),
+                    Command::Line(x, y) => cr.line_to(x as f64, y as f64),
+                    Command::Cubic(x1, y1, x2, y2, x, y) => cr.curve_to(
+                        x1 as f64, y1 as f64, x2 as f64, y2 as f64, x as f64, y as f64,
+                    ),
+                    Command::Close => cr.close_path(),
+                }
+            }
+            let alpha = if asleep.get() { 0.7 } else { 1.0 };
+            if let Some([r, g, b, a]) = shape.fill {
+                cr.set_source_rgba(
+                    r as f64 / 255.,
+                    g as f64 / 255.,
+                    b as f64 / 255.,
+                    a as f64 / 255. * alpha,
+                );
+                let _ = cr.fill_preserve();
+            }
+            if let Some([r, g, b, a]) = shape.stroke {
+                cr.set_source_rgba(
+                    r as f64 / 255.,
+                    g as f64 / 255.,
+                    b as f64 / 255.,
+                    a as f64 / 255. * alpha,
+                );
+                cr.set_line_width(shape.stroke_width as f64);
+                let _ = cr.stroke();
+            }
+        }
+        if !asleep.get() {
+            let [r, g, b, a] = jterm_core::reference_organism::AWAKE_COLOR;
+            cr.set_source_rgba(
+                r as f64 / 255.,
+                g as f64 / 255.,
+                b as f64 / 255.,
+                a as f64 / 255.,
+            );
+            cr.arc(51., 53., 2.0, 0., std::f64::consts::TAU);
+            let _ = cr.fill();
+        }
+    });
+    graphic
 }
 
 impl OrganismRuntime {
@@ -2170,6 +2257,61 @@ impl OrganismRuntime {
         live_body.set_can_target(false);
         live_body.set_focusable(false);
         live_body.set_accessible_role(gtk::AccessibleRole::Presentation);
+        // Keep canonical textual frames as accessible/test metadata while the
+        // visible body uses the same shared native paths in all four toolkits.
+        live_body.set_opacity(0.0);
+        let live_presentation = gtk::Overlay::new();
+        live_presentation.set_can_target(false);
+        let graphic_sleeping = Rc::new(Cell::new(false));
+        let graphic_frame = Rc::new(Cell::new(0));
+        let live_graphic =
+            reference_organism_graphic(graphic_sleeping.clone(), graphic_frame.clone());
+        live_graphic.set_halign(gtk::Align::Fill);
+        live_graphic.set_valign(gtk::Align::Fill);
+        live_graphic.set_content_width(64);
+        live_graphic.set_content_height(64);
+        live_presentation.set_child(Some(&live_graphic));
+        // Transparent canonical state is non-measuring; terminal typography
+        // cannot resize the shared 64px graphical contour.
+        live_presentation.add_overlay(&live_body);
+        live_presentation.set_measure_overlay(&live_body, false);
+        let live_speech_box = gtk::Box::new(Orientation::Horizontal, 5);
+        live_speech_box.add_css_class("reference-organism-speech");
+        live_speech_box.set_halign(gtk::Align::Start);
+        live_speech_box.set_valign(gtk::Align::Start);
+        live_speech_box.set_can_target(true);
+        let live_speech = Label::new(None);
+        live_speech.set_xalign(0.0);
+        live_speech.set_wrap(true);
+        live_speech.set_max_width_chars(26);
+        live_speech_box.append(&live_speech);
+        let live_focus = gtk::Button::new();
+        live_focus.add_css_class("flat");
+        live_focus.set_child(Some(&crate::workspace_shell::icon(
+            jterm_core::reference_icons::Icon::Terminal,
+        )));
+        live_focus.set_tooltip_text(Some("Focus terminal"));
+        live_focus.set_sensitive(false);
+        live_speech_box.append(&live_focus);
+        let dismiss = gtk::Button::new();
+        dismiss.add_css_class("flat");
+        dismiss.set_child(Some(&crate::workspace_shell::icon(
+            jterm_core::reference_icons::Icon::Close,
+        )));
+        dismiss.set_tooltip_text(Some("Dismiss message"));
+        let live_speech_dismissed = Rc::new(Cell::new(false));
+        let dismissed = live_speech_dismissed.clone();
+        let weak_bubble = live_speech_box.downgrade();
+        dismiss.connect_clicked(move |_| {
+            dismissed.set(true);
+            if let Some(bubble) = weak_bubble.upgrade() {
+                bubble.set_visible(false);
+            }
+        });
+        live_speech_box.append(&dismiss);
+        live_speech_box.set_visible(false);
+        live_presentation.add_overlay(&live_speech_box);
+        live_presentation.set_measure_overlay(&live_speech_box, false);
 
         let sticky_avatar = Label::new(Some("/\\_/\\"));
         // Micro-poses are all five ASCII characters; pinning the width keeps
@@ -2182,6 +2324,22 @@ impl OrganismRuntime {
         sticky_avatar.set_can_target(false);
         sticky_avatar.set_focusable(false);
         sticky_avatar.set_accessible_role(gtk::AccessibleRole::Presentation);
+        sticky_avatar.set_opacity(0.0);
+        let sticky_presentation = gtk::Overlay::new();
+        sticky_presentation.set_can_target(false);
+        sticky_presentation.set_child(Some(&sticky_avatar));
+        let sticky_graphic =
+            reference_organism_graphic(graphic_sleeping.clone(), graphic_frame.clone());
+        sticky_graphic.set_halign(gtk::Align::Fill);
+        sticky_graphic.set_valign(gtk::Align::Fill);
+        sticky_presentation.add_overlay(&sticky_graphic);
+        sticky_presentation.set_measure_overlay(&sticky_graphic, false);
+        let weak_compact = sticky_presentation.downgrade();
+        sticky_avatar.connect_visible_notify(move |avatar| {
+            if let Some(compact) = weak_compact.upgrade() {
+                compact.set_visible(avatar.is_visible());
+            }
+        });
 
         activity.body_enabled();
         let runtime = Rc::new(Self {
@@ -2259,7 +2417,16 @@ impl OrganismRuntime {
             card: outer.upcast(),
             sprite,
             live_body,
+            live_presentation,
+            live_graphic,
+            graphic_sleeping,
+            graphic_frame,
+            live_speech,
+            live_speech_box,
+            live_speech_dismissed,
+            live_focus,
             sticky_avatar,
+            sticky_presentation,
             badge,
             status,
             state,
@@ -2273,6 +2440,8 @@ impl OrganismRuntime {
         if self.sleeping.replace(sleeping) == sleeping {
             return;
         }
+        self.graphic_sleeping.set(sleeping);
+        self.live_graphic.queue_draw();
         if sleeping {
             self.activity.body_started_sleeping();
         } else {
@@ -2508,7 +2677,7 @@ impl OrganismRuntime {
         if !self.live_body.is_mapped() {
             return None;
         }
-        let bounds = self.live_body.compute_bounds(&view.widget())?;
+        let bounds = self.live_presentation.compute_bounds(&view.widget())?;
         let (x, y, width, height) = (
             f64::from(bounds.x()),
             f64::from(bounds.y()),
@@ -2968,6 +3137,11 @@ impl OrganismRuntime {
         self.explained_body_context.set(None);
         self.refresh_inline_sprite();
         self.refresh_growth_badge();
+        let speech = reaction.speech.unwrap_or("");
+        if self.live_speech.text().as_str() != speech {
+            self.live_speech.set_text(speech);
+            self.live_speech_dismissed.set(false);
+        }
         let status = match reaction.speech {
             Some(speech) => format!("{speech}  {}", reaction.description),
             None => reaction.description.clone(),
@@ -3362,6 +3536,8 @@ impl OrganismRuntime {
         // refresh when focus returns (there is no stale sprite cache).
         #[cfg(test)]
         self.spatial_renders.set(self.spatial_renders.get() + 1);
+        self.graphic_frame.set(sprite_frame);
+        self.live_graphic.queue_draw();
         let sprite = sprite_frame_with_context(context, sprite_frame);
         if self.live_body.text().as_str() != sprite.as_ref() {
             self.live_body.set_text(sprite.as_ref());
@@ -3376,6 +3552,12 @@ impl OrganismRuntime {
             return;
         }
 
+        if jterm_core::reference_conversation::fixture_enabled()
+            && view.widget().has_css_class("chat-mode")
+        {
+            self.hide_live_body(view);
+            return;
+        }
         let metrics = view.live_organism_surface_metrics();
         if metrics.alt_screen {
             // ActiveBlock owns the override and cleared desired visibility on
@@ -3407,8 +3589,16 @@ impl OrganismRuntime {
         // GTK reports zero requisition for an explicitly invisible Label,
         // which would otherwise make a tiny initial allocation self-locking.
         self.live_body.set_visible(true);
-        let (_, body_width, _, _) = self.live_body.measure(Orientation::Horizontal, -1);
-        let (_, body_height, _, _) = self.live_body.measure(Orientation::Vertical, body_width);
+        let speech = !self.live_speech.text().is_empty() && !self.live_speech_dismissed.get();
+        self.live_speech_box.set_visible(speech);
+        self.live_graphic
+            .set_content_width(if speech { 240 } else { 64 });
+        self.live_graphic
+            .set_content_height(if speech { 124 } else { 64 });
+        let (_, body_width, _, _) = self.live_presentation.measure(Orientation::Horizontal, -1);
+        let (_, body_height, _, _) = self
+            .live_presentation
+            .measure(Orientation::Vertical, body_width);
         // A size change can tighten the legal x/y band even when the terminal
         // itself did not resize. Snap before interpolating so a wider reaction
         // pose never spends intermediate frames inside the scrollbar gutter.
@@ -3432,15 +3622,19 @@ impl OrganismRuntime {
             geometry_frame,
             self.territory.get(),
         );
+        point = admit_below_output(surface, point);
         let full_fits = point.is_some();
         if !full_fits {
-            // Reuse this exact label as a single-line body when the three-line
-            // pose cannot fit. Measure its actual font, growth and current pose;
-            // never reserve another row or guess a fixed pixel width.
+            // Collapse speech before refusing the fixed64 graphical body.
+            // Canonical text follows its compact state as metadata only;
+            // no smaller visual contour is allowed to cover occupied pixels.
             let compact = sticky_glyph_with_context(context, sprite_frame);
             self.live_body.set_text(compact.as_ref());
-            let (_, width, _, _) = self.live_body.measure(Orientation::Horizontal, -1);
-            let (_, height, _, _) = self.live_body.measure(Orientation::Vertical, width);
+            self.live_speech_box.set_visible(false);
+            self.live_graphic.set_content_width(64);
+            self.live_graphic.set_content_height(64);
+            let (_, width, _, _) = self.live_presentation.measure(Orientation::Horizontal, -1);
+            let (_, height, _, _) = self.live_presentation.measure(Orientation::Vertical, width);
             surface.body_width = width;
             surface.body_height = height;
             point = surface_point_for_territory(
@@ -3452,6 +3646,7 @@ impl OrganismRuntime {
                 geometry_frame,
                 self.territory.get(),
             );
+            point = admit_below_output(surface, point);
         }
         let presentation = CompanionSurface::choose(
             self.enabled.get(),
@@ -3497,18 +3692,15 @@ impl OrganismRuntime {
                 Some((px, py)) => {
                     let x = approach(px, target.x, f64::from(metrics.cell_width.max(1)));
                     let mut y = approach(py, target.y, f64::from(metrics.cell_height.max(1)));
-                    if needs_output_clearance(mode, ambient, vigil) {
-                        // Never animate through the output band on the way to
-                        // a safe below-output target. Horizontal travel may
-                        // stay smooth while the safety-critical axis snaps.
-                        if let Some(clear_y) = below_output_y(surface) {
-                            y = y.max(f64::from(clear_y));
-                        }
+                    // Output can advance while the companion is in transit.
+                    // Its vertical clearance snaps on every pose, including idle.
+                    if let Some(clear_y) = below_output_y(surface) {
+                        y = y.max(f64::from(clear_y));
                     }
                     (x, y, (px, py) != (x, y))
                 }
             };
-            if view.move_live_organism_body(self.live_body.upcast_ref(), x, y) {
+            if view.move_live_organism_body(self.live_presentation.upcast_ref(), x, y) {
                 self.body_in_transit.set(moved);
                 self.body_position.set(Some((x, y)));
                 view.set_live_organism_visible(true);
@@ -4399,13 +4591,20 @@ impl OrganismHub {
         // A single body lives on the active terminal surface. Status and
         // physiology remain available through Inspect companion.
         {
-            if !view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0) {
+            if !view.put_live_organism_body(runtime.live_presentation.upcast_ref(), 0.0, 0.0) {
                 log::warn!("could not attach ASCII organism to the live terminal surface");
             }
-            if !view.put_sticky_organism_avatar(runtime.sticky_avatar.upcast_ref()) {
+            if !view.put_sticky_organism_avatar(runtime.sticky_presentation.upcast_ref()) {
                 log::warn!("could not attach ASCII organism to the sticky running header");
             }
         }
+        let weak_view = Rc::downgrade(view);
+        runtime.live_focus.set_sensitive(true);
+        runtime.live_focus.connect_clicked(move |_| {
+            if let Some(view) = weak_view.upgrade() {
+                view.grab_focus();
+            }
+        });
         runtime.refresh_surface(view, Instant::now());
         OrganismRuntime::start_surface_tick(&runtime, view);
         OrganismRuntime::install_prompt_evidence_observer(&runtime, view);
@@ -5015,6 +5214,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn admission_keeps_idle_body_below_output_or_hides_it() {
+        let surface = SurfaceBox {
+            width: 300,
+            height: 200,
+            right_gutter: 10,
+            cell_width: 10,
+            cell_height: 10,
+            body_width: 40,
+            body_height: 30,
+            cursor_row: 10,
+        };
+        let point = admit_below_output(surface, Some(SurfacePoint { x: 10.0, y: 20.0 })).unwrap();
+        assert_eq!(point.y, 110.0);
+        assert!(admit_below_output(
+            SurfaceBox {
+                cursor_row: 19,
+                ..surface
+            },
+            Some(point)
+        )
+        .is_none());
+    }
+
+    #[test]
     #[ignore = "requires DISPLAY"]
     fn one_companion_crosses_splits_without_cloning_its_body_or_mind() {
         gtk::init().expect("gtk display");
@@ -5038,8 +5261,8 @@ mod tests {
                     false,
                 );
                 presence.bind(token, view, &runtime);
-                view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0);
-                view.put_sticky_organism_avatar(runtime.sticky_avatar.upcast_ref());
+                view.put_live_organism_body(runtime.live_presentation.upcast_ref(), 0.0, 0.0);
+                view.put_sticky_organism_avatar(runtime.sticky_presentation.upcast_ref());
                 runtime
             })
             .collect();
@@ -5120,41 +5343,39 @@ mod tests {
                 runtimes[owner].last_human_input.set(None);
             }
         }
-        // Actual native font metrics force a compact fallback, then removing
-        // the style restores the full pose in the very same overlay label.
+        // The shared graphical body is fixed64; transparent metadata font
+        // changes cannot resize it. A separate real59px canvas test verifies
+        // fail-closed geometry instead of the old ASCII micro-pose boundary.
         let owner = &runtimes[1];
         owner.surface_behavior.set(Behavior::Idle);
         owner.interrupt_ambient();
-        // Pango attributes override theme CSS deterministically. Find the
-        // actual native full/compact boundary rather than assuming a font's
-        // pixel size or the window manager's allocated viewport height.
-        let mut compact_bounds = None;
-        for pixels in 8..=256 {
+        let body_before = owner.live_presentation.clone();
+        for pixels in [8, 64, 128, 256] {
             let attributes = gtk::pango::AttrList::new();
             attributes.insert(gtk::pango::AttrSize::new_size_absolute(
                 pixels * gtk::pango::SCALE,
             ));
             owner.live_body.set_attributes(Some(&attributes));
             owner.refresh_surface(&views[1], Instant::now());
-            if owner.body_position.get().is_some() && owner.live_body.text().lines().count() == 1 {
-                compact_bounds = Some(owner.surface_signature.get());
-                break;
-            }
+            settle();
+            assert_eq!(
+                owner.live_presentation, body_before,
+                "one native graphical body"
+            );
+            assert!(owner.body_position.get().is_some());
+            assert_eq!(
+                owner
+                    .live_presentation
+                    .measure(Orientation::Horizontal, -1)
+                    .1,
+                64
+            );
+            assert_eq!(
+                owner.live_presentation.measure(Orientation::Vertical, 64).1,
+                64
+            );
         }
-        let compact_bounds = compact_bounds
-            .expect("a measured compact glyph fits after the full pose outgrows its surface");
-        settle();
-        assert!(owner.live_body.is_mapped());
-        assert_eq!(owner.live_body.text().lines().count(), 1);
         owner.live_body.set_attributes(None);
-        owner.refresh_surface(&views[1], Instant::now());
-        settle();
-        assert!(owner.body_position.get().is_some());
-        assert!(
-            owner.live_body.text().lines().count() > 1,
-            "full pose restored on the same label"
-        );
-        assert_ne!(owner.surface_signature.get(), compact_bounds);
         presence.focus_view(None);
         for (runtime, view) in runtimes.iter().zip(&views) {
             assert!(!runtime.live_body.is_mapped());
@@ -5290,8 +5511,8 @@ mod tests {
         presence.bind(token, &view, &runtime);
         OrganismRuntime::install_map_observer(&runtime, &view);
         view.insert_inline_notice(&runtime.card);
-        view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0);
-        view.put_sticky_organism_avatar(runtime.sticky_avatar.upcast_ref());
+        view.put_live_organism_body(runtime.live_presentation.upcast_ref(), 0.0, 0.0);
+        view.put_sticky_organism_avatar(runtime.sticky_presentation.upcast_ref());
         let window = gtk::Window::new();
         window.set_default_size(640, 480);
         window.set_child(Some(&root));
@@ -6199,8 +6420,8 @@ mod tests {
         // it: production attachment no longer mounts an organism card.
         runtime.card.set_visible(true);
         view.insert_inline_notice(&runtime.card);
-        view.put_live_organism_body(runtime.live_body.upcast_ref(), 0.0, 0.0);
-        view.put_sticky_organism_avatar(runtime.sticky_avatar.upcast_ref());
+        view.put_live_organism_body(runtime.live_presentation.upcast_ref(), 0.0, 0.0);
+        view.put_sticky_organism_avatar(runtime.sticky_presentation.upcast_ref());
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let entry = gtk::Entry::new();
         content.append(&entry);
@@ -6525,8 +6746,10 @@ mod tests {
                 .live_body
                 .remove_css_class(POINTER_GREETING_CANDIDATE_CLASS);
             let without_candidate = (
-                runtime.live_body.measure(Orientation::Horizontal, -1),
-                runtime.live_body.measure(Orientation::Vertical, -1),
+                runtime
+                    .live_presentation
+                    .measure(Orientation::Horizontal, -1),
+                runtime.live_presentation.measure(Orientation::Vertical, -1),
             );
             runtime
                 .live_body
@@ -6534,8 +6757,10 @@ mod tests {
             assert_eq!(
                 without_candidate,
                 (
-                    runtime.live_body.measure(Orientation::Horizontal, -1),
-                    runtime.live_body.measure(Orientation::Vertical, -1),
+                    runtime
+                        .live_presentation
+                        .measure(Orientation::Horizontal, -1),
+                    runtime.live_presentation.measure(Orientation::Vertical, -1),
                 ),
                 "candidate paint does not change body requisition"
             );
@@ -6552,7 +6777,7 @@ mod tests {
                 .has_css_class(POINTER_GREETING_CANDIDATE_CLASS);
             let explicit_rejected = runtime.say_hello(&view).is_err();
             let cooldown_after_explicit = window_greeting_probe(&presence, token);
-            let held_bounds = runtime.live_body.compute_bounds(&view.widget());
+            let held_bounds = runtime.live_presentation.compute_bounds(&view.widget());
             if let Some(bounds) = held_bounds.as_ref() {
                 OrganismRuntime::observe_pointer(
                     &runtime,
@@ -6742,7 +6967,10 @@ mod tests {
                     .active,
                 Some(explicit_hold)
             );
-            let body = runtime.live_body.compute_bounds(&view.widget()).unwrap();
+            let body = runtime
+                .live_presentation
+                .compute_bounds(&view.widget())
+                .unwrap();
             let inside = (
                 f64::from(body.x() + body.width() / 2.0),
                 f64::from(body.y() + body.height() / 2.0),
@@ -6897,7 +7125,10 @@ mod tests {
         }
         // The existing mapped native fixture now checks the shared-core
         // adapter's resource and event boundaries, without another PTY/window.
-        let bounds = runtime.live_body.compute_bounds(&view.widget()).unwrap();
+        let bounds = runtime
+            .live_presentation
+            .compute_bounds(&view.widget())
+            .unwrap();
         let near = (
             f64::from(bounds.x() + bounds.width() / 2.0),
             f64::from(bounds.y() + bounds.height() / 2.0),

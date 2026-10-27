@@ -8,12 +8,12 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use vte4::{Terminal, TerminalExt};
 
-pub(super) const CONTROLS_HEIGHT: i32 = 40;
+pub(super) const CONTROLS_HEIGHT: i32 = 28;
 
 /// Keep room for the companion while letting wrapped input and completion
 /// menus grow through the same shell-owned measurements as Block mode.
 pub(super) fn composer_rows(input: i64, drawn: i64, viewport: i64) -> i64 {
-    input.max(drawn).clamp(4.min(viewport), viewport.max(1))
+    input.max(drawn).clamp(1, viewport.max(1))
 }
 
 /// Read the lifecycle owner's *current* state. In particular, an OSC marker
@@ -290,7 +290,10 @@ pub(super) fn layout(
         send.set_sensitive(state.get() == BlockState::AwaitingCommand);
         stop.set_sensitive(state.get() == BlockState::CollectingOutput);
         running.update(state.get(), &hint);
-        if prompt {
+        controls.set_tooltip_text(Some(hint.text().as_str()));
+        if prompt || in_transcript {
+            // A running command changes terminal ownership, not the shared
+            // 80px input/tool frame or its viewport insets.
             dock.add_css_class("chat-composer");
         } else {
             dock.remove_css_class("chat-composer");
@@ -966,6 +969,7 @@ mod tests {
             crate::child_env::capture_inherited_environment().expect("test child environment");
         });
         gtk::init().expect("GTK display");
+        crate::workspace_shell::install_css();
         let view: Rc<TermView> = TermView::new_with_spawner(
             &crate::config::Config::safe_defaults(),
             &crate::config::TerminalMode::Chat,
@@ -985,6 +989,7 @@ mod tests {
         let entry = gtk::Entry::new();
         entry.set_text("other pane retains focus");
         let box_ = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        box_.add_css_class("workspace-center");
         box_.append(&entry);
         box_.append(&view.root);
         let window = gtk::Window::builder()
@@ -1255,6 +1260,29 @@ mod tests {
             window.set_default_size(width, 560);
             view.set_font_scale(scale);
             pump_for(Duration::from_millis(250));
+            if window.width() > width {
+                fn explain(widget: &gtk::Widget, depth: usize) {
+                    let measured = widget.measure(gtk::Orientation::Horizontal, -1);
+                    if measured.0 > 150 || widget.has_css_class("chat-controls") {
+                        eprintln!(
+                            "MINIMUM depth={depth} type={} css={:?} min={} natural={} allocated={}",
+                            widget.type_().name(),
+                            widget.css_classes(),
+                            measured.0,
+                            measured.1,
+                            widget.width()
+                        );
+                    }
+                    if depth < 16 {
+                        let mut child = widget.first_child();
+                        while let Some(current) = child {
+                            explain(&current, depth + 1);
+                            child = current.next_sibling();
+                        }
+                    }
+                }
+                explain(window.upcast_ref(), 0);
+            }
             assert!(
                 window.width() <= width,
                 "narrow window was not actually allocated: requested {width}, got {}",

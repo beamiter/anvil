@@ -14,6 +14,9 @@ impl AppModel {
         }
         self.sidebar_visible = visible;
         self.sidebar_box.set_visible(visible);
+        if let Some(navigation) = self.content_paned.start_child() {
+            navigation.set_visible(visible);
+        }
         if visible && self.sidebar_view.get() == config::SidebarView::Files {
             self.file_tree_revalidate_due();
         }
@@ -84,7 +87,13 @@ impl AppModel {
         }
         use config::SidebarView;
         match view {
-            SidebarView::Tabs => self.sidebar_stack.set_visible_child_name("tabs"),
+            SidebarView::Tabs => self.sidebar_stack.set_visible_child_name(
+                if jterm_core::reference_conversation::fixture_enabled() {
+                    "reference-recent"
+                } else {
+                    "tabs"
+                },
+            ),
             SidebarView::Files => {
                 self.sidebar_stack.set_visible_child_name("files");
                 self.file_tree_revalidate_due();

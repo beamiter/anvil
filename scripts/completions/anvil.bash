@@ -16,7 +16,7 @@ _anvil()
             return
             ;;
         --mode)
-            COMPREPLY=($(compgen -W "block vte unified chat" -- "${current}"))
+            COMPREPLY=($(compgen -W "block chat" -- "${current}"))
             return
             ;;
         --shell-integration|--generate-completion|--completion)
@@ -32,7 +32,7 @@ _anvil()
     case "${current}" in
         --mode=*)
             local value="${current#*=}"
-            COMPREPLY=($(compgen -W "block vte unified chat" -- "${value}"))
+            COMPREPLY=($(compgen -W "block chat" -- "${value}"))
             COMPREPLY=("${COMPREPLY[@]/#/--mode=}")
             return
             ;;

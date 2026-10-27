@@ -62,6 +62,22 @@ impl AppModel {
             private: tab.is_some_and(|tab| tab.private_title),
         });
         self.window.set_title(Some(&title.window_title));
+        let presentation = match pane.map(|pane| &pane.terminal) {
+            Some(TermCtl::Block(controller)) => controller.model().mode(),
+            _ => TerminalMode::Block,
+        };
+        self.shell.sync(
+            if tab.is_some_and(|tab| tab.private_title) {
+                "Private session"
+            } else {
+                &title.window_title
+            },
+            cwd.as_deref()
+                .and_then(|path| path.to_str())
+                .unwrap_or("Local terminal"),
+            presentation,
+            tab.is_some_and(|tab| tab.private_title),
+        );
         // The own visible property, not effective visibility: the initial
         // refresh runs before the window is mapped.
         if !self.bottom_bar.get_visible() {

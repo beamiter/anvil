@@ -584,6 +584,8 @@ pub enum VteOutput {
     SearchStatus(SearchStatus),
     /// Open Find for the emitting pane, without relying on focus event timing.
     FindRequested,
+    /// Native workspace menu requests the existing application command palette.
+    CommandPaletteRequested,
     /// A finished block, with the full reconstructed command + exit + a
     /// captured-output sample. Drives agent-mode's run-observe loop. Emitted
     /// by BlockTerminal only (the plain VTE wrapper has no block concept).

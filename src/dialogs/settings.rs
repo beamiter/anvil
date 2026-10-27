@@ -2216,12 +2216,10 @@ impl Component for SettingsModel {
 
                     #[name(terminal_mode_row)]
                     adw::ComboRow {
-                        set_title: "Terminal Backend",
+                        set_title: "Terminal presentation",
                         set_subtitle: "Applies to new and restored local panes; running shells keep their mode",
                         set_model: Some(&gtk::StringList::new(&[
                             "Block",
-                            "VTE compatibility",
-                            "Unified (experimental)",
                             "Chat",
                         ])),
                         set_selected: model.values.terminal_mode,

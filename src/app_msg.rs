@@ -17,6 +17,7 @@ pub(crate) enum AppMsg {
     NextTab,
     PrevTab,
     ToggleSidebar,
+    FocusShell,
     MinimizeWindow,
     ToggleMaximizedWindow,
     WindowMaximized(bool),
