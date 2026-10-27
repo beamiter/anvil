@@ -10,6 +10,12 @@ use vte4::{Terminal, TerminalExt};
 
 pub(super) const CONTROLS_HEIGHT: i32 = 40;
 
+/// Keep room for the companion while letting wrapped input and completion
+/// menus grow through the same shell-owned measurements as Block mode.
+pub(super) fn composer_rows(input: i64, drawn: i64, viewport: i64) -> i64 {
+    input.max(drawn).clamp(4.min(viewport), viewport.max(1))
+}
+
 /// Read the lifecycle owner's *current* state. In particular, an OSC marker
 /// seen earlier in this session is not evidence of a ready prompt now.
 pub(super) fn surface(state: BlockState) -> ChatSurface {

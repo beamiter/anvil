@@ -943,6 +943,8 @@ fn block_css(config: &Config) -> String {
         /* Chat has its own transcript rhythm and live composer. These rules
            never match unchanged Block or managed-remote Block panes. */
         .chat-mode .block-list {{ background-color: {bg_hex}; }}
+        .chat-mode .chat-canvas,
+        .chat-mode .chat-composer-viewport {{ background-color: {bg_hex}; }}
         .chat-turn.block-finished {{
             border: none;
             outline: none;
@@ -969,18 +971,40 @@ fn block_css(config: &Config) -> String {
             margin: 4px 8px;
             padding: 3px 1px 3px 3px;
             border-radius: 18px;
-            outline: 1px solid rgba({acc_r},{acc_g},{acc_b},0.4);
+            outline: 1px solid rgba({fg_r},{fg_g},{fg_b},0.18);
             outline-offset: -1px;
             background-color: {bg_hex};
+            box-shadow: inset 0 1px rgba({fg_r},{fg_g},{fg_b},0.04);
         }}
-        .chat-input-hint {{ color: {dim_fg}; font-size: 0.8em; padding: 4px 8px; }}
+        .chat-mode .chat-controls {{
+            padding: 0 8px;
+            border-radius: 0 0 15px 15px;
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.025);
+        }}
+        .chat-shell-icon {{ color: {dim_fg}; }}
+        .chat-input-hint {{ color: {dim_fg}; font-size: 0.8em; padding: 4px 0; }}
         .chat-send {{
-            min-height: 24px;
-            min-width: 24px;
+            min-height: 28px;
+            min-width: 28px;
             padding: 0;
-            border-radius: 999px;
-            background-color: rgba({acc_r},{acc_g},{acc_b},0.75);
-            margin: 3px 6px;
+            border: none;
+            border-radius: 10px;
+            background-image: none;
+            background-color: {accent};
+            color: {bg_hex};
+            box-shadow: none;
+            margin: 4px 0 4px 6px;
+            transition: background-color 120ms ease-out;
+        }}
+        .chat-send:hover {{
+            background-color: mix({accent}, {fg_hex}, 0.15);
+        }}
+        .chat-send:active {{
+            background-color: mix({accent}, {bg_hex}, 0.15);
+        }}
+        .chat-send:disabled {{
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.08);
+            color: {dim_fg};
         }}
         .chat-mode .block-active.chat-empty-anchor {{
             min-height: 0;
@@ -1468,7 +1492,7 @@ fn block_css(config: &Config) -> String {
             box-shadow: inset 0 0 0 3px {accent};
         }}
         .chat-mode .chat-composer:focus-within {{
-            outline: 2px solid {accent};
+            outline: 2px solid rgba({acc_r},{acc_g},{acc_b},0.55);
             outline-offset: -2px;
         }}
         "#,

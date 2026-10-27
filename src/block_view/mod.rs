@@ -12110,10 +12110,15 @@ impl TermView {
         chat_controls.add_css_class("chat-controls");
         chat_controls.set_height_request(chat::CONTROLS_HEIGHT);
         chat_controls.set_visible(false);
+        let chat_shell_icon = gtk::Image::from_icon_name("utilities-terminal-symbolic");
+        chat_shell_icon.add_css_class("chat-shell-icon");
+        chat_shell_icon.set_pixel_size(14);
+        chat_controls.append(&chat_shell_icon);
         let chat_hint = gtk::Label::new(Some("Shell · Tab completes · ↑ history"));
         chat_hint.add_css_class("chat-input-hint");
         chat_hint.set_hexpand(true);
-        chat_hint.set_halign(gtk::Align::Start);
+        chat_hint.set_xalign(0.0);
+        chat_hint.set_ellipsize(gtk::pango::EllipsizeMode::End);
         let chat_send = icon_button("go-up-symbolic", "Send Enter to the live shell");
         chat_send.add_css_class("chat-send");
         chat_send.set_focusable(false);
@@ -12127,6 +12132,7 @@ impl TermView {
         chat_controls.append(&chat_stop);
         let chat_running = Rc::new(chat::RunningCommand::default());
         let chat_prompt_scroll = gtk::ScrolledWindow::new();
+        chat_prompt_scroll.add_css_class("chat-composer-viewport");
         chat_prompt_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::External);
         chat_prompt_scroll.set_propagate_natural_height(true);
         chat_prompt_scroll.set_min_content_height(0);
@@ -12548,8 +12554,13 @@ impl TermView {
                 // card is that grid too. Normal command output is rendered into
                 // the running block above, so the live input cell can still stay
                 // compact — it is only the visible height that collapses.
+                let compact_rows = if chat_mode {
+                    chat::composer_rows
+                } else {
+                    compact_card_rows
+                };
                 let grid_rows = if idle && !prompt_at_grid_top {
-                    compact_card_rows(input_rows(), 1, viewport_rows)
+                    compact_rows(input_rows(), 1, viewport_rows)
                 } else {
                     viewport_rows
                 };
@@ -12559,16 +12570,9 @@ impl TermView {
                     } else {
                         1
                     };
-                    compact_card_rows(input_rows(), drawn, viewport_rows)
+                    compact_rows(input_rows(), drawn, viewport_rows)
                 } else {
                     grid_rows
-                };
-                // Leave real blank terminal rows for the local ASCII companion.
-                // It uses the existing collision-aware overlay; no input is copied.
-                let card_rows = if chat_mode && state == BlockState::AwaitingCommand {
-                    card_rows.max(4).min(viewport_rows)
-                } else {
-                    card_rows
                 };
                 let grid_rows = if chat_mode && idle && !prompt_at_grid_top {
                     grid_rows.max(card_rows)
