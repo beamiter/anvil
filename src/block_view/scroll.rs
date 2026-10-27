@@ -456,6 +456,76 @@ mod canvas_native_tests {
 
     #[test]
     #[ignore = "requires a GTK display and frame clock; run with test-gtk-display.sh"]
+    fn capped_output_hands_remaining_pixels_to_retained_canvas() {
+        gtk::init().expect("GTK display");
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let retained = gtk::Label::new(Some("Retained history"));
+        retained.set_height_request(2000);
+        content.append(&retained);
+        let scroll = gtk::ScrolledWindow::builder().child(&content).build();
+        let window = gtk::Window::builder()
+            .default_width(640)
+            .default_height(400)
+            .child(&scroll)
+            .build();
+        let controller =
+            ScrollDebouncer::with_scroll_lock(Rc::new(Cell::new(true)), Rc::new(Cell::new(false)));
+        controller.install(&scroll, &content);
+        window.present();
+        spin_for(150);
+        let outer = scroll.vadjustment();
+        assert!(
+            bottom_value(&outer) > 1000.0,
+            "fixture must have a real scroll range"
+        );
+        outer.set_value(200.0);
+        let inner = gtk::Adjustment::new(99.5, 0.0, 120.0, 1.0, 10.0, 20.0);
+        let remaining = super::super::blocks::scroll_adjustment_by_input(&inner, 50.0, true, 20.0);
+        assert_eq!(inner.value(), 100.0);
+        assert_eq!(remaining, 40.0);
+        controller.scroll_wheel(&scroll, remaining, true);
+        assert_eq!(
+            outer.value(),
+            240.0,
+            "the same event must cross the output boundary"
+        );
+        assert!(controller.user_scrolled_up.get());
+        assert!(
+            retained.is_mapped(),
+            "handoff must retain the existing history widget"
+        );
+        assert!(
+            controller.tick.borrow().is_none(),
+            "precision deltas must not start a second easing loop"
+        );
+
+        inner.set_value(0.25);
+        let remaining = super::super::blocks::scroll_adjustment_by_input(&inner, -12.5, true, 20.0);
+        assert_eq!(inner.value(), 0.0);
+        assert_eq!(remaining, -7.5);
+        controller.scroll_wheel(&scroll, remaining, true);
+        assert_eq!(
+            outer.value(),
+            232.5,
+            "reverse handoff must retain subpixel position"
+        );
+        inner.set_value(50.0);
+        assert_eq!(
+            super::super::blocks::scroll_adjustment_by_input(&inner, 4.0, true, 20.0),
+            0.0
+        );
+        assert_eq!(
+            outer.value(),
+            232.5,
+            "inner consumption must not move the outer canvas too"
+        );
+        window.close();
+        spin_for(30);
+        assert!(controller.tick.borrow().is_none());
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display and frame clock; run with test-gtk-display.sh"]
     fn retained_canvas_scrolls_through_frames_and_yields_to_reading() {
         gtk::init().expect("GTK display");
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -634,6 +704,22 @@ mod canvas_native_tests {
 pub(crate) struct ViewportState {
     pub(crate) first_visible: usize,
     pub(crate) last_visible: usize,
+}
+
+impl ViewportState {
+    /// A valid viewport with no finished-card intersection (for example while
+    /// reading a tall live output). This is distinct from unusable tab geometry,
+    /// where callers retain the previous range instead of applying a new one.
+    pub(crate) fn empty() -> Self {
+        Self {
+            first_visible: 1,
+            last_visible: 0,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.first_visible > self.last_visible
+    }
 }
 
 impl Clone for ViewportState {

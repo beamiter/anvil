@@ -54,6 +54,7 @@ mod paste_feedback;
 mod prepared_search;
 mod review;
 mod scroll;
+mod scroll_transfer;
 mod selection_folding;
 mod selection_hold;
 pub(crate) use selection_folding::FoldSelectionResult;
@@ -10802,6 +10803,9 @@ fn compute_viewport_state(
     visible_top: i32,
     visible_bottom: i32,
 ) -> ViewportState {
+    if visible_bottom <= visible_top || visible_bottom <= 0 {
+        return ViewportState::empty();
+    }
     let mut y = 0_i32;
     let mut first = None;
     let mut last = 0;
@@ -10821,9 +10825,12 @@ fn compute_viewport_state(
         }
     }
 
-    ViewportState {
-        first_visible: first.unwrap_or(0),
-        last_visible: last,
+    match first {
+        Some(first_visible) if first_visible <= last => ViewportState {
+            first_visible,
+            last_visible: last,
+        },
+        _ => ViewportState::empty(),
     }
 }
 
@@ -10912,14 +10919,14 @@ fn viewport_states_for_scroll(
     }
 
     Some((
-        ViewportState {
-            first_visible: strict_first.unwrap_or(0),
+        strict_first.map_or_else(ViewportState::empty, |first_visible| ViewportState {
+            first_visible,
             last_visible: strict_last,
-        },
-        ViewportState {
-            first_visible: loose_first.unwrap_or(0),
+        }),
+        loose_first.map_or_else(ViewportState::empty, |first_visible| ViewportState {
+            first_visible,
             last_visible: loose_last,
-        },
+        }),
     ))
 }
 
@@ -10939,6 +10946,9 @@ fn viewport_page_size_changed(last_page_size: &Cell<Option<f64>>, page_size: f64
 }
 
 fn visible_indices_for_viewport(vp: &ViewportState) -> HashSet<usize> {
+    if vp.is_empty() {
+        return HashSet::new();
+    }
     (vp.first_visible..=vp.last_visible.min(vp.first_visible.saturating_add(1000))).collect()
 }
 
@@ -14240,6 +14250,7 @@ impl TermView {
                 scroll_debouncer.watch_gesture(&scroll_ctrl, &block_scroll);
             }
             scroll_ctrl.connect_scroll(move |controller, _dx, dy| {
+                let mut remaining = dy;
                 let unit = controller.unit();
                 let in_mouse_app = (fullscreen_for_scroll.get()
                     || bstate_for_scroll.get() == BlockState::AltScreen)
@@ -14283,12 +14294,13 @@ impl TermView {
                 ) {
                     if let Some(terminal) = vte_for_scroll.upgrade() {
                         if let Some(adjustment) = terminal.vadjustment() {
-                            if scroll_adjustment_by_input(
+                            remaining = scroll_adjustment_by_input(
                                 &adjustment,
                                 dy,
                                 unit == gtk::gdk::ScrollUnit::Surface,
                                 terminal.char_height() as f64,
-                            ) {
+                            );
+                            if remaining == 0.0 {
                                 return glib::Propagation::Stop;
                             }
                         }
@@ -14299,7 +14311,7 @@ impl TermView {
                 };
                 debouncer_for_scroll.scroll_wheel(
                     &outer,
-                    dy,
+                    remaining,
                     unit == gtk::gdk::ScrollUnit::Surface,
                 );
                 glib::Propagation::Stop
@@ -14319,14 +14331,16 @@ impl TermView {
                 scroll_debouncer.watch_gesture(&scrollbar_scroll, &block_scroll);
             }
             scrollbar_scroll.connect_scroll(move |controller, _dx, dy| {
+                let mut remaining = dy;
                 if let Some(terminal) = vte_for_scrollbar.upgrade() {
                     if let Some(adjustment) = terminal.vadjustment() {
-                        if scroll_adjustment_by_input(
+                        remaining = scroll_adjustment_by_input(
                             &adjustment,
                             dy,
                             controller.unit() == gtk::gdk::ScrollUnit::Surface,
                             terminal.char_height() as f64,
-                        ) {
+                        );
+                        if remaining == 0.0 {
                             return glib::Propagation::Stop;
                         }
                     }
@@ -14336,7 +14350,7 @@ impl TermView {
                 };
                 debouncer_for_scrollbar.scroll_wheel(
                     &outer,
-                    dy,
+                    remaining,
                     controller.unit() == gtk::gdk::ScrollUnit::Surface,
                 );
                 glib::Propagation::Stop
@@ -28264,6 +28278,47 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
     }
 
     #[test]
+    fn live_output_viewport_does_not_remap_finished_history() {
+        let blocks: VecDeque<BlockData> = std::iter::repeat_n(20, 2_000)
+            .map(block_with_height)
+            .collect();
+
+        for top in [40_000.0, 40_001.0, 400_000.0] {
+            let viewport = viewport_state_for_scroll(&blocks, top, 600.0, 0)
+                .expect("live-output viewport is valid, not transient tab geometry");
+            assert!(viewport.is_empty(), "no finished card intersects top={top}");
+            assert!(visible_indices_for_viewport(&viewport).is_empty());
+        }
+        let edge = viewport_state_for_scroll(&blocks, 39_999.0, 600.0, 0).unwrap();
+        assert_eq!(visible_indices_for_viewport(&edge), HashSet::from([1_999]));
+    }
+
+    #[test]
+    fn empty_history_has_no_phantom_visible_card() {
+        let blocks = VecDeque::new();
+
+        let viewport = viewport_state_for_scroll(&blocks, 0.0, 600.0, 1).unwrap();
+        assert!(viewport.is_empty());
+        assert!(visible_indices_for_viewport(&viewport).is_empty());
+        assert!(viewport_state_for_scroll(&blocks, 0.0, 0.0, 1).is_none());
+    }
+
+    #[test]
+    fn live_output_hysteresis_keeps_only_the_intersecting_tail() {
+        let blocks: VecDeque<BlockData> =
+            std::iter::repeat_n(20, 10).map(block_with_height).collect();
+
+        let (strict, loose) = viewport_states_for_scroll(&blocks, 210.0, 20.0, 0).unwrap();
+        assert!(strict.is_empty());
+        assert_eq!(visible_indices_for_viewport(&loose), HashSet::from([9]));
+        assert_eq!(
+            stable_visible_indices(&strict, Some(&loose), &HashSet::from([0, 8, 9])),
+            HashSet::from([9])
+        );
+        assert!(stable_visible_indices(&strict, Some(&loose), &HashSet::new()).is_empty());
+    }
+
+    #[test]
     fn boundary_jitter_cannot_toggle_a_rendered_block() {
         let blocks: VecDeque<BlockData> =
             std::iter::repeat_n(20, 10).map(block_with_height).collect();
@@ -28331,8 +28386,8 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         assert!(viewport_states_for_scroll(&blocks, 0.0, 0.5, 1).is_none());
         let empty = VecDeque::new();
         let (strict, loose) = viewport_states_for_scroll(&empty, 0.0, 40.0, 1).unwrap();
-        assert_eq!((strict.first_visible, strict.last_visible), (0, 0));
-        assert_eq!((loose.first_visible, loose.last_visible), (0, 0));
+        assert!(strict.is_empty());
+        assert!(loose.is_empty());
     }
 
     #[test]
