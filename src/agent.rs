@@ -151,6 +151,7 @@ pub(crate) struct AgentSession {
     next_execution_generation: u64,
     next_request_generation: u64,
     active_request: Option<AgentRequestRef>,
+    model_token: Option<jterm_core::agent::ModelRequestToken>,
     /// Held so dropping the session cancels an in-flight LLM request.
     pub(crate) in_flight: Option<crate::ai::AiHandle>,
     /// Tab + pane the session is bound to. Commands are typed into this
@@ -202,6 +203,7 @@ impl AgentSession {
             next_execution_generation: 0,
             next_request_generation: 0,
             active_request: None,
+            model_token: None,
             in_flight: None,
             bound_tab,
             bound_pane,
@@ -255,15 +257,16 @@ impl AgentSession {
     }
 
     pub(crate) fn accept_model_reply(&mut self, raw: &str) -> Result<ModelOutcome, SessionError> {
+        let token = self.model_token.take().or_else(|| self.inner.model_request_token()).ok_or(SessionError::Cancelled)?;
         self.active_request = None;
         self.in_flight = None;
         if raw.len() > MAX_AGENT_MODEL_REPLY_BYTES {
             // Recorded as a provider failure: no turn is consumed, nothing is
             // parsed, and the oversized bytes never reach the transcript.
-            self.inner.model_failed(format!(
+            self.inner.model_failed_for(&token, format!(
                 "model reply of {} bytes exceeds the {MAX_AGENT_MODEL_REPLY_BYTES}-byte Agent limit",
                 raw.len()
-            ))?;
+            )).map_err(request_session_error)?;
             return Err(SessionError::Protocol(ParseError::FieldTooLarge(
                 "model reply",
             )));
@@ -275,10 +278,10 @@ impl AgentSession {
                 // The staged jagent release performs this validation itself.
                 return self
                     .inner
-                    .accept_model_reply(r#"{"action":"run","command":"\n"}"#);
+                    .accept_model_reply_for(&token, r#"{"action":"run","command":"\n"}"#).map_err(request_session_error);
             }
         }
-        self.inner.accept_model_reply(raw)
+        self.inner.accept_model_reply_for(&token, raw).map_err(request_session_error)
     }
 
     /// Reserve an attempt before launching its worker. A second launch cannot
@@ -300,12 +303,13 @@ impl AgentSession {
             epoch: self.epoch(),
             generation,
         };
+        self.model_token = self.inner.model_request_token();
         self.active_request = Some(request);
         Some(request)
     }
 
     pub(crate) fn model_request_is_current(&self, request: AgentRequestRef) -> bool {
-        self.active_request == Some(request)
+        self.model_token.as_ref().is_some_and(|token| token.is_active()) && self.active_request == Some(request)
             && request.epoch == self.epoch()
             && self.state() == AgentState::AwaitingModel
             && !self.is_cancelled()
@@ -325,7 +329,11 @@ impl AgentSession {
         self.active_request = None;
         match reply {
             Ok(raw) => self.accept_model_reply(&raw).map(|_| true),
-            Err(error) => self.model_failed(error).map(|_| true),
+            Err(error) => {
+                let token = self.model_token.take().expect("checked request");
+                self.in_flight = None;
+                self.inner.model_failed_for(&token, error).map(|_| true).map_err(request_session_error)
+            },
         }
     }
 
@@ -2006,4 +2014,9 @@ mod tests {
         session.observe(id, 0, "safe").unwrap();
         assert_eq!(session.state(), AgentState::AwaitingModel);
     }
+}
+
+fn request_session_error(error: jterm_core::agent::ModelRequestError) -> SessionError {
+ match error { jterm_core::agent::ModelRequestError::Session(error) => error,
+ jterm_core::agent::ModelRequestError::StaleRequest => SessionError::Cancelled }
 }
