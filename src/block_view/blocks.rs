@@ -2901,11 +2901,13 @@ mod tests {
             let mut item = row.first_child();
             let mut previous_end = None;
             while let Some(widget) = item {
-                let bounds = widget.allocation();
+                let bounds = widget
+                    .compute_bounds(&row)
+                    .expect("metadata child bounds in its row");
                 if let Some(end) = previous_end {
-                    assert_eq!(bounds.x() - end, 6, "fixed metadata gap at {width}px");
+                    assert_eq!(bounds.x() - end, 6.0, "fixed metadata gap at {width}px");
                 }
-                assert!(bounds.x() + bounds.width() <= width);
+                assert!(bounds.x() + bounds.width() <= width as f32);
                 previous_end = Some(bounds.x() + bounds.width());
                 item = widget.next_sibling();
             }
