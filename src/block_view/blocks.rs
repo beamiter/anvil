@@ -2855,6 +2855,61 @@ mod tests {
             .downcast::<gtk::FlowBox>()
             .expect("wrapping context");
         assert_eq!(context.selection_mode(), gtk::SelectionMode::None);
+        let mut chat_config = Config::safe_defaults();
+        chat_config.terminal_mode = crate::config::TerminalMode::Chat;
+        let chat = FinishedBlock::new(
+            82,
+            "$ ",
+            "true",
+            None,
+            "",
+            Some(0),
+            &chat_config,
+            Some(42),
+            Some(1_700_000_000_000),
+            Some("/a/very/long/project/path"),
+            40,
+        );
+        let row = chat
+            .header_row
+            .next_sibling()
+            .expect("chat context row")
+            .downcast::<gtk::Box>()
+            .expect("compact chat metadata");
+        assert!(row.has_css_class("chat-context"));
+        assert_eq!(row.spacing(), 6);
+        assert!(!row.is_homogeneous());
+        let mut item = row.first_child();
+        let mut count = 0;
+        while let Some(widget) = item {
+            assert!(!widget.hexpands(), "metadata must not absorb spare width");
+            let label = widget
+                .clone()
+                .downcast::<gtk::Label>()
+                .expect("metadata label");
+            assert!(label.is_single_line_mode());
+            assert_eq!(label.xalign(), 0.0);
+            count += 1;
+            item = widget.next_sibling();
+        }
+        assert!(count >= 3, "folder, timestamp and duration remain visible");
+        // Exercise actual GTK allocation, including a narrow split. Spare
+        // width must stay after the last chip, not grow the inter-chip gaps.
+        for width in [320, 800] {
+            let (_, height, _, _) = row.measure(gtk::Orientation::Vertical, width);
+            row.allocate(width, height, -1, None);
+            let mut item = row.first_child();
+            let mut previous_end = None;
+            while let Some(widget) = item {
+                let bounds = widget.allocation();
+                if let Some(end) = previous_end {
+                    assert_eq!(bounds.x() - end, 6, "fixed metadata gap at {width}px");
+                }
+                assert!(bounds.x() + bounds.width() <= width);
+                previous_end = Some(bounds.x() + bounds.width());
+                item = widget.next_sibling();
+            }
+        }
         let mut child = card.header_row.first_child();
         while let Some(widget) = child {
             assert!(!widget.has_css_class("block-chip"));
@@ -4277,17 +4332,37 @@ impl FinishedBlock {
         lifecycle_chip.set_visible(false);
         header_row.append(&lifecycle_chip);
 
-        // Secondary context wraps independently from status and primary actions.
-        // Long paths must never displace Copy, recall, or the fold affordance.
-        let metadata = gtk::FlowBox::new();
+        // Chat reads as a compact message: surplus width belongs after the
+        // metadata, never between its chips. Block retains wrapping context.
+        let metadata: gtk::Widget = if chat {
+            let row = gtk::Box::new(Orientation::Horizontal, 6);
+            row.add_css_class("chat-context");
+            row.upcast()
+        } else {
+            let row = gtk::FlowBox::new();
+            row.set_selection_mode(gtk::SelectionMode::None);
+            row.set_min_children_per_line(1);
+            row.set_max_children_per_line(8);
+            row.set_column_spacing(6);
+            row.set_row_spacing(2);
+            row.upcast()
+        };
         metadata.add_css_class("block-context");
-        metadata.set_selection_mode(gtk::SelectionMode::None);
-        metadata.set_min_children_per_line(1);
-        metadata.set_max_children_per_line(8);
-        metadata.set_column_spacing(6);
-        metadata.set_row_spacing(2);
         metadata.set_halign(gtk::Align::Fill);
         metadata.set_hexpand(true);
+        let append_metadata = |label: &gtk::Label| {
+            if let Some(row) = metadata.downcast_ref::<gtk::Box>() {
+                label.set_hexpand(false);
+                label.set_single_line_mode(true);
+                label.set_xalign(0.0);
+                if label.ellipsize() != gtk::pango::EllipsizeMode::None {
+                    label.set_width_chars(1);
+                }
+                row.append(label);
+            } else if let Some(row) = metadata.downcast_ref::<gtk::FlowBox>() {
+                row.insert(label, -1);
+            }
+        };
 
         // Context chips (Warp-style): cwd pill + git-branch pill.
         if let Some(cwd_path) = cwd {
@@ -4300,7 +4375,7 @@ impl FinishedBlock {
             cwd_chip.set_halign(gtk::Align::Start);
             cwd_chip.set_ellipsize(gtk::pango::EllipsizeMode::Start);
             cwd_chip.set_max_width_chars(40);
-            metadata.insert(&cwd_chip, -1);
+            append_metadata(&cwd_chip);
 
             if let Some(branch) = git_branch_for(cwd_path) {
                 let git_chip = gtk::Label::new(Some(&format!("Branch: {branch}")));
@@ -4308,7 +4383,8 @@ impl FinishedBlock {
                 git_chip.set_halign(gtk::Align::Start);
                 git_chip.set_ellipsize(gtk::pango::EllipsizeMode::End);
                 git_chip.set_max_width_chars(28);
-                metadata.insert(&git_chip, -1);
+                git_chip.set_tooltip_text(Some(&format!("Branch: {branch}")));
+                append_metadata(&git_chip);
             }
         }
 
@@ -4316,7 +4392,7 @@ impl FinishedBlock {
         // keyboard actions on screen instead of requiring the user to remember
         // them. This label deliberately precedes the expanding spacer: it
         // spends the spacer's slack before the status and primary actions.
-        // Secondary metadata wraps independently beneath this row.
+        // Secondary metadata lives independently beneath this row.
         let selection_hint = gtk::Label::new(None);
         selection_hint.add_css_class("block-selection-hint");
         selection_hint.set_accessible_role(gtk::AccessibleRole::Status);
@@ -4354,7 +4430,7 @@ impl FinishedBlock {
                 ts_label.set_tooltip_text(Some(&detail));
                 ts_label.update_property(&[gtk::accessible::Property::Label(&detail)]);
             }
-            metadata.insert(&ts_label, -1);
+            append_metadata(&ts_label);
         }
 
         // Duration badge. Shares Unified's formatter: the card used to round
@@ -4367,7 +4443,7 @@ impl FinishedBlock {
             // The badge rounds; the tooltip does not. Comparing two runs of the
             // same build is the reason anyone reads this number at all.
             dur_label.set_tooltip_text(Some(&format!("{dur_ms} ms")));
-            metadata.insert(&dur_label, -1);
+            append_metadata(&dur_label);
         }
 
         // Exit code badge
