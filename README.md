@@ -1586,15 +1586,19 @@ dual terms.
 directory. Existing binaries are replaced atomically.
 
 The configuration is installed to `${XDG_CONFIG_HOME:-$HOME/.config}/anvil/config.toml`.
-On first installation, the bundled defaults are installed. For an existing
-regular config, the installer compares its TOML field structure with the bundled
-config, including nested tables. Changes only to values, comments, or ordering
-keep the existing file and do not create a backup. Added, removed, or renamed
-fields trigger a private `config.toml.backup.<unique suffix>` copy followed by
-atomic replacement with the bundled defaults. Array lengths and element values
-are ignored; fields within table elements are compared when both arrays contain
-tables. Copy selected custom settings back from the backup after a field change,
-or use `--no-config` to always retain your current settings.
+A missing config is created from the bundled defaults. An existing config
+without an installation record is adopted unchanged. The installer records its
+template beside the config in `.config.toml.installed-defaults`; subsequent
+installs compare the old and new **template fields**, including nested tables.
+Changes only to values, comments, ordering, or array lengths keep the config
+byte-for-byte and create no backup. Optional sections, custom colors, and fields
+materialized by the running application do not count as a template update.
+Added, removed, or renamed template fields trigger a private
+`config.toml.backup.<unique suffix>` copy and atomic replacement with the new
+defaults, unless the current config already has the new fields. The template
+record advances only after a successful update. Copy selected custom settings
+back from the backup after a field change, or use `--no-config` to skip both
+config and template-record updates.
 
 Comparison uses Python 3.11+ `tomllib`, or `tomli` on older Python 3 versions.
 If the parser is unavailable or either file cannot be parsed, the installer

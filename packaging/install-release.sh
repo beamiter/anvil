@@ -18,7 +18,7 @@ for option in "$@"; do
     case "${option}" in
         --no-config) INSTALL_CONFIG=0 ;;
         -h|--help)
-            printf 'Usage: ./install.sh [--no-config]\nDefault: install to ~/.local/bin; keep config values unless fields change.\nChanged fields: save config.toml.backup.* before replacing with bundled defaults.\nIf TOML comparison is unavailable, keep the old config.\n'
+            printf 'Usage: ./install.sh [--no-config]\nDefault: install to ~/.local/bin; preserve existing config and track template fields.\nChanged template fields: save config.toml.backup.* before replacing with bundled defaults.\nIf TOML comparison is unavailable, keep the old config.\n'
             exit 0 ;;
         *) printf 'Unknown option: %s\n' "${option}" >&2; exit 1 ;;
     esac
@@ -105,6 +105,7 @@ install_config_if_absent() {
     if ln -L -T -- "/proc/self/fd/${INSTALL_TEMP_FD}" "${dest}" 2>/dev/null; then
         cleanup_install_temp
         printf 'Created %s\n' "${dest}"
+        install_config_with_backup "${source}" "${dest}" "${dest}"
     elif [[ -e "${dest}" || -L "${dest}" ]]; then
         cleanup_install_temp
         printf 'Keeping concurrently created configuration: %s\n' "${dest}"

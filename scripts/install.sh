@@ -46,10 +46,11 @@ Options:
   --dry-run              Print commands without changing files
   -h, --help             Show this help
 
-Install config.toml on first use. Keep existing values when configuration
-fields are unchanged; when fields change, save a private config.toml.backup.*
-copy before replacing it with bundled defaults. Use --no-config to always keep
-your current settings. If TOML comparison is unavailable, keep the old config.
+Install config.toml on first use; adopt existing configs without resetting them.
+Record the bundled template in .config.toml.installed-defaults. On later installs,
+compare the old and new template fields; only field changes trigger a private
+config.toml.backup.* and replacement. Values and custom fields are preserved.
+Use --no-config to skip config updates. Unavailable TOML comparison keeps the file.
 
 Environment:
   DESTDIR                Optional staging root for packaging

@@ -3,7 +3,10 @@
 This archive contains a prebuilt `anvil` binary plus its desktop entry, shell
 integrations, example workflows, documented configuration, and welcome notebook.
 It installs only into the current user's XDG directories; root access is not
-required, and an existing `config.toml` is never overwritten.
+required. Existing configs are adopted unchanged. Later installs compare the
+bundled fields with `.config.toml.installed-defaults`; only template field
+changes cause a private backup and replacement. Value changes keep your config.
+Use `--no-config` to skip configuration updates.
 
 The archive is relocatable before installation, but it is not statically linked
 or self-contained; the compatible GTK/libadwaita/VTE runtime libraries below

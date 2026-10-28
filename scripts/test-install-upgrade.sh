@@ -15,15 +15,16 @@ printf 'custom = true\n' > "$XDG_CONFIG_HOME/$APP/config.toml"
 installer="$SCRIPT_DIR/install.sh"
 "$installer" --binary "$ROOT/binary" --no-desktop > "$ROOT/install.log"
 cmp "$ROOT/binary" "$HOME/.local/bin/$APP"
-cmp "$SCRIPT_DIR/../config.toml.example" "$XDG_CONFIG_HOME/$APP/config.toml"
+installed="$XDG_CONFIG_HOME/$APP/.config.toml.installed-defaults"
+cmp "$SCRIPT_DIR/../config.toml.example" "$installed"
+[[ $(cat "$XDG_CONFIG_HOME/$APP/config.toml") == 'custom = true' ]]
+[[ $(stat -c %a "$installed") == 600 ]]
 shopt -s nullglob
 backups=("$XDG_CONFIG_HOME/$APP/config.toml".backup.*)
-((${#backups[@]} == 1))
-[[ $(cat "${backups[0]}") == 'custom = true' ]]
-[[ $(stat -c %a "${backups[0]}") == 600 ]]
+((${#backups[@]} == 0))
 "$installer" --binary "$ROOT/binary" --no-desktop > "$ROOT/repeat.log"
 backups=("$XDG_CONFIG_HOME/$APP/config.toml".backup.*)
-((${#backups[@]} == 1))
+((${#backups[@]} == 0))
 printf 'custom = false\n' > "$XDG_CONFIG_HOME/$APP/config.toml"
 "$installer" --binary "$ROOT/binary" --no-desktop --no-config > "$ROOT/keep.log"
 [[ $(cat "$XDG_CONFIG_HOME/$APP/config.toml") == 'custom = false' ]]
@@ -41,6 +42,7 @@ printf 'custom = false\n' > "$XDG_CONFIG_HOME/$APP/config.toml"
     mkdir -p "$fixture_dir"
     bundled="$fixture_dir/default.toml"
     current="$fixture_dir/config.toml"
+    installed="$fixture_dir/.config.toml.installed-defaults"
     expected_backups=0
 
     assert_backup_count() {
@@ -49,6 +51,8 @@ printf 'custom = false\n' > "$XDG_CONFIG_HOME/$APP/config.toml"
     }
     install_fixture() {
         install_config_with_backup "$bundled" "$current" "$current" > "$ROOT/helper.log"
+        local temporaries=("$fixture_dir"/.config.toml.install.* "$fixture_dir"/.config.toml.template.*)
+        ((${#temporaries[@]} == 0))
     }
     assert_preserved() {
         local identity
@@ -64,6 +68,7 @@ printf 'custom = false\n' > "$XDG_CONFIG_HOME/$APP/config.toml"
         cp "$current" "$fixture_dir/expected.toml"
         install_fixture
         cmp "$bundled" "$current"
+        cmp "$bundled" "$installed"
         expected_backups=$((expected_backups + 1))
         assert_backup_count
         for copy in "$current".backup.*; do
@@ -85,6 +90,8 @@ TOML
     # First installation creates the config without a backup; repeating is inert.
     install_fixture
     cmp "$bundled" "$current"
+    cmp "$bundled" "$installed"
+    [[ $(stat -c %a "$installed") == 600 ]]
     assert_backup_count
     assert_preserved
     # Changing values, comments, formatting and ordering must preserve all bytes.
@@ -99,13 +106,17 @@ TOML
     # A field added to the new defaults requires a backed-up replacement.
     printf 'color = "blue"\n' >> "$bundled"
     assert_replaced
-    # A removed field also changes the schema, even without any additions.
+    # Local additions are custom settings, not changes in the application's schema.
     printf 'retired = true\n' >> "$current"
+    assert_preserved
+    # Removed and renamed fields in the new template require a backed-up update.
+    sed '/^color = /d' "$bundled" > "$fixture_dir/next.toml"
+    mv "$fixture_dir/next.toml" "$bundled"
     assert_replaced
-    # Renames and nested changes must not be missed by comparing only top-level keys.
-    sed 's/^size = /renamed_size = /' "$bundled" > "$current"
+    sed 's/^size = /renamed_size = /' "$bundled" > "$fixture_dir/next.toml"
+    mv "$fixture_dir/next.toml" "$bundled"
     assert_replaced
-    sed '/^color = /d' "$bundled" > "$current"
+    printf 'new_nested_field = true\n' >> "$bundled"
     assert_replaced
     # Dotted/quoted keys and inline tables are equivalent TOML representations.
     cat > "$bundled" <<'TOML'
@@ -148,6 +159,9 @@ key = "B"
 TOML
     assert_preserved
     printf '[[bindings]]\nkey = "B"\n' > "$current"
+    assert_preserved
+    sed 's/^action = /command = /' "$bundled" > "$fixture_dir/next.toml"
+    mv "$fixture_dir/next.toml" "$bundled"
     assert_replaced
     # A multiline string may contain text that looks like fields or sections.
     cat > "$bundled" <<'TOML'
@@ -170,6 +184,18 @@ TOML
     printf 'groups = [{ hosts = [] }]\n' > "$bundled"
     printf 'groups = [{ hosts = [{ name = "custom" }] }]\n' > "$current"
     assert_preserved
+    # Sparse/comment-only templates must not erase fields materialized by the app.
+    rm -- "$current" "$installed"
+    printf '# Default values come from the installed application.\n' > "$bundled"
+    install_fixture
+    printf 'font_size = 23\n[colors]\nbackground = "#123456"\n' > "$current"
+    assert_preserved
+    printf '# A new comment, same fields.\n' >> "$bundled"
+    assert_preserved
+    # A missing baseline is adopted without treating user settings as removals.
+    rm -- "$installed"
+    assert_preserved
+    cmp "$bundled" "$installed"
     # Valid but excessively nested TOML must fail closed at parser recursion limits.
     {
         printf 'nested = '
@@ -197,11 +223,23 @@ TOML
         python3() { return 1; }
         assert_preserved
     )
+    # An unreadable schema record must not cause an automatic reset.
+    printf '[broken\n' > "$installed"
+    assert_preserved
+    [[ $(cat "$installed") == '[broken' ]]
+    rm -- "$installed"
+    ln -s "$current" "$installed"
+    assert_preserved
+    [[ -L $installed ]]
+    rm -- "$installed"
+    assert_preserved
     # A dry-run should not create backups for changed fields.
     printf 'another_field = true\n' >> "$bundled"
+    cp "$installed" "$fixture_dir/installed-before-dry-run"
     # Used by the sourced config helper.
     # shellcheck disable=SC2034
     DRY_RUN=1
     assert_preserved
+    cmp "$fixture_dir/installed-before-dry-run" "$installed"
 )
 printf '%s install upgrade: ok\n' "$APP"

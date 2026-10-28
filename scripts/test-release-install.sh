@@ -76,6 +76,8 @@ run_install "${root}" >"${TEST_ROOT}/fresh.log" 2>&1
 config="${root}/config/anvil/config.toml"
 [[ -f "${config}" && ! -L "${config}" ]] || fail "initial config is not a regular file"
 [[ "$(stat -c '%a' -- "${config}")" == 600 ]] || fail "initial config mode is not 0600"
+cmp "${bundle}/share/doc/anvil/config.toml.example" "${config%/*}/.config.toml.installed-defaults" \
+    || fail "initial install did not record its template"
 sed 's/^opacity = .*/opacity = 0.5 # custom value/' "${config}" >"${root}/custom.toml"
 cp "${root}/custom.toml" "${config}"
 config_identity="$(stat -c '%d:%i:%s:%y:%z' -- "${config}")"
@@ -87,6 +89,9 @@ shopt -s nullglob
 config_backups=("${config}".backup.*)
 ((${#config_backups[@]} == 0)) || fail "same-field reinstall created a backup"
 printf 'custom = true\n' >"${config}"
+run_install "${root}" >>"${TEST_ROOT}/fresh.log" 2>&1
+[[ "$(<"${config}")" == 'custom = true' ]] || fail "same-template reinstall reset custom fields"
+printf '\n[new_schema]\nenabled = true\n' >>"${bundle}/share/doc/anvil/config.toml.example"
 run_install "${root}" >>"${TEST_ROOT}/fresh.log" 2>&1
 cmp "${bundle}/share/doc/anvil/config.toml.example" "${config}" || fail "reinstall did not update config"
 shopt -s nullglob

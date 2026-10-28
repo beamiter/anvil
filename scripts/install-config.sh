@@ -68,18 +68,31 @@ sys.exit(0 if comparable(new_keys) == comparable(old_keys) else 10)
 PYTHON
 }
 
-# Keep the current file unless a successful comparison proves fields changed.
+# Only changes between installed templates are schema changes. A user's optional
+# tables, saved defaults, and custom list entries are not a new application schema.
 keep_existing_config() {
-    local source="$1" current="$2" runtime_dest="$3" comparison=0
-    if cmp -s -- "${source}" "${current}"; then
-        printf 'Config already current: %s\n' "${runtime_dest}"
+    local source="$1" current="$2" runtime_dest="$3" installed="$4"
+    local comparison=0 current_comparison=0
+    config_fields_match "${source}" "${current}" || current_comparison=$?
+    if ((current_comparison != 0 && current_comparison != 10)); then
+        printf 'Keeping config (field comparison unavailable): %s\n' "${runtime_dest}"
+        return 2
+    fi
+    if [[ ! -e "${installed}" ]]; then
+        printf 'Keeping config (recording initial installed template): %s\n' "${runtime_dest}"
         return 0
     fi
-    config_fields_match "${source}" "${current}" || comparison=$?
+    config_fields_match "${source}" "${installed}" || comparison=$?
     case "${comparison}" in
-        0) printf 'Keeping config (fields unchanged): %s\n' "${runtime_dest}"; return 0 ;;
-        10) return 1 ;;
-        *) printf 'Keeping config (field comparison unavailable): %s\n' "${runtime_dest}"; return 0 ;;
+        0) printf 'Keeping config (template fields unchanged): %s\n' "${runtime_dest}"; return 0 ;;
+        10)
+            if ((current_comparison == 0)); then
+                printf 'Keeping config (already has current fields): %s\n' "${runtime_dest}"
+                return 0
+            fi
+            return 1
+            ;;
+        *) printf 'Keeping config (field comparison unavailable): %s\n' "${runtime_dest}"; return 2 ;;
     esac
 }
 
@@ -88,6 +101,7 @@ install_config_with_backup() (
     umask 077
     local source="$1" dest="$2" runtime_dest="$3" directory basename
     local temporary="" temporary_identity="" backup="" original_identity="" directory_fd=""
+    local installed installed_identity="" comparison=0
     # Invoked by the EXIT trap inside this function subshell.
     # shellcheck disable=SC2317
     cleanup_config_temp() {
@@ -100,6 +114,7 @@ install_config_with_backup() (
     trap cleanup_config_temp EXIT
     directory="${dest%/*}"
     basename="${dest##*/}"
+    installed="${directory}/.${basename}.installed-defaults"
     # Preserve explicit external configuration links, including dangling links.
     if [[ -L "${dest}" ]]; then
         printf 'Keeping symlinked config: %s\n' "${runtime_dest}"
@@ -108,9 +123,14 @@ install_config_with_backup() (
     if [[ -e "${dest}" && ! -f "${dest}" ]]; then
         die "configuration destination is not a regular file: ${runtime_dest}"
     fi
+    if [[ -L "${installed}" || ( -e "${installed}" && ! -f "${installed}" ) ]]; then
+        printf 'Keeping config (installed template is not a regular file): %s\n' "${runtime_dest}"
+        return 0
+    fi
     if ((DRY_RUN != 0)); then
-        if [[ -f "${dest}" ]] && keep_existing_config "${source}" "${dest}" "${runtime_dest}"; then
-            return 0
+        if [[ -f "${dest}" ]]; then
+            keep_existing_config "${source}" "${dest}" "${runtime_dest}" "${installed}" || comparison=$?
+            ((comparison == 1)) || return 0
         fi
         printf '  update config %q (back up existing contents before replacement)\n' "${runtime_dest}"
         return 0
@@ -120,6 +140,42 @@ install_config_with_backup() (
     exec {directory_fd}<"${directory}" || die "cannot open config directory"
     local bound="/proc/self/fd/${directory_fd}" target
     target="${bound}/${basename}"
+    installed="${bound}/.${basename}.installed-defaults"
+    if [[ -L "${installed}" || ( -e "${installed}" && ! -f "${installed}" ) ]]; then
+        printf 'Keeping config (installed template changed type): %s\n' "${runtime_dest}"
+        return 0
+    fi
+    if [[ -f "${installed}" ]]; then
+        installed_identity="$(stat -Lc '%d:%i:%s:%y:%z' -- "${installed}")"
+    fi
+    # Invoked only after the config has been kept or safely published. Advance
+    # the template last so a failed update is retried at the next installation.
+    save_installed_template() {
+        cleanup_config_temp
+        temporary=""
+        if [[ -n "${installed_identity}" ]]; then
+            [[ ! -L "${installed}" && -f "${installed}" \
+                && "$(stat -Lc '%d:%i:%s:%y:%z' -- "${installed}")" == "${installed_identity}" ]] \
+                || die "installed config template changed during installation"
+            if cmp -s -- "${source}" "${installed}"; then
+                return 0
+            fi
+        fi
+        temporary="$(mktemp "${bound}/.${basename}.template.XXXXXX")"
+        temporary_identity="$(stat -Lc '%d:%i' -- "${temporary}")"
+        install -m 0600 -- "${source}" "${temporary}"
+        # install may replace the reserved inode; cleanup must track its output.
+        temporary_identity="$(stat -Lc '%d:%i' -- "${temporary}")"
+        if [[ -n "${installed_identity}" ]]; then
+            [[ ! -L "${installed}" && -f "${installed}" \
+                && "$(stat -Lc '%d:%i:%s:%y:%z' -- "${installed}")" == "${installed_identity}" ]] \
+                || die "installed config template changed during installation"
+            mv -fT -- "${temporary}" "${installed}"
+            temporary=""
+        elif ! ln -T -- "${temporary}" "${installed}" 2>/dev/null; then
+            die "installed config template was concurrently created"
+        fi
+    }
     if [[ -L "${target}" ]]; then
         printf 'Keeping concurrently linked config: %s\n' "${runtime_dest}"
         return 0
@@ -127,7 +183,14 @@ install_config_with_backup() (
     if [[ -e "${target}" ]]; then
         [[ -f "${target}" ]] || die "configuration destination changed type"
         original_identity="$(stat -Lc '%d:%i:%s:%y:%z' -- "${target}")"
-        if keep_existing_config "${source}" "${target}" "${runtime_dest}"; then
+        keep_existing_config "${source}" "${target}" "${runtime_dest}" "${installed}" || comparison=$?
+        if ((comparison != 1)); then
+            if ((comparison == 0)); then
+                [[ ! -L "${target}" && -f "${target}" \
+                    && "$(stat -Lc '%d:%i:%s:%y:%z' -- "${target}")" == "${original_identity}" ]] \
+                    || die "config changed while comparing fields"
+                save_installed_template
+            fi
             return 0
         fi
         [[ "$(stat -Lc '%d:%i:%s:%y:%z' -- "${target}")" == "${original_identity}" ]] \
@@ -164,4 +227,5 @@ install_config_with_backup() (
         mv -fT -- "${temporary}" "${target}"
         temporary=""
     fi
+    save_installed_template
 )
