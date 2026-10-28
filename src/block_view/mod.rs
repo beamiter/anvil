@@ -31,6 +31,7 @@ use jterm_core::wheel::WheelAccumulator;
 mod activity_knowledge;
 mod alt_screen;
 mod ansi;
+mod block_reference;
 mod blocks;
 mod bookmarks;
 mod chat;
@@ -2115,7 +2116,13 @@ struct LiveKeyRecord {
 impl LiveKeyRecord {
     /// A new key press on the live VTE. Returns the ESC an earlier Alt chord
     /// left held, which the caller writes before this press commits anything.
-    fn record(&self, key: (KittyKey, KittyModifiers)) -> Option<&'static [u8]> {
+    fn record(&self, key: (KittyKey, KittyModifiers), is_modifier: bool) -> Option<&'static [u8]> {
+        // A pure GDK modifier has no VTE commit to consume this record. It
+        // must neither create pending input nor disturb a real pending key or
+        // the held first half of an Alt chord.
+        if is_modifier {
+            return None;
+        }
         let stale = self.take_held_escape();
         self.last_key.set(Some(key));
         stale
@@ -7409,6 +7416,9 @@ impl ReaderCtx {
             self.prompt_end_pos_rc.get(),
             self.prompt_anchor_rows_rc.get(),
         );
+        if std::env::var_os("ANVIL_BLOCK_REFERENCE_METRICS").is_some() {
+            log::info!(target:"anvil::block_reference","command_anchor ready={} recorded_rows={} current_rows={} start_col={} start_row={} end_col={} end_row={} columns={} declared_truncated={} reported_bytes={:?}",self.prompt_anchor_ready_rc.get(),self.prompt_anchor_rows_rc.get(),current_rows,start_col,start_row,cmd_end_col,cmd_end_row,self.backend.live_column_count(),meta.command_truncated,meta.command.as_ref().map(|command|command.len()));
+        }
         self.prompt_end_pos_rc.set((start_col, start_row));
         self.prompt_anchor_rows_rc.set(current_rows);
         let captured = if !self.prompt_anchor_ready_rc.get() {
@@ -10460,7 +10470,12 @@ fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
     let chrome = active_card_vchrome_for_classes(|class| {
         holder.as_ref().is_some_and(|h| h.has_css_class(class))
     });
-    let chrome = if chat::canvas_height(scroll).is_some() {
+    let block_canvas = scroll
+        .ancestor(gtk::Box::static_type())
+        .is_some_and(|widget| widget.has_css_class("block-native-canvas"));
+    let chrome = if block_canvas {
+        block_reference::HEADER_HEIGHT + 2 + 12
+    } else if chat::canvas_height(scroll).is_some() {
         0
     } else {
         chrome
@@ -11294,15 +11309,15 @@ impl KeyCtx {
                 let display = controller.widget().map(|widget| widget.display());
                 // The event's own layout group, so a multi-layout user is
                 // not reported the first installed layout's letters.
-                let layout = controller
+                let event = controller
                     .current_event()
-                    .and_then(|event| event.downcast::<gtk::gdk::KeyEvent>().ok())
-                    .map(|event| event.layout())
-                    .unwrap_or(0);
+                    .and_then(|event| event.downcast::<gtk::gdk::KeyEvent>().ok());
+                let layout = event.as_ref().map(|event| event.layout()).unwrap_or(0);
+                let is_modifier = event.as_ref().is_some_and(|event| event.is_modifier());
                 let key = kitty_key_event(keyval, keycode, layout, modifiers, display.as_ref());
                 // An Alt chord's ESC still held means its key never committed;
                 // it goes out on its own before anything this press sends.
-                if let Some(stale) = live_keys_for_key.record(key) {
+                if let Some(stale) = live_keys_for_key.record(key, is_modifier) {
                     pty_for_key.write_bytes(stale);
                 }
             }
@@ -11935,6 +11950,12 @@ impl TermView {
         crate::workspace_shell::apply_canvas_palette(&mut pane_config);
         let config = &pane_config;
         let chat_mode = *mode == crate::config::TerminalMode::Chat;
+        let block_mode = *mode == crate::config::TerminalMode::Block;
+        // The Block dock remains an unapplied follow-up until real resize /
+        // command-capture provenance passes. Keep its source recoverable while
+        // this checkpoint runs the established single-VTE Block input surface.
+        const BLOCK_DOCK_VERIFIED: bool = false;
+        let docked_input = chat_mode || (block_mode && BLOCK_DOCK_VERIFIED);
 
         ime_gate::install();
         // ── Build widget tree ──────────────────────────────────────────────
@@ -11943,6 +11964,9 @@ impl TermView {
         root.set_vexpand(true);
         root.set_focusable(true);
         root.add_css_class("term-view-root");
+        if *mode == crate::config::TerminalMode::Block {
+            root.add_css_class("block-command-canvas");
+        }
 
         // Block list inside a scrolled window
         let block_list = gtk::Box::new(Orientation::Vertical, 0);
@@ -11981,6 +12005,15 @@ impl TermView {
             live_raw_output.clone(),
         )));
         let active_vte = active.borrow().active_vte.clone();
+        let block_live_chrome = (*mode == crate::config::TerminalMode::Block).then(|| {
+            let chrome = block_reference::LiveChrome::new();
+            active
+                .borrow()
+                .widget()
+                .add_css_class("block-reference-live");
+            active.borrow().widget().prepend(&chrome.root);
+            chrome
+        });
         // The caller owns the mode decision. Managed remote panes deliberately
         // pass Block even when the shared config defaults to Unified.
         let unified = mode.is_unified();
@@ -12144,7 +12177,7 @@ impl TermView {
         scroll_overlay.add_overlay(&sticky_bar);
         scroll_overlay.add_overlay(&jump_fab);
         scroll_overlay.add_overlay(&running_pill);
-        let chat_organism_surface = chat_mode.then(|| {
+        let chat_organism_surface = docked_input.then(|| {
             let surface = gtk::Fixed::new();
             surface.set_can_target(false);
             surface.set_focusable(false);
@@ -12263,6 +12296,10 @@ impl TermView {
         let chat_canvas = gtk::Box::new(Orientation::Vertical, 0);
         chat_canvas.set_hexpand(true);
         chat_canvas.set_vexpand(true);
+        if block_mode && docked_input {
+            chat_canvas.add_css_class("block-native-canvas");
+            active.borrow().bind_block_grid_canvas(&chat_canvas);
+        }
         let chat_dock = gtk::Box::new(Orientation::Vertical, 0);
         chat_dock.set_hexpand(true);
         let chat_send = icon_button("go-up-symbolic", "Send Enter to the live shell");
@@ -12309,7 +12346,13 @@ impl TermView {
         chat_running_status.set_height_request(17);
         chat_running_status
             .set_tooltip_text(Some("The running command retains the terminal input"));
-        chat_dock.append(&chat_running_status);
+        let chat_status_chrome = gtk::Box::new(Orientation::Vertical, 0);
+        if block_mode && docked_input {
+            chat_status_chrome.set_vexpand(true);
+        }
+        crate::workspace_shell::own_composer_chrome(&chat_status_chrome);
+        chat_status_chrome.append(&chat_running_status);
+        chat_dock.append(&chat_status_chrome);
         chat_dock.append(&chat_controls);
         let weak_status = chat_running_status.downgrade();
         chat_stop.connect_visible_notify(move |stop| {
@@ -12324,8 +12367,10 @@ impl TermView {
             }
         });
         let chat_frame = gtk::Overlay::new();
-        let chat_resize_observer = if chat_mode {
-            root.add_css_class("chat-mode");
+        let chat_resize_observer = if docked_input {
+            if chat_mode {
+                root.add_css_class("chat-mode");
+            }
             chat_canvas.add_css_class("chat-canvas");
             chat_canvas.append(&scroll_overlay);
             chat_canvas.append(&chat_prompt_scroll);
@@ -12460,6 +12505,71 @@ impl TermView {
         let reserved_history_block_ids: Rc<RefCell<HashSet<u64>>> =
             Rc::new(RefCell::new(HashSet::new()));
         let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
+        let block_toolbar_refresh: Option<Rc<dyn Fn()>> =
+            if *mode == crate::config::TerminalMode::Block {
+                let toolbar = gtk::Box::new(Orientation::Horizontal, 6);
+                toolbar.add_css_class("block-reference-toolbar");
+                toolbar.add_css_class("anvil-ui-font");
+                toolbar.set_height_request(36);
+                let status = gtk::Label::new(Some("Live · 0 commands"));
+                block_reference::trace_label_font(&status, "live-toolbar");
+                status.set_xalign(0.0);
+                status.set_hexpand(true);
+                toolbar.append(&status);
+                let find = icon_button("edit-find-symbolic", "Search terminal output");
+                let callbacks = workspace_action_callbacks.clone();
+                find.connect_clicked(move |_| {
+                    for callback in callbacks.borrow().iter() {
+                        callback(crate::keybindings::Action::ToggleSearch);
+                    }
+                });
+                toolbar.append(&find);
+                let live = icon_button("go-bottom-symbolic", "Return to live output");
+                let debounce = scroll_debouncer.clone();
+                let scroll = block_scroll.downgrade();
+                live.connect_clicked(move |_| {
+                    if let Some(scroll) = scroll.upgrade() {
+                        debounce.reset_scroll_lock();
+                        debounce.pin_to_bottom_deferred(&scroll);
+                    }
+                });
+                toolbar.append(&live);
+                root.prepend(&toolbar);
+                let label = status.downgrade();
+                let blocks = Rc::downgrade(&finished_blocks_rc);
+                let reading = user_scrolled_up.clone();
+                let state = bstate.clone();
+                let refresh: Rc<dyn Fn()> = Rc::new(move || {
+                    if let (Some(label), Some(blocks)) = (label.upgrade(), blocks.upgrade()) {
+                        let count = blocks
+                            .borrow()
+                            .iter()
+                            .filter(|block| !block.is_background)
+                            .count()
+                            + usize::from(state.get() == BlockState::CollectingOutput);
+                        let text = format!(
+                            "{} · {count} commands",
+                            if reading.get() { "Reading" } else { "Live" }
+                        );
+                        if label.text().as_str() != text {
+                            label.set_text(&text);
+                        }
+                    }
+                });
+                let update = refresh.clone();
+                toolbar.connect_map(move |_| update());
+                let update = refresh.clone();
+                block_scroll
+                    .vadjustment()
+                    .connect_value_changed(move |_| update());
+                let update = refresh.clone();
+                block_scroll
+                    .vadjustment()
+                    .connect_changed(move |_| update());
+                Some(refresh)
+            } else {
+                None
+            };
         let find_state: Rc<RefCell<FindState>> = Rc::new(RefCell::new(FindState::default()));
 
         // Paint failures against the full-history track, independently of the
@@ -12703,12 +12813,14 @@ impl TermView {
                     // legacy Block floor of six rows must not expand it at
                     // CommandStart before any new output exists. Retain every
                     // proven row and preserve full-screen/scrollback fallback.
-                    let visible_rows =
-                        if chat_mode && prompt_at_grid_top && !live_force_full_for_layout.get() {
-                            next_high_water.clamp(1, viewport_rows.max(1))
-                        } else {
-                            visible_rows
-                        };
+                    let visible_rows = if docked_input
+                        && prompt_at_grid_top
+                        && !live_force_full_for_layout.get()
+                    {
+                        next_high_water.clamp(1, viewport_rows.max(1))
+                    } else {
+                        visible_rows
+                    };
                     live_rows_high_water.set(next_high_water);
                     holder.set_height_request(
                         (visible_rows as i32) * cell_h + blocks::terminal_vertical_insets(&vte),
@@ -12752,7 +12864,7 @@ impl TermView {
                 // card is that grid too. Normal command output is rendered into
                 // the running block above, so the live input cell can still stay
                 // compact — it is only the visible height that collapses.
-                let compact_rows = if chat_mode {
+                let compact_rows = if docked_input {
                     chat::composer_rows
                 } else {
                     compact_card_rows
@@ -12772,7 +12884,7 @@ impl TermView {
                 } else {
                     grid_rows
                 };
-                let grid_rows = if chat_mode && idle && !prompt_at_grid_top {
+                let grid_rows = if docked_input && idle && !prompt_at_grid_top {
                     grid_rows.max(card_rows)
                 } else {
                     grid_rows
@@ -12848,7 +12960,7 @@ impl TermView {
         };
         let layout_active_surface: Rc<dyn Fn()> = if unified {
             unified_layout_active_surface
-        } else if chat_mode {
+        } else if docked_input {
             chat::layout(
                 &active,
                 &bstate,
@@ -12957,14 +13069,38 @@ impl TermView {
         }
         let alt_screen_callbacks: AltScreenCallbacks = Rc::new(RefCell::new(vec![]));
         let command_started_callbacks: CommandStartedCallbacks = Rc::new(RefCell::new(vec![]));
-        if chat_mode {
+        if let Some(chrome) = &block_live_chrome {
+            let chrome = chrome.clone();
+            command_started_callbacks
+                .borrow_mut()
+                .push(Box::new(move |event| {
+                    chrome.update(&event.command, 0, true);
+                }));
+        }
+        if docked_input {
             let running = chat_running.clone();
             command_started_callbacks
                 .borrow_mut()
                 .push(Box::new(move |_| running.started()));
         }
         let command_finished_callbacks: CommandFinishedCallbacks = Rc::new(RefCell::new(vec![]));
+        if let Some(refresh) = block_toolbar_refresh.clone() {
+            let started = refresh.clone();
+            command_started_callbacks
+                .borrow_mut()
+                .push(Box::new(move |_| started()));
+            command_finished_callbacks
+                .borrow_mut()
+                .push(Box::new(move |_| refresh()));
+        }
         let block_finished_callbacks: BlockFinishedCallbacks = Rc::new(RefCell::new(vec![]));
+        if let Some(refresh) = block_toolbar_refresh {
+            block_finished_callbacks
+                .borrow_mut()
+                .push(BlockFinishedCallback::Metadata(Box::new(
+                    move |_, _, _, _| refresh(),
+                )));
+        }
         let ask_ai_about_block_callbacks: BlockContextCallbacks = Rc::new(RefCell::new(vec![]));
         let fix_block_with_agent_callbacks: FixBlockWithAgentCallbacks =
             Rc::new(RefCell::new(vec![]));
@@ -12985,7 +13121,7 @@ impl TermView {
         let live_keys: Rc<LiveKeyRecord> = Rc::new(LiveKeyRecord::default());
         let agent_prompt_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         let chat_send_intent: Rc<Cell<Option<chat::SendIntent>>> = Rc::new(Cell::new(None));
-        if chat_mode {
+        if docked_input {
             chat::connect_submit(
                 &chat_send,
                 &bstate,
@@ -13273,7 +13409,7 @@ impl TermView {
                 })
             } else {
                 Rc::new(BlockBackend {
-                    chat_running: chat_mode.then(|| chat_running.clone()),
+                    chat_running: docked_input.then(|| chat_running.clone()),
                     active_rc,
                     active_vte: active_vte_rc,
                     // Same construction-time policy passed to the submission
@@ -13608,7 +13744,7 @@ impl TermView {
             });
         }
 
-        if chat_mode {
+        if docked_input {
             let flags = kitty_flags.clone();
             let keys = live_keys.clone();
             let protocol_ready: Rc<dyn Fn() -> bool> =
@@ -13630,7 +13766,7 @@ impl TermView {
         // Running commands keep their existing status header while the user reads
         // history. Finished oversized blocks pin their command when the original
         // header has scrolled above the viewport but the block still spans it.
-        if !chat_mode {
+        if !docked_input {
             let pty = pty.clone();
             let human_input = human_input_callbacks.clone();
             let selection_feed_hold = selection_feed_hold.clone();
@@ -13641,7 +13777,7 @@ impl TermView {
                 });
             });
         }
-        if !chat_mode {
+        if !docked_input {
             // The pill's stop is the same interrupt as the sticky header's: the
             // two are never on screen together, so they are one control that
             // moves with the viewport.
@@ -13809,12 +13945,24 @@ impl TermView {
             let chat_hint = chat_hint.downgrade();
             let chat_state = bstate.clone();
             let chat_running = chat_running.clone();
+            let block_live_chrome = block_live_chrome.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
                 if sticky.parent().is_none() {
                     return glib::ControlFlow::Break;
                 }
+                if let Some(chrome) = &block_live_chrome {
+                    let seconds = block_start_time
+                        .get()
+                        .and_then(|start| start.elapsed().ok())
+                        .map_or(0, |elapsed| elapsed.as_secs());
+                    chrome.update(
+                        &running_cmd.borrow(),
+                        seconds,
+                        cmd_running.get() && !fullscreen.get(),
+                    );
+                }
 
-                if chat_mode {
+                if docked_input {
                     if let Some(hint) = chat_hint.upgrade() {
                         chat_running.update(chat_state.get(), &hint);
                     }
@@ -14547,7 +14695,7 @@ impl TermView {
             live_scrollbar.add_controller(scrollbar_scroll);
         }
 
-        let selection_root: gtk::Widget = if chat_mode {
+        let selection_root: gtk::Widget = if docked_input {
             root.clone().upcast()
         } else {
             block_scroll.clone().upcast()
@@ -24024,6 +24172,60 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
     }
 
     #[test]
+    fn pure_modifiers_do_not_create_or_replace_pending_terminal_input() {
+        use super::{
+            chat_send_commit_allowed, KittyKey, KittyModifiers, LiveCommit, LiveKeyRecord,
+        };
+        let modifier = (KittyKey::Functional, KittyModifiers::default());
+        let cpr = Cell::new(0);
+        let keys = LiveKeyRecord::default();
+        for _ in 0..2 {
+            assert_eq!(keys.record(modifier, true), None);
+            assert!(!keys.has_pending_input());
+            assert!(chat_send_commit_allowed("\r", false, &keys, 0));
+        }
+        // Functional does not mean modifier: arrows and other keys without a
+        // text codepoint still own their eventual native commit.
+        for (pending, commit) in [
+            (
+                (KittyKey::Unicode('x'), KittyModifiers::default()),
+                &b"x"[..],
+            ),
+            (
+                (KittyKey::Functional, KittyModifiers::default()),
+                &b"\x1b[A"[..],
+            ),
+            (
+                (
+                    KittyKey::Unicode('c'),
+                    KittyModifiers {
+                        ctrl: true,
+                        ..KittyModifiers::default()
+                    },
+                ),
+                &b"\x03"[..],
+            ),
+        ] {
+            assert_eq!(keys.record(pending, false), None);
+            assert!(keys.has_pending_input());
+            assert_eq!(keys.record(modifier, true), None);
+            assert_eq!(keys.last_key.get(), Some(pending));
+            assert!(!chat_send_commit_allowed("\r", false, &keys, 0));
+            assert_eq!(route(commit, &cpr, &keys, 0), typed(commit));
+            assert!(!keys.has_pending_input(), "the real commit retires its key");
+        }
+        let pending = alt_key(KittyKey::Unicode('b'));
+        assert_eq!(keys.record(pending, false), None);
+        assert_eq!(route(b"\x1b", &cpr, &keys, 0), LiveCommit::Held);
+        assert_eq!(keys.record(modifier, true), None);
+        assert_eq!(keys.last_key.get(), Some(pending));
+        assert!(keys.alt_escape.get().take_held().is_some());
+        assert!(!chat_send_commit_allowed("\r", false, &keys, 0));
+        assert_eq!(route(b"b", &cpr, &keys, 0), typed(b"\x1bb"));
+        assert!(!keys.has_pending_input());
+    }
+
+    #[test]
     fn chat_send_preserves_pending_protocol_and_native_keyboard_route() {
         use super::{chat_send_commit_allowed, LiveCommit, LiveKeyRecord};
         let keys = LiveKeyRecord::default();
@@ -24035,7 +24237,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         assert!(!chat_send_commit_allowed("\r", true, &keys, 0));
         assert!(!chat_send_commit_allowed("\r", false, &keys, 1));
         let pressed = alt_key(super::KittyKey::Unicode('b'));
-        keys.record(pressed);
+        keys.record(pressed, false);
         assert!(!chat_send_commit_allowed("\r", false, &keys, 0));
         assert_eq!(keys.last_key.get(), Some(pressed));
         assert_eq!(route(b"\x1b", &cpr, &keys, 0), LiveCommit::Held);
@@ -24045,13 +24247,16 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         }
         assert_eq!(route(b"b", &cpr, &keys, 0), typed(b"\x1bb"));
         assert!(chat_send_commit_allowed("\r", false, &keys, 0));
-        keys.record((
-            super::KittyKey::Enter,
-            super::KittyModifiers {
-                shift: true,
-                ..super::KittyModifiers::default()
-            },
-        ));
+        keys.record(
+            (
+                super::KittyKey::Enter,
+                super::KittyModifiers {
+                    shift: true,
+                    ..super::KittyModifiers::default()
+                },
+            ),
+            false,
+        );
         assert!(!chat_send_commit_allowed("\r", false, &keys, 1));
         assert!(
             matches!(route(b"\r", &cpr, &keys, 1), LiveCommit::Encoded(bytes) if bytes == b"\x1b[13;2u")
@@ -24065,7 +24270,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         let keys = LiveKeyRecord::default();
         let cpr = Cell::new(0);
         let pressed = alt_key(super::KittyKey::Unicode('b'));
-        assert_eq!(keys.record(pressed), None);
+        assert_eq!(keys.record(pressed, false), None);
         for (commit, report) in [
             // DECSET 1004 on every Alt+Tab, and DECSET 1003 pointer motion.
             (&b"\x1b[O"[..], TerminalReport::FocusOut),
@@ -24130,7 +24335,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         for private in [&b"\x1b[?1;2R"[..], b"\x1b[?1;2;1R"] {
             let keys = LiveKeyRecord::default();
             let pressed = alt_key(super::KittyKey::Unicode('b'));
-            keys.record(pressed);
+            keys.record(pressed, false);
             let cpr = Cell::new(1);
             for reply in [private, b"\x1b[1;2R"] {
                 // Even an armed submission must forward both replies.
@@ -24154,18 +24359,18 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         let cpr = Cell::new(0);
         // libvte 0.76 commits Alt+b as ESC and then `b`. Under the kitty
         // flags that is one chord, not `CSI 98;3u` followed by a typed `b`.
-        keys.record(alt_key(KittyKey::Unicode('b')));
+        keys.record(alt_key(KittyKey::Unicode('b')), false);
         assert_eq!(route(b"\x1b", &cpr, &keys, 1), LiveCommit::Held);
         assert_eq!(
             route(b"b", &cpr, &keys, 1),
             LiveCommit::Encoded(b"\x1b[98;3u".to_vec())
         );
         // Without flags the legacy pair still goes out as one write.
-        keys.record(alt_key(KittyKey::Unicode('b')));
+        keys.record(alt_key(KittyKey::Unicode('b')), false);
         assert_eq!(route(b"\x1b", &cpr, &keys, 0), LiveCommit::Held);
         assert_eq!(route(b"b", &cpr, &keys, 0), typed(b"\x1bb"));
         // Alt+Backspace takes the same two-commit path in libvte.
-        keys.record(alt_key(KittyKey::Backspace));
+        keys.record(alt_key(KittyKey::Backspace), false);
         assert_eq!(route(b"\x1b", &cpr, &keys, 1), LiveCommit::Held);
         assert_eq!(
             route(b"\x7f", &cpr, &keys, 1),
@@ -24173,14 +24378,14 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         );
 
         // Plain Esc is never held, and Alt+Esc arrives as one `ESC ESC`.
-        keys.record((KittyKey::Escape, super::KittyModifiers::default()));
+        keys.record((KittyKey::Escape, super::KittyModifiers::default()), false);
         assert_eq!(
             route(b"\x1b", &cpr, &keys, 1),
             LiveCommit::Encoded(b"\x1b[27u".to_vec())
         );
-        keys.record((KittyKey::Escape, super::KittyModifiers::default()));
+        keys.record((KittyKey::Escape, super::KittyModifiers::default()), false);
         assert_eq!(route(b"\x1b", &cpr, &keys, 0), typed(b"\x1b"));
-        keys.record(alt_key(KittyKey::Escape));
+        keys.record(alt_key(KittyKey::Escape), false);
         assert_eq!(route(b"\x1b\x1b", &cpr, &keys, 0), typed(b"\x1b\x1b"));
     }
 
@@ -24191,10 +24396,10 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         let keys = LiveKeyRecord::default();
         let cpr = Cell::new(0);
         // The next key press releases an ESC whose key never committed...
-        keys.record(alt_key(KittyKey::Unicode('b')));
+        keys.record(alt_key(KittyKey::Unicode('b')), false);
         assert_eq!(route(b"\x1b", &cpr, &keys, 0), LiveCommit::Held);
         assert_eq!(
-            keys.record(alt_key(KittyKey::Unicode('c'))),
+            keys.record(alt_key(KittyKey::Unicode('c')), false),
             Some(&b"\x1b"[..])
         );
         assert_eq!(keys.take_held_escape(), None);
@@ -24203,7 +24408,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         assert_eq!(keys.take_held_escape(), Some(&b"\x1b"[..]));
         assert_eq!(keys.take_held_escape(), None);
         // A joined chord leaves nothing for either to release.
-        keys.record(alt_key(KittyKey::Unicode('d')));
+        keys.record(alt_key(KittyKey::Unicode('d')), false);
         assert_eq!(route(b"\x1b", &cpr, &keys, 0), LiveCommit::Held);
         assert_eq!(route(b"d", &cpr, &keys, 0), typed(b"\x1bd"));
         assert_eq!(keys.take_held_escape(), None);
@@ -24250,7 +24455,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             (Some(false), LiveCommit::Encoded(b"\x1b[13;2u".to_vec())),
             (Some(true), typed(b"\r")),
         ] {
-            keys.record(shift_enter);
+            keys.record(shift_enter, false);
             let route = super::route_live_commit(b"\r", &cpr, false, &keys, 1, || {
                 kitty_rewrite_applies(BlockState::RawFallback, || foreground)
             });
@@ -24259,7 +24464,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
 
         // The probe is not asked when nothing could be encoded anyway.
         let never = || -> bool { panic!("no recorded key under flags") };
-        keys.record(alt_key(KittyKey::Unicode('a')));
+        keys.record(alt_key(KittyKey::Unicode('a')), false);
         assert_eq!(
             super::route_live_commit(b"a", &cpr, false, &keys, 0, never),
             typed(b"a")
@@ -24321,7 +24526,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             },
         );
         let route = |foreground_group: Option<i32>| {
-            keys.record(ctrl_c);
+            keys.record(ctrl_c, false);
             super::route_live_commit(b"\x03", &cpr, false, &keys, 1, || {
                 kitty_rewrite_applies(BlockState::RawFallback, || {
                     raw_fallback_shell_is_foreground(
@@ -25344,7 +25549,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         // recorded and its bytes still to come.
         let keys = Rc::new(LiveKeyRecord::default());
         let pressed = alt_key(KittyKey::Unicode('b'));
-        keys.record(pressed);
+        keys.record(pressed, false);
         let routed: Routed = Rc::new(RefCell::new(Vec::new()));
         {
             let keys = keys.clone();

@@ -1,0 +1,105 @@
+--- a/src/block_view/mod.rs
++++ b/src/block_view/mod.rs
+@@ -3825,6 +3825,13 @@
+ /// and the query-only submission surface, so no prompt consumer can drift.
+ fn prompt_anchor_rebases_on_row_delta(unified: bool) -> bool {
+     !unified
++}
++
++fn prompt_anchor_rebases_for_presentation(unified: bool, stable_block_grid: bool) -> bool {
++    // Retained v2 Block changes only a clip's seat/visible height. Its native
++    // grid stays pane-sized, so a ring-row anchor has identity just as Unified
++    // does. Keep the existing compact policy for Chat and legacy consumers.
++    !stable_block_grid && prompt_anchor_rebases_on_row_delta(unified)
+ }
+ 
+ /// Return the PromptEnd anchor as it exists on this pane's live surface now.
+@@ -7417,7 +7424,7 @@
+             self.prompt_anchor_rows_rc.get(),
+         );
+         if std::env::var_os("ANVIL_BLOCK_REFERENCE_METRICS").is_some() {
+-            log::info!(target:"anvil::block_reference","command_anchor ready={} recorded_rows={} current_rows={} start_col={} start_row={} end_col={} end_row={} columns={} declared_truncated={} reported_bytes={:?}",self.prompt_anchor_ready_rc.get(),self.prompt_anchor_rows_rc.get(),current_rows,start_col,start_row,cmd_end_col,cmd_end_row,self.backend.live_column_count(),meta.command_truncated,meta.command.as_ref().map(|command|command.len()));
++            log::info!(target:"anvil::block_reference","command_anchor ready={} recorded_rows={} current_rows={} provisional_col={} provisional_row={} start_col={} start_row={} end_col={} end_row={} columns={} declared_truncated={} reported_bytes={:?}",self.prompt_anchor_ready_rc.get(),self.prompt_anchor_rows_rc.get(),current_rows,self.prompt_end_pos_rc.get().0,self.prompt_end_pos_rc.get().1,start_col,start_row,cmd_end_col,cmd_end_row,self.backend.live_column_count(),meta.command_truncated,meta.command.as_ref().map(|command|command.len()));
+         }
+         self.prompt_end_pos_rc.set((start_col, start_row));
+         self.prompt_anchor_rows_rc.set(current_rows);
+@@ -11951,11 +11958,7 @@
+         let config = &pane_config;
+         let chat_mode = *mode == crate::config::TerminalMode::Chat;
+         let block_mode = *mode == crate::config::TerminalMode::Block;
+-        // The Block dock remains an unapplied follow-up until real resize /
+-        // command-capture provenance passes. Keep its source recoverable while
+-        // this checkpoint runs the established single-VTE Block input surface.
+-        const BLOCK_DOCK_VERIFIED: bool = false;
+-        let docked_input = chat_mode || (block_mode && BLOCK_DOCK_VERIFIED);
++        let docked_input = chat_mode || block_mode;
+ 
+         ime_gate::install();
+         // ── Build widget tree ──────────────────────────────────────────────
+@@ -12296,7 +12299,7 @@
+         let chat_canvas = gtk::Box::new(Orientation::Vertical, 0);
+         chat_canvas.set_hexpand(true);
+         chat_canvas.set_vexpand(true);
+-        if block_mode && docked_input {
++        if block_mode {
+             chat_canvas.add_css_class("block-native-canvas");
+             active.borrow().bind_block_grid_canvas(&chat_canvas);
+         }
+@@ -12347,7 +12350,7 @@
+         chat_running_status
+             .set_tooltip_text(Some("The running command retains the terminal input"));
+         let chat_status_chrome = gtk::Box::new(Orientation::Vertical, 0);
+-        if block_mode && docked_input {
++        if block_mode {
+             chat_status_chrome.set_vexpand(true);
+         }
+         crate::workspace_shell::own_composer_chrome(&chat_status_chrome);
+@@ -12477,7 +12480,8 @@
+         // Derived from the same switch that selects the render backend and
+         // copied into its SubmissionSurface: Block's compact/full transition
+         // rebases; Unified's one stable full-size grid does not.
+-        let rebase_prompt_anchor_on_row_delta = prompt_anchor_rebases_on_row_delta(unified);
++        let rebase_prompt_anchor_on_row_delta =
++            prompt_anchor_rebases_for_presentation(unified, block_mode);
+ 
+         // Scroll-lock flags shared across the contents_changed pin, value_changed
+         // detector, FAB, and ScrollDebouncer. `user_scrolled_up` suppresses the
+@@ -18490,6 +18494,25 @@
+     }
+ 
+     #[test]
++    fn stable_block_window_grow_keeps_top_prompt_anchor_bounded() {
++        let policy = super::prompt_anchor_rebases_for_presentation(false, true);
++        let old = prompt_anchor_for_surface(true, (0, 0), 18, 22);
++        assert_eq!(old, (0, 4));
++        assert!(!command_capture_range_is_bounded(old.1, 0, 88));
++        let fixed = prompt_anchor_for_surface(policy, (0, 0), 18, 22);
++        assert_eq!(fixed, (0, 0));
++        assert!(command_capture_range_is_bounded(fixed.1, 0, 88));
++        assert!(
++            super::prompt_anchor_rebases_for_presentation(false, false),
++            "Chat keeps its existing policy"
++        );
++        assert!(
++            !super::prompt_anchor_rebases_for_presentation(true, false),
++            "Unified keeps identity"
++        );
++    }
++
++    #[test]
+     fn unified_zones_retain_identity_and_drop_the_oldest_past_the_cap() {
+         let finalized = |id, command: &str| CompletedCommandRecord {
+             id,
+--- a/src/workspace_shell.rs
++++ b/src/workspace_shell.rs
+@@ -939,8 +939,8 @@
+         } else {
+             self.center.remove_css_class("block-workspace");
+         }
+-        // Block's unverified dock is not active in this checkpoint.
+-        self.block_shelf.set_visible(mode != TerminalMode::Chat);
++        self.block_shelf
++            .set_visible(!matches!(mode, TerminalMode::Chat | TerminalMode::Block));
+         self.canvas_header
+             .set_height_request(if mode == TerminalMode::Block {
+                 42

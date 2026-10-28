@@ -523,15 +523,9 @@ fn create_pane(
     env_extra: Vec<(String, String)>,
     sender: &ComponentSender<AppModel>,
 ) -> Pane {
-    // Public Block uses the existing continuous native VTE backend. Keep the
-    // legacy Block renderer available internally for persisted/test contracts;
-    // this adapter is the single workspace presentation boundary for new,
-    // restored, split and managed-remote panes.
-    let mode = if mode == TerminalMode::Block && !cwd_external {
-        TerminalMode::Unified
-    } else {
-        mode
-    };
+    // New Block panes use the existing native retained command-card backend.
+    // Legacy Unified restores keep their continuous VTE and history identity;
+    // choosing a presentation never restarts an already running shell.
     // A restored or remote pane arrives with the identity it must keep, so jsh
     // reopens the same session. Every other pane mints one here rather than
     // launching without: `--session` is what makes jsh announce `session_id=`
@@ -854,8 +848,8 @@ impl SimpleComponent for AppModel {
         // The reference workspace has one stable navigation shell. Legacy
         // presentation values remain readable, but only Block and Chat are
         // offered by the new GUI. Running pane identity is never recreated.
-        if !init.safe_mode && config.terminal_mode != TerminalMode::Chat {
-            config.terminal_mode = TerminalMode::Block;
+        if !init.safe_mode {
+            config.terminal_mode = config.terminal_mode.workspace_backend();
         }
         config.tab_placement = config::TabPlacement::Sidebar;
         config.sidebar_visible = true;
@@ -1813,6 +1807,14 @@ impl SimpleComponent for AppModel {
                 font_groups::FontGroup::Ui,
             ),
             (
+                model
+                    .shell
+                    .block_composer_chrome
+                    .clone()
+                    .upcast::<gtk::Widget>(),
+                font_groups::FontGroup::Ui,
+            ),
+            (
                 model.shell.inspector.clone().upcast::<gtk::Widget>(),
                 font_groups::FontGroup::Ui,
             ),
@@ -1844,6 +1846,17 @@ impl SimpleComponent for AppModel {
                 };
                 let Some(delta) = font_groups::wheel_step(control, notches) else {
                     return glib::Propagation::Proceed;
+                };
+                // Footer tool/status leaves are UI chrome inside the Content
+                // stack. Delegate their actual mapped pointer ownership here
+                // so the outer capture does not consume them as editor input.
+                let group = if group == font_groups::FontGroup::Content
+                    && controller.widget().is_some_and(|root| {
+                        workspace_shell::composer_chrome_owns_font_scroll(&root)
+                    }) {
+                    font_groups::FontGroup::Ui
+                } else {
+                    group
                 };
                 zsender.input(AppMsg::GroupFontStep(group, delta));
                 glib::Propagation::Stop

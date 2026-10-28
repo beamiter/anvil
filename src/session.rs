@@ -82,9 +82,8 @@ static SNAPSHOT_OWNER: OnceLock<Result<SnapshotOwner, String>> = OnceLock::new()
 #[serde(tag = "type", rename_all = "lowercase")]
 pub(crate) enum PaneLayout {
     Leaf {
-        /// Legacy pane backend recorded by older snapshots.  Restores use the
-        /// current `terminal_mode` configuration instead, so changing the
-        /// configuration takes effect on the next launch.
+        /// Legacy pane backend. Explicit Unified snapshots retain their native
+        /// history backend; other local leaves use the current configuration.
         mode: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,

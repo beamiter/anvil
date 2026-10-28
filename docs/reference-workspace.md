@@ -21,10 +21,10 @@ controls invoke the existing close/minimize/maximize actions.
 
 The visible choices are Block and Chat. Help and shell completions expose the
 same two choices. Legacy `vte` and `unified` CLI/config spellings remain readable.
-Local public Block panes use the existing continuous Unified VTE backend; it
-retains OSC lifecycle, searchable zone history, native selection and fractional
-scroll behavior. Managed external panes keep the existing Block backend rather
-than changing their remote reconnect/history contract without validation.
+New public Block panes use the retained native command-card backend described
+in `design/block-reference-v2.md`. Explicit legacy Unified configurations and
+saved local Unified panes retain their continuous backend and identity.
+Managed external panes keep the existing Block integration contract.
 
 Chat retains its single live VTE, independently scrolling transcript and guarded
 send/stop controls. Metadata is packed at a fixed six pixel gap. The reference
@@ -200,3 +200,30 @@ transcript continues to own culling, streaming, reading anchors and follow
 intent; the font layer does not replace it or request continuous redraws.
 Native PTY zoom remains independently verified rather than standing in as
 evidence for authored message fonts.
+
+Composer tools and the visible running-status line are small independent UI
+chrome leaves. Their actual labels follow UI size and scale; the live terminal
+editor and enclosing composer remain Content-owned. The ancestor Content wheel
+controller delegates only mapped chrome with actual native pointer ownership,
+while native popovers retain their SameNative boundary. The four existing UI
+roots retain their typography and geometry. The hidden `chat-input-hint` is a
+state bridge for the status text and tooltip, not a painted font sample; native
+font gates measure the visible Tools glyph and running-status label instead.
+
+Pure GDK modifier presses (for example Ctrl held for font scrolling) do not
+create a pending terminal-key record: VTE emits no commit for those presses.
+The recorder uses the real key event's `is_modifier` flag, rather than treating
+all functional keys as modifiers. Skipping a modifier neither clears a genuine
+pending key nor flushes a held Alt escape. Optional Send/Stop keep the existing
+protocol, command generation, foreground identity, selection and immediate
+writer-admission guards.
+
+Authored Chat roles also honor the existing Content Font Size setting. Their
+nominal sizes (heading 20px, paragraph 12px, code 10px) are retained at the
+production default Content description, 14pt. Configured and nominal Pango
+descriptions resolve in the same actual window context; their size ratio is
+multiplied by the independent Content scale. Absolute-pixel sizes remain pixels,
+point sizes remain points, and GTK handles device scale once. This changes only
+`.anvil-content-font`; UI normalization, legacy UI freezing and terminal input
+authority retain their existing paths. Combined size/scale ratios are not
+clamped again to the scale-only range.

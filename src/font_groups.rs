@@ -95,6 +95,8 @@ mod tests {
         assert!(routing.contains("sidebar_box.clone()"));
         assert!(routing.contains("side_stack.clone()"));
         assert!(routing.contains("model.shell.canvas_header.clone()"));
+        let compact: String = routing.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("model.shell.block_composer_chrome.clone()"));
         assert!(routing.contains("model.shell.inspector.clone()"));
         assert!(routing.contains("stack.clone()"));
         assert!(!routing.contains("ai_paned.clone()"));

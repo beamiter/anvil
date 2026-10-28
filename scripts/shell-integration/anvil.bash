@@ -70,6 +70,84 @@ else
     __anvil_command_token=anvil-bash-${BASHPID:-$$}
     __anvil_agent_ready() { :; }
 fi
+# Optional logical command metadata never changes the user's history policy.
+__anvil_shell_pid=${BASHPID:-$$}
+__anvil_history_next=
+__anvil_history_policy() {
+    [[ -o history && -z ${HISTIGNORE:-} ]] || return 1
+    # These policies only omit new entries. Never accept erasedups (which can
+    # renumber entries), unknown tokens, or pattern-based HISTIGNORE filtering.
+    local policy=${HISTCONTROL:-} token
+    while [[ -n $policy ]]; do
+        token=${policy%%:*}
+        case $token in ''|ignorespace|ignoredups|ignoreboth) ;; *) return 1 ;; esac
+        [[ $policy == *:* ]] || break
+        policy=${policy#*:}
+    done
+    builtin shopt -q cmdhist || return 1
+    [[ ${BASHPID:-$$} == "$__anvil_shell_pid" && ${BASH_SUBSHELL:-0} == 0 ]] || return 1
+    # Custom traps may change history between input acceptance and preexec.
+    [[ -n ${__anvil_expected_debug:-} && ${__anvil_active_traps:-} == "$__anvil_expected_debug" ]]
+}
+
+__anvil_history_entry() {
+    local HISTTIMEFORMAT= LC_ALL=C raw limit=${1:-16416} 2>/dev/null || return 1
+    # Bound the reader and command-substitution result, including the numeric
+    # prefix. Closing the pipe stops an oversized producer without draining it.
+    # Bash already owns the history entry; this does not bound its own storage.
+    # A sentinel preserves trailing newlines through command substitution.
+    raw=$(builtin history 1 | (
+        IFS= builtin read -r -N "$limit" raw || :
+        builtin printf '%s.' "$raw"
+    ))
+    raw=${raw%.}
+    [[ $limit == 32 ]] || (( ${#raw} < 16416 )) || return 1
+    raw=${raw%$'\n'}
+    __anvil_history_number=
+    __anvil_history_text=
+    [[ -n $raw ]] || return 0
+    raw=${raw#"${raw%%[![:blank:]]*}"}
+    [[ $raw == *'  '* ]] || return 1
+    __anvil_history_number=${raw%%'  '*}
+    case $__anvil_history_number in ''|*[!0-9]*) return 1 ;; esac
+    [[ $limit == 32 ]] && return 0
+    __anvil_history_text=${raw#*'  '}
+}
+
+__anvil_history_arm() {
+    __anvil_history_next=
+    __anvil_history_policy || return
+    local __anvil_history_number __anvil_history_text
+    # Only the bounded number prefix is needed to arm the next command.
+    __anvil_history_entry 32 || return
+    local previous=${__anvil_history_number:-0}
+    case $previous in ''|*[!0-9]*) return ;; esac
+    case ${HISTCMD:-} in ''|*[!0-9]*) return ;; esac
+    (( ${#previous} <= 9 && ${#HISTCMD} <= 9 )) || return
+    (( HISTCMD == 10#$previous + 1 )) || return
+    __anvil_history_next=$HISTCMD
+}
+
+__anvil_history_command_url() {
+    local expected=$__anvil_history_next
+    __anvil_history_next=
+    __anvil_command_url=
+    [[ -n $expected ]] && __anvil_history_policy || return
+    local __anvil_history_number __anvil_history_text
+    __anvil_history_entry || return
+    [[ $__anvil_history_number == "$expected" && ${HISTCMD:-} == "$expected" ]] || return
+    local LC_ALL=C i ch out= 2>/dev/null || return 1
+    (( ${#__anvil_history_text} > 0 && ${#__anvil_history_text} <= 16384 )) || return
+    for ((i = 0; i < ${#__anvil_history_text}; i++)); do
+        ch=${__anvil_history_text:i:1}
+        case $ch in
+            [A-Za-z0-9._~-]) out+=$ch ;;
+            *) builtin printf -v out '%s%%%02X' "$out" "'$ch" ;;
+        esac
+    done
+    __anvil_command_url=$out
+}
+
 __anvil_marker_seq=0
 __anvil_marker_id=""
 export -n __anvil_marker_seq __anvil_marker_id
@@ -83,7 +161,13 @@ __anvil_prompt_end()   { __anvil_osc "133;B"; }
 __anvil_command_start() {
     ((__anvil_marker_seq++)) || true
     __anvil_marker_id="${__anvil_command_token}-${__anvil_marker_seq}"
-    __anvil_osc "133;C;id=${__anvil_marker_id}"
+    local __anvil_command_url
+    __anvil_history_command_url || :
+    if [[ -n $__anvil_command_url ]]; then
+        __anvil_osc "133;C;id=${__anvil_marker_id};cmdline_url=${__anvil_command_url}"
+    else
+        __anvil_osc "133;C;id=${__anvil_marker_id}"
+    fi
 }
 
 # OSC 133 ;D;<exit> — command finished with the given exit code.
@@ -142,6 +226,7 @@ __anvil_preexec() {
     if (( __anvil_in_command == 0 )); then
         __anvil_in_command=1
         __anvil_command_start
+        __anvil_active_traps=
     fi
 }
 
@@ -175,10 +260,18 @@ __anvil_prompt_command() {
     for command in "${__anvil_saved_prompt_commands[@]}"; do
         [[ -n $command ]] && builtin eval -- "$command"
     done
+    # Saved prompt hooks may import or clear history. Arm only after them.
+    __anvil_history_arm || :
+    # A replaced hook must not reuse the prompt's trap observation.
+    __anvil_active_traps=
     __anvil_in_prompt_command=0
 }
 
 unset PROMPT_COMMAND
 PROMPT_COMMAND=__anvil_prompt_command
 export TERM_PROGRAM=anvil
-trap '__anvil_preexec' DEBUG
+# Capture at top-level: non-inherited DEBUG traps are hidden from trap -p
+# inside ordinary functions. The metadata policy needs this exact observation.
+__anvil_active_traps=
+trap 'if [[ $BASH_COMMAND == __anvil_prompt_command ]] || (( __anvil_in_command == 0 && __anvil_in_prompt_command == 0 )); then __anvil_active_traps=$(builtin trap -p); fi; __anvil_preexec' DEBUG
+__anvil_expected_debug=$(builtin trap -p DEBUG)

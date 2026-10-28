@@ -283,6 +283,59 @@ pub(crate) fn reference_ui_role_multiplier(config: &Config, context: &gtk::pango
     }
 }
 
+/// The existing Content size controls authored messages as well as the PTY.
+/// Keep their role hierarchy relative to the production default description,
+/// resolving point/absolute-pixel units in one real content font context.
+/// UI size normalization and its legacy freezing remain independent.
+pub(crate) fn reference_content_role_multiplier(
+    config: &Config,
+    context: &gtk::pango::Context,
+) -> f64 {
+    use gtk::pango::prelude::FontExt;
+
+    static NOMINAL: OnceLock<(i32, bool)> = OnceLock::new();
+    let &(nominal_size, nominal_absolute) = NOMINAL.get_or_init(|| {
+        let description = FontDescription::from_string(&Config::safe_defaults().font_desc);
+        (description.size(), description.is_size_absolute())
+    });
+    let mut nominal = context
+        .font_description()
+        .unwrap_or_else(|| FontDescription::from_string("sans-serif"));
+    if nominal_absolute {
+        nominal.set_absolute_size(f64::from(nominal_size));
+    } else {
+        nominal.set_size(nominal_size);
+    }
+    let description = FontDescription::from_string(&config.font_desc);
+    let size = if description.size() > 0 {
+        description.size()
+    } else {
+        nominal_size
+    };
+    let mut configured = nominal.clone();
+    if description.is_size_absolute() {
+        configured.set_absolute_size(f64::from(size));
+    } else {
+        configured.set_size(size);
+    }
+    let scale = if config.default_font_scale.is_finite() {
+        config.default_font_scale.clamp(0.1, 10.0)
+    } else {
+        1.0
+    };
+    let resolved = |description: &FontDescription| {
+        context
+            .load_font(description)
+            .map(|font| font.describe_with_absolute_size().size())
+            .filter(|size| *size > 0)
+            .map(f64::from)
+    };
+    match (resolved(&configured), resolved(&nominal)) {
+        (Some(configured), Some(nominal)) => scale * configured / nominal,
+        _ => scale,
+    }
+}
+
 /// Scope display-wide CSS to this application's window. Explicit text-node
 /// rules override desktop heading/caption sizes and fixed pane-header sizes;
 /// images and decorative connection dots keep their own icon sizing.

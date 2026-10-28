@@ -230,6 +230,14 @@ pub(super) fn layout(
             )
         };
         let in_transcript = target == ChatSurface::Running;
+        if !in_transcript {
+            if let Some(header) = holder
+                .first_child()
+                .filter(|child| child.has_css_class("block-reference-header"))
+            {
+                header.set_visible(false);
+            }
+        }
         let prompt = target.composer_docked();
         let native = matches!(target, ChatSurface::Passthrough | ChatSurface::Fullscreen);
         let Some(canvas) = frame.child().and_downcast::<gtk::Box>() else {
@@ -272,7 +280,18 @@ pub(super) fn layout(
             if let Some(parent) = clip.parent().and_downcast::<gtk::Box>() {
                 parent.remove(&clip);
             }
-            destination.prepend(&clip);
+            if in_transcript {
+                if let Some(header) = holder
+                    .first_child()
+                    .filter(|child| child.has_css_class("block-reference-header"))
+                {
+                    destination.insert_child_after(&clip, Some(&header));
+                } else {
+                    destination.prepend(&clip);
+                }
+            } else {
+                destination.prepend(&clip);
+            }
             moved = true;
         }
         if native {
@@ -1369,10 +1388,23 @@ mod tests {
         drive(&chat, PROMPT, BlockState::AwaitingCommand);
         let provider = crate::startup_ui::install_dynamic_css_provider();
         let mut config = crate::config::Config::safe_defaults();
+        crate::font::freeze_ui_font(&mut config);
+        let hint = widget_with_class(&chat.root, "chat-input-hint")
+            .downcast::<gtk::Label>()
+            .unwrap();
+        let tools = widget_with_class(&chat.root, "shell-tool-label")
+            .downcast::<gtk::Label>()
+            .unwrap();
+        let controls = widget_with_class(&chat.root, "chat-controls");
+        let mut tools_glyph = None;
         for (desc, scale) in [("Monospace 16px", 1.25), ("Monospace 24px", 1.5)] {
             config.font_desc = desc.into();
             config.default_font_scale = scale;
             provider.load_from_string(&crate::config_ops::dynamic_css(&config));
+            crate::workspace_shell::apply_ui_font_scale(crate::font::reference_ui_role_multiplier(
+                &config,
+                &window.pango_context(),
+            ));
             for view in [&*chat, &block] {
                 view.set_font(desc);
                 view.set_font_scale(scale);
@@ -1391,13 +1423,76 @@ mod tests {
                     gtk::pango::FontDescription::from_string(desc).size()
                 );
             }
-            let hint = widget_with_class(&chat.root, "chat-input-hint");
+            // The old hint is now a hidden state bridge, not painted text.
+            // Keep its production state/tooltip contract, and measure the
+            // actual visible Chrome glyph instead of inventing hidden fonts.
+            assert!(!hint.is_visible());
             assert_eq!(
-                hint.pango_context().font_description().unwrap().size(),
-                expected
+                controls.tooltip_text().as_deref(),
+                Some(hint.text().as_str())
             );
+            assert!(tools.is_mapped());
+            assert_eq!(
+                tools.pango_context().font_description().unwrap().size(),
+                10 * gtk::pango::SCALE
+            );
+            let glyph = tools.layout().pixel_size();
+            if let Some(previous) = tools_glyph {
+                assert_eq!(glyph, previous, "Main font must not change Chrome glyphs");
+            }
+            tools_glyph = Some(glyph);
             assert_footer_inside_pane(&chat, &button(&chat, "chat-send"));
         }
+        drive(&chat, START, BlockState::CollectingOutput);
+        let status = widget_with_class(&chat.root, "chat-running-status")
+            .downcast::<gtk::Label>()
+            .unwrap();
+        assert!(status.is_mapped());
+        assert!(!hint.is_visible());
+        assert_eq!(status.text(), hint.text());
+        let base_glyph = tools_glyph.unwrap();
+        for (size, scale) in [(14.0, 1.0), (14.0, 1.3), (28.0, 1.0), (14.0, 1.0)] {
+            config.ui_font_size = Some(size);
+            config.ui_font_size_absolute = false;
+            config.ui_font_scale = Some(scale);
+            provider.load_from_string(&crate::config_ops::dynamic_css(&config));
+            let factor =
+                crate::font::reference_ui_role_multiplier(&config, &window.pango_context());
+            crate::workspace_shell::apply_ui_font_scale(factor);
+            pump_for(Duration::from_millis(250));
+            assert!(tools.is_mapped() && status.is_mapped());
+            for (label, base) in [(&tools, 10.0), (&status, 11.0)] {
+                let raw = label.pango_context().font_description().unwrap().size();
+                let expected = (base * factor * f64::from(gtk::pango::SCALE)).round() as i32;
+                assert!(
+                    (raw - expected).abs() <= 1,
+                    "visible Chrome font {raw} vs {expected}"
+                );
+            }
+            let glyph = tools.layout().pixel_size();
+            if factor > 1.1 {
+                assert!(
+                    glyph.0 > base_glyph.0 && glyph.1 > base_glyph.1,
+                    "actual Tools glyph must grow"
+                );
+            } else {
+                assert_eq!(glyph, base_glyph);
+            }
+            assert_eq!(
+                entry.pango_context().font_description().unwrap().size(),
+                36 * gtk::pango::SCALE,
+                "UI settings must not change Content entry"
+            );
+            assert_eq!(chat.active_vte.font_scale(), 1.5);
+            assert_eq!(
+                chat.active_vte.font().unwrap().size(),
+                24 * gtk::pango::SCALE
+            );
+            assert_eq!(status.text(), hint.text());
+            assert!(!hint.is_visible());
+            eprintln!("visible footer: UI size={size} scale={scale} factor={factor} Tools glyph={glyph:?} status_raw={}", status.pango_context().font_description().unwrap().size());
+        }
+        crate::workspace_shell::apply_ui_font_scale(1.0);
         window.destroy();
         gtk::style_context_remove_provider_for_display(
             &gtk::gdk::Display::default().unwrap(),
@@ -1758,11 +1853,30 @@ mod tests {
         drive(&view, PROMPT, BlockState::AwaitingCommand);
         drive(&view, START, BlockState::CollectingOutput);
         let stop = button(&view, "chat-stop");
+        // The reference control has no CSS padding and rounded corners.
+        // (2,2) lies outside its hit shape; use a real, validated inside point
+        // when asking GtkButton's release gesture to emit clicked.
+        let hit = (
+            f64::from(stop.width()) / 2.0,
+            f64::from(stop.height()) / 2.0,
+        );
+        assert!(
+            stop.contains(hit.0, hit.1),
+            "mapped Stop center must be a hit"
+        );
+        eprintln!(
+            "Stop hit: size={}x{} old_corner={} center=({},{})",
+            stop.width(),
+            stop.height(),
+            stop.contains(2.0, 2.0),
+            hit.0,
+            hit.1
+        );
         let feedback = Rc::new(Cell::new(0));
         let feedback_cb = feedback.clone();
         view.connect_human_input(move |_| feedback_cb.set(feedback_cb.get() + 1));
         view.pty.drain_test_slave(Duration::from_millis(20));
-        press_capture(&stop, 2.0, 2.0);
+        press_capture(&stop, hit.0, hit.1);
         stop.emit_clicked();
         assert_eq!(
             view.pty.drain_test_slave(Duration::from_millis(30)),
@@ -1787,14 +1901,14 @@ mod tests {
         // capture gesture. It must not replay the held new command too early.
         press_capture(
             &view.root,
-            f64::from(stop_bounds.x()) + 5.0,
-            f64::from(stop_bounds.y()) + 5.0,
+            f64::from(stop_bounds.x()) + hit.0,
+            f64::from(stop_bounds.y()) + hit.1,
         );
         assert!(
             view.active_vte.has_selection(),
             "the control owns selection-feed release"
         );
-        press_capture(&stop, 2.0, 2.0);
+        press_capture(&stop, hit.0, hit.1);
         stop.emit_clicked();
         assert_eq!(view.bstate.get(), BlockState::CollectingOutput);
         assert!(view
@@ -1804,7 +1918,7 @@ mod tests {
         assert_eq!(feedback.get(), 1);
         // A long press begun on the old displayed command must also fail when
         // a normal (not held) parser update replaces the command before release.
-        press_capture(&stop, 2.0, 2.0);
+        press_capture(&stop, hit.0, hit.1);
         drive(&view, &next_start, BlockState::CollectingOutput);
         stop.emit_clicked();
         assert!(view
@@ -1813,8 +1927,8 @@ mod tests {
             .is_empty());
         assert_eq!(feedback.get(), 1);
         // Old release cleanup must not erase the newer held press's identity.
-        press_capture(&stop, 2.0, 2.0);
-        release_capture(&stop, 2.0, 2.0);
+        press_capture(&stop, hit.0, hit.1);
+        release_capture(&stop, hit.0, hit.1);
         // The old command is still current at release, so GtkButton sends a
         // legitimate interrupt now. Account for that exact byte before the
         // next press; drain_test_slave does not pump the pending GTK idle.
@@ -1823,7 +1937,7 @@ mod tests {
             b"\x03"
         );
         assert_eq!(feedback.get(), 2);
-        press_capture(&stop, 2.0, 2.0);
+        press_capture(&stop, hit.0, hit.1);
         drive(&view, &next_start, BlockState::CollectingOutput);
         stop.emit_clicked();
         assert_eq!(
@@ -1834,14 +1948,14 @@ mod tests {
         assert_eq!(feedback.get(), 2);
         // Also prove the newer token survives old idle cleanup, rather than
         // passing the refusal above merely because every token was erased.
-        press_capture(&stop, 2.0, 2.0);
-        release_capture(&stop, 2.0, 2.0);
+        press_capture(&stop, hit.0, hit.1);
+        release_capture(&stop, hit.0, hit.1);
         assert_eq!(
             view.pty.drain_test_slave(Duration::from_millis(30)),
             b"\x03"
         );
         assert_eq!(feedback.get(), 3);
-        press_capture(&stop, 2.0, 2.0);
+        press_capture(&stop, hit.0, hit.1);
         pump_for(Duration::from_millis(20));
         stop.emit_clicked();
         assert_eq!(
@@ -1850,7 +1964,7 @@ mod tests {
             "old release cleanup must preserve the newer same-command press"
         );
         assert_eq!(feedback.get(), 4);
-        press_capture(&stop, 2.0, 2.0);
+        press_capture(&stop, hit.0, hit.1);
         view.pty.set_test_foreground_group(Some(202));
         stop.emit_clicked();
         assert!(view
@@ -1858,7 +1972,7 @@ mod tests {
             .drain_test_slave(Duration::from_millis(30))
             .is_empty());
         assert_eq!(feedback.get(), 4);
-        press_capture(&stop, 2.0, 2.0);
+        press_capture(&stop, hit.0, hit.1);
         stop.emit_clicked();
         assert_eq!(
             view.pty.drain_test_slave(Duration::from_millis(30)),

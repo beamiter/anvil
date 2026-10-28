@@ -1,0 +1,77 @@
+{
+  "version": 2,
+  "reference": {
+    "name": "Forge Developer Terminal Workspace.png",
+    "library_file_id": "libfile_386d1b318688819193315dce1da6f9e1",
+    "sha256": "dc81db85112b6804424a2cdbbd94e232ca2335be2e0b36a620756f6725e26bf1",
+    "size": [1672, 941],
+    "root_viewed_actual_local_pixels": true,
+    "caveat": "AI-generated raster reference; text and exact typography are not authoritative application state. Measurements are approximate."
+  },
+  "scope": {
+    "apps": ["anvil", "forge"],
+    "presentation": "Block",
+    "preserve": ["Chat presentation", "shared outer shell geometry", "PTY identity", "legacy config/session parsing", "ANSI colors", "native selection/copy", "IME", "infinite canvas virtualization and reading intent"],
+    "internal_backend": "Use existing native BlockBackend for newly created Block panes; retain Unified legacy restore compatibility without restarting live PTYs.",
+    "publication": "Local commits only; no new master publication authorized."
+  },
+  "colors": {
+    "canvas": "#091323",
+    "output": "#0E1621",
+    "composer": "#172338",
+    "header": "#101C30",
+    "border": "#293C57",
+    "text": "#D5DEEC",
+    "secondary": "#91A4BF",
+    "gutter": "#637D9C",
+    "success": "#39DDA0",
+    "failure": "#FF646F",
+    "running": "#4199FF"
+  },
+  "geometry": {
+    "reference_center_bounds": [244, 56, 1129, 877],
+    "local_header_height": 42,
+    "live_toolbar_height": 36,
+    "canvas_horizontal_inset": 12,
+    "card_gap": 10,
+    "card_radius": 10,
+    "card_border": 1,
+    "card_header_inset": 16,
+    "card_header_icon": 24,
+    "card_header_icon_gap": 16,
+    "output_gutter_width": 24,
+    "output_gutter_gap": 16,
+    "header_text_and_output_inset": 56,
+    "header_min_height": 40,
+    "header_with_subtitle_min_height": 48,
+    "output_vertical_padding": 6,
+    "composer_min_height": 68,
+    "composer_bottom_inset": 8,
+    "composer_radius": 12,
+    "composer_tool_height": 28,
+    "composer_tool_gap": 6,
+    "running_border_geometry": "Same one-pixel border and allocation as all states; glow is paint only."
+  },
+  "typography": {
+    "reference_estimate": {"command_mono_px": 12, "output_mono_px": 11, "metadata_px": 10, "output_line_height_px": 18},
+    "native_font_authority": "Continue to honor existing Main font size/family and ContentScale. Do not silently change configured VTE font sizes to fit the raster. Explicit reference fixture font settings must be recorded separately from production defaults."
+  },
+  "component_contract": {
+    "header": "Real command string, optional real description or cwd tooltip, real status/elapsed, native context-menu button. No invented descriptions.",
+    "status": "Existing shell protocol/exit/timestamp state: running blue, exit zero completed green, nonzero failed red. Missing protocol/state is neutral, never a fabricated success.",
+    "gutter": "Separate native draw layer. Number output source rows/logical lines; document wrap policy. Never insert numbers or control bytes into PTY, ANSI buffers, selection or copied text.",
+    "output": "Native existing readonly VTE projection per finished record, no PTY per card; retain source-grid and selection identity. Running output uses the existing active terminal.",
+    "live_toolbar": "Actual command count and existing live/follow state; real existing search/actions, or clearly unavailable controls.",
+    "composer": "Move/reuse the existing active native input clip, with one input owner and bounded multiline growth. Prompt and running/foreground modes must preserve authority and IME/caret visibility. No duplicate active terminal/composer, no Enter expansion, no hard clipping to meet the minimum.",
+    "organism": "Existing single app-level organism; never instantiate per card or cover output/input."
+  },
+  "acceptance": [
+    "Capture new native Block at the reference size and the existing 1356x704 size, recording source SHA, logical size, DPR, and explicit font configuration.",
+    "Use actual safe commands yielding success, nonzero failure, and a running process; never print simulated UI/status as evidence.",
+    "Verify unchanged Chat presentation with the same fixture and font settings.",
+    "Verify exact input bytes, native selection/copy without gutter numbers, ANSI color, Stop/foreground recovery, IME, terminal resize and split identity.",
+    "Verify settled history reading does not jump during output or panel actions, and long output uses existing virtualization without per-frame rebuilding.",
+    "Preserve legacy Unified config/session parsing and do not spawn/restart a PTY merely to switch presentation.",
+    "Reference visual acceptance remains open until actual native screenshots are reviewed."
+  ]
+}

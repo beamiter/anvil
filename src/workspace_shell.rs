@@ -18,6 +18,7 @@ pub(crate) struct Chrome {
     pub rail: gtk::Box,
     pub center: gtk::Box,
     pub canvas_header: gtk::Box,
+    pub block_composer_chrome: gtk::Box,
     pub inspector: gtk::Box,
     pub status: gtk::Box,
     title: gtk::Label,
@@ -174,6 +175,54 @@ fn unavailable(text: &str) -> gtk::Button {
     button.set_sensitive(false);
     button.set_tooltip_text(Some("Not connected yet"));
     button
+}
+
+struct ComposerChromeRoot {
+    widget: gtk::glib::WeakRef<gtk::Widget>,
+    pointer: gtk::glib::WeakRef<gtk::EventControllerMotion>,
+}
+
+thread_local! {
+    static COMPOSER_CHROME_ROOTS: std::cell::RefCell<Vec<ComposerChromeRoot>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+/// Only tool/status chrome opts in. The editable terminal and composer frame
+/// remain Content-owned; weak entries cannot keep a closed pane alive.
+pub(crate) fn own_composer_chrome(widget: &impl IsA<gtk::Widget>) {
+    let widget = widget.as_ref();
+    widget.add_css_class("reference-composer-chrome");
+    widget.add_css_class("anvil-ui-font");
+    let pointer = gtk::EventControllerMotion::new();
+    pointer.set_propagation_phase(gtk::PropagationPhase::Capture);
+    pointer.set_propagation_limit(gtk::PropagationLimit::SameNative);
+    COMPOSER_CHROME_ROOTS.with_borrow_mut(|roots| {
+        roots.retain(|root| root.widget.upgrade().is_some());
+        roots.push(ComposerChromeRoot {
+            widget: widget.downgrade(),
+            pointer: pointer.downgrade(),
+        });
+    });
+    widget.add_controller(pointer);
+}
+
+/// The ancestor Content capture handler delegates these mapped pointer-owned
+/// leaves before consuming the wheel. Keyboard focus never chooses the group.
+pub(crate) fn composer_chrome_owns_font_scroll(root: &gtk::Widget) -> bool {
+    COMPOSER_CHROME_ROOTS.with_borrow(|roots| {
+        roots.iter().any(|entry| {
+            entry.widget.upgrade().is_some_and(|widget| {
+                widget.is_mapped()
+                    && widget.height() > 0
+                    && (widget == *root || widget.is_ancestor(root))
+                    && entry
+                        .pointer
+                        .upgrade()
+                        .is_some_and(|pointer| pointer.contains_pointer())
+            })
+        })
+    })
 }
 
 /// One native tool row for both public presentations. The caller retains
@@ -392,6 +441,7 @@ pub(crate) fn composer_tools(
     });
     let controls = gtk::Box::new(gtk::Orientation::Vertical, 0);
     controls.add_css_class("chat-controls");
+    own_composer_chrome(&controls);
     controls.set_height_request(tokens::CONTROL_HEIGHT as i32);
     controls.set_vexpand(true);
     controls.set_valign(gtk::Align::End);
@@ -845,6 +895,7 @@ impl Chrome {
             rail,
             center,
             canvas_header: header,
+            block_composer_chrome: block_tools,
             inspector,
             status,
             title,
@@ -883,7 +934,19 @@ impl Chrome {
         self.workspace_name.set_tooltip_text(Some(path));
         self.context_details.set_label(path);
         self.status.set_tooltip_text(Some(path));
+        if mode == TerminalMode::Block {
+            self.center.add_css_class("block-workspace");
+        } else {
+            self.center.remove_css_class("block-workspace");
+        }
+        // Block's unverified dock is not active in this checkpoint.
         self.block_shelf.set_visible(mode != TerminalMode::Chat);
+        self.canvas_header
+            .set_height_request(if mode == TerminalMode::Block {
+                42
+            } else {
+                tokens::CANVAS_HEADER_HEIGHT as i32
+            });
         if mode != TerminalMode::Chat
             && log::log_enabled!(target: "anvil::workspace_shell", log::Level::Debug)
         {
@@ -984,6 +1047,9 @@ fn role_font_css(scale: f64, scope: &str) -> String {
                 ".workspace-navigation",
                 ".workspace-inspector",
                 ".workspace-canvas-header",
+                ".reference-composer-chrome",
+                ".block-reference-header",
+                ".block-reference-toolbar",
             ] {
                 if selector.strip_prefix(root).is_some_and(|suffix| {
                     suffix
@@ -1050,7 +1116,11 @@ pub(crate) fn apply_content_font_scale(scale: f64) {
 pub(crate) fn apply_canvas_palette(config: &mut Config) {
     // This is called only on the pane's private configuration snapshot.
     // A custom palette or explicit theme remains under the user's control.
-    if config.terminal_mode != TerminalMode::Chat || config.theme_name != "default" {
+    if !matches!(
+        config.terminal_mode,
+        TerminalMode::Chat | TerminalMode::Block
+    ) || config.theme_name != "default"
+    {
         return;
     }
     if let Some(default) = crate::config::builtin_themes()
@@ -1072,6 +1142,13 @@ pub(crate) fn apply_canvas_palette(config: &mut Config) {
             1.0,
         )
     };
+    if config.terminal_mode == TerminalMode::Block {
+        // Private pane presentation only; ANSI palette, configured fonts and
+        // the persisted/user configuration keep their original authority.
+        config.foreground = rgba([0xD5, 0xDE, 0xEC]);
+        config.background = rgba([0x0E, 0x16, 0x21]);
+        return;
+    }
     if let Some(light) = crate::config::builtin_themes()
         .into_iter()
         .find(|theme| theme.name == "light")
@@ -1269,6 +1346,145 @@ mod tests {
             );
         }
         apply_ui_font_scale(1.0);
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn reference_content_size_preserves_units_roles_and_ui_independence() {
+        use gtk::pango::prelude::FontExt;
+        gtk::init().unwrap();
+        install_css();
+        let window = gtk::Window::new();
+        window.add_css_class("anvil-font-sync");
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let header = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        header.add_css_class("workspace-canvas-header");
+        header.add_css_class("anvil-ui-font");
+        let title = label("Canvas header", "shell-canvas-title");
+        header.append(&title);
+        column.append(&header);
+        let transcript = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        transcript.add_css_class("anvil-content-font");
+        let document = crate::workspace_conversation::render(
+            &jterm_core::reference_conversation::acceptance_fixture(),
+        );
+        transcript.append(&document);
+        column.append(&transcript);
+        window.set_child(Some(&column));
+        window.present();
+        fn find(widget: &gtk::Widget, class: &str, within: bool) -> Option<gtk::Label> {
+            let within = within || widget.has_css_class(class);
+            if within {
+                if let Ok(label) = widget.clone().downcast::<gtk::Label>() {
+                    return Some(label);
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(node) = child {
+                if let Some(label) = find(&node, class, within) {
+                    return Some(label);
+                }
+                child = node.next_sibling();
+            }
+            None
+        }
+        let roles: Vec<_> = [
+            ("conversation-heading", 20.0),
+            ("conversation-paragraph", 12.0),
+            ("conversation-chip", 9.0),
+            ("conversation-step-title", 10.0),
+            ("conversation-code-path", 10.0),
+            ("conversation-code-text", 10.0),
+            ("conversation-line-number", 9.0),
+        ]
+        .into_iter()
+        .map(|(class, base)| {
+            (
+                find(document.upcast_ref(), class, false).expect(class),
+                base,
+            )
+        })
+        .collect();
+        let context = window.pango_context();
+        let mut config = Config::safe_defaults();
+        config.ui_font_size = Some(14.0);
+        config.ui_font_size_absolute = false;
+        config.ui_font_scale = Some(1.0);
+        let nominal = gtk::pango::FontDescription::from_string(&config.font_desc);
+        assert_eq!(nominal.size(), 14 * gtk::pango::SCALE);
+        assert!(
+            !nominal.is_size_absolute(),
+            "the production nominal remains 14pt"
+        );
+        let nominal_px = f64::from(
+            context
+                .load_font(&nominal)
+                .unwrap()
+                .describe_with_absolute_size()
+                .size(),
+        ) / f64::from(gtk::pango::SCALE);
+        // Each point size is resolved to Pango units independently. Keep the
+        // strict raw-unit assertion against native 28pt resolution instead of
+        // assuming its quantized value is exactly twice resolved 14pt.
+        let point_28 = gtk::pango::FontDescription::from_string("sans-serif 28");
+        let point_28_px = f64::from(
+            context
+                .load_font(&point_28)
+                .unwrap()
+                .describe_with_absolute_size()
+                .size(),
+        ) / f64::from(gtk::pango::SCALE);
+        let point_ratio = point_28_px / nominal_px;
+        for (description, scale, expected_factor, ui) in [
+            ("Monospace 14", 1.0, 1.0, 1.0),
+            ("Monospace 28", 1.0, point_ratio, 1.0),
+            ("Monospace 14px", 1.0, 14.0 / nominal_px, 1.0),
+            ("Monospace 28px", 1.0, 28.0 / nominal_px, 1.0),
+            ("Monospace 28", 1.3, point_ratio * 1.3, 1.0),
+            ("Monospace 28px", 1.3, 36.4 / nominal_px, 1.0),
+            ("Monospace 28", 10.0, point_ratio * 10.0, 1.0),
+            ("Monospace 14", 1.0, 1.0, 1.3),
+            ("Monospace 14", 1.0, 1.0, 1.0),
+        ] {
+            config.font_desc = description.into();
+            config.default_font_scale = scale;
+            config.ui_font_scale = Some(ui);
+            apply_ui_font_scale(crate::font::reference_ui_role_multiplier(&config, &context));
+            apply_content_font_scale(crate::font::reference_content_role_multiplier(
+                &config, &context,
+            ));
+            let main = gtk::glib::MainContext::default();
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(100);
+            while std::time::Instant::now() < until {
+                while main.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            for (label, base) in &roles {
+                let actual = label.pango_context().font_description().unwrap().size();
+                let expected =
+                    (base * expected_factor * f64::from(gtk::pango::SCALE)).round() as i32;
+                assert!(
+                    (actual - expected).abs() <= 1,
+                    "{description} scale={scale}: {} actual={actual} expected={expected}",
+                    label.text()
+                );
+                let glyph = label.layout().pixel_size();
+                assert!(
+                    glyph.0 > 0 && glyph.1 > 0,
+                    "a real role glyph must remain rendered"
+                );
+            }
+            let actual = title.pango_context().font_description().unwrap().size();
+            let expected = (12.0 * ui * f64::from(gtk::pango::SCALE)).round() as i32;
+            assert!(
+                (actual - expected).abs() <= 1,
+                "Content size must not change Chrome"
+            );
+            eprintln!("content-size: desc={description} content_scale={scale} nominal_px={nominal_px} expected_factor={expected_factor} ui_scale={ui} dpr={} heading_raw={}", window.scale_factor(), roles[0].0.pango_context().font_description().unwrap().size());
+        }
+        apply_ui_font_scale(1.0);
+        apply_content_font_scale(1.0);
         window.close();
     }
 

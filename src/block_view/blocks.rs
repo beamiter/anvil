@@ -1214,7 +1214,7 @@ fn clamp_render_cols(recorded_cols: i64, width_px: i64, cell_width_px: i64) -> i
     recorded.min((width_px / cell_width_px).max(2))
 }
 
-fn output_display_text(text: &str) -> &str {
+pub(super) fn output_display_text(text: &str) -> &str {
     let text = if let Some(stripped) = text.strip_prefix("\r\n") {
         stripped
     } else if let Some(stripped) = text.strip_prefix('\n') {
@@ -1654,6 +1654,119 @@ mod tests {
             child = current.next_sibling();
         }
         None
+    }
+
+    #[test]
+    #[ignore = "requires isolated DISPLAY; real VTE, clipboard and frame clock"]
+    fn reference_block_preserves_fold_filter_copy_and_cached_gutter() {
+        gtk::init().expect("gtk init");
+        let mut config = Config::safe_defaults();
+        config.terminal_mode = crate::config::TerminalMode::Block;
+        config.finished_block_viewport_rows = 6;
+        super::super::install_block_css(&config);
+        let output = (1..=96)
+            .map(|index| format!("\x1b[36mkeep-{index:03}\x1b[0m payload\r\n"))
+            .collect::<String>();
+        let card = FinishedBlock::new(
+            719,
+            "$ ",
+            "printf native-component-proof",
+            None,
+            &output,
+            Some(0),
+            &config,
+            Some(7),
+            None,
+            None,
+            80,
+        );
+        let owner = super::super::organism_settings_test_view_for_mode(
+            crate::config::TerminalMode::Block,
+            None,
+        );
+        card.connect_actions(
+            &owner.active_vte,
+            &owner.verified_submission,
+            &owner.bracketed_paste,
+            &owner.active,
+        );
+        assert!(card.widget().has_css_class("block-reference-card"));
+        let scroll = gtk::ScrolledWindow::builder().child(card.widget()).build();
+        let window = gtk::Window::builder()
+            .default_width(900)
+            .default_height(640)
+            .child(&scroll)
+            .build();
+        window.present();
+        spin_main_context_until(|| card.output_vte.is_mapped());
+        spin_main_context_for(std::time::Duration::from_millis(120));
+        let expanded_height = card.widget().height();
+        assert!(expanded_height > 40);
+
+        // Copy uses the actual action/native clipboard. Painted numbers and
+        // ANSI decoration must never become command-output bytes.
+        card.copy_output_btn.emit_clicked();
+        let copied = glib::MainContext::default()
+            .block_on(card.output_vte.clipboard().read_text_future())
+            .expect("native clipboard read")
+            .expect("copied output");
+        assert_eq!(copied.as_str(), strip_ansi(&output));
+
+        // More and keyboard folding share this exact closure. A hidden
+        // collapse button still needs a strong native parent to own it.
+        (card.toggle_collapsed)();
+        assert!(card.is_output_collapsed());
+        spin_main_context_until(|| !card.output_vte.is_mapped());
+        (card.toggle_collapsed)();
+        assert!(!card.is_output_collapsed());
+        spin_main_context_until(|| card.output_vte.is_mapped());
+        spin_main_context_for(std::time::Duration::from_millis(120));
+        assert_eq!(card.widget().height(), expanded_height);
+
+        (card.toggle_filter)();
+        let entry = find_search_entry(card.widget().upcast_ref()).expect("native filter entry");
+        let filter_row = entry.parent().expect("filter row");
+        assert_eq!(filter_row.parent(), Some(card.content.clone().upcast()));
+        assert_eq!(card.header_row.next_sibling(), Some(filter_row.clone()));
+        let generation = card.displayed_generation.get();
+        entry.set_text("keep-003");
+        spin_main_context_until(|| card.displayed_generation.get() != generation);
+        assert_eq!(
+            strip_ansi(
+                card.displayed_output
+                    .borrow()
+                    .as_deref()
+                    .expect("filtered view")
+            ),
+            "keep-003 payload"
+        );
+        (card.toggle_filter)();
+        spin_main_context_until(|| card.displayed_output.borrow().is_none());
+        spin_main_context_for(std::time::Duration::from_millis(120));
+        assert_eq!(&*card.full_output.borrow(), &output);
+
+        // A repeated native draw/scroll is not a new display generation.
+        // Keep the existing scan counter strict, including gutter scans.
+        OUTPUT_VISUAL_ROW_COUNT_CALLS.with(|calls| calls.set(0));
+        for _ in 0..4 {
+            card.widget().queue_draw();
+            spin_main_context_for(std::time::Duration::from_millis(25));
+        }
+        if let Some(adjustment) = card.output_vte.vadjustment() {
+            adjustment.set_value(
+                (adjustment.upper() - adjustment.page_size()).max(adjustment.lower()),
+            );
+        }
+        spin_main_context_for(std::time::Duration::from_millis(50));
+        OUTPUT_VISUAL_ROW_COUNT_CALLS.with(|calls| {
+            assert_eq!(
+                calls.get(),
+                0,
+                "draw/scroll must reuse the existing gutter generation"
+            );
+        });
+        window.close();
+        while glib::MainContext::default().iteration(false) {}
     }
 
     #[test]
@@ -3556,6 +3669,9 @@ const fn finished_card_vchrome_px(compact: bool) -> i32 {
 
 pub(crate) fn estimated_finished_block_height(config: &Config, output_rows: i64) -> i32 {
     let cell = estimated_cell_height_px(config);
+    if config.terminal_mode == crate::config::TerminalMode::Block {
+        return super::block_reference::estimated_height(cell, 1, output_rows);
+    }
     // Chat combines context/status; its separate 16px role is pixel chrome.
     // Block keeps separate command/context logical rows.
     let rows = output_rows.clamp(1, i32::MAX as i64) as i32;
@@ -3610,6 +3726,9 @@ pub(crate) fn estimated_finished_block_height_for_text(
     output: &str,
     cols: i64,
 ) -> i32 {
+    if config.terminal_mode == crate::config::TerminalMode::Block && output.trim().is_empty() {
+        return estimated_finished_block_height(config, 0);
+    }
     estimated_finished_block_height_for_rows(config, output_visual_row_count(output, cols), cols)
 }
 
@@ -4185,6 +4304,7 @@ impl FinishedBlock {
     ) -> Self {
         let is_background = cmd.trim().is_empty();
         let chat = config.terminal_mode == crate::config::TerminalMode::Chat;
+        let reference_block = config.terminal_mode == crate::config::TerminalMode::Block;
         let cols = cols.clamp(1, MAX_FINISHED_VTE_COLUMNS);
         let estimated_retained_bytes = precomputed.retained_bytes.unwrap_or_else(|| {
             estimated_live_finished_block_retained_bytes(
@@ -4258,10 +4378,14 @@ impl FinishedBlock {
         // block last used them; virtualization owns this request from here on.
         outer.set_hexpand(true);
         outer.set_vexpand(false);
+        if !reference_block {
+            outer.remove_css_class("block-reference-card");
+        }
         // A recycled shell belongs to this pane's current presentation, never
         // the mutable global preference or its previous pooled record.
         if chat {
             outer.add_css_class("chat-turn");
+            outer.remove_css_class("block-reference-card");
         } else {
             outer.remove_css_class("chat-turn");
         }
@@ -4901,7 +5025,37 @@ impl FinishedBlock {
         // live card's scrollbar already rides its clip for the same reason.
         let output_box = gtk::Overlay::new();
         output_box.set_hexpand(true);
-        output_box.set_child(Some(&output_vte));
+        if reference_block {
+            let body = gtk::Box::new(Orientation::Horizontal, super::block_reference::OUTPUT_GAP);
+            body.add_css_class("block-reference-output");
+            body.set_margin_start(16);
+            body.set_margin_end(16);
+            let gutter = super::block_reference::output_gutter(
+                &output_vte,
+                full_output.clone(),
+                displayed_output.clone(),
+                displayed_generation.clone(),
+            );
+            body.append(&gutter);
+            body.append(&output_vte);
+            output_box.set_child(Some(&body));
+            // Observe native allocation without a tick or layout owner. A
+            // width-only pane resize must redraw labels even at the same font.
+            let observer = gtk::DrawingArea::new();
+            observer.set_can_target(false);
+            observer.set_focusable(false);
+            let gutter = gutter.downgrade();
+            observer.connect_resize(move |_, _, _| {
+                if let Some(gutter) = gutter.upgrade() {
+                    gutter.queue_draw();
+                }
+            });
+            output_box.add_overlay(&observer);
+            output_box.set_measure_overlay(&observer, false);
+            output_box.set_clip_overlay(&observer, true);
+        } else {
+            output_box.set_child(Some(&output_vte));
+        }
         if chat {
             output_vte.add_css_class("chat-output-terminal");
             output_vte.set_color_background(&RGBA::new(0.0, 0.0, 0.0, 0.0));
@@ -5451,9 +5605,10 @@ impl FinishedBlock {
                         .and_downcast::<gtk::Box>()
                         .filter(|row| row.has_css_class("chat-result-card"));
                     let parent = result.as_ref().unwrap_or(&content);
-                    let anchor = result
-                        .as_ref()
-                        .and_then(|row| row.first_child())
+                    let anchor = cmd_row
+                        .parent()
+                        .filter(|parent| parent.has_css_class("block-reference-header"))
+                        .or_else(|| result.as_ref().and_then(|row| row.first_child()))
                         .unwrap_or_else(|| cmd_row.clone().upcast::<gtk::Widget>());
                     let handles = build_filter_row(parent, &anchor);
                     *built.borrow_mut() = handles;
@@ -5502,6 +5657,22 @@ impl FinishedBlock {
             ));
             content.append(&cmd_row);
             content.append(&result);
+        } else if reference_block {
+            super::block_reference::decorate_finished(super::block_reference::FinishedChrome {
+                outer: &outer,
+                content: &content,
+                header: &header_row,
+                command: &cmd_row,
+                command_vte: &command_vte,
+                command_text: cmd,
+                metadata: &metadata,
+                status,
+                duration_ms,
+                cwd,
+                more: &more,
+                actions: &action_box,
+                collapse: &collapse_btn,
+            });
         }
 
         FinishedBlock {
@@ -5511,7 +5682,11 @@ impl FinishedBlock {
             content,
             virtualized_height: Rc::new(Cell::new(estimated_finished_block_height(
                 config,
-                estimated_visible_rows,
+                if reference_block && !has_output {
+                    0
+                } else {
+                    estimated_visible_rows
+                },
             ))),
             virtualized: Rc::new(Cell::new(false)),
             compact: Rc::new(Cell::new(config.block_compact)),
@@ -5727,6 +5902,12 @@ impl FinishedBlock {
     /// Switch this card between the normal and compact densities in place and
     /// return the height its virtualization placeholder must contribute.
     pub(crate) fn set_compact(&self, compact: bool) -> i32 {
+        if self.widget.has_css_class("block-reference-card") {
+            // V2 uses fixed shared card rhythm; old density chrome must not
+            // rewrite margins or a parked document height on this renderer.
+            self.compact.set(compact);
+            return self.virtualized_height.get().max(1);
+        }
         let previous = self.compact.replace(compact);
         if previous != compact {
             let delta = finished_card_vchrome_px(compact)
@@ -5890,6 +6071,17 @@ impl FinishedBlock {
         } else {
             bounded_command_rows
         };
+        if self.widget.has_css_class("block-reference-card") {
+            return Some(super::block_reference::estimated_height(
+                cell_height,
+                command_height_rows,
+                if text.trim().is_empty() {
+                    0
+                } else {
+                    visible_rows
+                },
+            ));
+        }
         let rows_for_height = visible_rows
             .saturating_add(if self.widget.has_css_class("chat-turn") {
                 2
@@ -6097,6 +6289,9 @@ pub(crate) struct ActiveBlock {
     /// Last applied `(width_px, grid_px, visible_px)`, so a layout pass that
     /// changes nothing does not queue a resize.
     live_geometry: Cell<(i32, i32, i32)>,
+    /// Stable pane canvas for v2's physical grid. The clip may change seats;
+    /// neither input/output insets nor content height may resize the child.
+    block_grid_canvas: glib::WeakRef<gtk::Box>,
     /// High-water row extent of the command in flight. Monotone within one
     /// command so a `\r` progress bar, an `ESC[1A` redraw or a mid-command
     /// `clear` can never make the card shrink under the output already on
@@ -6344,6 +6539,7 @@ impl ActiveBlock {
             live_spacer,
             live_clip,
             live_geometry: Cell::new((0, 0, 0)),
+            block_grid_canvas: glib::WeakRef::new(),
             live_extent_rows: Rc::new(Cell::new(0)),
             live_cursor_origin: Rc::new(Cell::new(None)),
             live_cursor_high: Rc::new(Cell::new(0)),
@@ -6401,7 +6597,12 @@ impl ActiveBlock {
         let cell_h = cell_h.max(1);
         let grid_rows = grid_rows.max(1);
         let visible_rows = visible_rows.clamp(1, grid_rows);
-        let width_px = self.live_clip.width();
+        let width_px = self
+            .block_grid_canvas
+            .upgrade()
+            .map(|canvas| canvas.width().saturating_sub(2 * 12 + 2 + 2 * 16 + 24 + 16))
+            .filter(|width| *width > 0)
+            .unwrap_or_else(|| self.live_clip.width());
         let insets = terminal_vertical_insets(&self.active_vte);
         let visible_px = live_rows_height_px(cell_h, visible_rows, insets);
         if width_px <= 0 {
@@ -6424,6 +6625,10 @@ impl ActiveBlock {
         self.vte_overlay.set_size_request(width_px, grid_px);
         self.live_spacer.set_height_request(visible_px);
         true
+    }
+
+    pub(crate) fn bind_block_grid_canvas(&self, canvas: &gtk::Box) {
+        self.block_grid_canvas.set(Some(canvas));
     }
 
     /// The measured live card. The pane resize watcher keys off its width:

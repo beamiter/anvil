@@ -1203,6 +1203,10 @@ fn block_css(config: &Config) -> String {
         .block-header {{
             border-radius: 6px 6px 0 0;
         }}
+        .block-command-canvas .block-reference-live-command {{
+            font-family: {font_stack};
+            font-size: {font_size};
+        }}
         .block-context {{
             margin: 0 8px 2px 12px;
         }}

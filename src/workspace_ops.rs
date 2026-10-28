@@ -639,6 +639,26 @@ fn restored_leaf_mode(configured: TerminalMode, remote_integrated: bool) -> Term
     }
 }
 
+fn restored_leaf_mode_with_saved(
+    configured: TerminalMode,
+    saved: &str,
+    remote_integrated: bool,
+) -> TerminalMode {
+    if !remote_integrated && TerminalMode::parse(saved) == Some(TerminalMode::Unified) {
+        TerminalMode::Unified
+    } else {
+        restored_leaf_mode(configured, remote_integrated)
+    }
+}
+
+fn restored_leaf_remote_integrated(
+    missing_profile: bool,
+    external_namespace: bool,
+    replay_requires_block: bool,
+) -> bool {
+    !missing_profile && (external_namespace || replay_requires_block)
+}
+
 fn managed_remote_host_for_restore(
     hosts: &[config::RemoteHost],
     name: &str,
@@ -1018,6 +1038,7 @@ impl AppModel {
     ) -> gtk::Widget {
         match node {
             session::PaneLayout::Leaf {
+                mode: saved_mode,
                 cwd,
                 cwd_external,
                 remote_name,
@@ -1087,18 +1108,24 @@ impl AppModel {
                 let missing_managed_remote = remote_name.is_some();
                 let replay_argv =
                     replay_argv_for_unmanaged_leaf(remote_name.as_deref(), cmds.as_deref());
-                // The current configuration remains authoritative for restored
-                // local backends. Remote-integrated panes stay on Block because
+                // Explicit old Unified snapshots retain their backend/history.
+                // Other local leaves keep configured fallback; remote-integrated panes stay on Block because
                 // their OSC cwd/session/reconnect signals are part of the
                 // restore contract even in VTE compatibility mode.
                 let external_cwd = missing_managed_remote
                     || *cwd_external
                     || replay_argv.is_some_and(process::command_uses_external_cwd);
-                let remote_integrated = !missing_managed_remote
-                    && (restored_sid.is_some()
-                        || replay_argv.is_some_and(process::command_requires_block_integration));
-                let mode =
-                    restored_leaf_mode(self.config.borrow().terminal_mode, remote_integrated);
+                // A local journal/session ID is not evidence of a remote shell.
+                let remote_integrated = restored_leaf_remote_integrated(
+                    missing_managed_remote,
+                    *cwd_external,
+                    replay_argv.is_some_and(process::command_requires_block_integration),
+                );
+                let mode = restored_leaf_mode_with_saved(
+                    self.config.borrow().terminal_mode,
+                    saved_mode,
+                    remote_integrated,
+                );
                 // OSC 7 from ssh/mosh/container shells reports a path in that
                 // remote namespace. It must neither be passed as a local spawn
                 // cwd nor suppress safe argv replay when absent on this host.
@@ -3229,12 +3256,14 @@ mod pane_tree_tests {
         format_running_process_summary, move_tab_edge_notice, move_tab_need_two_notice,
         pane_header_title, persistence_failure_notice, pinned_reorder_destination,
         plan_pane_into_tab, plan_tab_into_pane, prepare_then_commit, reconnect_target_is_valid,
-        replay_argv_for_unmanaged_leaf, restored_leaf_mode, snapshot_restorable_command,
-        split_layout_reason, swap_target_in_visual_order, switch_tab_empty_notice,
-        tab_drop_preview_is_valid, tab_selection_after_close, DropTabIdentity, LeafSlot,
-        PaneIntoTabPlan, SplitLayoutKind, TabIntoPanePlan, PERSISTENCE_FAILURE_NOTICE_COOLDOWN,
+        replay_argv_for_unmanaged_leaf, restored_leaf_mode, restored_leaf_mode_with_saved,
+        restored_leaf_remote_integrated, snapshot_restorable_command, split_layout_reason,
+        swap_target_in_visual_order, switch_tab_empty_notice, tab_drop_preview_is_valid,
+        tab_selection_after_close, DropTabIdentity, LeafSlot, PaneIntoTabPlan, SplitLayoutKind,
+        TabIntoPanePlan, PERSISTENCE_FAILURE_NOTICE_COOLDOWN,
     };
     use crate::config::TerminalMode;
+    use crate::session;
     use crate::workspace::ConnStatus;
     use relm4::gtk;
     use relm4::gtk::prelude::*;
@@ -3856,6 +3885,67 @@ mod pane_tree_tests {
                 TerminalMode::Unified
             ));
         }
+    }
+
+    #[test]
+    fn saved_unified_identity_survives_the_new_block_default() {
+        assert_eq!(
+            restored_leaf_mode_with_saved(TerminalMode::Block, "unified", false),
+            TerminalMode::Unified
+        );
+        assert_eq!(
+            restored_leaf_mode_with_saved(TerminalMode::Chat, "unified", false),
+            TerminalMode::Unified
+        );
+        assert_eq!(
+            restored_leaf_mode_with_saved(TerminalMode::Block, "future-mode", false),
+            TerminalMode::Block
+        );
+        assert_eq!(
+            restored_leaf_mode_with_saved(TerminalMode::Chat, "block", false),
+            TerminalMode::Chat
+        );
+        assert_eq!(
+            restored_leaf_mode_with_saved(TerminalMode::Unified, "unified", true),
+            TerminalMode::Block
+        );
+    }
+
+    #[test]
+    fn local_unified_snapshot_with_journal_id_keeps_its_backend() {
+        let leaf = session::PaneLayout::captured_leaf(
+            "unified".to_string(),
+            Some("/tmp".to_string()),
+            false,
+            None,
+            Some("0123456789abcdef0123456789abcdef".to_string()),
+            None,
+        );
+        let wire = serde_json::to_value(&leaf).expect("actual bounded capture serializes");
+        assert_eq!(wire["type"], "leaf");
+        assert_eq!(wire["mode"], "unified");
+        assert!(wire["sid"].is_string());
+        let session::PaneLayout::Leaf {
+            mode,
+            cwd_external,
+            sid,
+            remote_name,
+            ..
+        } = leaf
+        else {
+            panic!("leaf")
+        };
+        assert!(sid.is_some());
+        assert!(remote_name.is_none());
+        let remote = restored_leaf_remote_integrated(false, cwd_external, false);
+        assert!(!remote);
+        assert_eq!(
+            restored_leaf_mode_with_saved(TerminalMode::Block, &mode, remote),
+            TerminalMode::Unified
+        );
+        assert!(restored_leaf_remote_integrated(false, true, false));
+        assert!(restored_leaf_remote_integrated(false, false, true));
+        assert!(!restored_leaf_remote_integrated(true, true, true));
     }
 
     #[test]

@@ -156,7 +156,9 @@ impl AppModel {
             &config,
             &self.window.pango_context(),
         ));
-        crate::workspace_shell::apply_content_font_scale(config.default_font_scale);
+        crate::workspace_shell::apply_content_font_scale(
+            crate::font::reference_content_role_multiplier(&config, &self.window.pango_context()),
+        );
     }
 }
 

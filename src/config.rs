@@ -40,6 +40,14 @@ pub enum TerminalMode {
 }
 
 impl TerminalMode {
+    /// Public VTE is an accepted old spelling of Block. Explicit Unified keeps
+    /// its persistent backend; the GUI still labels both native forms Block.
+    pub(crate) fn workspace_backend(self) -> Self {
+        match self {
+            Self::Vte => Self::Block,
+            other => other,
+        }
+    }
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Block => "block",
@@ -2482,6 +2490,25 @@ mod tests {
         assert!(TerminalMode::Chat.uses_term_view());
         assert!(!TerminalMode::Chat.is_unified());
         assert!(!TerminalMode::Vte.uses_term_view());
+    }
+
+    #[test]
+    fn explicit_unified_config_and_cli_survive_workspace_normalization() {
+        let configured = TerminalMode::parse("unified").expect("legacy config value");
+        assert_eq!(configured.workspace_backend(), TerminalMode::Unified);
+        let cli = crate::cli::parse(["--mode", "unified"].map(std::ffi::OsString::from))
+            .expect("legacy CLI");
+        let crate::cli::Command::Run(options) = cli.command else {
+            panic!("launch request")
+        };
+        assert_eq!(options.mode, Some(crate::cli::Mode::Unified));
+        assert_eq!(
+            TerminalMode::Unified.workspace_backend(),
+            TerminalMode::Unified
+        );
+        assert_eq!(TerminalMode::Vte.workspace_backend(), TerminalMode::Block);
+        assert_eq!(TerminalMode::Block.workspace_backend(), TerminalMode::Block);
+        assert_eq!(TerminalMode::Chat.workspace_backend(), TerminalMode::Chat);
     }
 
     #[test]

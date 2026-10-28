@@ -243,3 +243,62 @@ popover.reference-tools-popover { background:transparent; border:0; box-shadow:n
 #reference-tools-menu button.reference-tool-row label.reference-tool-description,#reference-tools-menu button.reference-tool-row:disabled,#reference-tools-menu button.reference-tool-row:disabled * { color:#91a2bb; filter:none; opacity:1; }
 
 .workspace-center label.chat-running-status { font-family:"DejaVu Sans",sans-serif; font-size:11px; color:#8290a7; }
+
+/* Native role aliases for the tool/status leaf scope. The hidden state bridge
+   keeps no painted typography contract; editor/terminal input is outside. */
+.reference-composer-chrome label:not(.chat-input-hint) { font-size:10px; }
+.reference-composer-chrome label.reference-tool-description { font-size:9px; }
+.reference-composer-chrome label.chat-running-status { font-size:11px; }
+
+/* Block reference v2: native command cards; Chat keeps its existing theme. */
+.workspace-center.block-workspace { background:#091323; color:#d5deec; }
+.block-workspace .workspace-canvas-header { background:#101c30; color:#d5deec; border-color:#293c57; }
+.block-workspace .workspace-canvas-header label { color:#d5deec; }
+.block-workspace .workspace-canvas-header .shell-canvas-subtitle { color:#91a4bf; }
+.workspace-center .block-command-canvas { margin:0; border:none; border-radius:0; background:#091323; }
+.block-command-canvas .block-scroll,.block-command-canvas .block-list { background:#091323; }
+.block-command-canvas .block-list .block-reference-card { border:1px solid #293c57; border-radius:10px; padding:0; outline:none; background:#0e1621; box-shadow:none; }
+.block-command-canvas .block-list .block-reference-card.block-selected { outline:1px solid #4199ff; outline-offset:-1px; }
+.block-command-canvas .block-reference-header { background:#101c30; border-bottom:1px solid #293c57; padding:0; color:#d5deec; }
+.block-command-canvas .block-reference-command { padding:0; margin:0; }
+.block-command-canvas .block-reference-command terminal { padding:0; margin:0; background:transparent; }
+.block-command-canvas .block-reference-command-icon { color:#91baff; border:1px solid #34578a; border-radius:6px; background:#172c4d; }
+.block-command-canvas .block-reference-status { border-radius:5px; padding:3px 7px; color:#91a4bf; background:#1c2b40; }
+.block-command-canvas .block-reference-status.completed { color:#39dda0; background:#12352e; }
+.block-command-canvas .block-reference-status.failed { color:#ff646f; background:#3b222e; }
+.block-command-canvas .block-reference-status.running { color:#4199ff; background:#152f50; }
+.block-command-canvas .block-reference-elapsed { color:#91a4bf; }
+.block-command-canvas .block-reference-more { min-height:22px; min-width:22px; padding:0; color:#91a4bf; border:1px solid #293c57; border-radius:5px; }
+.block-command-canvas .block-reference-output { padding:6px 0; background:#0e1621; }
+.block-command-canvas .block-reference-output terminal { margin:0; padding:0; }
+.block-command-canvas .block-reference-gutter { color:#637d9c; background:transparent; }
+.block-workspace .shell-block-composer { background:#172338; border-color:#293c57; color:#91a4bf; }
+.block-workspace .shell-block-input-hint { color:#91a4bf; }
+.block-command-canvas .block-list .block-reference-live { border:1px solid #4199ff; border-radius:10px; margin:5px 12px; padding:0; outline:none; background:#0e1621; box-shadow:0 0 9px rgba(65,153,255,0.15); }
+.block-command-canvas .block-reference-live-command { color:#d5deec; }
+.block-command-canvas .block-reference-live.block-alt-screen { border-color:transparent; box-shadow:none; }
+.block-command-canvas .block-reference-toolbar { padding:0 12px; background:#101c30; color:#91a4bf; border-bottom:1px solid #293c57; }
+.block-command-canvas .block-reference-toolbar button { min-height:24px; min-width:24px; padding:0; background:transparent; color:#91a4bf; }
+/* A Block root deliberately outranks the legacy non-Chat terminal frame. */
+.workspace-center .term-view-root.block-command-canvas:not(.chat-mode) { margin:0; border:none; border-radius:0; outline:none; background:#091323; }
+.block-command-canvas .block-list { padding-top:5px; padding-bottom:5px; }
+.block-command-canvas .block-active.chat-empty-anchor { border:none; outline:none; box-shadow:none; min-height:0; margin:0; padding:0; }
+.workspace-center .block-command-canvas .chat-composer { min-height:52px; padding:8px 10px; margin:4px 12px 8px; border-radius:12px; background:#172338; color:#d5deec; outline:1px solid #293c57; outline-offset:-1px; box-shadow:none; }
+.workspace-center .block-command-canvas .chat-controls { background:transparent; }
+.workspace-center .block-command-canvas .chat-controls button,.block-workspace .shell-block-composer button { background:#16243a; border-color:#293c57; color:#91a4bf; }
+.workspace-center .block-command-canvas .chat-controls button:disabled,.block-workspace .shell-block-composer button:disabled { color:#637d9c; opacity:1; }
+.workspace-center .block-command-canvas .chat-controls .chat-send { background:#347df6; color:white; }
+.workspace-center .block-command-canvas .chat-controls .chat-stop { background:#462538; color:#ff646f; }
+.workspace-center .block-command-canvas label.chat-running-status { color:#91a4bf; }
+/* Keep the ten-pixel gap in the indexed holder, outside the painted surface. */
+.block-command-canvas .block-list .block-reference-card { border:none; border-radius:0; background:transparent; outline:none; box-shadow:none; }
+.block-command-canvas .block-reference-card-surface { border:1px solid #293c57; border-radius:10px; padding:0; background:#0e1621; }
+.block-command-canvas .block-list .block-reference-card.block-selected { outline:none; }
+.block-command-canvas .block-reference-card.block-selected .block-reference-card-surface { outline:1px solid #4199ff; outline-offset:-1px; }
+.block-command-canvas .block-list { padding-top:10px; }
+.block-command-canvas .block-list .block-reference-live { margin-top:0; margin-bottom:10px; }
+/* Authored roles for the new native Block components, under existing UI scale. */
+.block-reference-toolbar label { font-size:12px; }
+.block-reference-header label:not(.block-reference-live-command) { font-size:10px; }
+.workspace-center .block-command-canvas .chat-controls button:not(.chat-send):not(.chat-stop) { background:#16243a; background-image:none; border-color:#293c57; color:#91a4bf; }
+.workspace-center .block-command-canvas .chat-controls button:disabled * { color:#637d9c; opacity:1; }
