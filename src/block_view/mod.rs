@@ -7521,7 +7521,7 @@ impl ReaderCtx {
             self.prompt_anchor_rows_rc.get(),
         );
         if std::env::var_os("ANVIL_BLOCK_REFERENCE_METRICS").is_some() {
-            log::info!(target:"anvil::block_reference","command_anchor ready={} recorded_rows={} current_rows={} start_col={} start_row={} end_col={} end_row={} columns={} declared_truncated={} reported_bytes={:?}",self.prompt_anchor_ready_rc.get(),self.prompt_anchor_rows_rc.get(),current_rows,start_col,start_row,cmd_end_col,cmd_end_row,self.backend.live_column_count(),meta.command_truncated,meta.command.as_ref().map(|command|command.len()));
+            log::info!(target:"anvil::block_reference","command_anchor ready={} recorded_rows={} current_rows={} start_col={} start_row={} end_col={} end_row={} columns={} declared_truncated={} reported_bytes={:?} display_idle_input_stamp={:?}",self.prompt_anchor_ready_rc.get(),self.prompt_anchor_rows_rc.get(),current_rows,start_col,start_row,cmd_end_col,cmd_end_row,self.backend.live_column_count(),meta.command_truncated,meta.command.as_ref().map(|command|command.len()),self.pty_for_init.display_idle_input_stamp());
         }
         self.prompt_end_pos_rc.set((start_col, start_row));
         self.prompt_anchor_rows_rc.set(current_rows);

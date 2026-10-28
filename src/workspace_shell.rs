@@ -238,12 +238,12 @@ pub(crate) fn composer_tools(
     let secondary = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let add = unavailable("Attach");
     add.add_css_class("chat-add");
-    add.set_child(Some(&footer_icon(Icon::Plus)));
+    add.set_child(Some(&icon(Icon::Plus)));
     secondary.append(&add);
     for name in ["Attach", "Image", "Code"] {
         let button = unavailable(name);
-        let content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        content.append(&footer_icon(Icon::from_key(&name.to_ascii_lowercase())));
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        content.append(&icon(Icon::from_key(&name.to_ascii_lowercase())));
         content.append(&gtk::Label::new(Some(name)));
         button.set_child(Some(&content));
         secondary.append(&button);
@@ -252,8 +252,8 @@ pub(crate) fn composer_tools(
     terminal.add_css_class("flat");
     terminal.add_css_class("chat-terminal-capsule");
     terminal.set_focus_on_click(false);
-    let terminal_content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    terminal_content.append(&footer_icon(Icon::Terminal));
+    let terminal_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    terminal_content.append(&icon(Icon::Terminal));
     terminal_content.append(&label("Terminal", "shell-canvas-subtitle"));
     terminal.set_child(Some(&terminal_content));
     terminal.set_tooltip_text(Some("Focus the active terminal"));
@@ -280,7 +280,10 @@ pub(crate) fn composer_tools(
     tools_label.set_width_chars(0);
     tools_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     tools_content.append(&tools_label);
-    tools_content.append(&footer_icon(Icon::ChevronDown));
+    let chevron = footer_icon(Icon::ChevronDown);
+    chevron.set_content_width(12);
+    chevron.set_content_height(12);
+    tools_content.append(&chevron);
     tools.set_child(Some(&tools_content));
     tools.set_direction(gtk::ArrowType::Up);
     tools.set_always_show_arrow(false);
@@ -409,11 +412,12 @@ pub(crate) fn composer_tools(
     row.append(&spacer);
     let model = unavailable(tokens::MODEL_UNAVAILABLE_LABEL);
     model.add_css_class("chat-tool-capsule");
+    model.add_css_class("shell-composer-model");
     model.set_width_request(tokens::COMPOSER_MODEL_MIN_WIDTH as i32);
     model.set_tooltip_text(Some("No agent model is connected to this shell input"));
     row.append(&model);
     send.add_css_class("chat-send");
-    send.set_child(Some(&footer_icon(Icon::Send)));
+    send.set_child(Some(&icon(Icon::Send)));
     row.append(send);
     if let Some(stop) = stop {
         row.append(stop);
@@ -441,6 +445,7 @@ pub(crate) fn composer_tools(
     });
     let controls = gtk::Box::new(gtk::Orientation::Vertical, 0);
     controls.add_css_class("chat-controls");
+    controls.add_css_class("reference-composer-controls");
     own_composer_chrome(&controls);
     controls.set_height_request(tokens::CONTROL_HEIGHT as i32);
     controls.set_vexpand(true);
@@ -823,7 +828,9 @@ impl Chrome {
         };
         let overview = crate::workspace_conversation::inspector(&inspector_model, fixture);
         let overview_scroll = gtk::ScrolledWindow::new();
+        overview_scroll.add_css_class("reference-inspector-scroll");
         overview_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        overview_scroll.set_vexpand(true);
         overview_scroll.set_child(Some(&overview));
         panel.add_named(&overview_scroll, Some("overview"));
         panel.add_named(side_stack, Some("live"));
@@ -1305,6 +1312,20 @@ pub(crate) fn observe_layout(
                 for (name, class) in [
                     ("chat_composer", "chat-composer"),
                     ("live_toolbar", "block-reference-toolbar"),
+                    ("footer", "reference-composer-controls"),
+                    ("footer_model", "shell-composer-model"),
+                    ("footer_send", "chat-send"),
+                    ("footer_stop", "chat-stop"),
+                    ("footer_tools", "reference-tools-button"),
+                    ("inspector_overview", "reference-rich-inspector"),
+                    ("inspector_scroll", "reference-inspector-scroll"),
+                    ("inspector_agent_heading", "reference-inspector-agent-heading"),
+                    ("inspector_metadata", "reference-inspector-metadata"),
+                    ("inspector_current", "reference-inspector-current"),
+                    ("inspector_queue", "reference-inspector-queue"),
+                    ("inspector_terminal_section", "reference-inspector-terminal-section"),
+                    ("inspector_output_heading", "reference-inspector-output-heading"),
+                    ("inspector_output", "reference-inspector-output"),
                 ] {
                     if let Some(widget) = mapped_child(window.upcast_ref(), class) {
                         if let Some(rect) = bounds(&widget) {
@@ -1312,7 +1333,34 @@ pub(crate) fn observe_layout(
                         }
                     }
                 }
-                log::info!(target:"anvil::workspace_shell","native_shell_geometry {}",serde_json::json!({"window":[window.width(),window.height()],"dpr":window.scale_factor(),"regions":regions}));
+                fn footer_buttons(
+                    widget: &gtk::Widget,
+                    window: &gtk::Window,
+                    output: &mut Vec<serde_json::Value>,
+                ) {
+                    if !widget.is_mapped() {
+                        return;
+                    }
+                    if widget.is::<gtk::Button>() || widget.is::<gtk::MenuButton>() {
+                        if let Some(rect) = widget.compute_bounds(window) {
+                            output.push(serde_json::json!({
+                                "classes":widget.css_classes().iter().map(ToString::to_string).collect::<Vec<_>>(),
+                                "bounds":[rect.x(),rect.y(),rect.width(),rect.height()],
+                                "sensitive":widget.is_sensitive(),
+                            }));
+                        }
+                    }
+                    let mut child = widget.first_child();
+                    while let Some(node) = child {
+                        footer_buttons(&node, window, output);
+                        child = node.next_sibling();
+                    }
+                }
+                let mut buttons = Vec::new();
+                if let Some(footer) = mapped_child(window.upcast_ref(), "reference-composer-controls") {
+                    footer_buttons(&footer, &window, &mut buttons);
+                }
+                log::info!(target:"anvil::workspace_shell","native_shell_geometry {}",serde_json::json!({"window":[window.width(),window.height()],"dpr":window.scale_factor(),"regions":regions,"footer_buttons":buttons}));
             });
         }
     });

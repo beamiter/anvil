@@ -366,6 +366,10 @@ pub(crate) fn write_all_fd(fd: RawFd, mut data: &[u8]) -> io::Result<()> {
 struct FdWriterQueue {
     messages: VecDeque<Vec<u8>>,
     bytes: usize,
+    /// Display-proof invalidation only: one increment per nonempty admitted
+    /// message or successful immediate action, never per worker retry. This
+    /// is not proof of kernel delivery or command/input authorization.
+    admission_sequence: u64,
     // Protected by the same mutex as dequeue/admission. Queued-byte capacity
     // intentionally excludes this message, but optional actions must not.
     in_flight: bool,
@@ -432,6 +436,20 @@ impl Drop for FdWriter {
 }
 
 impl FdWriter {
+    /// A display proof can only start at an idle transport boundary. Merely
+    /// comparing counters would miss previously admitted typeahead whose tail
+    /// is still in flight. Busy locks and exhausted counters fail closed.
+    fn display_idle_input_stamp(&self) -> Option<u64> {
+        let queue = self.shared.queue.try_lock().ok()?;
+        (!queue.closed
+            && !self.shared.cancelled.load(Ordering::Acquire)
+            && !queue.in_flight
+            && queue.messages.is_empty()
+            && queue.bytes == 0
+            && queue.admission_sequence != u64::MAX)
+            .then_some(queue.admission_sequence)
+    }
+
     /// Stop admission and discard unsent input. The worker owns its descriptor
     /// until it observes cancellation; this does not synchronously join it.
     fn cancel(&self) {
@@ -457,7 +475,7 @@ impl FdWriter {
         target_is_current: impl FnOnce() -> bool,
     ) -> Result<(), FdWriterSendError> {
         let refused = |reason| FdWriterSendError { len: 1, reason };
-        let queue = self
+        let mut queue = self
             .shared
             .queue
             .try_lock()
@@ -487,6 +505,9 @@ impl FdWriter {
                 Ok(written as usize)
             }
         });
+        if result.is_ok() {
+            queue.admission_sequence = queue.admission_sequence.saturating_add(1);
+        }
         drop(queue);
         result
     }
@@ -523,6 +544,7 @@ impl FdWriter {
         }
         queue.bytes += len;
         queue.messages.push_back(data);
+        queue.admission_sequence = queue.admission_sequence.saturating_add(1);
         drop(queue);
         self.shared.ready.notify_one();
         Ok(())
@@ -648,6 +670,7 @@ fn spawn_fd_writer_inner(
         queue: Mutex::new(FdWriterQueue {
             messages: VecDeque::new(),
             bytes: 0,
+            admission_sequence: 0,
             in_flight: false,
             closed: false,
         }),
@@ -1258,6 +1281,22 @@ impl OwnedPty {
             }
         };
         filter_and_admit_input(&mut guard, &self.input_tx, data, modes)
+    }
+
+    /// Observe accepted transport input for a future native display-origin
+    /// fence. `None` means closed, busy, framed input or exhausted observation
+    /// space. This neither grants submission authority nor acknowledges that
+    /// the shell consumed any bytes; IME/preedit, geometry and lifecycle still
+    /// require their own invalidation. No payload or private text is exposed.
+    pub(crate) fn display_idle_input_stamp(&self) -> Option<u64> {
+        if self.reader_cancelled.load(Ordering::Acquire) {
+            return None;
+        }
+        let guard = self.input_guard.try_lock().ok()?;
+        if guard.in_frame() {
+            return None;
+        }
+        self.input_tx.display_idle_input_stamp()
     }
 
     /// Fail-closed, immediate dispatch for Chat's optional Send/Stop only.
@@ -2797,6 +2836,7 @@ mod tests {
                 queue: Mutex::new(FdWriterQueue {
                     messages: VecDeque::new(),
                     bytes: queued_bytes,
+                    admission_sequence: 0,
                     in_flight: false,
                     closed,
                 }),
@@ -2818,6 +2858,157 @@ mod tests {
         let data = queue.messages.pop_front().unwrap_or_default();
         queue.bytes = queue.bytes.saturating_sub(data.len());
         data
+    }
+
+    #[test]
+    fn display_input_stamp_rejects_busy_and_saturated_observations_without_losing_bytes() {
+        let writer = queued_writer(false, 0);
+        assert_eq!(writer.display_idle_input_stamp(), Some(0));
+        writer.send(Vec::new()).unwrap();
+        let mut guard = pty_input::InputGuard::new();
+        filter_and_admit_input(
+            &mut guard,
+            &writer,
+            b"\nnot admitted",
+            pty_input::PasteModes { bracketed: false },
+        )
+        .unwrap();
+        assert_eq!(writer.display_idle_input_stamp(), Some(0));
+
+        writer.send(b"first".to_vec()).unwrap();
+        assert_eq!(writer.display_idle_input_stamp(), None);
+        assert_eq!(take_queued(&writer), b"first");
+        assert_eq!(writer.display_idle_input_stamp(), Some(1));
+        let clone = writer.clone();
+        clone.send(b"second".to_vec()).unwrap();
+        assert_eq!(writer.display_idle_input_stamp(), None);
+        assert_eq!(take_queued(&writer), b"second");
+        assert_eq!(writer.display_idle_input_stamp(), Some(2));
+        assert!(writer
+            .send(vec![0; FD_WRITER_MAX_MESSAGE_BYTES + 1])
+            .is_err());
+        assert_eq!(writer.display_idle_input_stamp(), Some(2));
+        let full = queued_writer(false, FD_WRITER_MAX_QUEUED_BYTES);
+        assert!(full.send(b"refused".to_vec()).is_err());
+        assert_eq!(full.shared.queue.lock().unwrap().admission_sequence, 0);
+        assert_eq!(full.display_idle_input_stamp(), None);
+        let closed = queued_writer(true, 0);
+        assert!(closed.send(b"refused".to_vec()).is_err());
+        assert_eq!(closed.shared.queue.lock().unwrap().admission_sequence, 0);
+        assert_eq!(closed.display_idle_input_stamp(), None);
+
+        {
+            let mut queue = writer.shared.queue.lock().unwrap();
+            assert_eq!(writer.display_idle_input_stamp(), None, "no blocking lock");
+            queue.in_flight = true;
+        }
+        assert_eq!(writer.display_idle_input_stamp(), None);
+        {
+            let mut queue = writer.shared.queue.lock().unwrap();
+            queue.in_flight = false;
+            queue.admission_sequence = u64::MAX - 1;
+        }
+        writer.send(b"last observable input".to_vec()).unwrap();
+        assert_eq!(take_queued(&writer), b"last observable input");
+        assert_eq!(writer.display_idle_input_stamp(), None);
+        // Observation exhaustion never wraps into an old valid stamp and
+        // never blocks otherwise valid transport input.
+        writer.send(b"still delivered".to_vec()).unwrap();
+        assert_eq!(take_queued(&writer), b"still delivered");
+        assert_eq!(
+            writer.shared.queue.lock().unwrap().admission_sequence,
+            u64::MAX
+        );
+        assert_eq!(writer.display_idle_input_stamp(), None);
+        writer.cancel();
+        assert_eq!(writer.display_idle_input_stamp(), None);
+    }
+
+    #[test]
+    fn display_input_stamp_covers_fifo_actions_frames_and_close_on_the_same_pty() {
+        let pty = OwnedPty::from_openpty(Some(true)).unwrap();
+        let wait_idle = |expected| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while pty.display_idle_input_stamp() != Some(expected) {
+                assert!(Instant::now() < deadline, "transport did not become idle");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        pty.set_test_foreground_group(Some(101));
+        assert_eq!(pty.display_idle_input_stamp(), Some(0));
+        assert!(pty.try_dispatch_chat_byte(3, 101, false, || false).is_err());
+        assert!(pty
+            .try_dispatch_chat_byte(b'X', 101, false, || true)
+            .is_err());
+        assert_eq!(pty.display_idle_input_stamp(), Some(0));
+
+        for (i, byte) in [3, b'\r'].into_iter().enumerate() {
+            pty.try_dispatch_chat_byte(byte, 101, false, || true)
+                .unwrap();
+            assert_eq!(pty.drain_test_slave_exact(1), [byte]);
+            wait_idle(i as u64 + 1);
+        }
+        let typed = "界🙂".as_bytes();
+        pty.try_write_bytes(typed).unwrap();
+        assert_eq!(pty.drain_test_slave_exact(typed.len()), typed);
+        wait_idle(3);
+        pty.try_write_bytes(&[]).unwrap();
+        assert_eq!(pty.display_idle_input_stamp(), Some(3));
+
+        pty.shell_bracketed_paste.store(true, Ordering::Relaxed);
+        pty.try_write_bytes(pty_input::PASTE_START).unwrap();
+        assert_eq!(
+            pty.drain_test_slave_exact(pty_input::PASTE_START.len()),
+            pty_input::PASTE_START
+        );
+        assert_eq!(pty.display_idle_input_stamp(), None, "frame remains open");
+        pty.try_write_bytes(b"frame body").unwrap();
+        assert_eq!(pty.drain_test_slave_exact(10), b"frame body");
+        assert_eq!(pty.display_idle_input_stamp(), None);
+        pty.try_write_bytes(pty_input::PASTE_END).unwrap();
+        assert_eq!(
+            pty.drain_test_slave_exact(pty_input::PASTE_END.len()),
+            pty_input::PASTE_END
+        );
+        wait_idle(6);
+
+        pty.kill();
+        assert_eq!(pty.display_idle_input_stamp(), None);
+        assert!(pty.try_write_bytes(b"late input").is_err());
+        assert_eq!(
+            pty.input_tx.shared.queue.lock().unwrap().admission_sequence,
+            6
+        );
+        assert!(pty.drain_test_slave(Duration::from_millis(10)).is_empty());
+    }
+
+    #[test]
+    fn display_input_stamp_does_not_accept_old_inflight_typeahead_or_count_refused_actions() {
+        let pty = OwnedPty::from_openpty(Some(true)).unwrap();
+        pty.set_test_foreground_group(Some(101));
+        let earlier = pty.test_start_inflight_input();
+        assert_eq!(pty.display_idle_input_stamp(), None);
+        assert_eq!(
+            pty.input_tx.shared.queue.lock().unwrap().admission_sequence,
+            1
+        );
+        for byte in [3, b'\r'] {
+            assert!(pty
+                .try_dispatch_chat_byte(byte, 101, false, || true)
+                .is_err());
+        }
+        assert_eq!(
+            pty.input_tx.shared.queue.lock().unwrap().admission_sequence,
+            1
+        );
+        let data = pty.drain_test_slave_exact(earlier);
+        assert!(data.iter().all(|byte| *byte == b'x'));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pty.display_idle_input_stamp() != Some(1) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(pty.drain_test_slave(Duration::from_millis(10)).is_empty());
     }
 
     #[test]

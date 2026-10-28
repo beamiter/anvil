@@ -321,4 +321,35 @@ popover.reference-tools-popover { background:transparent; border:0; box-shadow:n
 .shell-inspector-tabs { padding-left:6px; padding-right:6px; }
 .shell-agent-card { margin-left:6px; margin-right:6px; }
 .workspace-center .chat-composer { min-height:52px; margin:4px 12px 8px; padding:8px 10px; }
-.workspace-center .shell-block-composer { min-height:50px; margin:4px 12px 8px; padding:8px 11px; }
+.workspace-center .shell-block-composer { min-height:52px; margin:4px 12px 8px; padding:8px 10px; border:0; outline:1px solid #293c57; outline-offset:-1px; }
+.workspace-center .shell-block-composer .chat-controls { padding:0 2px; }
+
+/* Match Forge's packed native controls without changing the accepted dock.
+   CSS minimums below are content sizes; the native allocation is measured by
+   the opt-in shell diagnostics. The two action states share one 36px slot. */
+.workspace-center .reference-composer-controls button { min-width:23px; padding-left:6px; padding-right:6px; }
+.workspace-center .reference-composer-controls .chat-add { min-width:23px; min-height:26px; padding:0 6px; }
+.workspace-center .reference-composer-controls .chat-send,
+.workspace-center .reference-composer-controls .chat-stop { min-width:36px; min-height:28px; padding:0; margin:0; border-width:0; }
+
+/* Shared developer Inspector sections. Context/live pages keep their existing
+   presentation; only this typed overview adopts the verified native mapping. */
+.workspace-inspector .shell-agent-card.reference-rich-inspector { margin:0 6px 14px; padding:13px 16px 7px 14px; border:1px solid transparent; border-radius:0; background:transparent; }
+.workspace-inspector .reference-rich-inspector label { font-family:"DejaVu Sans",sans-serif; font-size:9px; color:#9cafcb; }
+.workspace-inspector .reference-rich-inspector label.reference-card-title { font-size:11px; font-weight:600; color:#d6e2f6; }
+.workspace-inspector .reference-rich-inspector label.reference-section-label { font-size:8px; font-weight:700; letter-spacing:1px; color:#8196b4; margin:0; min-height:10px; }
+.workspace-inspector .reference-rich-inspector .reference-neutral-badge { padding:0 5px; color:#9dafc9; border-radius:5px; background:#2c3a50; }
+.workspace-inspector .reference-rich-inspector .reference-inspector-metadata { padding:11px 9px 12px; border:1px solid #293c57; border-radius:7px; background:#111d30; }
+.workspace-inspector .reference-rich-inspector .reference-inspector-current,
+.workspace-inspector .reference-rich-inspector .reference-inspector-empty-card { padding:0 11px; border:1px solid #293c57; border-radius:7px; background:#17253a; }
+.workspace-inspector .reference-rich-inspector .reference-inspector-icon-tile { border-radius:6px; background:#20324b; color:#8fa9cd; }
+.workspace-inspector .reference-rich-inspector .reference-rich-step { padding:0 7px; border-bottom:0; }
+.workspace-inspector .reference-rich-inspector .reference-step-running { background:#263d5a; border:1px solid #38587a; border-radius:7px; }
+.workspace-inspector .reference-rich-inspector .reference-step-complete label.reference-step-symbol { color:#5fbea3; }
+.workspace-inspector .reference-rich-inspector .reference-step-running label.reference-step-symbol { color:#80a9fa; }
+.workspace-inspector .reference-rich-inspector .reference-inspector-terminal-section { border-top:1px solid #26354b; padding:18px 0 12px; }
+.workspace-inspector .reference-rich-inspector .reference-inspector-output { background:#080e19; border:1px solid #293c57; border-radius:7px; }
+.workspace-inspector .reference-rich-inspector .reference-terminal-body { padding:8px 9px; }
+.workspace-inspector .reference-rich-inspector .reference-inspector-output-empty .reference-terminal-body { padding:0; }
+.workspace-inspector .reference-rich-inspector progressbar trough { min-height:4px; background:#34445c; }
+.workspace-inspector .reference-rich-inspector progressbar progress { background:#648bef; }
