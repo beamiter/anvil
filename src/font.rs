@@ -239,6 +239,50 @@ pub(crate) fn freeze_ui_font(config: &mut Config) {
     config.ui_font_scale = Some(scale);
 }
 
+/// Preserve authored role proportions relative to the existing nominal 14pt
+/// UI default. Resolve both descriptions in the same real widget context so
+/// absolute pixels are not mistaken for points or multiplied by device scale.
+pub(crate) fn reference_ui_role_multiplier(config: &Config, context: &gtk::pango::Context) -> f64 {
+    use gtk::pango::prelude::FontExt;
+
+    let scale = crate::font_groups::ui_scale(config.default_font_scale, config.ui_font_scale);
+    let scale = if scale.is_finite() {
+        scale.clamp(0.1, 10.0)
+    } else {
+        1.0
+    };
+    let size = ui_font_size(config);
+    let size = if size.is_finite() {
+        size.clamp(0.1, 10_000.0)
+    } else {
+        14.0
+    };
+    let units = f64::from(gtk::pango::SCALE);
+    let mut nominal = context
+        .font_description()
+        .unwrap_or_else(|| FontDescription::from_string("sans-serif"));
+    nominal.set_size(14 * gtk::pango::SCALE);
+    let mut configured = nominal.clone();
+    if ui_font_size_absolute(config) {
+        configured.set_absolute_size(size * units);
+    } else {
+        configured.set_size((size * units).round() as i32);
+    }
+    let resolved = |description: &FontDescription| {
+        context
+            .load_font(description)
+            .map(|font| font.describe_with_absolute_size().size())
+            .filter(|size| *size > 0)
+            .map(f64::from)
+    };
+    match (resolved(&configured), resolved(&nominal)) {
+        (Some(configured), Some(nominal)) => scale * configured / nominal,
+        // A missing font context retains the prior role appearance. Avoid a
+        // guessed DPI and retry through the next normal appearance update.
+        _ => scale,
+    }
+}
+
 /// Scope display-wide CSS to this application's window. Explicit text-node
 /// rules override desktop heading/caption sizes and fixed pane-header sizes;
 /// images and decorative connection dots keep their own icon sizing.

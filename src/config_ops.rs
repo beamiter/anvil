@@ -151,6 +151,12 @@ impl AppModel {
     pub(crate) fn apply_dynamic_css(&self) {
         let css = dynamic_css(&self.config.borrow());
         self.dyn_css.load_from_data(&css);
+        let config = self.config.borrow();
+        crate::workspace_shell::apply_ui_font_scale(crate::font::reference_ui_role_multiplier(
+            &config,
+            &self.window.pango_context(),
+        ));
+        crate::workspace_shell::apply_content_font_scale(config.default_font_scale);
     }
 }
 

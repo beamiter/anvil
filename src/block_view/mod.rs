@@ -3702,6 +3702,9 @@ type CommandFinishedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandFinishedEvent)>
 type PromptEvidenceInvalidatedCallbacks = Rc<RefCell<Vec<Rc<dyn Fn()>>>>;
 type HumanInputCallbacks = Rc<RefCell<Vec<Box<dyn Fn(HumanInputKind)>>>>;
 type AltScreenCallbacks = Rc<RefCell<Vec<Box<dyn Fn(AltScreenTransition)>>>>;
+type WorkspaceActionCallbacks = Rc<RefCell<Vec<Box<dyn Fn(crate::keybindings::Action)>>>>;
+type ChatOrganismFrameConnection =
+    Rc<RefCell<Option<(glib::WeakRef<gtk::gdk::FrameClock>, glib::SignalHandlerId)>>>;
 
 fn emit_command_started(callbacks: &CommandStartedCallbacks, event: CommandStartedEvent) {
     for callback in callbacks.borrow().iter() {
@@ -4521,7 +4524,7 @@ pub struct TermView {
     cwd_callbacks: CwdCallbacks,
     remote_session_callbacks: StrCallbacks,
     exited_callbacks: IntCallbacks,
-    workspace_action_callbacks: Rc<RefCell<Vec<Box<dyn Fn(crate::keybindings::Action)>>>>,
+    workspace_action_callbacks: WorkspaceActionCallbacks,
     bell_callbacks: VoidCallbacks,
     title_callbacks: StrCallbacks,
     activity_callbacks: VoidCallbacks,
@@ -11946,6 +11949,9 @@ impl TermView {
         block_list.set_vexpand(true); // anvil: expand so the active card fills
                                       // the space left below finished blocks.
         block_list.add_css_class("block-list");
+        if chat_mode {
+            block_list.add_css_class("anvil-content-font");
+        }
 
         let block_scroll = ScrolledWindow::new();
         block_scroll.set_hexpand(true);
@@ -12168,9 +12174,7 @@ impl TermView {
                     }
                 });
             }
-            let connection: Rc<
-                RefCell<Option<(glib::WeakRef<gtk::gdk::FrameClock>, glib::SignalHandlerId)>>,
-            > = Rc::new(RefCell::new(None));
+            let connection: ChatOrganismFrameConnection = Rc::new(RefCell::new(None));
             let connected = connection.clone();
             let weak_surface = surface.downgrade();
             let weak_scroll = block_scroll.downgrade();
@@ -12268,7 +12272,7 @@ impl TermView {
         chat_stop.add_css_class("destructive-action");
         chat_stop.set_focusable(false);
         chat_stop.set_visible(false);
-        let workspace_action_callbacks: Rc<RefCell<Vec<Box<dyn Fn(crate::keybindings::Action)>>>> =
+        let workspace_action_callbacks: WorkspaceActionCallbacks =
             Rc::new(RefCell::new(Vec::new()));
         let focus_terminal = active_vte.downgrade();
         let (chat_controls, chat_hint) = crate::workspace_shell::composer_tools(

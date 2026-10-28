@@ -1793,6 +1793,8 @@ impl SimpleComponent for AppModel {
         // never keyboard focus. Stop before terminal mouse reporting/VTE zoom.
         // Native popovers retain SameNative isolation; divider/background events
         // outside these roots do not accidentally choose a neighboring group.
+        // New shell UI roots never enclose the terminal/content stack. The
+        // legacy side-stack UI root remains inside the inspector's UI scope.
         for (widget, group) in [
             (
                 top_bar_handle.clone().upcast::<gtk::Widget>(),
@@ -1804,6 +1806,14 @@ impl SimpleComponent for AppModel {
             ),
             (
                 side_stack.clone().upcast::<gtk::Widget>(),
+                font_groups::FontGroup::Ui,
+            ),
+            (
+                model.shell.canvas_header.clone().upcast::<gtk::Widget>(),
+                font_groups::FontGroup::Ui,
+            ),
+            (
+                model.shell.inspector.clone().upcast::<gtk::Widget>(),
                 font_groups::FontGroup::Ui,
             ),
             (

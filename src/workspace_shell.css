@@ -13,7 +13,7 @@
 .shell-keycap { font-size:8px; padding:1px 4px; border:1px solid #3a465b; border-radius:3px; color:#8795ad; }
 .shell-modes { background:#141e30; border-radius:7px; }
 .shell-modes button:hover { background:#283d6f; color:#fff; }
-.shell-modes button.shell-current-mode { background:#6477ed; color:white; box-shadow:0 0 7px rgba(106,126,255,0.3); }
+.shell-modes button.shell-current-mode { background:#5c7ef0; color:white; box-shadow:0 0 7px rgba(92,126,240,0.26); }
 .workspace-rail { background:#0d1522; padding:12px 0 10px; border-right:1px solid #263246; color:#8998b1; }
 .workspace-rail button { min-width:34px; min-height:34px; border-radius:8px; padding:0; margin:0 10px; color:#8795ad; }
 .workspace-rail image { -gtk-icon-size:16px; }
@@ -42,7 +42,7 @@
 .shell-canvas-title { font-size:12px; font-weight:600; }
 .shell-canvas-subtitle { font-size:9px; color:#8290a7; }
 .workspace-center .pane-header { background:transparent; color:#66738a; min-height:0; }
-.workspace-center .term-view-root,.workspace-center .block-list,.workspace-center .chat-canvas,.workspace-center .chat-composer-viewport { background:transparent; }
+.workspace-center .term-view-root,.workspace-center .block-list,.workspace-center .chat-canvas,.workspace-center .chat-composer-viewport,.workspace-center .chat-mode .block-scroll { background:transparent; }
 .workspace-center .term-view-root:not(.chat-mode) { margin:16px 28px 0; border-radius:12px; border:1px solid #cad5e6; }
 .workspace-center .chat-mode .block-list { padding:16px 28px 8px; }
 .workspace-center .chat-turn { padding:8px 0; margin:0; }

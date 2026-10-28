@@ -9,14 +9,15 @@ use crate::{
     AppModel,
 };
 use gtk::prelude::*;
-use vte4::TerminalExt;
 use jterm_core::reference_shell as tokens;
 use relm4::{gtk, ComponentSender};
+use vte4::TerminalExt;
 
 pub(crate) struct Chrome {
     pub top: gtk::Overlay,
     pub rail: gtk::Box,
     pub center: gtk::Box,
+    pub canvas_header: gtk::Box,
     pub inspector: gtk::Box,
     pub status: gtk::Box,
     title: gtk::Label,
@@ -88,7 +89,9 @@ fn product_icon(product: &str, size: i32) -> gtk::Image {
     }
     let texture = CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if let Some(texture) = cache.get(product) { return Some(texture.clone()); }
+        if let Some(texture) = cache.get(product) {
+            return Some(texture.clone());
+        }
         let bytes = jterm_core::reference_identity::png(product)?;
         let texture = gtk::gdk::Texture::from_bytes(&gtk::glib::Bytes::from_static(bytes)).ok()?;
         cache.insert(product.to_string(), texture.clone());
@@ -240,8 +243,10 @@ pub(crate) fn composer_tools(
     popover.set_position(gtk::PositionType::Top);
     popover.set_has_arrow(false);
     let entries = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    entries.set_width_request((jterm_core::reference_popup::WIDTH
-        - 2.0 * jterm_core::reference_popup::PADDING - 2.0) as i32);
+    entries.set_width_request(
+        (jterm_core::reference_popup::WIDTH - 2.0 * jterm_core::reference_popup::PADDING - 2.0)
+            as i32,
+    );
     for command in jterm_core::reference_popup::COMMANDS {
         use jterm_core::reference_popup::ToolCommandId;
         if command.separator_before {
@@ -268,13 +273,15 @@ pub(crate) fn composer_tools(
             let action = workspace_action.clone();
             let id = command.id;
             entry.connect_clicked(move |_| {
-                if let Some(popover) = weak_popover.upgrade() { popover.popdown(); }
+                if let Some(popover) = weak_popover.upgrade() {
+                    popover.popdown();
+                }
                 log::debug!(target: "anvil::workspace_shell", "tools_action={id:?}");
                 match id {
                     ToolCommandId::Terminal => focus(),
                     ToolCommandId::CommandPalette => action(Action::ToggleCommandPalette),
                     ToolCommandId::SearchCanvas => action(Action::ToggleSearch),
-                    _ => {},
+                    _ => {}
                 }
             });
         }
@@ -423,7 +430,10 @@ impl Chrome {
             control.set_valign(gtk::Align::Center);
             identity.append(&control);
         }
-        let app_icon = product_icon("anvil", jterm_core::reference_identity::PRODUCT_ICON_SIZE as i32);
+        let app_icon = product_icon(
+            "anvil",
+            jterm_core::reference_identity::PRODUCT_ICON_SIZE as i32,
+        );
         app_icon.add_css_class("shell-brand-icon");
         identity.append(&app_icon);
         identity.append(&label("anvil", "shell-brand"));
@@ -685,6 +695,7 @@ impl Chrome {
             tokens::HEADER_ACTION_GAP as i32,
         );
         header.add_css_class("workspace-canvas-header");
+        header.add_css_class("anvil-ui-font");
         header.set_height_request(tokens::CANVAS_HEADER_HEIGHT as i32);
         let headings = gtk::Box::new(gtk::Orientation::Vertical, 3);
         headings.set_hexpand(true);
@@ -734,13 +745,17 @@ impl Chrome {
             &send,
             None,
             std::rc::Rc::new(move || focus_sender.input(AppMsg::FocusShell)),
-            { let sender = sender.clone(); std::rc::Rc::new(move |action| sender.input(AppMsg::Action(action))) },
+            {
+                let sender = sender.clone();
+                std::rc::Rc::new(move |action| sender.input(AppMsg::Action(action)))
+            },
         );
         block_shelf.append(&block_tools);
         center.append(&block_shelf);
 
         let inspector = gtk::Box::new(gtk::Orientation::Vertical, 0);
         inspector.add_css_class("workspace-inspector");
+        inspector.add_css_class("anvil-ui-font");
         inspector.set_width_request((tokens::INSPECTOR_WIDTH - 1.0) as i32);
         let inspector_tabs = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         inspector_tabs.add_css_class("shell-inspector-tabs");
@@ -829,6 +844,7 @@ impl Chrome {
             top,
             rail,
             center,
+            canvas_header: header,
             inspector,
             status,
             title,
@@ -856,8 +872,13 @@ impl Chrome {
         self.title.set_tooltip_text(Some(title));
         self.path.set_label(path);
         self.path.set_tooltip_text(Some(path));
-        self.workspace_name.set_label(if private { "Private session" } else {
-            std::path::Path::new(path).file_name().and_then(|value| value.to_str()).unwrap_or("Local workspace")
+        self.workspace_name.set_label(if private {
+            "Private session"
+        } else {
+            std::path::Path::new(path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("Local workspace")
         });
         self.workspace_name.set_tooltip_text(Some(path));
         self.context_details.set_label(path);
@@ -908,6 +929,122 @@ pub(crate) fn install_css() {
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 20,
         );
     }
+}
+
+thread_local! {
+    static UI_FONT_PROVIDER: std::cell::RefCell<Option<gtk::CssProvider>> = const {
+        std::cell::RefCell::new(None)
+    };
+    static CONTENT_FONT_PROVIDER: std::cell::RefCell<Option<gtk::CssProvider>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Keep the reference roles' different base sizes within their owning subtree.
+/// The original stylesheet remains the source of those sizes; a
+/// display-wide generic label override would flatten the role hierarchy.
+fn role_font_css(scale: f64, scope: &str) -> String {
+    static RULES: std::sync::OnceLock<Vec<(Vec<String>, f64)>> = std::sync::OnceLock::new();
+    let rules = RULES.get_or_init(|| {
+        let comments = regex::Regex::new(r"(?s)/\*.*?\*/").unwrap();
+        let source = comments.replace_all(include_str!("workspace_shell.css"), "");
+        let blocks = regex::Regex::new(r"(?s)([^{}]+)\{([^{}]*)\}").unwrap();
+        let font_size =
+            regex::Regex::new(r"(?:^|;)\s*font-size\s*:\s*([0-9.]+)px\s*(?:;|$)").unwrap();
+        blocks
+            .captures_iter(&source)
+            .filter_map(|rule| {
+                let size = font_size.captures(&rule[2])?[1].parse::<f64>().ok()?;
+                let selectors = rule[1]
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|selector| !selector.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                Some((selectors, size))
+            })
+            .collect()
+    });
+    // UI scale and size are validated independently. Their combined ratio
+    // can legitimately exceed the scale-only range (for example 28pt * 10).
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let mut css = String::new();
+    for (selectors, size) in rules {
+        let mut scoped = Vec::new();
+        for selector in selectors {
+            scoped.push(format!("window.anvil-font-sync {scope} {selector}"));
+            // A capture root can itself carry this role (rather than being
+            // an ancestor). Add the same specificity in either arrangement.
+            for root in [
+                ".workspace-titlebar",
+                ".workspace-navigation",
+                ".workspace-inspector",
+                ".workspace-canvas-header",
+            ] {
+                if selector.strip_prefix(root).is_some_and(|suffix| {
+                    suffix
+                        .chars()
+                        .next()
+                        .is_none_or(|next| matches!(next, ' ' | '.' | ':' | '[' | '>' | '+' | '~'))
+                }) {
+                    let owned = selector.replacen(root, &format!("{root}{scope}"), 1);
+                    scoped.push(format!("window.anvil-font-sync {owned}"));
+                    break;
+                }
+            }
+        }
+        css.push_str(&format!(
+            "{} {{ font-size: {}px; }}\n",
+            scoped.join(","),
+            size * scale
+        ));
+    }
+    css
+}
+
+pub(crate) fn apply_ui_font_scale(scale: f64) {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return;
+    };
+    UI_FONT_PROVIDER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let provider = slot.get_or_insert_with(|| {
+            let provider = gtk::CssProvider::new();
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 21,
+            );
+            provider
+        });
+        provider.load_from_string(&role_font_css(scale, ".anvil-ui-font"));
+    });
+}
+
+/// Authored message roles belong to the document, not the surrounding chrome
+/// or composer. Their owner is the existing transcript subtree; geometry and
+/// reading/follow intent remain with that retained canvas.
+pub(crate) fn apply_content_font_scale(scale: f64) {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return;
+    };
+    CONTENT_FONT_PROVIDER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let provider = slot.get_or_insert_with(|| {
+            let provider = gtk::CssProvider::new();
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 21,
+            );
+            provider
+        });
+        provider.load_from_string(&role_font_css(scale, ".anvil-content-font"));
+    });
 }
 
 pub(crate) fn apply_canvas_palette(config: &mut Config) {
@@ -1034,4 +1171,251 @@ pub(crate) fn observe_layout(
             );
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn reference_ui_size_preserves_nominal_density_and_point_pixel_units() {
+        use gtk::pango::prelude::FontExt;
+
+        gtk::init().unwrap();
+        install_css();
+        let window = gtk::Window::new();
+        window.add_css_class("anvil-font-sync");
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let header = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        header.add_css_class("workspace-canvas-header");
+        header.add_css_class("anvil-ui-font");
+        let title = label("Canvas header", "shell-canvas-title");
+        header.append(&title);
+        column.append(&header);
+        let document = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        document.add_css_class("native-conversation");
+        let content = label("Authored content", "conversation-heading");
+        document.append(&content);
+        column.append(&document);
+        window.set_child(Some(&column));
+        window.present();
+        let context = window.pango_context();
+        let nominal = gtk::pango::FontDescription::from_string("sans-serif 14");
+        let nominal_px = f64::from(
+            context
+                .load_font(&nominal)
+                .unwrap()
+                .describe_with_absolute_size()
+                .size(),
+        ) / f64::from(gtk::pango::SCALE);
+        let mut config = Config::safe_defaults();
+        assert_eq!(
+            crate::font::reference_ui_role_multiplier(&config, &context),
+            1.0
+        );
+        // A frozen legacy point or absolute-pixel UI value must not jump when
+        // Content is subsequently edited. This uses the unchanged migration.
+        for legacy in ["Monospace 14", "Monospace 16px"] {
+            config.font_desc = legacy.into();
+            config.ui_font_size = None;
+            config.ui_font_scale = None;
+            config.default_font_scale = 1.5;
+            let before = crate::font::reference_ui_role_multiplier(&config, &context);
+            crate::font::freeze_ui_font(&mut config);
+            config.default_font_scale = 1.8;
+            config.font_desc = "Monospace 32".into();
+            assert_eq!(
+                crate::font::reference_ui_role_multiplier(&config, &context),
+                before
+            );
+        }
+        for (size, absolute, scale) in [
+            (14.0, false, 1.0),
+            (28.0, false, 1.0),
+            (14.0, true, 1.0),
+            (28.0, true, 1.0),
+            (28.0, false, 1.3),
+            (28.0, true, 1.3),
+            (72.0, false, 10.0),
+        ] {
+            config.ui_font_size = Some(size);
+            config.ui_font_size_absolute = absolute;
+            config.ui_font_scale = Some(scale);
+            let factor = crate::font::reference_ui_role_multiplier(&config, &context);
+            let expected = if absolute {
+                size / nominal_px
+            } else {
+                size / 14.0
+            } * scale;
+            assert!((factor - expected).abs() < 0.001, "{factor} vs {expected}");
+            apply_ui_font_scale(factor);
+            let main = gtk::glib::MainContext::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+            while std::time::Instant::now() < deadline {
+                while main.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let raw = title.pango_context().font_description().unwrap().size();
+            let expected_raw = (12.0 * factor * f64::from(gtk::pango::SCALE)).round() as i32;
+            assert!((raw - expected_raw).abs() <= 1, "{raw} vs {expected_raw}");
+            assert_eq!(
+                content.pango_context().font_description().unwrap().size(),
+                20 * gtk::pango::SCALE
+            );
+            eprintln!(
+                "ui-size: size={size} absolute={absolute} scale={scale} nominal_px={nominal_px} factor={factor} raw_header={raw} widget_scale={}",
+                window.scale_factor()
+            );
+        }
+        apply_ui_font_scale(1.0);
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn reference_content_roles_scale_independently_of_chrome() {
+        gtk::init().unwrap();
+        install_css();
+        let window = gtk::Window::new();
+        window.add_css_class("anvil-font-sync");
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let header = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        header.add_css_class("workspace-canvas-header");
+        header.add_css_class("anvil-ui-font");
+        let title = label("Canvas header", "shell-canvas-title");
+        header.append(&title);
+        column.append(&header);
+        let transcript = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        transcript.add_css_class("anvil-content-font");
+        let document = crate::workspace_conversation::render(
+            &jterm_core::reference_conversation::acceptance_fixture(),
+        );
+        transcript.append(&document);
+        column.append(&transcript);
+        window.set_child(Some(&column));
+        window.present();
+        fn first_label(widget: &gtk::Widget) -> Option<gtk::Label> {
+            if let Ok(label) = widget.clone().downcast::<gtk::Label>() {
+                return Some(label);
+            }
+            let mut child = widget.first_child();
+            while let Some(node) = child {
+                if let Some(label) = first_label(&node) {
+                    return Some(label);
+                }
+                child = node.next_sibling();
+            }
+            None
+        }
+        fn find(widget: &gtk::Widget, class: &str) -> Option<gtk::Label> {
+            if widget.has_css_class(class) {
+                if let Some(label) = first_label(widget) {
+                    return Some(label);
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(node) = child {
+                if let Some(label) = find(&node, class) {
+                    return Some(label);
+                }
+                child = node.next_sibling();
+            }
+            None
+        }
+        let roles: Vec<_> = [
+            ("conversation-heading", 20.0),
+            ("conversation-paragraph", 12.0),
+            ("conversation-chip", 9.0),
+            ("conversation-step-title", 10.0),
+            ("conversation-code-path", 10.0),
+            ("conversation-code-text", 10.0),
+            ("conversation-line-number", 9.0),
+        ]
+        .into_iter()
+        .map(|(class, base)| {
+            let widget = find(document.upcast_ref(), class).expect(class);
+            (widget, base)
+        })
+        .collect();
+        for (ui, content) in [(1.0, 1.0), (1.3, 1.0), (1.3, 1.3), (1.0, 1.3), (1.0, 1.0)] {
+            apply_ui_font_scale(ui);
+            apply_content_font_scale(content);
+            let context = gtk::glib::MainContext::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+            while std::time::Instant::now() < deadline {
+                while context.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            for (label, pixels) in roles
+                .iter()
+                .map(|(label, base)| (label, base * content))
+                .chain(std::iter::once((&title, 12.0 * ui)))
+            {
+                let actual = label.pango_context().font_description().unwrap().size();
+                let expected = (pixels * gtk::pango::SCALE as f64).round() as i32;
+                assert!(
+                    (actual - expected).abs() <= 1,
+                    "{}: {actual} vs {expected}",
+                    label.text()
+                );
+            }
+        }
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn reference_ui_font_roles_scale_without_flattening_content() {
+        gtk::init().unwrap();
+        install_css();
+        let window = gtk::Window::new();
+        window.add_css_class("anvil-font-sync");
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let header = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        header.add_css_class("workspace-canvas-header");
+        header.add_css_class("anvil-ui-font");
+        let title = label("Canvas header", "shell-canvas-title");
+        header.append(&title);
+        let inspector = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        inspector.add_css_class("workspace-inspector");
+        inspector.add_css_class("anvil-ui-font");
+        let task = label("Task title", "shell-agent-title");
+        let metadata = label("Task metadata", "conversation-inspector-value");
+        inspector.append(&task);
+        inspector.append(&metadata);
+        let document = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        document.add_css_class("native-conversation");
+        let content = label("Content heading", "conversation-heading");
+        document.append(&content);
+        for part in [&header, &inspector, &document] {
+            column.append(part);
+        }
+        window.set_child(Some(&column));
+        window.present();
+        for scale in [1.0, 1.3, 1.0] {
+            apply_ui_font_scale(scale);
+            let context = gtk::glib::MainContext::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+            while std::time::Instant::now() < deadline {
+                while context.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            for (label, pixels) in [
+                (&title, 12.0 * scale),
+                (&task, 11.0 * scale),
+                (&metadata, 9.0 * scale),
+                (&content, 20.0),
+            ] {
+                let actual = label.pango_context().font_description().unwrap().size();
+                let expected = (pixels * gtk::pango::SCALE as f64).round() as i32;
+                assert!(
+                    (actual - expected).abs() <= 1,
+                    "{}: {actual} vs {expected}",
+                    label.text()
+                );
+            }
+        }
+        window.close();
+    }
 }

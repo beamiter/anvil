@@ -736,7 +736,9 @@ fn connect_view_outputs(
         move |action| {
             let _ = sender.output(match action {
                 crate::keybindings::Action::ToggleSearch => VteOutput::FindRequested,
-                crate::keybindings::Action::ToggleCommandPalette => VteOutput::CommandPaletteRequested,
+                crate::keybindings::Action::ToggleCommandPalette => {
+                    VteOutput::CommandPaletteRequested
+                }
                 _ => return,
             });
         }

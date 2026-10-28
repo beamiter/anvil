@@ -94,6 +94,8 @@ mod tests {
         assert!(routing.contains("top_bar_handle.clone()"));
         assert!(routing.contains("sidebar_box.clone()"));
         assert!(routing.contains("side_stack.clone()"));
+        assert!(routing.contains("model.shell.canvas_header.clone()"));
+        assert!(routing.contains("model.shell.inspector.clone()"));
         assert!(routing.contains("stack.clone()"));
         assert!(!routing.contains("ai_paned.clone()"));
         assert!(routing.contains("jterm_core::wheel::SURFACE_UNITS_PER_STEP"));

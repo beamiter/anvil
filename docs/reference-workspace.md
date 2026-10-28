@@ -145,11 +145,58 @@ Native Bash history comparison remains a separate correctness issue: archived
 master and this implementation both retained the literal visible PS1 prefix
 in every controlled test record. Strong exact-command assertions remain
 failed. Seven controlled runs, including a matched 85×26 PTY, retained all
-command bytes after that prefix; an earlier first-command truncation observed
-by a screenshot driver has not been reproduced or attributed. No prompt
-stripping or persisted-history rewriting is used to hide either issue.
+command bytes after that prefix. Later native first-command comparisons
+reproduced nonempty partial captures on both archived master and this
+implementation while Bash retained and executed every input byte. In a
+controlled settled-prefix/adjacent-tail-and-Enter case, archived master lost
+the same final five bytes as the earlier implementation screenshot, and its
+complete application-history value was byte-identical to that observation.
+Other valid runs lost one, three, or eight bytes; this is not an invariant
+five-byte crop introduced by the GUI rebuild. No prompt stripping or
+persisted-history rewriting is used to hide either issue.
 
-A later fast-initialization screenshot run reproduced first-command tail loss
-in the application's history record while Bash retained and executed the full
-command. Its baseline attribution is still unknown; it is separate from the
-confirmed PS1-prefix defect and remains an acceptance limitation.
+The Bash integration and command-range/provenance/finalization code are
+byte-identical across that baseline and the implementation. Bare Bash marks
+provide no full command metadata, so CommandStart scrapes the current VTE
+range; finalization prefers any nonempty scrape and uses the typed shadow
+only when it is empty. The evidence is consistent with the documented
+asynchronous-feed capture race, but no per-packet VTE parse/paint trace was
+recorded, so the exact scheduler ordering and any GUI-induced change in
+failure probability remain unproven. The existing partial-history defect is
+not repaired here and remains an acceptance limitation independent of PS1
+prefix contamination.
+
+The reference canvas header and complete overview inspector now have real UI
+font capture roots. They do not enclose the terminal/content stack; native
+popup isolation and the embedded Vim wheel exception remain intact. UI zoom
+keeps the stylesheet's different role sizes and multiplies them by the
+independent UI scale, rather than replacing every label with one size. At
+scale 1 the reference header/task/metadata roles remain 12/11/9 pixels.
+
+The existing independent UI size also applies to reference roles. It is
+normalized against nominal 14pt (the existing default) using resolved
+absolute font sizes in the same actual Pango context, then multiplied by the
+independent UI scale. Point versus absolute-pixel units and legacy None
+freezing remain unchanged; GTK handles device scale without another DPR
+multiplier. Size and scale retain their separate configuration limits, with
+no extra clamp on their combined factor. If font resolution is unavailable,
+the layer retains its previous scale-only appearance until the next normal
+appearance update.
+
+This contract preserves the default fixed logical role sizes, including at a
+different font DPI. A point-size ratio therefore cancels that DPI, whereas an
+absolute-pixel value relative to nominal 14pt varies with actual font DPI.
+It does not claim to restore OS font-density enlargement of the authored
+default roles. The reference fixture now explicitly uses default 14pt UI
+size. Older fixture captures used 10px, whose effect had been hidden by the
+size-control omission; those captures are retained with their original
+configuration rather than being relabeled as default14pt.
+
+A subsequent Content-only follow-up gives the authored transcript its own
+font scope: heading, body, metadata, task rows, diff headers, code and line
+numbers retain their different default sizes and follow the independent
+Content scale. Chrome and composer are outside that scope. The same existing
+transcript continues to own culling, streaming, reading anchors and follow
+intent; the font layer does not replace it or request continuous redraws.
+Native PTY zoom remains independently verified rather than standing in as
+evidence for authored message fonts.
