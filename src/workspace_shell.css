@@ -302,3 +302,23 @@ popover.reference-tools-popover { background:transparent; border:0; box-shadow:n
 .block-reference-header label:not(.block-reference-live-command) { font-size:10px; }
 .workspace-center .block-command-canvas .chat-controls button:not(.chat-send):not(.chat-stop) { background:#16243a; background-image:none; border-color:#293c57; color:#91a4bf; }
 .workspace-center .block-command-canvas .chat-controls button:disabled * { color:#637d9c; opacity:1; }
+/* The retained Block shelf lives beside, rather than inside, the native
+   terminal root. Keep its tools dark without changing Chat or input ownership. */
+.workspace-center.block-workspace .shell-block-composer .chat-controls button:not(.chat-send):not(.chat-stop) { background:#16243a; background-image:none; border-color:#293c57; color:#91a4bf; }
+.workspace-center.block-workspace .shell-block-composer .chat-controls button:disabled,.workspace-center.block-workspace .shell-block-composer .chat-controls button:disabled * { background-image:none; filter:none; opacity:1; color:#91a4bf; }
+.workspace-center.block-workspace .shell-block-composer .chat-controls button.chat-send { background:#347df6; background-image:none; border-color:#347df6; color:#d5deec; }
+.workspace-center.block-workspace .shell-block-composer .chat-controls button.chat-send:disabled { background:#203650; border-color:#345171; color:#9badc7; opacity:1; }
+.workspace-center.block-workspace .shell-block-composer .chat-controls button.chat-send:disabled * { color:#9badc7; }
+
+/* Anvil/Forge October workspace: common outer geometry in both modes.
+   Sizes are logical pixels. Composer height is a minimum: native multiline
+   input and explicit user font sizes retain their existing bounded growth. */
+.workspace-titlebar { min-height:54px; }
+.workspace-titlebar .shell-search { min-height:34px; }
+.workspace-titlebar .shell-modes button { min-height:32px; min-width:58px; }
+.workspace-rail button { margin-left:9px; margin-right:9px; }
+.workspace-navigation.tab-strip { min-width:163px; }
+.shell-inspector-tabs { padding-left:6px; padding-right:6px; }
+.shell-agent-card { margin-left:6px; margin-right:6px; }
+.workspace-center .chat-composer { min-height:52px; margin:4px 12px 8px; padding:8px 10px; }
+.workspace-center .shell-block-composer { min-height:50px; margin:4px 12px 8px; padding:8px 11px; }

@@ -22,7 +22,28 @@ use jterm_core::process::shell_single_quote;
 // A Nerd Font by default: a plain `Monospace` covers no icon glyph, and the
 // per-glyph fallback that follows is fontconfig's global sort, which hands
 // prompt and statusline icons to whichever font claims the Private Use Area.
-const DEFAULT_FONT_DESC: &str = "JetBrainsMono Nerd Font Mono 14";
+const DEFAULT_FONT_DESC: &str = "JetBrainsMono Nerd Font Mono 12px";
+// Main text uses logical pixels; chrome keeps its independent point-size
+// baseline so a compact terminal font cannot shrink navigation and controls.
+const DEFAULT_UI_FONT_SIZE: f64 = 14.0;
+
+fn resolved_ui_font_settings(
+    size: Option<f64>,
+    absolute: Option<bool>,
+    scale: Option<f64>,
+) -> (f64, bool, f64) {
+    let size = size
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(0.1, 10_000.0));
+    let scale = scale
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(0.1, 10.0));
+    (
+        size.unwrap_or(DEFAULT_UI_FONT_SIZE),
+        absolute.unwrap_or(false),
+        scale.unwrap_or(1.0),
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Terminal Mode
@@ -863,8 +884,8 @@ impl Config {
             font_desc: DEFAULT_FONT_DESC.to_string(),
             icon_font: None,
             default_font_scale: 1.0,
-            ui_font_scale: None,
-            ui_font_size: None,
+            ui_font_scale: Some(1.0),
+            ui_font_size: Some(DEFAULT_UI_FONT_SIZE),
             ui_font_size_absolute: false,
             theme_name: theme.name.clone(),
             foreground: theme.foreground,
@@ -2037,6 +2058,8 @@ fn resolve_file_config(fc: FileConfig) -> (Config, Vec<Theme>, KeybindingMap) {
     );
     let font_desc = resolve_setting_text(env_string("ANVIL_FONT"), fc.font, MAX_FONT_DESC_BYTES)
         .unwrap_or_else(|| DEFAULT_FONT_DESC.to_string());
+    let (ui_font_size, ui_font_size_absolute, ui_font_scale) =
+        resolved_ui_font_settings(fc.ui_font_size, fc.ui_font_size_absolute, fc.ui_font_scale);
     // Left unset so `crate::font` can pick whichever icon font is installed.
     let icon_font = resolve_setting_text(
         env_string("ANVIL_ICON_FONT"),
@@ -2202,15 +2225,9 @@ fn resolve_file_config(fc: FileConfig) -> (Config, Vec<Theme>, KeybindingMap) {
         font_desc,
         icon_font,
         default_font_scale,
-        ui_font_size_absolute: fc.ui_font_size_absolute.unwrap_or(false),
-        ui_font_size: fc
-            .ui_font_size
-            .filter(|v| v.is_finite())
-            .map(|v| v.clamp(0.1, 10000.0)),
-        ui_font_scale: fc
-            .ui_font_scale
-            .filter(|v| v.is_finite())
-            .map(|v| v.clamp(0.1, 10.0)),
+        ui_font_size_absolute,
+        ui_font_size: Some(ui_font_size),
+        ui_font_scale: Some(ui_font_scale),
         theme_name: theme.name.clone(),
         foreground,
         background,
@@ -2521,6 +2538,34 @@ mod tests {
         assert_eq!(
             example.get("font").and_then(toml::Value::as_str),
             Some(DEFAULT_FONT_DESC)
+        );
+    }
+
+    #[test]
+    fn default_main_pixels_and_independent_ui_preserve_explicit_ui_units() {
+        let config = Config::safe_defaults();
+        let main = gtk::pango::FontDescription::from_string(&config.font_desc);
+        assert!(main.is_size_absolute());
+        assert_eq!(main.size(), 12 * gtk::pango::SCALE);
+        assert_eq!(config.ui_font_size, Some(14.0));
+        assert!(!config.ui_font_size_absolute);
+        assert_eq!(config.ui_font_scale, Some(1.0));
+        assert_eq!(
+            resolved_ui_font_settings(None, None, None),
+            (14.0, false, 1.0)
+        );
+        // UI defaults no longer inherit an unrelated Main setting or zoom.
+        assert_eq!(
+            resolved_ui_font_settings(Some(16.5), Some(true), Some(1.25)),
+            (16.5, true, 1.25)
+        );
+        assert_eq!(
+            resolved_ui_font_settings(Some(16.5), Some(false), Some(1.25)),
+            (16.5, false, 1.25)
+        );
+        assert_eq!(
+            resolved_ui_font_settings(Some(f64::NAN), None, Some(f64::INFINITY)),
+            (14.0, false, 1.0)
         );
     }
 

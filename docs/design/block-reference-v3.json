@@ -1,0 +1,121 @@
+{
+  "version": 3,
+  "reference": {
+    "name": "Forge Developer Terminal Workspace.png",
+    "library_file_id": "libfile_386d1b318688819193315dce1da6f9e1",
+    "sha256": "dc81db85112b6804424a2cdbbd94e232ca2335be2e0b36a620756f6725e26bf1",
+    "size": [
+      1672,
+      941
+    ],
+    "root_viewed_actual_local_pixels": true,
+    "caveat": "AI-generated raster reference; text and exact typography are not authoritative application state. Measurements are approximate."
+  },
+  "scope": {
+    "apps": [
+      "anvil",
+      "forge"
+    ],
+    "outer_shell": "Shared by Block and Chat; Ember/Frost continue using reference_shell.",
+    "core_module": "jterm_core::developer_workspace",
+    "core_local_revision": "f7919f0ead723bccb81463cb1ed43a7855e7e05f",
+    "publication": "Local commits and Library backup only for this batch; published master checkpoints remain unchanged."
+  },
+  "geometry": {
+    "logical_reference": [
+      1672,
+      941
+    ],
+    "titlebar": 55,
+    "rail": 53,
+    "navigation_including_boundary": 191,
+    "inspector": 298,
+    "center_header": 42,
+    "live_toolbar": 36,
+    "card_horizontal_inset": 12,
+    "card_gap": 10,
+    "composer_min_height": 68,
+    "composer_horizontal_inset": 12,
+    "composer_bottom": 8,
+    "inspector_inner_inset": 7,
+    "inspector_tabs_height": 42,
+    "search": [
+      484,
+      36,
+      10
+    ],
+    "search_center_offset": 0,
+    "mode_control_height": 34,
+    "mode_control_top": 11,
+    "mode_control_min_width": 72,
+    "expected_center": [
+      244,
+      55,
+      1130,
+      886
+    ],
+    "expected_composer": [
+      256,
+      865,
+      1106,
+      68
+    ],
+    "bounds_tolerance": "Measured raster edges are estimates, usually within about2px; no unsupported exact font/kernel provenance claim."
+  },
+  "typography": {
+    "default_content": "JetBrainsMono Nerd Font Mono 12px",
+    "content_size_units": "absolute logical pixels, not12pt and not an artificial transform",
+    "default_UI": "14pt, scale1; independent from missing Main/UI font inheritance",
+    "configured_values": "Preserve explicit font strings and their pixel/point units. Never rewrite daily user configuration.",
+    "default_authored_chat_roles": {
+      "heading": 20,
+      "body": 12,
+      "code": 10
+    },
+    "migration_boundary": [
+      "Missing UI values now use14pt/scale1 instead of inheriting only-Main font/zoom.",
+      "Authored content uses a12px nominal baseline. Explicit configured native font sizes remain actual native sizes, while authored relative text extents can change from the prior14pt baseline.",
+      "Settings font-size edits must preserve absolute/point units, native grid/cursor/text and independent Main/UI zoom authority."
+    ]
+  },
+  "responsive": {
+    "minimum_center_for_sidebars": 480,
+    "collapse_order": [
+      "inspector",
+      "navigation"
+    ],
+    "constraints": [
+      "Search must shrink/hide to a reachable launcher without forcing a wide minimum window.",
+      "Tool captions can compact while actions/tooltips and one send/stop owner remain reachable.",
+      "One empty input row may use68px minimum; multiline input grows within bounds and keeps the actual caret visible."
+    ]
+  },
+  "running_output": {
+    "goal": "One real command header, output-only body and separate noncopying logical-line gutter.",
+    "guards": [
+      "Use actual PTY/FTCS execution and source boundaries; never delete text by matching a fixture command.",
+      "One ActiveVTE/PTY retains input, IME and cancellation authority.",
+      "Interactive/fullscreen or ambiguous output retains the complete native terminal; no hard crop of real programs.",
+      "Preserve ANSI, native selection/copy, fractional reading anchors and streaming viewport culling."
+    ]
+  },
+  "colors": {
+    "canvas": "#091323",
+    "output": "#0E1621",
+    "composer": "#172338",
+    "header": "#101C30",
+    "border": "#293C57",
+    "text": "#D5DEEC",
+    "secondary": "#91A4BF",
+    "gutter": "#637D9C",
+    "success": "#39DDA0",
+    "failure": "#FF646F",
+    "running": "#4199FF"
+  },
+  "evidence": {
+    "core_geometry": "evidence/developer-workspace-core/contract-tests.log",
+    "core_archive": "evidence/developer-workspace-core/archive-verification.json",
+    "published_checkpoints": "evidence/github-connector-publication/checkpoint3/final-master-heads.json",
+    "prior_backup": "libfile_f98775f44cf881918275de3a063e5979 version2"
+  }
+}

@@ -362,7 +362,8 @@ pub(crate) fn window_font_css(config: &Config) -> String {
          window.anvil-font-sync .anvil-ui-font entry,
          window.anvil-font-sync .anvil-ui-font text,
          window.anvil-font-sync .anvil-ui-font textview,
-         window.anvil-font-sync .anvil-ui-font treeview {{ font-size: {ui_size}; }}"
+         window.anvil-font-sync .anvil-ui-font treeview {{ font-size: {ui_size}; }}
+         window.anvil-font-sync .anvil-ui-font label.block-reference-live-command {{ font-size: {size}; }}"
     )
 }
 
@@ -430,10 +431,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn independent_ui_size_preserves_legacy_pixel_size_and_main_edits() {
+    fn independent_ui_size_preserves_explicit_pixel_size_and_main_edits() {
         let mut config = Config::safe_defaults();
         config.font_desc = "Monospace 16px".into();
         config.default_font_scale = 1.5;
+        config.ui_font_size = Some(16.0);
+        config.ui_font_size_absolute = true;
+        config.ui_font_scale = Some(1.5);
         assert_eq!(ui_font_size(&config), 16.0);
         assert!(ui_font_size_absolute(&config));
         let legacy = window_font_css(&config);
@@ -494,7 +498,23 @@ mod tests {
         let split = gtk::Label::new(Some("Second pane"));
         root.append(&content);
         root.append(&split);
-        let labels = [top_label, sidebar_label, right_label, content, split];
+        // Running command text is Main-owned even inside its UI-owned status
+        // header. Independent defaults must not silently turn it into 14pt.
+        let running_header = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        running_header.add_css_class("anvil-ui-font");
+        running_header.add_css_class("block-reference-header");
+        let running_command = gtk::Label::new(Some("Running command"));
+        running_command.add_css_class("block-reference-live-command");
+        running_header.append(&running_command);
+        root.append(&running_header);
+        let labels = [
+            top_label,
+            sidebar_label,
+            right_label,
+            content,
+            split,
+            running_command,
+        ];
         let mut config = Config::safe_defaults();
         config.font_desc = "Monospace 12px".into();
         config.ui_font_size_absolute = true;
@@ -777,8 +797,10 @@ mod tests {
         );
         let terminal = crate::terminal::vte::create_terminal(&config);
         let reference = vte4::Terminal::new();
+        let mut reference_description = FontDescription::from_string(&config.font_desc);
+        reference_description.set_family(expected);
         reference.set_font(Some(&font_description(
-            &format!("{expected} 14"),
+            &reference_description.to_string(),
             icon_family(&config),
         )));
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -816,6 +838,18 @@ mod tests {
         assert_eq!(
             terminal.text_format(vte4::Format::Text),
             reference.text_format(vte4::Format::Text)
+        );
+        let actual_font = terminal.font().unwrap();
+        eprintln!(
+            "default-font: configured={} actual={} pango_units={} absolute={} cell={}x{} scale={} dpr={}",
+            config.font_desc,
+            actual_font,
+            actual_font.size(),
+            actual_font.is_size_absolute(),
+            terminal.char_width(),
+            terminal.char_height(),
+            terminal.font_scale(),
+            terminal.scale_factor()
         );
         window.close();
         assert_eq!(config.font_desc, before);

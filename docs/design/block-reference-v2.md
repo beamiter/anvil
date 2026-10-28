@@ -1,5 +1,29 @@
 # Block native card checkpoint
 
+## Default-font migration
+
+The next reference batch changes the built-in Main default to
+`JetBrainsMono Nerd Font Mono 12px`: 12 logical, absolute Pango pixels, not
+12 points. This is a shared implementation choice estimated from the raster,
+not a claim that its original font has been identified. Missing UI size and
+scale now resolve independently to 14pt and 1.0, including when an explicit
+Main font or Main zoom is configured. Existing configurations that relied on
+an absent UI setting inheriting Main therefore change chrome appearance.
+Explicit Main/env/TOML and UI values retain their font strings, px/pt units,
+and zoom authority; loading does not rewrite the user's configuration.
+
+Chat's authored default roles remain heading 20px, body 12px and code 10px.
+Their Main-group multiplier uses the new 12px production nominal, while the
+UI multiplier retains its independent 14pt nominal. Consequently an explicit
+older Main size has a different relative authored-message extent under this
+new baseline; preserving the explicit value does not imply identical old
+rich-text pixels. Settings continues preserving Pango units and independent
+group mutations. The experimental Block dock remains disabled, and this font
+batch does not change capture guards, running-output projection or PTY input.
+
+The historical checkpoint notes below describe the defaults and evidence at
+those earlier source revisions, before this migration.
+
 The local PNG in `block-reference-v2.json` was inspected before implementation.
 The raster's text is not treated as actual commands or application state.
 This checkpoint changes only the Block center; the shared outer shell, Chat,
@@ -150,3 +174,52 @@ UI font unset, DPR1 and both real window sizes were retained. This closes only
 the history-enabled metadata path. The previously recorded history-off capture
 failures, running-card resize geometry, More document-height synchronization,
 compact Block dock and remaining interaction/visual acceptance stay open.
+
+## More fold document synchronization
+
+More now updates the exact record's retained height when it changes fold state,
+then samples the actual native allocation after two frames. The selected-card
+chrome participates in that sample. Filtered records keep their zero-height
+sentinel; weak card/pane references and identity checks retire stale callbacks.
+The pane's viewport and visible-card set are reconciled without returning the
+reader to live output or writing input bytes. The zero-output row-count estimator
+now agrees with the text estimator and constructor's header-only geometry.
+
+A strict display-backed test used the same test harness with old committed
+`b20178e` product source and the local fix. Old source failed: the folded card
+was 140px while metadata remained 226px. The fix passed in both Block and Chat:
+fold/unfold metadata equaled actual height, all output bytes survived, reading
+intent stayed set and no terminal input was emitted. The old failure and five
+external native frames remain preserved; the fixed run retained 27 native frames.
+The original complete More/focus/retired-card regression and visible/parked fold
+regression passed unchanged in their assertions. Their More lookup now follows
+the actual button field after the new Block header moved it out of quick actions.
+This does not claim that every older keyboard/bulk-fold estimate has become an
+exact post-layout allocation; the older regression's geometry trace is retained.
+
+History-disabled control runs separately reproduced sentinel/PS1/tail loss on
+old `686202a`/core `366c554` and the current frozen history-enabled-metadata
+checkpoint with history explicitly disabled. The strict pair held the first
+prompt until the same 1356×704 window size, then ran the original commands and
+resize sequence. The PTY budgets differed between implementations, so this
+confirms the old failure class but leaves any increased impact from the new UI
+unattributed. No capture, input-shadow or reviewed-submission guard was changed
+in the More fix.
+
+## Block footer state colors
+
+The retained Block shelf now uses the dark control surfaces from the new Block
+reference. Enabled Send keeps its blue state, while disabled Send has a visibly
+different deep blue-gray fill, border and readable muted arrow. Sensitivity and
+input authority are unchanged. The selectors require the Block workspace and
+retained shelf; no spacing, dimensions, Main font defaults or Chat controls change.
+The first bright disabled-Send rendering was retained as a rejected visual stage.
+
+The final release was captured at both 1672×941 and 1356×704, DPR1, default
+Main 14pt and UI size unset. Real command metadata remained byte-exact across
+the original three commands and post-resize burst. Separate before/after Chat
+captures used the same explicitly labelled native acceptance fixture and a
+fixture-only disabled caret blink: all 954624 window pixels were identical.
+These static images are not a no-flash, full IME or complete behavior certification.
+The earlier More/fold logs retain native allocation warnings whose old/new
+attribution is unresolved, distinct from their passing height/ownership assertions.

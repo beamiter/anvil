@@ -13,15 +13,15 @@
 # Appearance. Built-in themes: default, light, solarized-dark,
 # solarized-light, gruvbox-dark, gruvbox-light, dracula, nord.
 theme = "default"
-font = "JetBrainsMono Nerd Font Mono 14"
+font = "JetBrainsMono Nerd Font Mono 12px"
 # Family used for icon glyphs `font` does not cover (Nerd Font powerline
 # separators, devicons, codicons). Unset auto-picks an installed Nerd Font;
 # set "none" to leave those glyphs to fontconfig's own fallback.
 # icon_font = "Symbols Nerd Font Mono"
 font_scale = 1.0
-# Optional independent sidebar/top-bar size and zoom. Unset values inherit
-# the legacy font appearance until a group is changed. Ctrl+wheel over either
-# bar changes this group; over content changes font_scale.
+# Sidebar/top-bar size and zoom have independent defaults. Main content uses
+# logical pixels; the UI keeps its separate point size. Ctrl+wheel over either
+# bar changes this group; over content it changes font_scale.
 # ui_font_scale = 1.0
 # ui_font_size = 14.0
 # false = points, true = absolute pixels (preserved when migrating a px font).

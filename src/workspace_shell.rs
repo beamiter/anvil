@@ -9,7 +9,7 @@ use crate::{
     AppModel,
 };
 use gtk::prelude::*;
-use jterm_core::reference_shell as tokens;
+use jterm_core::developer_workspace as tokens;
 use relm4::{gtk, ComponentSender};
 use vte4::TerminalExt;
 
@@ -515,11 +515,12 @@ impl Chrome {
         let modes = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         modes.add_css_class("shell-modes");
         modes.set_valign(gtk::Align::Center);
-        modes.set_height_request(28);
+        modes.set_height_request(tokens::MODE_CONTROL_HEIGHT as i32);
         let mut mode_buttons = Vec::new();
         for (title, index) in [("Block", 0), ("Chat", 1)] {
             let mode_button = gtk::Button::with_label(title);
             mode_button.add_css_class("flat");
+            mode_button.set_width_request(tokens::MODE_CONTROL_MIN_WIDTH as i32);
             mode_button.set_focus_on_click(false);
             mode_button.set_tooltip_text(Some(
                 "Choose the presentation for new panes; existing shells remain running",
@@ -546,7 +547,7 @@ impl Chrome {
         top.insert_child_after(&title_spacer, Some(&path));
         search.set_hexpand(false);
         search.set_width_request(tokens::SEARCH_WIDTH as i32);
-        search.set_height_request((tokens::SEARCH_HEIGHT - 2.0) as i32);
+        search.set_height_request(tokens::SEARCH_HEIGHT as i32);
         search.set_halign(gtk::Align::Center);
         search.set_valign(gtk::Align::Start);
         search.set_margin_start((tokens::SEARCH_CENTER_OFFSET * 2.0) as i32);
@@ -809,7 +810,7 @@ impl Chrome {
         inspector.set_width_request((tokens::INSPECTOR_WIDTH - 1.0) as i32);
         let inspector_tabs = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         inspector_tabs.add_css_class("shell-inspector-tabs");
-        inspector_tabs.set_height_request(tokens::CANVAS_HEADER_HEIGHT as i32);
+        inspector_tabs.set_height_request(tokens::INSPECTOR_TABS_HEIGHT as i32);
         let panel = gtk::Stack::new();
         panel.set_hhomogeneous(false);
         panel.set_vhomogeneous(false);
@@ -942,11 +943,7 @@ impl Chrome {
         // Block's unverified dock is not active in this checkpoint.
         self.block_shelf.set_visible(mode != TerminalMode::Chat);
         self.canvas_header
-            .set_height_request(if mode == TerminalMode::Block {
-                42
-            } else {
-                tokens::CANVAS_HEADER_HEIGHT as i32
-            });
+            .set_height_request(tokens::CANVAS_HEADER_HEIGHT as i32);
         if mode != TerminalMode::Chat
             && log::log_enabled!(target: "anvil::workspace_shell", log::Level::Debug)
         {
@@ -1198,6 +1195,7 @@ pub(crate) fn recent_fixture() -> gtk::Box {
 /// GTK allocation signals observe size changes without a permanent frame tick.
 pub(crate) fn observe_layout(
     host: &gtk::Overlay,
+    chrome: &Chrome,
     navigation: &gtk::Widget,
     inspector: &gtk::Box,
     navigation_split: &gtk::Paned,
@@ -1210,11 +1208,28 @@ pub(crate) fn observe_layout(
     observer.set_valign(gtk::Align::Fill);
     host.add_overlay(&observer);
     host.set_measure_overlay(&observer, false);
+    // Opt-in acceptance diagnostics sample actual native allocation after the
+    // resize settles. They do not feed geometry back into layout or input.
+    let geometry = std::env::var_os("ANVIL_BLOCK_REFERENCE_METRICS").map(|_| {
+        [
+            ("titlebar", chrome.top.upcast_ref::<gtk::Widget>()),
+            ("rail", chrome.rail.upcast_ref()),
+            ("navigation", navigation),
+            ("center", chrome.center.upcast_ref()),
+            ("header", chrome.canvas_header.upcast_ref()),
+            ("inspector", inspector.upcast_ref()),
+            ("block_composer", chrome.block_shelf.upcast_ref()),
+            ("search", chrome.search.upcast_ref()),
+        ]
+        .into_iter()
+        .map(|(name, widget)| (name, widget.downgrade()))
+        .collect::<Vec<_>>()
+    });
     let navigation = navigation.downgrade();
     let inspector = inspector.downgrade();
     let navigation_split = navigation_split.downgrade();
     let inspector_split = inspector_split.downgrade();
-    observer.connect_resize(move |_, width, height| {
+    observer.connect_resize(move |observer, width, height| {
         let layout =
             tokens::Layout::for_size(width as f32, height as f32 + tokens::TITLEBAR_HEIGHT);
         if let Some(navigation) = navigation.upgrade() {
@@ -1246,6 +1261,59 @@ pub(crate) fn observe_layout(
                         0.0
                     }) as i32,
             );
+        }
+        if let Some(nodes) = &geometry {
+            let nodes = nodes.clone();
+            let observer = observer.downgrade();
+            gtk::glib::idle_add_local_once(move || {
+                let Some(window) = observer
+                    .upgrade()
+                    .and_then(|observer| observer.root())
+                    .and_downcast::<gtk::Window>()
+                else {
+                    return;
+                };
+                fn mapped_child(widget: &gtk::Widget, class: &str) -> Option<gtk::Widget> {
+                    if !widget.is_mapped() {
+                        return None;
+                    }
+                    if widget.has_css_class(class) {
+                        return Some(widget.clone());
+                    }
+                    let mut child = widget.first_child();
+                    while let Some(node) = child {
+                        if let Some(found) = mapped_child(&node, class) {
+                            return Some(found);
+                        }
+                        child = node.next_sibling();
+                    }
+                    None
+                }
+                let bounds = |widget: &gtk::Widget| {
+                    widget.compute_bounds(&window).map(|rect| {
+                        serde_json::json!({"x":rect.x(),"y":rect.y(),"width":rect.width(),"height":rect.height()})
+                    })
+                };
+                let mut regions = serde_json::Map::new();
+                for (name, widget) in nodes {
+                    if let Some(widget) = widget.upgrade().filter(|widget| widget.is_mapped()) {
+                        if let Some(rect) = bounds(&widget) {
+                            regions.insert(name.to_string(), rect);
+                        }
+                    }
+                }
+                for (name, class) in [
+                    ("chat_composer", "chat-composer"),
+                    ("live_toolbar", "block-reference-toolbar"),
+                ] {
+                    if let Some(widget) = mapped_child(window.upcast_ref(), class) {
+                        if let Some(rect) = bounds(&widget) {
+                            regions.insert(name.to_string(), rect);
+                        }
+                    }
+                }
+                log::info!(target:"anvil::workspace_shell","native_shell_geometry {}",serde_json::json!({"window":[window.width(),window.height()],"dpr":window.scale_factor(),"regions":regions}));
+            });
         }
     });
 }
@@ -1412,10 +1480,10 @@ mod tests {
         config.ui_font_size_absolute = false;
         config.ui_font_scale = Some(1.0);
         let nominal = gtk::pango::FontDescription::from_string(&config.font_desc);
-        assert_eq!(nominal.size(), 14 * gtk::pango::SCALE);
+        assert_eq!(nominal.size(), 12 * gtk::pango::SCALE);
         assert!(
-            !nominal.is_size_absolute(),
-            "the production nominal remains 14pt"
+            nominal.is_size_absolute(),
+            "the production Main nominal is 12 logical pixels"
         );
         let nominal_px = f64::from(
             context
@@ -1424,9 +1492,16 @@ mod tests {
                 .describe_with_absolute_size()
                 .size(),
         ) / f64::from(gtk::pango::SCALE);
-        // Each point size is resolved to Pango units independently. Keep the
-        // strict raw-unit assertion against native 28pt resolution instead of
-        // assuming its quantized value is exactly twice resolved 14pt.
+        // Resolve point sizes independently; Pango's quantized point result
+        // must not be treated as an absolute-pixel size or a rounded ratio.
+        let point_14 = gtk::pango::FontDescription::from_string("sans-serif 14");
+        let point_14_px = f64::from(
+            context
+                .load_font(&point_14)
+                .unwrap()
+                .describe_with_absolute_size()
+                .size(),
+        ) / f64::from(gtk::pango::SCALE);
         let point_28 = gtk::pango::FontDescription::from_string("sans-serif 28");
         let point_28_px = f64::from(
             context
@@ -1435,17 +1510,19 @@ mod tests {
                 .describe_with_absolute_size()
                 .size(),
         ) / f64::from(gtk::pango::SCALE);
-        let point_ratio = point_28_px / nominal_px;
+        let point_14_ratio = point_14_px / nominal_px;
+        let point_28_ratio = point_28_px / nominal_px;
         for (description, scale, expected_factor, ui) in [
-            ("Monospace 14", 1.0, 1.0, 1.0),
-            ("Monospace 28", 1.0, point_ratio, 1.0),
+            ("Monospace 12px", 1.0, 1.0, 1.0),
+            ("Monospace 14", 1.0, point_14_ratio, 1.0),
+            ("Monospace 28", 1.0, point_28_ratio, 1.0),
             ("Monospace 14px", 1.0, 14.0 / nominal_px, 1.0),
             ("Monospace 28px", 1.0, 28.0 / nominal_px, 1.0),
-            ("Monospace 28", 1.3, point_ratio * 1.3, 1.0),
+            ("Monospace 28", 1.3, point_28_ratio * 1.3, 1.0),
             ("Monospace 28px", 1.3, 36.4 / nominal_px, 1.0),
-            ("Monospace 28", 10.0, point_ratio * 10.0, 1.0),
-            ("Monospace 14", 1.0, 1.0, 1.3),
-            ("Monospace 14", 1.0, 1.0, 1.0),
+            ("Monospace 28", 10.0, point_28_ratio * 10.0, 1.0),
+            ("Monospace 12px", 1.0, 1.0, 1.3),
+            ("Monospace 12px", 1.0, 1.0, 1.0),
         ] {
             config.font_desc = description.into();
             config.default_font_scale = scale;

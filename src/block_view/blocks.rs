@@ -1753,9 +1753,8 @@ mod tests {
             spin_main_context_for(std::time::Duration::from_millis(25));
         }
         if let Some(adjustment) = card.output_vte.vadjustment() {
-            adjustment.set_value(
-                (adjustment.upper() - adjustment.page_size()).max(adjustment.lower()),
-            );
+            adjustment
+                .set_value((adjustment.upper() - adjustment.page_size()).max(adjustment.lower()));
         }
         spin_main_context_for(std::time::Duration::from_millis(50));
         OUTPUT_VISUAL_ROW_COUNT_CALLS.with(|calls| {
@@ -2321,6 +2320,22 @@ mod tests {
             estimated_finished_block_height(&compact, 17),
             estimated_finished_block_height(&roomy, 17) - 9
         );
+    }
+
+    #[test]
+    fn reference_empty_output_has_no_phantom_document_row() {
+        let mut config = Config::safe_defaults();
+        config.terminal_mode = crate::config::TerminalMode::Block;
+        let header_only = estimated_finished_block_height(&config, 0);
+        assert_eq!(
+            estimated_finished_block_height_for_text(&config, "", 80),
+            header_only
+        );
+        assert_eq!(
+            estimated_finished_block_height_for_rows(&config, 0, 80),
+            header_only
+        );
+        assert!(estimated_finished_block_height_for_rows(&config, 1, 80) > header_only);
     }
 
     #[test]
@@ -3744,6 +3759,9 @@ pub(crate) fn estimated_finished_block_height_for_rows(
     output_rows: i64,
     cols: i64,
 ) -> i32 {
+    if config.terminal_mode == crate::config::TerminalMode::Block && output_rows <= 0 {
+        return estimated_finished_block_height(config, 0);
+    }
     let requested_rows = output_rows
         .min(config.finished_block_viewport_rows as i64)
         .max(1);
@@ -4746,8 +4764,17 @@ impl FinishedBlock {
         } else {
             cols
         };
-        let command_vte =
-            create_finished_terminal(config, command_cols, cmd_rows.max(1), cmd_rows.max(1), true);
+        // The command's map handler below owns its real wrapped row budget.
+        // A constructor-level one-logical-row settling pass can otherwise run
+        // after the wrapped feed and discard its prefix before the command's
+        // own settling pass expands it again (notably with the 12px default).
+        let command_vte = create_finished_terminal(
+            config,
+            command_cols,
+            cmd_rows.max(1),
+            cmd_rows.max(1),
+            false,
+        );
         if chat {
             command_vte.set_hexpand(false);
             command_vte.add_css_class("chat-command-terminal");

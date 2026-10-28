@@ -99,12 +99,7 @@ fn more_opens_complete_menu_preserves_selection_and_retires_stale_cards() {
             settle();
             let selected = view.selected_block_ids.borrow().clone();
             let card = view.finished_blocks.borrow().last().unwrap().clone();
-            let more = card
-                .action_box
-                .last_child()
-                .unwrap()
-                .downcast::<gtk::Button>()
-                .unwrap();
+            let more = card.more_btn.clone();
             assert_eq!(more.action_name().as_deref(), Some("block.show-menu"));
             assert!(more.is_mapped(), "the target header must be on screen");
             assert!(
@@ -207,6 +202,105 @@ fn more_opens_complete_menu_preserves_selection_and_retires_stale_cards() {
                 "retired card cannot reopen or target a replacement"
             );
         }
+        window.close();
+        settle();
+    }
+}
+
+#[test]
+#[ignore = "requires isolated DISPLAY; real More popover and frame allocation"]
+fn more_fold_round_trip_reconciles_the_actual_document_height() {
+    gtk::init().expect("GTK display");
+    crate::workspace_shell::install_css();
+    for mode in [
+        crate::config::TerminalMode::Block,
+        crate::config::TerminalMode::Chat,
+    ] {
+        let view = organism_settings_test_view_for_mode(mode, None);
+        let center = gtk::Box::new(Orientation::Vertical, 0);
+        center.add_css_class("workspace-center");
+        center.append(&view.root);
+        let window = gtk::Window::builder()
+            .default_width(758)
+            .default_height(662)
+            .child(&center)
+            .build();
+        window.present();
+        let paint_barrier = || {
+            let clock = window.frame_clock().expect("native frame clock");
+            let frames = Rc::new(Cell::new(0));
+            let observed = frames.clone();
+            let signal = clock.connect_after_paint(move |_| observed.set(observed.get() + 1));
+            let started = Instant::now();
+            while frames.get() < 8 && started.elapsed() < Duration::from_secs(3) {
+                window.queue_draw();
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            clock.disconnect(signal);
+            assert!(frames.get() >= 8, "native allocation and paint barrier");
+        };
+        paint_barrier();
+        view.pty.emit_test_output(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        paint_barrier();
+        // This bounded protocol fixture drives the actual reader/backend. No
+        // command is executed by the recorder and no metadata is fabricated
+        // as an agent task or a claimed test result in the application.
+        view.pty.emit_test_output(b"fixture_output\r\n\x1b]133;C;cmdline_url=fixture_output\x07first\r\nsecond\r\nthird\r\nfourth\r\nfifth\r\nsixth\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        paint_barrier();
+        assert_eq!(view.finished_blocks.borrow().len(), 1);
+        let card = view.finished_blocks.borrow()[0].clone();
+        let native_output = card.output_vte.text_format(vte4::Format::Text).unwrap();
+        let source_output = view.block_data.borrow()[0].output.clone();
+        view.pty.drain_test_slave(Duration::from_millis(20));
+        view.scroll_debouncer.user_scrolled_up.set(true);
+
+        let action = |name: &str| {
+            let menus = popovers(card.widget());
+            assert_eq!(menus.len(), 1, "one actual More popover");
+            let button = button_named(menus[0].upcast_ref(), name)
+                .unwrap_or_else(|| panic!("actual More action missing: {name}"));
+            assert!(button.is_mapped(), "the menu action must really be visible");
+            button
+        };
+        card.more_btn.emit_clicked();
+        paint_barrier();
+        let expanded = card.widget().height();
+        action("Fold Output").emit_clicked();
+        paint_barrier();
+        assert!(card.is_output_collapsed());
+        assert!(!card.output_vte.is_mapped());
+        assert!(card.widget().height() < expanded);
+        assert_eq!(
+            view.block_data.borrow()[0].estimated_height,
+            card.widget().height()
+        );
+
+        card.more_btn.emit_clicked();
+        paint_barrier();
+        action("Unfold Output").emit_clicked();
+        paint_barrier();
+        assert!(!card.is_output_collapsed());
+        assert!(card.output_vte.is_mapped());
+        assert_eq!(card.widget().height(), expanded);
+        assert_eq!(view.block_data.borrow()[0].estimated_height, expanded);
+        let indexed_height: i32 = view
+            .block_data
+            .borrow()
+            .iter()
+            .map(|record| record.estimated_height)
+            .sum();
+        assert_eq!(indexed_height, expanded);
+        assert_eq!(
+            card.output_vte.text_format(vte4::Format::Text).unwrap(),
+            native_output
+        );
+        assert_eq!(view.block_data.borrow()[0].output, source_output);
+        assert!(view.scroll_debouncer.user_scrolled_up.get());
+        assert!(view
+            .pty
+            .drain_test_slave(Duration::from_millis(20))
+            .is_empty());
         window.close();
         settle();
     }

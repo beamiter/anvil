@@ -5565,6 +5565,7 @@ struct BlockBackend {
     widget_pool_for_cb: Rc<RefCell<WidgetPool>>,
     find_state_rc: Rc<RefCell<FindState>>,
     visible_indices_rc: Rc<RefCell<std::collections::HashSet<usize>>>,
+    viewport_rc: Rc<RefCell<ViewportState>>,
     fullscreen_rc: Rc<Cell<bool>>,
     selected_block_ids_rc: SelectedBlockIds,
     selected_block_id_rc: Rc<Cell<Option<u64>>>,
@@ -5626,6 +5627,109 @@ struct BlockBackend {
     /// backend is built before. Read only by the context menu, to answer "what
     /// text is selected right now" before the card selection repaints over it.
     cross_selection_slot: Rc<RefCell<Option<Rc<CrossSelection>>>>,
+}
+
+/// More owns an exact card action, but its height belongs to the shared
+/// document. Reconcile the estimate immediately, then sample the real native
+/// allocation after layout, including selected-card chrome. All widget edges
+/// remain weak so a pending fold cannot retain a closed pane or an evicted card.
+#[derive(Clone)]
+struct FoldLayoutSync {
+    finished: std::rc::Weak<RefCell<Vec<FinishedBlock>>>,
+    data: Rc<RefCell<VecDeque<BlockData>>>,
+    config: Rc<RefCell<Config>>,
+    active: std::rc::Weak<RefCell<ActiveBlock>>,
+    scroll: glib::WeakRef<ScrolledWindow>,
+    list: glib::WeakRef<gtk::Box>,
+    viewport: Rc<RefCell<ViewportState>>,
+    visible: Rc<RefCell<HashSet<usize>>>,
+    redraw: FailureMarkerRedraw,
+}
+
+impl FoldLayoutSync {
+    fn reconcile(&self, id: u64, widget: &gtk::Box, measured: bool) {
+        let (Some(finished), Some(scroll), Some(list)) = (
+            self.finished.upgrade(),
+            self.scroll.upgrade(),
+            self.list.upgrade(),
+        ) else {
+            return;
+        };
+        let finished = finished.borrow();
+        let Some(card) = finished
+            .iter()
+            .find(|card| card.id == id && card.widget() == widget)
+        else {
+            return;
+        };
+        let config = self.config.borrow();
+        let fallback = self
+            .active
+            .upgrade()
+            .map(|active| active.borrow().grid_cols() as i64)
+            .unwrap_or(80);
+        let mut data = self.data.borrow_mut();
+        let Some(record) = data.iter_mut().find(|record| record.id == id) else {
+            return;
+        };
+        // A filtered-away record contributes zero pixels. A popover action
+        // must never accidentally put it back into the scroll document.
+        if record.estimated_height != 0 {
+            record.estimated_height = if measured
+                && card.widget().is_mapped()
+                && card.widget().height_request() == -1
+                && card.widget().height() > 1
+            {
+                card.remember_allocated_height(card.widget().height())
+            } else {
+                card.set_placeholder_height(collapsed_aware_block_height(
+                    &config,
+                    record,
+                    card.is_output_collapsed(),
+                    fallback,
+                ))
+            };
+        }
+        let adjustment = scroll.vadjustment();
+        if let Some((strict, loose)) = viewport_states_for_scroll(
+            &data,
+            adjustment.value(),
+            adjustment.page_size(),
+            config.virtual_scroll_margin,
+        ) {
+            let new_visible = stable_visible_indices(&strict, Some(&loose), &self.visible.borrow());
+            *self.viewport.borrow_mut() = strict;
+            apply_visible_indices_with_measurement(
+                &finished,
+                &mut data,
+                &mut self.visible.borrow_mut(),
+                new_visible,
+                measured,
+            );
+        }
+        drop(data);
+        drop(config);
+        drop(finished);
+        (self.redraw)();
+        list.queue_allocate();
+    }
+
+    fn after_allocation(&self, id: u64, widget: &gtk::Box) {
+        let layout = self.clone();
+        let weak = widget.downgrade();
+        let frames = Cell::new(0);
+        widget.add_tick_callback(move |_, _| {
+            let frame = frames.get() + 1;
+            frames.set(frame);
+            if frame < 2 {
+                return glib::ControlFlow::Continue;
+            }
+            if let Some(widget) = weak.upgrade() {
+                layout.reconcile(id, &widget, true);
+            }
+            glib::ControlFlow::Break
+        });
+    }
 }
 
 /// Per-zone snapshot ceiling: finalize reads at most this many raw bytes from
@@ -8148,6 +8252,17 @@ impl RenderBackend for BlockBackend {
         let current_cwd_for_menu = self.current_cwd_for_menu.clone();
         let menu_keybindings = self.menu_keybindings.clone();
         let cross_selection_for_menu = self.cross_selection_slot.clone();
+        let fold_layout = FoldLayoutSync {
+            finished: Rc::downgrade(&self.finished_blocks_for_cb),
+            data: self.block_data_for_cb.clone(),
+            config: self.config_for_cb.clone(),
+            active: Rc::downgrade(&self.active_rc),
+            scroll: self.block_scroll_rc.downgrade(),
+            list: self.block_list_rc.downgrade(),
+            viewport: self.viewport_rc.clone(),
+            visible: self.visible_indices_rc.clone(),
+            redraw: self.failure_marker_redraw.clone(),
+        };
 
         let right_click = gtk::GestureClick::new();
         right_click.set_button(3);
@@ -8610,10 +8725,25 @@ impl RenderBackend for BlockBackend {
                     crate::keybindings::Action::ToggleBlockCollapsed,
                 );
                 let popover_c = popover.clone();
-                let finished_for_fold = finished_menu_clone.clone();
+                let finished_for_fold = Rc::downgrade(&finished_blocks_for_menu);
+                let card_for_fold = card.downgrade();
+                let fold_layout = fold_layout.clone();
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
-                    (finished_for_fold.toggle_collapsed)();
+                    let (Some(finished), Some(widget)) =
+                        (finished_for_fold.upgrade(), card_for_fold.upgrade())
+                    else {
+                        return;
+                    };
+                    let changed = finished
+                        .borrow()
+                        .iter()
+                        .find(|card| card.id == block_id && card.widget() == &widget)
+                        .is_some_and(|card| card.set_collapsed(!card.is_output_collapsed()));
+                    if changed {
+                        fold_layout.reconcile(block_id, &widget, false);
+                        fold_layout.after_allocation(block_id, &widget);
+                    }
                 });
                 vbox.append(&item);
             }
@@ -12505,71 +12635,72 @@ impl TermView {
         let reserved_history_block_ids: Rc<RefCell<HashSet<u64>>> =
             Rc::new(RefCell::new(HashSet::new()));
         let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
-        let block_toolbar_refresh: Option<Rc<dyn Fn()>> =
-            if *mode == crate::config::TerminalMode::Block {
-                let toolbar = gtk::Box::new(Orientation::Horizontal, 6);
-                toolbar.add_css_class("block-reference-toolbar");
-                toolbar.add_css_class("anvil-ui-font");
-                toolbar.set_height_request(36);
-                let status = gtk::Label::new(Some("Live · 0 commands"));
-                block_reference::trace_label_font(&status, "live-toolbar");
-                status.set_xalign(0.0);
-                status.set_hexpand(true);
-                toolbar.append(&status);
-                let find = icon_button("edit-find-symbolic", "Search terminal output");
-                let callbacks = workspace_action_callbacks.clone();
-                find.connect_clicked(move |_| {
-                    for callback in callbacks.borrow().iter() {
-                        callback(crate::keybindings::Action::ToggleSearch);
+        let block_toolbar_refresh: Option<Rc<dyn Fn()>> = if *mode
+            == crate::config::TerminalMode::Block
+        {
+            let toolbar = gtk::Box::new(Orientation::Horizontal, 6);
+            toolbar.add_css_class("block-reference-toolbar");
+            toolbar.add_css_class("anvil-ui-font");
+            toolbar.set_height_request(jterm_core::developer_workspace::LIVE_TOOLBAR_HEIGHT as i32);
+            let status = gtk::Label::new(Some("Live · 0 commands"));
+            block_reference::trace_label_font(&status, "live-toolbar");
+            status.set_xalign(0.0);
+            status.set_hexpand(true);
+            toolbar.append(&status);
+            let find = icon_button("edit-find-symbolic", "Search terminal output");
+            let callbacks = workspace_action_callbacks.clone();
+            find.connect_clicked(move |_| {
+                for callback in callbacks.borrow().iter() {
+                    callback(crate::keybindings::Action::ToggleSearch);
+                }
+            });
+            toolbar.append(&find);
+            let live = icon_button("go-bottom-symbolic", "Return to live output");
+            let debounce = scroll_debouncer.clone();
+            let scroll = block_scroll.downgrade();
+            live.connect_clicked(move |_| {
+                if let Some(scroll) = scroll.upgrade() {
+                    debounce.reset_scroll_lock();
+                    debounce.pin_to_bottom_deferred(&scroll);
+                }
+            });
+            toolbar.append(&live);
+            root.prepend(&toolbar);
+            let label = status.downgrade();
+            let blocks = Rc::downgrade(&finished_blocks_rc);
+            let reading = user_scrolled_up.clone();
+            let state = bstate.clone();
+            let refresh: Rc<dyn Fn()> = Rc::new(move || {
+                if let (Some(label), Some(blocks)) = (label.upgrade(), blocks.upgrade()) {
+                    let count = blocks
+                        .borrow()
+                        .iter()
+                        .filter(|block| !block.is_background)
+                        .count()
+                        + usize::from(state.get() == BlockState::CollectingOutput);
+                    let text = format!(
+                        "{} · {count} commands",
+                        if reading.get() { "Reading" } else { "Live" }
+                    );
+                    if label.text().as_str() != text {
+                        label.set_text(&text);
                     }
-                });
-                toolbar.append(&find);
-                let live = icon_button("go-bottom-symbolic", "Return to live output");
-                let debounce = scroll_debouncer.clone();
-                let scroll = block_scroll.downgrade();
-                live.connect_clicked(move |_| {
-                    if let Some(scroll) = scroll.upgrade() {
-                        debounce.reset_scroll_lock();
-                        debounce.pin_to_bottom_deferred(&scroll);
-                    }
-                });
-                toolbar.append(&live);
-                root.prepend(&toolbar);
-                let label = status.downgrade();
-                let blocks = Rc::downgrade(&finished_blocks_rc);
-                let reading = user_scrolled_up.clone();
-                let state = bstate.clone();
-                let refresh: Rc<dyn Fn()> = Rc::new(move || {
-                    if let (Some(label), Some(blocks)) = (label.upgrade(), blocks.upgrade()) {
-                        let count = blocks
-                            .borrow()
-                            .iter()
-                            .filter(|block| !block.is_background)
-                            .count()
-                            + usize::from(state.get() == BlockState::CollectingOutput);
-                        let text = format!(
-                            "{} · {count} commands",
-                            if reading.get() { "Reading" } else { "Live" }
-                        );
-                        if label.text().as_str() != text {
-                            label.set_text(&text);
-                        }
-                    }
-                });
-                let update = refresh.clone();
-                toolbar.connect_map(move |_| update());
-                let update = refresh.clone();
-                block_scroll
-                    .vadjustment()
-                    .connect_value_changed(move |_| update());
-                let update = refresh.clone();
-                block_scroll
-                    .vadjustment()
-                    .connect_changed(move |_| update());
-                Some(refresh)
-            } else {
-                None
-            };
+                }
+            });
+            let update = refresh.clone();
+            toolbar.connect_map(move |_| update());
+            let update = refresh.clone();
+            block_scroll
+                .vadjustment()
+                .connect_value_changed(move |_| update());
+            let update = refresh.clone();
+            block_scroll
+                .vadjustment()
+                .connect_changed(move |_| update());
+            Some(refresh)
+        } else {
+            None
+        };
         let find_state: Rc<RefCell<FindState>> = Rc::new(RefCell::new(FindState::default()));
 
         // Paint failures against the full-history track, independently of the
@@ -13302,6 +13433,10 @@ impl TermView {
         // non-reentrant). Parser flags (mouse/focus reporting) are NOT covered:
         // ParserConfig below snapshots them at construction.
         let config_shared: Rc<RefCell<Config>> = Rc::new(RefCell::new(config.clone()));
+        let viewport = Rc::new(RefCell::new(ViewportState {
+            first_visible: 0,
+            last_visible: 0,
+        }));
 
         // ── Wire PTY → parser → block events ─────────────────────────────
         let render_backend_slot: Rc<RefCell<Option<Rc<dyn RenderBackend>>>> =
@@ -13425,6 +13560,7 @@ impl TermView {
                     widget_pool_for_cb,
                     find_state_rc: find_state.clone(),
                     visible_indices_rc,
+                    viewport_rc: viewport.clone(),
                     fullscreen_rc,
                     selected_block_ids_rc: selected_block_ids.clone(),
                     selected_block_id_rc: selected_block_id.clone(),
@@ -14869,10 +15005,7 @@ impl TermView {
             reserved_history_block_ids,
             failure_marker_redraw,
             finished_blocks: finished_blocks_rc,
-            viewport: Rc::new(RefCell::new(ViewportState {
-                first_visible: 0,
-                last_visible: 0,
-            })),
+            viewport,
             widget_pool,
             visible_indices,
             selected_block_ids,
@@ -29587,3 +29720,6 @@ mod more_menu_tests;
 
 #[cfg(test)]
 mod readline_preservation_tests;
+
+#[cfg(test)]
+mod native_ack_tests;

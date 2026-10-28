@@ -2092,8 +2092,11 @@ mod tests {
             write_fixture(&path, legacy);
             let snapshot = read_validated_snapshot(&path).unwrap();
             let (mut config, _, _) = config::load_config_from_table(snapshot.table.as_ref());
-            assert_eq!(config.ui_font_scale, None);
-            assert_eq!(config.ui_font_size, None);
+            assert_eq!(config.font_desc, "Monospace 16");
+            assert_eq!(config.default_font_scale, 1.5);
+            assert_eq!(config.ui_font_scale, Some(1.0));
+            assert_eq!(config.ui_font_size, Some(14.0));
+            assert!(!config.ui_font_size_absolute);
             crate::font::freeze_ui_font(&mut config);
             let mut content = config.default_font_scale;
             let mut ui = config.ui_font_scale;
@@ -2104,7 +2107,7 @@ mod tests {
             let saved = read_validated_snapshot(&path).unwrap();
             let (reloaded, _, _) = config::load_config_from_table(saved.table.as_ref());
             let expected = if first == FontGroup::Content {
-                (2.0, Some(1.5))
+                (2.0, Some(1.0))
             } else {
                 (1.5, Some(2.0))
             };
@@ -2112,12 +2115,12 @@ mod tests {
                 (reloaded.default_font_scale, reloaded.ui_font_scale),
                 expected
             );
-            assert_eq!(reloaded.ui_font_size, Some(16.0));
+            assert_eq!(reloaded.ui_font_size, Some(14.0));
             assert!(!reloaded.ui_font_size_absolute);
             let mut externally_edited = saved.table.clone().unwrap();
             externally_edited.insert("font".into(), toml::Value::String("Monospace 36px".into()));
             let (after_main_edit, _, _) = config::load_config_from_table(Some(&externally_edited));
-            assert_eq!(after_main_edit.ui_font_size, Some(16.0));
+            assert_eq!(after_main_edit.ui_font_size, Some(14.0));
             assert!(!after_main_edit.ui_font_size_absolute);
             assert_eq!(
                 saved.table.as_ref().unwrap()["future"]["keep"].as_bool(),

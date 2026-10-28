@@ -853,8 +853,8 @@ impl SimpleComponent for AppModel {
         }
         config.tab_placement = config::TabPlacement::Sidebar;
         config.sidebar_visible = true;
-        config.sidebar_width = jterm_core::reference_shell::NAVIGATION_WIDTH as u32;
-        config.ai_panel_width = jterm_core::reference_shell::INSPECTOR_WIDTH as u32;
+        config.sidebar_width = jterm_core::developer_workspace::NAVIGATION_WIDTH as u32;
+        config.ai_panel_width = jterm_core::developer_workspace::INSPECTOR_WIDTH as u32;
         config.bottom_bar = false;
         let shell_argv = if init.safe_mode {
             Rc::new(vec!["sh".to_string()])
@@ -1372,10 +1372,12 @@ impl SimpleComponent for AppModel {
         navigation_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
         navigation_scroll.set_propagate_natural_height(false);
         navigation_scroll.set_child(Some(&sidebar_box));
-        navigation_scroll.set_width_request(jterm_core::reference_shell::NAVIGATION_WIDTH as i32);
+        navigation_scroll
+            .set_width_request(jterm_core::developer_workspace::NAVIGATION_WIDTH as i32);
         navigation_scroll.set_vexpand(true);
         let navigation_column = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        navigation_column.set_width_request(jterm_core::reference_shell::NAVIGATION_WIDTH as i32);
+        navigation_column
+            .set_width_request(jterm_core::developer_workspace::NAVIGATION_WIDTH as i32);
         navigation_column.append(&navigation_scroll);
         navigation_column.append(&shell.status);
         content_paned.set_start_child(Some(&navigation_column));
@@ -1392,6 +1394,7 @@ impl SimpleComponent for AppModel {
         content_paned.set_hexpand(true);
         workspace_shell::observe_layout(
             &workspace_body,
+            &shell,
             navigation_column.upcast_ref(),
             &shell.inspector,
             &content_paned,

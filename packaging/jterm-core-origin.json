@@ -1,0 +1,10 @@
+{
+  "published_core_commit": "7ca26848793a021b5c777755c592cccb6098bec2",
+  "published_core_tree": "4f359fc43d5378fc8dab6572443eae11b96fe48b",
+  "equivalent_local_source_commit": "f7919f0ead723bccb81463cb1ed43a7855e7e05f",
+  "archive_sha256": "4b6bf93257eb4ad33a2763f1df393d97cbec9ce476178cdaccb5ca0c8a427c2a",
+  "archive_members": 199,
+  "scope": "Packaged src/, assets/, runtime/ and Cargo files match the published tree.35 nonbuild CI/docs paths are omitted.",
+  "verification": "Full packaged blob and executable modes verified; isolated offline locked dependency resolution passed without another checkout.",
+  "publication_boundary": "Source checkpoint only; not complete GUI/behavior or1:1 acceptance."
+}

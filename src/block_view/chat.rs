@@ -312,7 +312,7 @@ pub(super) fn layout(
         controls.set_tooltip_text(Some(hint.text().as_str()));
         if prompt || in_transcript {
             // A running command changes terminal ownership, not the shared
-            // 80px input/tool frame or its viewport insets.
+            // minimum input/tool frame or its viewport insets.
             dock.add_css_class("chat-composer");
         } else {
             dock.remove_css_class("chat-composer");
