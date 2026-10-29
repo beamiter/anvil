@@ -1254,9 +1254,11 @@ pub(crate) fn install_css() {
     }
 }
 
+type FixedChromeWidth = (gtk::glib::WeakRef<gtk::Widget>, f32, Option<f32>);
+
 thread_local! {
     static UI_ROLE_SCALE: std::cell::Cell<f64> = const { std::cell::Cell::new(1.0) };
-    static FIXED_CHROME_WIDTHS: std::cell::RefCell<Vec<(gtk::glib::WeakRef<gtk::Widget>, f32, Option<f32>)>> = const {
+    static FIXED_CHROME_WIDTHS: std::cell::RefCell<Vec<FixedChromeWidth>> = const {
         std::cell::RefCell::new(Vec::new())
     };
     static FIXED_CHROME_ICONS: std::cell::RefCell<Vec<(gtk::glib::WeakRef<gtk::DrawingArea>, f32)>> = const {
