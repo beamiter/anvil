@@ -36,6 +36,8 @@ printf 'custom = false\n' > "$XDG_CONFIG_HOME/$APP/config.toml"
     # The shared helper is checked separately.
     # shellcheck source=/dev/null
     source "$SCRIPT_DIR/install-config.sh"
+    # Called indirectly by the sourced install-config.sh helper.
+    # shellcheck disable=SC2317,SC2329
     die() { printf '%s\n' "$*" >&2; exit 1; }
     DRY_RUN=0
     fixture_dir="$ROOT/config comparison"
@@ -215,11 +217,15 @@ TOML
     # A missing/unavailable parser also keeps the current configuration.
     printf 'new_field = true\n' > "$bundled"
     (
+        # Called indirectly by the sourced install-config.sh helper.
+        # shellcheck disable=SC2317,SC2329
         python3() { return 127; }
         assert_preserved
     )
     # An interpreter failure with exit 1 must not masquerade as changed fields.
     (
+        # Called indirectly by the sourced install-config.sh helper.
+        # shellcheck disable=SC2317,SC2329
         python3() { return 1; }
         assert_preserved
     )

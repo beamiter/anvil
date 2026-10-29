@@ -3534,13 +3534,24 @@ impl OrganismRuntime {
         // Pane-local command reconciliation still runs for non-owners.
         // Render spatial pixels only after arbitration, including the first
         // refresh when focus returns (there is no stale sprite cache).
-        #[cfg(test)]
-        self.spatial_renders.set(self.spatial_renders.get() + 1);
-        self.graphic_frame.set(sprite_frame);
-        self.live_graphic.queue_draw();
         let sprite = sprite_frame_with_context(context, sprite_frame);
-        if self.live_body.text().as_str() != sprite.as_ref() {
-            self.live_body.set_text(sprite.as_ref());
+        let sprite_changed = self.live_body.text().as_str() != sprite.as_ref();
+        // Static still reconciles ownership, state and safe placement below.
+        // Its unchanged frame-zero pixels need no repeated GTK redraw request;
+        // a changed frame or actual stale canonical label must still update.
+        if self.motion.get() != OrganismMotion::Static
+            || self.graphic_frame.get() != sprite_frame
+            || sprite_changed
+        {
+            // This counts redraw submissions, not native draw callbacks (an
+            // unmapped fixture can exercise this path without painting).
+            #[cfg(test)]
+            self.spatial_renders.set(self.spatial_renders.get() + 1);
+            self.graphic_frame.set(sprite_frame);
+            self.live_graphic.queue_draw();
+            if sprite_changed {
+                self.live_body.set_text(sprite.as_ref());
+            }
         }
 
         if suppress_live_body_for_focus(mode) {
@@ -5667,6 +5678,54 @@ mod tests {
         runtime.motion.set(OrganismMotion::Full);
         runtime.refresh_surface(&view, Instant::now());
         assert_eq!(runtime.spatial_renders.get(), before);
+
+        // Keep the original exact count above. Static is not disabled: it
+        // repairs changed canonical state once, then skips identical work.
+        assert!(!view.widget().is_mapped());
+        assert!(!runtime.live_graphic.is_mapped());
+        runtime.enabled.set(true);
+        runtime.motion.set(OrganismMotion::Static);
+        runtime.live_body.set_text("stale static fixture");
+        let before_stale = runtime.spatial_renders.get();
+        runtime.refresh_surface(&view, Instant::now());
+        assert_eq!(runtime.spatial_renders.get(), before_stale + 1);
+        assert_ne!(runtime.live_body.text().as_str(), "stale static fixture");
+        let still = runtime.live_body.text();
+        for _ in 0..4 {
+            runtime.refresh_surface(&view, Instant::now());
+        }
+        assert_eq!(runtime.spatial_renders.get(), before_stale + 1);
+        assert_eq!(runtime.live_body.text(), still);
+        presence.focus_view(None);
+        runtime.live_body.set_text("stale non-owner static fixture");
+        runtime.refresh_surface(&view, Instant::now());
+        assert_eq!(runtime.spatial_renders.get(), before_stale + 1);
+        assert_eq!(
+            runtime.live_body.text().as_str(),
+            "stale non-owner static fixture"
+        );
+        presence.focus_view(Some(&view));
+        assert_eq!(runtime.spatial_renders.get(), before_stale + 2);
+        assert_ne!(
+            runtime.live_body.text().as_str(),
+            "stale non-owner static fixture"
+        );
+        // A stale graphical frame is also real work even when its canonical
+        // label is already current. Static must restore frame zero once.
+        runtime.graphic_frame.set(9);
+        runtime.refresh_surface(&view, Instant::now());
+        assert_eq!(runtime.graphic_frame.get(), 0);
+        assert_eq!(runtime.spatial_renders.get(), before_stale + 3);
+        runtime.refresh_surface(&view, Instant::now());
+        assert_eq!(runtime.spatial_renders.get(), before_stale + 3);
+        runtime.enabled.set(false);
+        runtime.live_body.set_text("stale disabled static fixture");
+        runtime.refresh_surface(&view, Instant::now());
+        assert_eq!(runtime.spatial_renders.get(), before_stale + 3);
+        assert_eq!(
+            runtime.live_body.text().as_str(),
+            "stale disabled static fixture"
+        );
     }
 
     #[test]
