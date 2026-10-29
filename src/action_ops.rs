@@ -639,7 +639,10 @@ impl AppModel {
                 }
             }
             Action::ToggleAiPanel | Action::OpenAiPanel => {
-                match action.ai_panel_target_visibility(self.ai_panel_visible.get()) {
+                let visible = self.ai_panel_visible.get()
+                    && self.shell.inspector_is_shown()
+                    && self.shell.inspector_live_is_selected();
+                match action.ai_panel_target_visibility(visible) {
                     Some(true) => self.show_ai_session_panel(),
                     Some(false) => self.set_ai_panel_visible(false, true),
                     None => unreachable!("matched only AI-panel actions"),

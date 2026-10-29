@@ -2,6 +2,11 @@
 .workspace-titlebar button { min-height:26px; min-width:20px; border-radius:7px; padding:0 6px; color:#c0cbe0; }
 .workspace-titlebar .shell-window-control { min-height:24px; min-width:24px; padding:0; opacity:0.8; background:transparent; }
 .workspace-titlebar .shell-window-control:hover { background:#28364f; }
+.workspace-titlebar button.shell-inspector-toggle { min-width:0; min-height:0; padding:0; margin:0; border:0; border-radius:7px; background:transparent; color:#90a0b9; box-shadow:none; }
+.workspace-titlebar button.shell-inspector-toggle:checked { background:#283d6f; color:#dde5f4; }
+.workspace-titlebar button.shell-inspector-toggle:hover { background:#263554; }
+.workspace-titlebar button.shell-inspector-toggle:disabled { opacity:1; filter:none; color:#71829a; }
+.workspace-inspector-drawer { border:0; padding:0; background:#0f1825; box-shadow:-6px 0 16px rgba(4,10,20,0.22); }
 .workspace-titlebar image { -gtk-icon-size:12px; }
 .shell-brand { font-size:13px; font-weight:700; margin-left:3px; }
 .shell-brand-icon { color:#8c9bff; margin-left:8px; }

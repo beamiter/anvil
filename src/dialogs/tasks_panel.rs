@@ -1010,6 +1010,7 @@ impl Component for TasksPanelModel {
                             #[name(page_stack)]
                             gtk::Stack {
                                 set_hexpand: true,
+                                set_hhomogeneous: false,
                                 set_vexpand: true,
 
                                 add_named[Some(STREAM_PAGE)] = &gtk::Box {

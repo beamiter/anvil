@@ -603,6 +603,7 @@ impl AppModel {
         // a restored panel stays visible and explains provider errors in
         // place instead of silently changing the saved preference.
         self.set_ai_panel_visible(true, true);
+        self.shell.show_inspector_live();
         let client = match ai::client_from_config(&self.config.borrow()) {
             Ok(client) => client,
             Err(error) => {
@@ -666,19 +667,9 @@ impl AppModel {
     }
 
     pub(crate) fn restore_ai_panel_width(&self) {
-        if !self.ai_panel_visible.get() {
-            return;
-        }
-        let paned = self.ai_paned.clone();
-        let requested = self.config.borrow().ai_panel_width;
-        if let Some(position) = restored_ai_panel_position(paned.width(), requested) {
-            paned.set_position(position);
-        }
-        gtk::glib::idle_add_local_once(move || {
-            if let Some(position) = restored_ai_panel_position(paned.width(), requested) {
-                paned.set_position(position);
-            }
-        });
+        // The retained outer inspector is the sole width/placement authority.
+        // A stale AI-panel idle must never reopen or resize a hidden drawer.
+        self.shell.refresh_inspector_layout();
     }
 }
 

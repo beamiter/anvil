@@ -208,10 +208,13 @@ impl AppModel {
             );
             return;
         }
-        let visible = !self.tasks_panel_visible.get();
+        let visible = !self.tasks_panel_visible.get()
+            || !self.shell.inspector_is_shown()
+            || !self.shell.inspector_live_is_selected();
         self.tasks_panel_visible.set(visible);
         self.sync_side_panel();
         if visible {
+            self.shell.show_inspector_live();
             // Opening the panel (for example from the attention badge) shows
             // the ordinary views, never a hidden-tasks list left from before.
             self.tasks_panel.emit(TasksPanelMsg::LeaveHidden);

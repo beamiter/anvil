@@ -106,8 +106,10 @@ const MIN_TAB_WIDTH: u32 = 80;
 const MAX_TAB_WIDTH: u32 = 480;
 const MIN_AI_PANEL_WIDTH: u32 = 240;
 const MAX_AI_PANEL_WIDTH: u32 = 1_200;
+#[cfg(test)]
 const MIN_AI_WORKSPACE_WIDTH: i32 = 200;
 
+#[cfg(test)]
 fn restored_ai_panel_position(total_width: i32, requested_width: u32) -> Option<i32> {
     if total_width <= MIN_AI_PANEL_WIDTH as i32 + MIN_AI_WORKSPACE_WIDTH {
         return None;
@@ -1258,7 +1260,6 @@ impl SimpleComponent for AppModel {
             });
         let initial_ai_panel_visible =
             config.borrow().ai_enabled && config.borrow().ai_panel_visible && !init.safe_mode;
-        let initial_ai_panel_width = config.borrow().ai_panel_width;
         let ai_panel = dialogs::ai_panel::AiPanelModel::builder()
             .launch(dialogs::ai_panel::AiPanelInit {
                 redact_secrets: config.borrow().ai_redact_secrets,
@@ -1276,25 +1277,17 @@ impl SimpleComponent for AppModel {
                     AppMsg::TaskPanelAction(action)
                 }
             });
-        // Both right-side panels share the `ai_paned` end slot through one
-        // stack: the persisted width/visibility behavior stays identical for
-        // AI Chats, and Tasks rides the same chrome without its own config.
+        // Provider pages keep their existing preferences inside the retained
+        // outer inspector. The workspace shell alone owns its allocation.
         let side_stack = gtk::Stack::new();
         side_stack.add_css_class("anvil-ui-font");
+        side_stack.add_css_class("shell-inspector-live-pages");
+        side_stack.set_hhomogeneous(false);
         side_stack.add_named(ai_panel.widget(), Some("chats"));
         side_stack.add_named(tasks_panel.widget(), Some("tasks"));
         side_stack.set_visible_child_name("chats");
         side_stack.set_visible(initial_ai_panel_visible);
         ai_paned.set_end_child(Some(&side_stack));
-        // The initial window is 800 px wide and the left sidebar has already
-        // claimed its configured share. A map-time idle below corrects this
-        // estimate against the compositor's actual allocation.
-        let initial_inner_width = 800_i32.saturating_sub(sidebar_width);
-        if let Some(position) =
-            restored_ai_panel_position(initial_inner_width, initial_ai_panel_width)
-        {
-            ai_paned.set_position(position);
-        }
         let notebook = notebook::NotebookModel::builder()
             .launch(notebook::NotebookInit {
                 parent: root.clone(),
@@ -1538,25 +1531,22 @@ impl SimpleComponent for AppModel {
 
         {
             let width_sender = sender.clone();
-            let panel = model.side_stack.clone();
+            let panel = model.side_stack.downgrade();
+            let inspector = model.shell.inspector.downgrade();
             model.ai_paned.connect_position_notify(move |paned| {
-                if !panel.is_visible() {
+                let (Some(panel), Some(inspector)) = (panel.upgrade(), inspector.upgrade()) else {
+                    return;
+                };
+                if !panel.is_visible()
+                    || !inspector.is_mapped()
+                    || paned.end_child().as_ref() != Some(inspector.upcast_ref::<gtk::Widget>())
+                {
                     return;
                 }
                 if let Some(measured) =
                     ai_panel_width_from_geometry(paned.width(), paned.position())
                 {
                     width_sender.input(AppMsg::AiPanelWidthChanged(measured));
-                }
-            });
-        }
-        if initial_ai_panel_visible {
-            let paned = model.ai_paned.clone();
-            gtk::glib::idle_add_local_once(move || {
-                if let Some(position) =
-                    restored_ai_panel_position(paned.width(), initial_ai_panel_width)
-                {
-                    paned.set_position(position);
                 }
             });
         }
@@ -2016,6 +2006,18 @@ impl SimpleComponent for AppModel {
             AppMsg::PrevTab => self.switch_tab(-1, &sender),
             AppMsg::ToggleSidebar => {
                 self.set_sidebar_visible(!self.sidebar_visible, true);
+            }
+            AppMsg::ToggleInspector => {
+                let inspector_owned_focus =
+                    gtk::prelude::RootExt::focus(&self.window).is_some_and(|focus| {
+                        widget_is_within(focus, self.shell.inspector.upcast_ref())
+                    });
+                self.shell.toggle_inspector();
+                if inspector_owned_focus && !self.shell.inspector_is_shown() {
+                    if let Some(terminal) = self.active_terminal() {
+                        terminal.emit(VteInput::GrabFocus);
+                    }
+                }
             }
             AppMsg::MinimizeWindow => self.window.minimize(),
             AppMsg::ToggleMaximizedWindow => {

@@ -198,6 +198,8 @@ impl Component for AiPanelModel {
                 #[name(title_entry)]
                 gtk::Entry {
                     set_hexpand: true,
+                    // The title flexes inside the retained 306px inspector.
+                    set_width_chars: 1,
                     set_tooltip_text: Some("Rename this chat"),
                     connect_changed[sender] => move |entry| {
                         sender.input(AiPanelMsg::Rename(entry.text().to_string()));
@@ -228,6 +230,7 @@ impl Component for AiPanelModel {
             #[name(page_stack)]
             gtk::Stack {
                 set_hexpand: true,
+                set_hhomogeneous: false,
                 set_vexpand: true,
 
                 add_named[Some(CHAT_PAGE)] = &gtk::Box {
@@ -432,6 +435,13 @@ impl Component for AiPanelModel {
             scroll_queued: Rc::new(Cell::new(false)),
         };
         let widgets = view_output!();
+        // Consent is truthful and readable without setting the entire panel's
+        // minimum width to the length of this status sentence.
+        if let Some(label) = widgets.include_recent.child().and_downcast::<gtk::Label>() {
+            label.set_wrap(true);
+            label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+            label.set_xalign(0.0);
+        }
 
         {
             let sender = sender.clone();

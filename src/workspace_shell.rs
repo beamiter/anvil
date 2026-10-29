@@ -31,6 +31,77 @@ pub(crate) struct Chrome {
     block_shelf: gtk::Box,
     presentation_navigation: gtk::Label,
     search: gtk::Button,
+    inspector_control: std::rc::Rc<InspectorControl>,
+    inspector_pages: gtk::Stack,
+}
+
+/// The outer inspector is independent of the provider/task page it contains.
+/// None retains the existing automatic collapse; an explicit Show also works
+/// as a drawer on ordinary narrow windows. No page or terminal is recreated.
+struct InspectorControl {
+    requested: std::cell::Cell<Option<bool>>,
+    shown: std::cell::Cell<bool>,
+    available: std::cell::Cell<bool>,
+    button: gtk::ToggleButton,
+    refresh: std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InspectorPlacement {
+    Hidden,
+    Docked,
+    Drawer,
+}
+
+fn inspector_placement(
+    layout: &tokens::Layout,
+    requested: Option<bool>,
+) -> (InspectorPlacement, bool) {
+    let inline = layout.inspector.is_some();
+    // Keep a small part of the canvas reachable beside a narrow drawer. The
+    // actual panel remains its normal width and its own content can scroll.
+    let drawer_fits = layout.titlebar.width
+        >= tokens::RAIL_WIDTH + tokens::INSPECTOR_WIDTH + 2.0 * tokens::CONTROL_HEIGHT
+        && layout.center.height >= tokens::INSPECTOR_TABS_HEIGHT + tokens::CONTROL_HEIGHT;
+    let placement = if requested == Some(false) {
+        InspectorPlacement::Hidden
+    } else if inline {
+        InspectorPlacement::Docked
+    } else if requested == Some(true) && drawer_fits {
+        InspectorPlacement::Drawer
+    } else {
+        InspectorPlacement::Hidden
+    };
+    (placement, inline || drawer_fits)
+}
+
+impl InspectorControl {
+    fn sync_button(&self, placement: InspectorPlacement, available: bool) {
+        let shown = placement != InspectorPlacement::Hidden;
+        self.shown.set(shown);
+        self.available.set(available);
+        self.button.set_active(shown);
+        self.button.set_sensitive(available);
+        let title = if shown {
+            "Hide right sidebar"
+        } else {
+            "Show right sidebar"
+        };
+        let description = if available {
+            "Toggle the right inspector. Narrow windows use a sidebar drawer."
+        } else {
+            "The window is too small to fit the right sidebar. Enlarge it to show the sidebar."
+        };
+        self.button.set_tooltip_text(Some(&if available {
+            title.into()
+        } else {
+            format!("{title}\n{description}")
+        }));
+        self.button.update_property(&[
+            gtk::accessible::Property::Label(title),
+            gtk::accessible::Property::Description(description),
+        ]);
+    }
 }
 
 fn label(text: &str, class: &str) -> gtk::Label {
@@ -612,6 +683,26 @@ impl Chrome {
             sender,
             AppMsg::Action(Action::ToggleSettings),
         ));
+        let inspector_button = gtk::ToggleButton::new();
+        inspector_button.add_css_class("flat");
+        inspector_button.add_css_class("shell-inspector-toggle");
+        inspector_button.set_size_request(28, 28);
+        inspector_button.set_valign(gtk::Align::Center);
+        inspector_button.set_focus_on_click(false);
+        inspector_button.set_child(Some(&icon(jterm_core::reference_icons::Icon::PanelRight)));
+        let inspector_sender = sender.clone();
+        inspector_button.connect_clicked(move |_| {
+            inspector_sender.input(AppMsg::ToggleInspector);
+        });
+        let inspector_control = std::rc::Rc::new(InspectorControl {
+            requested: std::cell::Cell::new(None),
+            shown: std::cell::Cell::new(true),
+            available: std::cell::Cell::new(true),
+            button: inspector_button,
+            refresh: std::cell::RefCell::new(None),
+        });
+        inspector_control.sync_button(InspectorPlacement::Docked, true);
+        top.append(&inspector_control.button);
 
         // The launcher is centered independently of the left/right controls;
         // extra window width belongs to the canvas, not an expanding search.
@@ -636,13 +727,47 @@ impl Chrome {
         title_overlay.set_measure_overlay(&title_observer, false);
         let search_width_gate = search.downgrade();
         let path_width_gate = path.downgrade();
-        title_observer.connect_resize(move |_, width, _| {
-            if let Some(search) = search_width_gate.upgrade() {
-                search.set_visible(width >= 1024);
-            }
-            if let Some(path) = path_width_gate.upgrade() {
-                path.set_visible(width >= 1120);
-            }
+        let title_allocation = title_overlay.downgrade();
+        let title_visibility_epoch = std::rc::Rc::new(std::cell::Cell::new(0_u64));
+        title_observer.connect_resize(move |observer, _, _| {
+            let epoch = title_visibility_epoch.get().wrapping_add(1);
+            title_visibility_epoch.set(epoch);
+            let current_epoch = title_visibility_epoch.clone();
+            let observer = observer.downgrade();
+            let search = search_width_gate.clone();
+            let path = path_width_gate.clone();
+            let title = title_allocation.clone();
+            // The observer is itself a non-measuring overlay. Changing a
+            // sibling's visibility during this allocation can leave that
+            // sibling mapped with its previous zero allocation. Apply only
+            // the latest resize outside layout, then allocate the real host.
+            gtk::glib::idle_add_local_once(move || {
+                if current_epoch.get() != epoch {
+                    return;
+                }
+                let (Some(observer), Some(title)) = (observer.upgrade(), title.upgrade()) else {
+                    return;
+                };
+                let width = observer.width();
+                if width <= 0 {
+                    return;
+                }
+                let mut reallocate = false;
+                if let Some(search) = search.upgrade() {
+                    let visible = width >= 1024;
+                    reallocate |= search.is_visible() != visible
+                        || (visible && (search.width() <= 0 || search.height() <= 0));
+                    search.set_visible(visible);
+                }
+                if let Some(path) = path.upgrade() {
+                    let visible = width >= 1120;
+                    reallocate |= path.is_visible() != visible;
+                    path.set_visible(visible);
+                }
+                if reallocate {
+                    title.queue_allocate();
+                }
+            });
         });
         let top = title_overlay;
 
@@ -881,11 +1006,12 @@ impl Chrome {
         let inspector = gtk::Box::new(gtk::Orientation::Vertical, 0);
         inspector.add_css_class("workspace-inspector");
         inspector.add_css_class("anvil-ui-font");
-        inspector.set_width_request((tokens::INSPECTOR_WIDTH - 1.0) as i32);
+        inspector.set_width_request(tokens::INSPECTOR_WIDTH as i32);
         let inspector_tabs = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         inspector_tabs.add_css_class("shell-inspector-tabs");
         inspector_tabs.set_height_request(tokens::INSPECTOR_TABS_HEIGHT as i32);
         let panel = gtk::Stack::new();
+        panel.add_css_class("shell-inspector-pages");
         panel.set_hhomogeneous(false);
         panel.set_vhomogeneous(false);
         panel.set_vexpand(true);
@@ -902,7 +1028,18 @@ impl Chrome {
         overview_scroll.set_vexpand(true);
         overview_scroll.set_child(Some(&overview));
         panel.add_named(&overview_scroll, Some("overview"));
-        panel.add_named(side_stack, Some("live"));
+        // Keep legacy provider/task controls accessible without letting their
+        // natural minimum replace the shared inspector width. This one host
+        // and the original live stack survive every dock/drawer transition.
+        let live_host = gtk::ScrolledWindow::new();
+        live_host.add_css_class("shell-inspector-live-scroll");
+        live_host.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
+        live_host.set_propagate_natural_width(false);
+        live_host.set_propagate_natural_height(false);
+        live_host.set_hexpand(true);
+        live_host.set_vexpand(true);
+        live_host.set_child(Some(side_stack));
+        panel.add_named(&live_host, Some("live"));
         let context_page = gtk::Box::new(gtk::Orientation::Vertical, 12);
         context_page.add_css_class("shell-agent-card");
         context_page.append(&label("SESSION CONTEXT", "shell-section"));
@@ -915,7 +1052,11 @@ impl Chrome {
         context_page.append(&context_notice);
         context_page.set_valign(gtk::Align::Start);
         panel.add_named(&context_page, Some("context"));
-        panel.set_visible_child_name("overview");
+        panel.set_visible_child_name(if side_stack.is_visible() {
+            "live"
+        } else {
+            "overview"
+        });
         let live_panel = panel.downgrade();
         side_stack.connect_visible_notify(move |stack| {
             if let Some(panel) = live_panel.upgrade() {
@@ -936,21 +1077,33 @@ impl Chrome {
             if page == "overview" {
                 tab.add_css_class("shell-selected");
             }
-            let panel = panel.clone();
-            let agent = agent_tab.clone();
-            let context = context_tab.clone();
+            let panel = panel.downgrade();
             tab.connect_clicked(move |_| {
-                panel.set_visible_child_name(page);
-                agent.remove_css_class("shell-selected");
-                context.remove_css_class("shell-selected");
-                if page == "overview" {
-                    agent.add_css_class("shell-selected");
-                } else {
-                    context.add_css_class("shell-selected");
+                if let Some(panel) = panel.upgrade() {
+                    panel.set_visible_child_name(page);
                 }
             });
             inspector_tabs.append(tab);
         }
+        let agent = agent_tab.downgrade();
+        let context = context_tab.downgrade();
+        panel.connect_visible_child_name_notify(move |panel| {
+            let context_selected = panel.visible_child_name().as_deref() == Some("context");
+            if let Some(agent) = agent.upgrade() {
+                if context_selected {
+                    agent.remove_css_class("shell-selected");
+                } else {
+                    agent.add_css_class("shell-selected");
+                }
+            }
+            if let Some(context) = context.upgrade() {
+                if context_selected {
+                    context.add_css_class("shell-selected");
+                } else {
+                    context.remove_css_class("shell-selected");
+                }
+            }
+        });
         let files_tab = unavailable("Files");
         files_tab.set_tooltip_text(Some("Right-side file inspection is not connected yet. Project files are available in the left navigation."));
         files_tab.set_width_request(tokens::INSPECTOR_TAB_WIDTH as i32);
@@ -986,6 +1139,39 @@ impl Chrome {
             presentation_navigation: presentation_navigation
                 .expect("presentation navigation label"),
             search,
+            inspector_control,
+            inspector_pages: panel,
+        }
+    }
+
+    pub(crate) fn toggle_inspector(&self) {
+        if !self.inspector_control.available.get() {
+            return;
+        }
+        self.inspector_control
+            .requested
+            .set(Some(!self.inspector_control.shown.get()));
+        self.refresh_inspector_layout();
+    }
+
+    pub(crate) fn inspector_is_shown(&self) -> bool {
+        self.inspector_control.shown.get()
+    }
+
+    pub(crate) fn inspector_live_is_selected(&self) -> bool {
+        self.inspector_pages.visible_child_name().as_deref() == Some("live")
+    }
+
+    pub(crate) fn show_inspector_live(&self) {
+        self.inspector_control.requested.set(Some(true));
+        self.inspector_pages.set_visible_child_name("live");
+        self.refresh_inspector_layout();
+    }
+
+    pub(crate) fn refresh_inspector_layout(&self) {
+        let refresh = self.inspector_control.refresh.borrow().clone();
+        if let Some(refresh) = refresh {
+            refresh();
         }
     }
 
@@ -1339,55 +1525,126 @@ pub(crate) fn observe_layout(
             ("inspector", inspector.upcast_ref()),
             ("block_composer", chrome.block_shelf.upcast_ref()),
             ("search", chrome.search.upcast_ref()),
+            (
+                "inspector_toggle",
+                chrome.inspector_control.button.upcast_ref(),
+            ),
         ]
         .into_iter()
         .map(|(name, widget)| (name, widget.downgrade()))
         .collect::<Vec<_>>()
     });
+    // A single, non-measuring drawer retains the same inspector on narrow
+    // windows. Its viewport is also retained when the panel docks again.
+    let drawer = gtk::ScrolledWindow::new();
+    drawer.add_css_class("workspace-inspector-drawer");
+    drawer.set_policy(gtk::PolicyType::External, gtk::PolicyType::Never);
+    drawer.set_min_content_width(tokens::INSPECTOR_WIDTH as i32);
+    drawer.set_max_content_width(tokens::INSPECTOR_WIDTH as i32);
+    drawer.set_propagate_natural_width(true);
+    drawer.set_halign(gtk::Align::End);
+    drawer.set_valign(gtk::Align::Fill);
+    drawer.set_visible(false);
+    let drawer_viewport = gtk::Viewport::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+    drawer_viewport.set_scroll_to_focus(false);
+    drawer.set_child(Some(&drawer_viewport));
+    host.add_overlay(&drawer);
+    host.set_measure_overlay(&drawer, false);
     let navigation = navigation.downgrade();
     let inspector = inspector.downgrade();
     let navigation_split = navigation_split.downgrade();
     let inspector_split = inspector_split.downgrade();
+    let drawer = drawer.downgrade();
+    let drawer_viewport = drawer_viewport.downgrade();
+    let observer_weak = observer.downgrade();
+    let control = std::rc::Rc::downgrade(&chrome.inspector_control);
     let diagnostic_epoch = std::rc::Rc::new(std::cell::Cell::new(0_u64));
-    observer.connect_resize(move |observer, width, height| {
-        let layout =
-            tokens::Layout::for_size(width as f32, height as f32 + tokens::TITLEBAR_HEIGHT);
+    let apply: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
+        let (
+            Some(observer),
+            Some(control),
+            Some(inspector),
+            Some(split),
+            Some(drawer),
+            Some(drawer_viewport),
+        ) = (
+            observer_weak.upgrade(),
+            control.upgrade(),
+            inspector.upgrade(),
+            inspector_split.upgrade(),
+            drawer.upgrade(),
+            drawer_viewport.upgrade(),
+        )
+        else {
+            return;
+        };
+        let width = observer.width();
+        let height = observer.height();
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        let base = tokens::Layout::for_size(width as f32, height as f32 + tokens::TITLEBAR_HEIGHT);
+        let panel_focus = observer
+            .root()
+            .and_downcast::<gtk::Window>()
+            .and_then(|window| gtk::prelude::RootExt::focus(&window))
+            .filter(|focus| crate::widget_is_within(focus.clone(), inspector.upcast_ref()));
+        if panel_focus.is_some() && base.inspector.is_none() && control.requested.get().is_none() {
+            // Keep a focused panel in a drawer rather than hiding its owner
+            // merely because the default presentation auto-collapses.
+            control.requested.set(Some(true));
+        }
+        let (placement, available) = inspector_placement(&base, control.requested.get());
+        let layout = if placement == InspectorPlacement::Docked {
+            base
+        } else {
+            base.without_inspector()
+        };
+        let in_drawer =
+            drawer_viewport.child().as_ref() == Some(inspector.upcast_ref::<gtk::Widget>());
+        let moving = (placement == InspectorPlacement::Drawer && !in_drawer)
+            || (placement == InspectorPlacement::Docked && in_drawer);
+        match placement {
+            InspectorPlacement::Drawer if !in_drawer => {
+                split.set_end_child(None::<&gtk::Widget>);
+                drawer_viewport.set_child(Some(&inspector));
+            }
+            InspectorPlacement::Docked if in_drawer => {
+                drawer_viewport.set_child(None::<&gtk::Widget>);
+                split.set_end_child(Some(&inspector));
+            }
+            _ => {}
+        }
+        inspector.set_visible(placement != InspectorPlacement::Hidden);
+        drawer.set_visible(placement == InspectorPlacement::Drawer);
+        if moving {
+            if let Some(focus) = panel_focus.filter(|focus| {
+                focus.is_mapped() && focus.root().as_ref() == observer.root().as_ref()
+            }) {
+                // GTK repairs focus synchronously to a container while the
+                // original input is temporarily unparented. Finish this
+                // synchronous remap before arming the existing idle guard;
+                // actual later user choices still supersede that guard.
+                focus.grab_focus();
+                crate::block_view::restore_live_focus_deferred(&focus);
+            }
+        }
         if let Some(navigation) = navigation.upgrade() {
             navigation.set_visible(layout.navigation.is_some());
         }
-        if let Some(inspector) = inspector.upgrade() {
-            inspector.set_visible(layout.inspector.is_some());
-        }
         if let Some(split) = navigation_split.upgrade() {
-            split.set_position(if layout.navigation.is_some() {
-                tokens::NAVIGATION_WIDTH as i32
-            } else {
-                0
-            });
+            split.set_position(layout.navigation.map_or(0, |rect| rect.width as i32));
         }
-        if let Some(split) = inspector_split.upgrade() {
-            let inner = width as f32
-                - tokens::RAIL_WIDTH
-                - if layout.navigation.is_some() {
-                    tokens::NAVIGATION_WIDTH
-                } else {
-                    0.0
-                };
-            split.set_position(
-                (inner
-                    - if layout.inspector.is_some() {
-                        tokens::INSPECTOR_WIDTH
-                    } else {
-                        0.0
-                    }) as i32,
-            );
-        }
+        split.set_position(layout.center.width as i32);
+        control.sync_button(placement, available);
         if let Some(nodes) = &geometry {
             let epoch = diagnostic_epoch.get().wrapping_add(1);
             diagnostic_epoch.set(epoch);
-            schedule_geometry_sample(observer, nodes.clone(), epoch, diagnostic_epoch.clone());
+            schedule_geometry_sample(&observer, nodes.clone(), epoch, diagnostic_epoch.clone());
         }
     });
+    *chrome.inspector_control.refresh.borrow_mut() = Some(apply.clone());
+    observer.connect_resize(move |_, _, _| apply());
 }
 
 // This opt-in observer never drives layout or input. Idle after a resize can
@@ -1435,9 +1692,14 @@ fn schedule_geometry_sample(
                 };
                 let composer = regions.get("chat_composer").or_else(|| regions.get("block_composer"));
                 let valid = composer.is_some_and(within) && regions.get("footer").is_some_and(within);
-                let equal = last.borrow().as_ref() == Some(&sample);
+                // Streaming history changes its adjustment independently of
+                // shell allocation. Report it, but never wait for output to
+                // stop before accepting two equal structural samples.
+                let mut structural_sample = sample.clone();
+                structural_sample.as_object_mut().unwrap().remove("canvas_scroll");
+                let equal = last.borrow().as_ref() == Some(&structural_sample);
                 stable.set(if valid { if equal { stable.get().saturating_add(1) } else { 1 } } else { 0 });
-                *last.borrow_mut() = Some(sample.clone());
+                *last.borrow_mut() = Some(structural_sample);
                 sample["sample_phase"] = serde_json::json!("after-paint");
                 sample["sample_epoch"] = serde_json::json!(epoch);
                 sample["sample_frame"] = serde_json::json!(frame);
@@ -1468,6 +1730,19 @@ fn collect_native_geometry(
     window: &gtk::Window,
     nodes: &[(&'static str, gtk::glib::WeakRef<gtk::Widget>)],
 ) -> serde_json::Value {
+    fn retained_child(widget: &gtk::Widget, class: &str) -> Option<gtk::Widget> {
+        if widget.has_css_class(class) {
+            return Some(widget.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(node) = child {
+            if let Some(found) = retained_child(&node, class) {
+                return Some(found);
+            }
+            child = node.next_sibling();
+        }
+        None
+    }
     fn mapped_child(widget: &gtk::Widget, class: &str) -> Option<gtk::Widget> {
         if !widget.is_mapped() {
             return None;
@@ -1506,6 +1781,8 @@ fn collect_native_geometry(
         ("footer_send", "chat-send"),
         ("footer_stop", "chat-stop"),
         ("footer_tools", "reference-tools-button"),
+        ("inspector_drawer", "workspace-inspector-drawer"),
+        ("inspector_live_host", "shell-inspector-live-scroll"),
         ("inspector_overview", "reference-rich-inspector"),
         ("inspector_scroll", "reference-inspector-scroll"),
         (
@@ -1567,12 +1844,112 @@ fn collect_native_geometry(
             "font":badge.pango_context().font_description().map(|font| font.to_string()),
         })
     });
-    serde_json::json!({"window":[window.width(),window.height()],"dpr":window.scale_factor(),"regions":regions,"footer_buttons":buttons,"badge_style":badge_style,"window_opacity":window.opacity()})
+    fn minimum_width_chain(widget: &gtk::Widget, path: &str, output: &mut Vec<serde_json::Value>) {
+        let (minimum, natural, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
+        if minimum >= 280 {
+            let stack = widget.downcast_ref::<gtk::Stack>();
+            output.push(serde_json::json!({
+                "path":path,"type":widget.type_().name(),
+                "classes":widget.css_classes().iter().map(|class|class.as_str()).collect::<Vec<_>>(),
+                "minimum":minimum,"natural":natural,"width_request":widget.width_request(),
+                "visible":widget.is_visible(),"mapped":widget.is_mapped(),
+                "stack_hhomogeneous":stack.map(|stack|stack.is_hhomogeneous()),
+                "stack_selected":stack.and_then(|stack|stack.visible_child_name()).map(|name|name.to_string()),
+                "label_chars":widget.downcast_ref::<gtk::Label>().map(|label|label.text().chars().count()),
+            }));
+        }
+        let mut index = 0;
+        let mut child = widget.first_child();
+        while let Some(node) = child {
+            minimum_width_chain(&node, &format!("{path}/{index}"), output);
+            index += 1;
+            child = node.next_sibling();
+        }
+    }
+    let right_sidebar = retained_child(window.upcast_ref(), "workspace-inspector").map(|panel| {
+        let mut minimum_widths = Vec::new();
+        minimum_width_chain(&panel, "inspector", &mut minimum_widths);
+        let pages = retained_child(&panel, "shell-inspector-pages")
+            .and_then(|pages| pages.downcast::<gtk::Stack>().ok());
+        let live_host = retained_child(&panel, "shell-inspector-live-scroll")
+            .and_then(|host|host.downcast::<gtk::ScrolledWindow>().ok());
+        let live_pages = retained_child(&panel, "shell-inspector-live-pages")
+            .and_then(|pages| pages.downcast::<gtk::Stack>().ok());
+        let toggle = mapped_child(window.upcast_ref(), "shell-inspector-toggle")
+            .and_then(|toggle| toggle.downcast::<gtk::ToggleButton>().ok());
+        let focus = gtk::prelude::RootExt::focus(window);
+        serde_json::json!({
+            "visible":panel.is_visible(),
+            "mapped":panel.is_mapped(),
+            "minimum_width_chain":minimum_widths,
+            "live_scroll":live_host.as_ref().map(|host| {
+                let horizontal = host.hadjustment();
+                let vertical = host.vadjustment();
+                serde_json::json!({
+                    "object":format!("{:p}",host.as_ptr()),"mapped":host.is_mapped(),
+                    "horizontal":[horizontal.value(),horizontal.upper(),horizontal.page_size()],
+                    "vertical":[vertical.value(),vertical.upper(),vertical.page_size()],
+                    "horizontal_scrollbar_mapped":host.hscrollbar().is_mapped(),
+                    "vertical_scrollbar_mapped":host.vscrollbar().is_mapped(),
+                })
+            }),
+            "panel_object":format!("{:p}",panel.as_ptr()),
+            "pages_object":pages.as_ref().map(|pages|format!("{:p}",pages.as_ptr())),
+            "selected_page":pages.as_ref().and_then(|pages|pages.visible_child_name()).map(|name|name.to_string()),
+            "selected_live_page":live_pages.as_ref().and_then(|pages|pages.visible_child_name()).map(|name|name.to_string()),
+            "drawer":panel.is_mapped() && panel.ancestor(gtk::ScrolledWindow::static_type())
+                .is_some_and(|parent|parent.has_css_class("workspace-inspector-drawer")),
+            "toggle_active":toggle.as_ref().is_some_and(gtk::prelude::ToggleButtonExt::is_active),
+            "toggle_sensitive":toggle.as_ref().is_some_and(gtk::prelude::WidgetExt::is_sensitive),
+            "tooltip":toggle.as_ref().and_then(gtk::prelude::WidgetExt::tooltip_text).map(|text|text.to_string()),
+            "focus_object":focus.as_ref().map(|focus|format!("{:p}",focus.as_ptr())),
+            "focus_type":focus.as_ref().map(|focus|focus.type_().name()),
+            "focus_in_panel":focus.is_some_and(|focus|crate::widget_is_within(focus,&panel)),
+        })
+    });
+    let canvas_scroll = mapped_child(window.upcast_ref(), "block-scroll")
+        .and_then(|scroll| scroll.downcast::<gtk::ScrolledWindow>().ok())
+        .map(|scroll| {
+            let adjustment = scroll.vadjustment();
+            serde_json::json!({
+                "object":format!("{:p}",scroll.as_ptr()),
+                "value":adjustment.value(),"upper":adjustment.upper(),
+                "page_size":adjustment.page_size(),
+            })
+        });
+    serde_json::json!({"window":[window.width(),window.height()],"dpr":window.scale_factor(),"regions":regions,"footer_buttons":buttons,"badge_style":badge_style,"window_opacity":window.opacity(),"right_sidebar":right_sidebar,"canvas_scroll":canvas_scroll})
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inspector_toggle_uses_narrow_drawer_and_keeps_the_explicit_choice() {
+        for (width, height, choice, placement, available) in [
+            (1356.0, 704.0, None, InspectorPlacement::Docked, true),
+            (1356.0, 704.0, Some(false), InspectorPlacement::Hidden, true),
+            (1356.0, 704.0, Some(true), InspectorPlacement::Docked, true),
+            (800.0, 640.0, None, InspectorPlacement::Hidden, true),
+            (800.0, 640.0, Some(true), InspectorPlacement::Drawer, true),
+            (700.0, 480.0, Some(true), InspectorPlacement::Drawer, true),
+            (700.0, 480.0, Some(false), InspectorPlacement::Hidden, true),
+            (350.0, 480.0, Some(true), InspectorPlacement::Hidden, false),
+            (700.0, 90.0, Some(true), InspectorPlacement::Hidden, false),
+        ] {
+            assert_eq!(
+                inspector_placement(&tokens::Layout::for_size(width, height), choice),
+                (placement, available),
+                "{width}x{height}, requested={choice:?}"
+            );
+        }
+        let closed = tokens::Layout::for_size(1356.0, 704.0).without_inspector();
+        assert!(closed.inspector.is_none());
+        assert_eq!(closed.center.width, 1064.0);
+        assert_eq!(closed.header.width, 1064.0);
+        assert_eq!(closed.composer.width, 1008.0);
+        assert_eq!(closed.composer.y, 613.0);
+    }
 
     #[test]
     #[ignore = "requires a native GTK display"]
