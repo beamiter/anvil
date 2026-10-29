@@ -1839,13 +1839,62 @@ fn exercise_expanded_presentation(
     // allocate before requesting a position, otherwise its resize policy can
     // scale that request using the old axis length.
     let horizontal_axis = settled_fixture_layout(surface, &view.widget(), terminal, settle);
-    let horizontal_requested = split.width() / 2;
+    // Preserve the CI failure's real clipping boundary as a negative control.
+    // GtkPaned may allocate its child at the native minimum while translating
+    // it left of the requested divider. Positive intersection is not enough:
+    // neither a full body nor its fallback may paint outside that ancestor.
+    let clipped_position = 185;
+    split.set_position(clipped_position);
+    let clipped_layout = settled_fixture_layout(surface, &view.widget(), terminal, settle);
+    assert_eq!(split.position(), clipped_position);
+    assert!(surface
+        .candidates
+        .iter()
+        .all(|c| !surface.candidate_fits(c)));
+    assert_eq!(surface.current_presentation(), Presentation::Hidden);
+    assert!(surface.candidates.iter().all(|c| c.opacity() == 0.0));
+    assert!(surface.source.borrow().is_none());
+    assert_eq!(requisition(), expanded_req);
+    let clock = surface.current_host().unwrap().frame_clock().unwrap();
+    for _ in 0..3 {
+        clock.emit_by_name::<()>("after-paint", &[]);
+        assert_eq!(surface.current_presentation(), Presentation::Hidden);
+        assert!(surface.candidates.iter().all(|c| c.opacity() == 0.0));
+        assert!(surface.geometry_idle.borrow().is_none());
+        assert!(surface.source.borrow().is_none());
+        assert_eq!(requisition(), expanded_req);
+    }
+    println!("VTE_PANED_CLIPPED requested={clipped_position} settled={clipped_layout:?}");
+
+    // Half the pane is not necessarily a legal Expanded positive control.
+    // Reserve at least the real subtree's native min/natural width, then
+    // verify actual allocations and complete Pango ink/logical containment.
+    let root = surface.root.upgrade().expect("live fixture root");
+    let (root_min, root_natural, _, _) = root.measure(gtk::Orientation::Horizontal, -1);
+    let horizontal_requested = (split.width() / 2).max(root_min).max(root_natural);
+    assert!(horizontal_requested > clipped_position);
+    assert!(horizontal_requested <= split.max_position());
     split.set_position(horizontal_requested);
     let horizontal_layout = settled_fixture_layout(surface, &view.widget(), terminal, settle);
-    println!("VTE_PANED_AXIS horizontal requested={horizontal_requested} before={vertical_layout:?} axis={horizontal_axis:?} settled={horizontal_layout:?}");
+    println!("VTE_PANED_AXIS horizontal requested={horizontal_requested} root_min={root_min} root_natural={root_natural} before={vertical_layout:?} axis={horizontal_axis:?} settled={horizontal_layout:?}");
     let wide_position = split.position();
-    assert!(wide_position > 1);
+    assert_eq!(wide_position, horizontal_requested);
+    assert!(root.width() >= root_min.max(root_natural));
+    assert!(surface.candidates[..surface.full_count]
+        .iter()
+        .all(|c| surface.candidate_fits(c)));
     assert_eq!(surface.current_presentation(), Presentation::Expanded);
+    assert_eq!(
+        surface.candidates[..surface.full_count]
+            .iter()
+            .filter(|c| c.opacity() == 1.0)
+            .count(),
+        1
+    );
+    assert!(surface.candidates[surface.full_count..]
+        .iter()
+        .all(|c| c.opacity() == 0.0));
+    assert!(surface.source.borrow().is_none());
     assert_eq!(requisition(), expanded_req);
     split.set_position(1);
     settle(Duration::from_millis(100));
