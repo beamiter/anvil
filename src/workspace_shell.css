@@ -36,7 +36,7 @@
 .shell-spaces .shell-muted { font-size:8px; }
 .shell-navigation-status { color:#8798b4; font-size:8px; margin-top:10px; padding-top:10px; border-top:1px solid #2a384d; }
 .workspace-center { background:linear-gradient(135deg,#fafbff,#e4f0fe); color:#24334d; }
-.workspace-canvas-header { background:rgba(250,251,255,0.85); padding:0 20px; border-bottom:1px solid #d8e1ef; color:#27364f; }
+.workspace-canvas-header { background:rgba(250,251,255,0.85); padding:0 20px 0 28px; border-bottom:1px solid #d8e1ef; color:#27364f; }
 .workspace-canvas-header button { min-width:24px; min-height:24px; padding:0; color:#6c7b92; border-radius:6px; }
 .workspace-canvas-header image { -gtk-icon-size:12px; }
 .shell-canvas-title { font-size:12px; font-weight:600; }
@@ -50,9 +50,9 @@
 .workspace-center .chat-command-capsule { background:#d9e4fa; border-radius:12px; padding:10px 14px; }
 .workspace-center .chat-context .chat-meta-chip { font-size:9px; border-radius:5px; padding:2px 6px; background:#edf1fb; color:#6d7893; }
 .workspace-center .chat-composer { margin:4px 28px 11px; padding:8px 10px 1px; border-radius:14px; background:#fefefe; outline:1px solid #bdcce4; outline-offset:-1px; box-shadow:0 4px 12px rgba(57,80,135,0.08); }
-.workspace-center .chat-controls { background:transparent; min-height:28px; padding:0 2px; border-radius:0 0 12px 12px; }
+.workspace-center .chat-controls { background:transparent; min-height:28px; padding:0 0 0 2px; border-radius:0 0 12px 12px; }
 .workspace-center .chat-controls button { border-radius:7px; min-height:26px; min-width:24px; padding:0 5px; }
-.workspace-center .chat-send { background:#6678ef; color:white; }
+.workspace-center .chat-send { background:#5c7ef0; color:white; }
 .workspace-center .chat-input-hint { color:#7e8ba1; font-size:9px; }
 .workspace-center .chat-mode .chat-composer:focus-within { outline:2px solid #8799f4; outline-offset:-2px; }
 .workspace-center .chat-mode .chat-composer:focus-within .chat-controls { background:transparent; }
@@ -82,17 +82,18 @@ window.anvil-font-sync,window.anvil-font-sync decoration { padding:0; margin:0; 
 .shell-block-composer label.shell-block-input-hint { font-size:11px; }
 .workspace-center .chat-mode .reference-conversation-document { padding:0 39px 12px 28px; }
 .native-conversation label { font-family:"DejaVu Sans",sans-serif; font-size:12px; font-weight:400; color:#35445e; }
-.native-conversation label.conversation-author { font-size:11px; font-weight:700; color:#27364f; }
+.native-conversation label.conversation-author { font-size:12px; font-weight:700; color:#28344c; }
 .native-conversation label.conversation-timing { font-size:9px; color:#8b97ac; }
-.native-conversation label.conversation-heading { font-size:20px; font-weight:600; color:#24334c; }
+.native-conversation label.conversation-heading { font-size:20px; font-weight:700; color:#28344c; }
 .native-conversation label.conversation-paragraph { font-size:12px; color:#4e5c74; }
 .conversation-avatar { min-width:20px; min-height:20px; border-radius:50%; background:#7282e8; color:white; }
 .native-conversation label.conversation-avatar { font-size:10px; color:white; font-weight:600; }
 .conversation-user-bubble { background:#d9e4fa; border-radius:12px; padding:10px 12px; }
+.native-conversation .conversation-user-bubble label.conversation-paragraph { color:#35445e; }
 .native-conversation label.conversation-chip { font-size:9px; border:1px solid #d4deef; background:#edf2fc; border-radius:5px; padding:2px 6px; color:#728099; }
 .conversation-steps { border:1px solid #dce5f3; border-radius:7px; background:#eef3fc; }
 .conversation-step { padding:3px 7px; border-bottom:1px solid #e0e8f5; }
-.native-conversation label.conversation-step-title { font-size:10px; }
+.native-conversation label.conversation-step-title { font-size:10px; color:#4e647f; }
 .native-conversation label.conversation-step-time { font-size:9px; color:#8492aa; }
 .native-conversation label.conversation-step-icon { font-size:10px; color:#7b9f91; }
 .conversation-step-running { background:#e1eafb; }
@@ -123,9 +124,9 @@ window.anvil-font-sync,window.anvil-font-sync decoration { padding:0; margin:0; 
 .workspace-navigation .shell-recent-row label.shell-muted { font-size:8px; }
 .workspace-center .chat-composer { min-height:69px; padding-bottom:3px; }
 .shell-block-composer { min-height:58px; }
-.workspace-center .chat-controls button:not(.chat-send):not(.chat-stop),.shell-block-composer button { border:1px solid #dbe3f1; background:#fbfcff; }
+.workspace-center .chat-controls button:not(.chat-send):not(.chat-stop),.shell-block-composer button { border:1px solid #d4e0f0; background:#f7faff; }
 .workspace-center .chat-controls .chat-tool-capsule { padding:0 7px; }
-.conversation-role-header label.conversation-author { font-size:11px; font-weight:600; }
+.conversation-role-header label.conversation-author { font-size:12px; font-weight:700; }
 .conversation-role-header label.conversation-timing { font-size:9px; }
 .workspace-inspector { background:#0f1825; color:#bbc8db; border-left:1px solid #29374c; font-family:"DejaVu Sans",sans-serif; font-size:10px; }
 .shell-inspector-tabs { padding:0 13px; border-bottom:1px solid #29374c; }
@@ -177,7 +178,7 @@ window.anvil-font-sync,window.anvil-font-sync decoration { padding:0; margin:0; 
 .shell-block-composer { min-height:65px; padding:10px 11px 3px; }
 .shell-block-composer .chat-controls { padding:0; }
 .workspace-center .chat-controls .chat-add,.workspace-center .chat-controls .chat-send,.workspace-center .chat-controls .chat-stop { padding:0; min-width:28px; min-height:28px; margin:0; }
-.chat-terminal-capsule { border:1px solid #dbe3f1; background:#fbfcff; padding:0 5px; border-radius:7px; min-height:26px; color:#596a87; }
+.chat-terminal-capsule { border:1px solid #d4e0f0; background:#f7faff; padding:0 5px; border-radius:7px; min-height:26px; color:#596a87; }
 .chat-terminal-capsule label { font-size:10px; color:#596a87; }
 .shell-block-composer .chat-tool-capsule { padding:0 7px; }
 
@@ -267,8 +268,13 @@ popover.reference-tools-popover { background:transparent; border:0; box-shadow:n
 .block-command-canvas .block-reference-status.completed { color:#39dda0; background:#12352e; }
 .block-command-canvas .block-reference-status.failed { color:#ff646f; background:#3b222e; }
 .block-command-canvas .block-reference-status.running { color:#4199ff; background:#152f50; }
+.block-command-canvas .block-reference-status label { font-weight:700; color:inherit; }
+.block-command-canvas .block-reference-command-icon.failed { background:#3c2632; border-color:#765057; color:#ff9b9f; }
+.block-command-canvas .block-reference-header { background-image:linear-gradient(to bottom,#132037,#101b2e); }
 .block-command-canvas .block-reference-elapsed { color:#91a4bf; }
 .block-command-canvas .block-reference-more { min-height:22px; min-width:22px; padding:0; color:#91a4bf; border:1px solid #293c57; border-radius:5px; }
+.block-command-canvas .block-reference-more { background:#142238; box-shadow:none; }
+.block-command-canvas .block-reference-more:hover { background:#1d304d; }
 .block-command-canvas .block-reference-output { padding:6px 0; background:#0e1621; }
 .block-command-canvas .block-reference-output terminal { margin:0; padding:0; }
 .block-command-canvas .block-reference-gutter { color:#637d9c; background:transparent; }
@@ -283,7 +289,7 @@ popover.reference-tools-popover { background:transparent; border:0; box-shadow:n
 .workspace-center .term-view-root.block-command-canvas:not(.chat-mode) { margin:0; border:none; border-radius:0; outline:none; background:#091323; }
 .block-command-canvas .block-list { padding-top:5px; padding-bottom:5px; }
 .block-command-canvas .block-active.chat-empty-anchor { border:none; outline:none; box-shadow:none; min-height:0; margin:0; padding:0; }
-.workspace-center .block-command-canvas .chat-composer { min-height:52px; padding:8px 10px; margin:4px 12px 8px; border-radius:12px; background:#172338; color:#d5deec; outline:1px solid #293c57; outline-offset:-1px; box-shadow:none; }
+.workspace-center .block-command-canvas .chat-composer { min-height:64px; padding:8px 10px; margin:4px 28px 11px; border-radius:14px; background:#172338; color:#d5deec; outline:1px solid #293c57; outline-offset:-1px; box-shadow:none; }
 .workspace-center .block-command-canvas .chat-controls { background:transparent; }
 .workspace-center .block-command-canvas .chat-controls button,.block-workspace .shell-block-composer button { background:#16243a; border-color:#293c57; color:#91a4bf; }
 .workspace-center .block-command-canvas .chat-controls button:disabled,.block-workspace .shell-block-composer button:disabled { color:#637d9c; opacity:1; }
@@ -310,44 +316,48 @@ popover.reference-tools-popover { background:transparent; border:0; box-shadow:n
 .workspace-center.block-workspace .shell-block-composer .chat-controls button.chat-send:disabled { background:#203650; border-color:#345171; color:#9badc7; opacity:1; }
 .workspace-center.block-workspace .shell-block-composer .chat-controls button.chat-send:disabled * { color:#9badc7; }
 
-/* Anvil/Forge October workspace: common outer geometry in both modes.
+/* Four-native shared outer geometry in both modes.
    Sizes are logical pixels. Composer height is a minimum: native multiline
    input and explicit user font sizes retain their existing bounded growth. */
-.workspace-titlebar { min-height:54px; }
-.workspace-titlebar .shell-search { min-height:34px; }
-.workspace-titlebar .shell-modes button { min-height:32px; min-width:58px; }
-.workspace-rail button { margin-left:9px; margin-right:9px; }
-.workspace-navigation.tab-strip { min-width:163px; }
-.shell-inspector-tabs { padding-left:6px; padding-right:6px; }
-.shell-agent-card { margin-left:6px; margin-right:6px; }
-.workspace-center .chat-composer { min-height:52px; margin:4px 12px 8px; padding:8px 10px; }
-.workspace-center .shell-block-composer { min-height:52px; margin:4px 12px 8px; padding:8px 10px; border:0; outline:1px solid #293c57; outline-offset:-1px; }
-.workspace-center .shell-block-composer .chat-controls { padding:0 2px; }
+.workspace-titlebar { min-height:41px; }
+.workspace-titlebar .shell-search { min-height:26px; }
+.workspace-titlebar .shell-modes button { min-height:26px; min-width:0; }
+.workspace-rail button { margin-left:10px; margin-right:10px; }
+.workspace-navigation.tab-strip { min-width:209px; }
+.shell-inspector-tabs { padding-left:13px; padding-right:13px; }
+.shell-agent-card { margin-left:13px; margin-right:13px; }
+.workspace-center .chat-composer { min-height:64px; margin:4px 28px 11px; padding:8px 10px; }
+.workspace-center .shell-block-composer { min-height:64px; margin:4px 28px 11px; padding:8px 10px; border:0; outline:1px solid #293c57; outline-offset:-1px; }
+.workspace-center .shell-block-composer .chat-controls { padding:0 0 0 2px; }
 
 /* Match Forge's packed native controls without changing the accepted dock.
    CSS minimums below are content sizes; the native allocation is measured by
-   the opt-in shell diagnostics. The two action states share one 36px slot. */
-.workspace-center .reference-composer-controls button { min-width:23px; padding-left:6px; padding-right:6px; }
-.workspace-center .reference-composer-controls .chat-add { min-width:23px; min-height:26px; padding:0 6px; }
+   the opt-in shell diagnostics. The two action states share one 28px slot. */
+.workspace-center .chat-controls.reference-composer-controls button:not(.chat-add):not(.chat-send):not(.chat-stop) { min-width:0; padding-left:4px; padding-right:4px; }
+.workspace-center .reference-composer-controls .reference-composer-fixed { min-width:0; }
+.workspace-center .reference-composer-controls .chat-add { min-width:0; min-height:26px; padding:0; }
+.workspace-center .chat-controls.reference-composer-controls .reference-tools-button > button:not(.chat-add):not(.chat-send):not(.chat-stop) { min-width:0; padding-left:2px; padding-right:2px; }
 .workspace-center .reference-composer-controls .chat-send,
-.workspace-center .reference-composer-controls .chat-stop { min-width:36px; min-height:28px; padding:0; margin:0; border-width:0; }
+.workspace-center .reference-composer-controls .chat-stop { min-width:0; min-height:28px; padding:0; margin:0; border-width:0; }
 
 /* Shared developer Inspector sections. Context/live pages keep their existing
    presentation; only this typed overview adopts the verified native mapping. */
-.workspace-inspector .shell-agent-card.reference-rich-inspector { margin:0 6px 14px; padding:13px 16px 7px 14px; border:1px solid transparent; border-radius:0; background:transparent; }
+.workspace-inspector .shell-agent-card.reference-rich-inspector { margin:0 13px 14px; padding:13px 13px 7px; border:1px solid #314056; border-radius:12px; background:#1c293a; }
 .workspace-inspector .reference-rich-inspector label { font-family:"DejaVu Sans",sans-serif; font-size:9px; color:#9cafcb; }
 .workspace-inspector .reference-rich-inspector label.reference-card-title { font-size:11px; font-weight:600; color:#d6e2f6; }
 .workspace-inspector .reference-rich-inspector label.reference-section-label { font-size:8px; font-weight:700; letter-spacing:1px; color:#8196b4; margin:0; min-height:10px; }
-.workspace-inspector .reference-rich-inspector .reference-neutral-badge { padding:0 5px; color:#9dafc9; border-radius:5px; background:#2c3a50; }
-.workspace-inspector .reference-rich-inspector .reference-inspector-metadata { padding:11px 9px 12px; border:1px solid #293c57; border-radius:7px; background:#111d30; }
+.workspace-inspector .reference-rich-inspector .reference-neutral-badge { min-height:14px; padding:2px 5px; font-size:8px; color:#90a0b9; border-radius:5px; background:#162133; }
+.workspace-inspector .reference-rich-inspector .reference-agent-badge-active { color:#dde5f4; background:#283d6f; }
+.workspace-inspector .reference-rich-inspector .reference-agent-badge-neutral { color:#90a0b9; background:#162133; }
+.workspace-inspector .reference-rich-inspector .reference-inspector-metadata { padding:0; border:0; border-radius:0; background:transparent; }
 .workspace-inspector .reference-rich-inspector .reference-inspector-current,
-.workspace-inspector .reference-rich-inspector .reference-inspector-empty-card { padding:0 11px; border:1px solid #293c57; border-radius:7px; background:#17253a; }
+.workspace-inspector .reference-rich-inspector .reference-inspector-empty-card { padding:0 7px; border:1px solid #38587a; border-radius:7px; background:#23374e; }
 .workspace-inspector .reference-rich-inspector .reference-inspector-icon-tile { border-radius:6px; background:#20324b; color:#8fa9cd; }
 .workspace-inspector .reference-rich-inspector .reference-rich-step { padding:0 7px; border-bottom:0; }
 .workspace-inspector .reference-rich-inspector .reference-step-running { background:#263d5a; border:1px solid #38587a; border-radius:7px; }
 .workspace-inspector .reference-rich-inspector .reference-step-complete label.reference-step-symbol { color:#5fbea3; }
 .workspace-inspector .reference-rich-inspector .reference-step-running label.reference-step-symbol { color:#80a9fa; }
-.workspace-inspector .reference-rich-inspector .reference-inspector-terminal-section { border-top:1px solid #26354b; padding:18px 0 12px; }
+.workspace-inspector .reference-rich-inspector .reference-inspector-terminal-section { border:0; padding:0; }
 .workspace-inspector .reference-rich-inspector .reference-inspector-output { background:#080e19; border:1px solid #293c57; border-radius:7px; }
 .workspace-inspector .reference-rich-inspector .reference-terminal-body { padding:8px 9px; }
 .workspace-inspector .reference-rich-inspector .reference-inspector-output-empty .reference-terminal-body { padding:0; }

@@ -78,9 +78,34 @@ pub(crate) fn icon(kind: jterm_core::reference_icons::Icon) -> gtk::DrawingArea 
 
 fn footer_icon(kind: jterm_core::reference_icons::Icon) -> gtk::DrawingArea {
     let icon = icon(kind);
-    icon.set_content_width(jterm_core::reference_popup::FOOTER_ICON_SIZE as i32);
-    icon.set_content_height(jterm_core::reference_popup::FOOTER_ICON_SIZE as i32);
+    let size = jterm_core::reference_popup::FOOTER_ICON_SIZE;
+    FIXED_CHROME_ICONS.with_borrow_mut(|entries| {
+        entries.retain(|(icon, _)| icon.upgrade().is_some());
+        entries.push((icon.downgrade(), size));
+    });
+    let size = (f64::from(size) * chrome_geometry_scale()).round() as i32;
+    icon.set_content_width(size);
+    icon.set_content_height(size);
     icon
+}
+
+fn chrome_geometry_scale() -> f64 {
+    UI_ROLE_SCALE.with(|scale| scale.get().max(1.0))
+}
+
+fn fixed_chrome_width(widget: &impl IsA<gtk::Widget>, width: f32) {
+    let widget = widget.as_ref();
+    let height = widget
+        .has_css_class("reference-composer-fixed")
+        .then_some(tokens::CONTROL_HEIGHT);
+    FIXED_CHROME_WIDTHS.with_borrow_mut(|entries| {
+        entries.retain(|(widget, _, _)| widget.upgrade().is_some());
+        entries.push((widget.downgrade(), width, height));
+    });
+    widget.set_width_request((f64::from(width) * chrome_geometry_scale()).round() as i32);
+    if let Some(height) = height {
+        widget.set_height_request((f64::from(height) * chrome_geometry_scale()).round() as i32);
+    }
 }
 
 fn product_icon(product: &str, size: i32) -> gtk::Image {
@@ -234,27 +259,45 @@ pub(crate) fn composer_tools(
     workspace_action: std::rc::Rc<dyn Fn(Action)>,
 ) -> (gtk::Box, gtk::Label) {
     use jterm_core::reference_icons::Icon;
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     let secondary = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let add = unavailable("Attach");
     add.add_css_class("chat-add");
-    add.set_child(Some(&icon(Icon::Plus)));
+    add.add_css_class("reference-composer-fixed");
+    fixed_chrome_width(&add, tokens::COMPOSER_PLUS_WIDTH);
+    add.set_child(Some(&footer_icon(Icon::Plus)));
     secondary.append(&add);
-    for name in ["Attach", "Image", "Code"] {
+    let mut optional_tools = Vec::new();
+    for (name, width) in [
+        ("Attach", tokens::COMPOSER_ATTACH_WIDTH),
+        ("Image", tokens::COMPOSER_IMAGE_WIDTH),
+        ("Code", tokens::COMPOSER_CODE_WIDTH),
+    ] {
         let button = unavailable(name);
-        let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        content.append(&icon(Icon::from_key(&name.to_ascii_lowercase())));
-        content.append(&gtk::Label::new(Some(name)));
+        button.add_css_class("reference-composer-fixed");
+        fixed_chrome_width(&button, width);
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        content.append(&footer_icon(Icon::from_key(&name.to_ascii_lowercase())));
+        let title = gtk::Label::new(Some(name));
+        title.set_width_chars(0);
+        title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        content.append(&title);
         button.set_child(Some(&content));
+        optional_tools.push(button.downgrade());
         secondary.append(&button);
     }
     let terminal = gtk::Button::new();
     terminal.add_css_class("flat");
     terminal.add_css_class("chat-terminal-capsule");
+    terminal.add_css_class("reference-composer-fixed");
+    fixed_chrome_width(&terminal, tokens::COMPOSER_TERMINAL_WIDTH);
     terminal.set_focus_on_click(false);
-    let terminal_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    terminal_content.append(&icon(Icon::Terminal));
-    terminal_content.append(&label("Terminal", "shell-canvas-subtitle"));
+    let terminal_content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    terminal_content.append(&footer_icon(Icon::Terminal));
+    let terminal_label = label("Terminal", "shell-canvas-subtitle");
+    terminal_label.set_width_chars(0);
+    terminal_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    terminal_content.append(&terminal_label);
     terminal.set_child(Some(&terminal_content));
     terminal.set_tooltip_text(Some("Focus the active terminal"));
     terminal.update_property(&[gtk::accessible::Property::Label("Focus terminal")]);
@@ -273,6 +316,9 @@ pub(crate) fn composer_tools(
     let tools = gtk::MenuButton::new();
     tools.add_css_class("flat");
     tools.add_css_class("reference-tools-button");
+    tools.add_css_class("reference-composer-fixed");
+    fixed_chrome_width(&tools, tokens::COMPOSER_TOOLS_WIDTH);
+    tools.set_margin_start(tokens::METADATA_GAP as i32);
     let tools_content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     let tools_grid = footer_icon(Icon::Grid);
     tools_content.append(&tools_grid);
@@ -281,8 +327,6 @@ pub(crate) fn composer_tools(
     tools_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     tools_content.append(&tools_label);
     let chevron = footer_icon(Icon::ChevronDown);
-    chevron.set_content_width(12);
-    chevron.set_content_height(12);
     tools_content.append(&chevron);
     tools.set_child(Some(&tools_content));
     tools.set_direction(gtk::ArrowType::Up);
@@ -409,17 +453,24 @@ pub(crate) fn composer_tools(
     row.append(&hint);
     let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
+    spacer.set_width_request(tokens::METADATA_GAP as i32);
     row.append(&spacer);
     let model = unavailable(tokens::MODEL_UNAVAILABLE_LABEL);
     model.add_css_class("chat-tool-capsule");
     model.add_css_class("shell-composer-model");
-    model.set_width_request(tokens::COMPOSER_MODEL_MIN_WIDTH as i32);
+    model.add_css_class("reference-composer-fixed");
+    fixed_chrome_width(&model, tokens::COMPOSER_MODEL_MIN_WIDTH);
+    model.set_margin_end(tokens::METADATA_GAP as i32);
     model.set_tooltip_text(Some("No agent model is connected to this shell input"));
     row.append(&model);
     send.add_css_class("chat-send");
-    send.set_child(Some(&icon(Icon::Send)));
+    send.add_css_class("reference-composer-fixed");
+    fixed_chrome_width(send, tokens::COMPOSER_SEND_WIDTH);
+    send.set_child(Some(&footer_icon(Icon::Send)));
     row.append(send);
     if let Some(stop) = stop {
+        stop.add_css_class("reference-composer-fixed");
+        fixed_chrome_width(stop, tokens::COMPOSER_SEND_WIDTH);
         row.append(stop);
     }
     let overlay = gtk::Overlay::new();
@@ -429,18 +480,36 @@ pub(crate) fn composer_tools(
     observer.set_focusable(false);
     overlay.add_overlay(&observer);
     overlay.set_measure_overlay(&observer, false);
-    let weak_secondary = secondary_scroll.downgrade();
-    let weak_tools_grid = tools_grid.downgrade();
-    observer.connect_resize(move |_, width, _| {
-        if let Some(secondary) = weak_secondary.upgrade() {
-            // Model and Send keep their slots. The same live Terminal focus
-            // action remains available in Tools when secondary content yields.
-            secondary.set_visible(width >= 310);
+    let terminal = terminal.downgrade();
+    let model = model.downgrade();
+    observer.connect_resize(move |observer, width, _| {
+        // Compact thresholds refer to the whole composer border box, not the
+        // tool row after padding. UI zoom uses the same role ratio; DPR is
+        // already handled by GTK and is never applied a second time here.
+        let mut ancestor = observer.parent();
+        let mut available = f64::from(width);
+        while let Some(widget) = ancestor {
+            if widget.has_css_class("chat-composer") || widget.has_css_class("shell-block-composer")
+            {
+                if let Some(bounds) = widget.compute_bounds(&widget) {
+                    available = f64::from(bounds.width());
+                }
+                break;
+            }
+            ancestor = widget.parent();
         }
-        if let Some(grid) = weak_tools_grid.upgrade() {
-            // Decorative grid yields before the 120px model or Send slot.
-            // Tools text, chevron and every menu action remain reachable.
-            grid.set_visible(width >= 310);
+        let available = available / chrome_geometry_scale();
+        for widget in &optional_tools {
+            if let Some(widget) = widget.upgrade() {
+                widget.set_visible(available >= f64::from(tokens::COMPOSER_SECONDARY_MIN_WIDTH));
+            }
+        }
+        if let Some(model) = model.upgrade() {
+            model.set_visible(available >= f64::from(tokens::COMPOSER_MODEL_MIN_AVAILABLE));
+        }
+        if let Some(terminal) = terminal.upgrade() {
+            // Its existing focus callback is also reachable in Tools.
+            terminal.set_visible(available >= f64::from(tokens::COMPOSER_TERMINAL_MIN_AVAILABLE));
         }
     });
     let controls = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -525,7 +594,7 @@ impl Chrome {
         for (title, index) in [("Block", 0), ("Chat", 1)] {
             let mode_button = gtk::Button::with_label(title);
             mode_button.add_css_class("flat");
-            mode_button.set_width_request(tokens::MODE_CONTROL_MIN_WIDTH as i32);
+            fixed_chrome_width(&mode_button, tokens::MODE_CONTROL_MIN_WIDTH);
             mode_button.set_focus_on_click(false);
             mode_button.set_tooltip_text(Some(
                 "Choose the presentation for new panes; existing shells remain running",
@@ -976,6 +1045,7 @@ impl Chrome {
         if jterm_core::reference_conversation::fixture_enabled() {
             let fixture = jterm_core::reference_conversation::acceptance_fixture();
             self.title.set_label(&fixture.title);
+            self.title.set_tooltip_text(Some(&fixture.title));
             self.mode
                 .set_label(jterm_core::reference_conversation::FIXTURE_LABEL);
         } else {
@@ -999,6 +1069,13 @@ pub(crate) fn install_css() {
 }
 
 thread_local! {
+    static UI_ROLE_SCALE: std::cell::Cell<f64> = const { std::cell::Cell::new(1.0) };
+    static FIXED_CHROME_WIDTHS: std::cell::RefCell<Vec<(gtk::glib::WeakRef<gtk::Widget>, f32, Option<f32>)>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+    static FIXED_CHROME_ICONS: std::cell::RefCell<Vec<(gtk::glib::WeakRef<gtk::DrawingArea>, f32)>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
     static UI_FONT_PROVIDER: std::cell::RefCell<Option<gtk::CssProvider>> = const {
         std::cell::RefCell::new(None)
     };
@@ -1080,6 +1157,13 @@ pub(crate) fn apply_ui_font_scale(scale: f64) {
     let Some(display) = gtk::gdk::Display::default() else {
         return;
     };
+    UI_ROLE_SCALE.with(|value| {
+        value.set(if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        })
+    });
     UI_FONT_PROVIDER.with(|slot| {
         let mut slot = slot.borrow_mut();
         let provider = slot.get_or_insert_with(|| {
@@ -1093,6 +1177,34 @@ pub(crate) fn apply_ui_font_scale(scale: f64) {
         });
         provider.load_from_string(&role_font_css(scale, ".anvil-ui-font"));
     });
+    let widths = FIXED_CHROME_WIDTHS.with_borrow_mut(|entries| {
+        entries.retain(|(widget, _, _)| widget.upgrade().is_some());
+        entries
+            .iter()
+            .filter_map(|(widget, width, height)| {
+                widget.upgrade().map(|widget| (widget, *width, *height))
+            })
+            .collect::<Vec<_>>()
+    });
+    // Registry borrows end before setters can cause native size notifications.
+    for (widget, width, height) in widths {
+        widget.set_width_request((f64::from(width) * chrome_geometry_scale()).round() as i32);
+        if let Some(height) = height {
+            widget.set_height_request((f64::from(height) * chrome_geometry_scale()).round() as i32);
+        }
+    }
+    let icons = FIXED_CHROME_ICONS.with_borrow_mut(|entries| {
+        entries.retain(|(icon, _)| icon.upgrade().is_some());
+        entries
+            .iter()
+            .filter_map(|(icon, size)| icon.upgrade().map(|icon| (icon, *size)))
+            .collect::<Vec<_>>()
+    });
+    for (icon, size) in icons {
+        let size = (f64::from(size) * chrome_geometry_scale()).round() as i32;
+        icon.set_content_width(size);
+        icon.set_content_height(size);
+    }
 }
 
 /// Authored message roles belong to the document, not the surrounding chrome
@@ -1236,6 +1348,7 @@ pub(crate) fn observe_layout(
     let inspector = inspector.downgrade();
     let navigation_split = navigation_split.downgrade();
     let inspector_split = inspector_split.downgrade();
+    let diagnostic_epoch = std::rc::Rc::new(std::cell::Cell::new(0_u64));
     observer.connect_resize(move |observer, width, height| {
         let layout =
             tokens::Layout::for_size(width as f32, height as f32 + tokens::TITLEBAR_HEIGHT);
@@ -1270,100 +1383,191 @@ pub(crate) fn observe_layout(
             );
         }
         if let Some(nodes) = &geometry {
-            let nodes = nodes.clone();
-            let observer = observer.downgrade();
-            gtk::glib::idle_add_local_once(move || {
-                let Some(window) = observer
-                    .upgrade()
-                    .and_then(|observer| observer.root())
-                    .and_downcast::<gtk::Window>()
-                else {
-                    return;
-                };
-                fn mapped_child(widget: &gtk::Widget, class: &str) -> Option<gtk::Widget> {
-                    if !widget.is_mapped() {
-                        return None;
-                    }
-                    if widget.has_css_class(class) {
-                        return Some(widget.clone());
-                    }
-                    let mut child = widget.first_child();
-                    while let Some(node) = child {
-                        if let Some(found) = mapped_child(&node, class) {
-                            return Some(found);
-                        }
-                        child = node.next_sibling();
-                    }
-                    None
-                }
-                let bounds = |widget: &gtk::Widget| {
-                    widget.compute_bounds(&window).map(|rect| {
-                        serde_json::json!({"x":rect.x(),"y":rect.y(),"width":rect.width(),"height":rect.height()})
-                    })
-                };
-                let mut regions = serde_json::Map::new();
-                for (name, widget) in nodes {
-                    if let Some(widget) = widget.upgrade().filter(|widget| widget.is_mapped()) {
-                        if let Some(rect) = bounds(&widget) {
-                            regions.insert(name.to_string(), rect);
-                        }
-                    }
-                }
-                for (name, class) in [
-                    ("chat_composer", "chat-composer"),
-                    ("live_toolbar", "block-reference-toolbar"),
-                    ("footer", "reference-composer-controls"),
-                    ("footer_model", "shell-composer-model"),
-                    ("footer_send", "chat-send"),
-                    ("footer_stop", "chat-stop"),
-                    ("footer_tools", "reference-tools-button"),
-                    ("inspector_overview", "reference-rich-inspector"),
-                    ("inspector_scroll", "reference-inspector-scroll"),
-                    ("inspector_agent_heading", "reference-inspector-agent-heading"),
-                    ("inspector_metadata", "reference-inspector-metadata"),
-                    ("inspector_current", "reference-inspector-current"),
-                    ("inspector_queue", "reference-inspector-queue"),
-                    ("inspector_terminal_section", "reference-inspector-terminal-section"),
-                    ("inspector_output_heading", "reference-inspector-output-heading"),
-                    ("inspector_output", "reference-inspector-output"),
-                ] {
-                    if let Some(widget) = mapped_child(window.upcast_ref(), class) {
-                        if let Some(rect) = bounds(&widget) {
-                            regions.insert(name.to_string(), rect);
-                        }
-                    }
-                }
-                fn footer_buttons(
-                    widget: &gtk::Widget,
-                    window: &gtk::Window,
-                    output: &mut Vec<serde_json::Value>,
-                ) {
-                    if !widget.is_mapped() {
-                        return;
-                    }
-                    if widget.is::<gtk::Button>() || widget.is::<gtk::MenuButton>() {
-                        if let Some(rect) = widget.compute_bounds(window) {
-                            output.push(serde_json::json!({
-                                "classes":widget.css_classes().iter().map(ToString::to_string).collect::<Vec<_>>(),
-                                "bounds":[rect.x(),rect.y(),rect.width(),rect.height()],
-                                "sensitive":widget.is_sensitive(),
-                            }));
-                        }
-                    }
-                    let mut child = widget.first_child();
-                    while let Some(node) = child {
-                        footer_buttons(&node, window, output);
-                        child = node.next_sibling();
-                    }
-                }
-                let mut buttons = Vec::new();
-                if let Some(footer) = mapped_child(window.upcast_ref(), "reference-composer-controls") {
-                    footer_buttons(&footer, &window, &mut buttons);
-                }
-                log::info!(target:"anvil::workspace_shell","native_shell_geometry {}",serde_json::json!({"window":[window.width(),window.height()],"dpr":window.scale_factor(),"regions":regions,"footer_buttons":buttons}));
-            });
+            let epoch = diagnostic_epoch.get().wrapping_add(1);
+            diagnostic_epoch.set(epoch);
+            schedule_geometry_sample(observer, nodes.clone(), epoch, diagnostic_epoch.clone());
         }
     });
+}
+
+// This opt-in observer never drives layout or input. Idle after a resize can
+// precede the descendants' next allocation; sample actual after-paint bounds
+// instead, bounded to eight frames and requiring two equal valid samples.
+fn schedule_geometry_sample(
+    observer: &gtk::DrawingArea,
+    nodes: Vec<(&'static str, gtk::glib::WeakRef<gtk::Widget>)>,
+    epoch: u64,
+    current_epoch: std::rc::Rc<std::cell::Cell<u64>>,
+) {
+    let observer = observer.downgrade();
+    gtk::glib::idle_add_local_once(move || {
+        let Some(window) = observer
+            .upgrade()
+            .and_then(|widget| widget.root())
+            .and_downcast::<gtk::Window>()
+        else {
+            return;
+        };
+        let Some(clock) = window.frame_clock() else {
+            return;
+        };
+        let window = window.downgrade();
+        let frames = std::cell::Cell::new(0_u8);
+        let stable = std::cell::Cell::new(0_u8);
+        let last = std::cell::RefCell::new(None::<serde_json::Value>);
+        let handler = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let stored_handler = handler.clone();
+        let id = clock.connect_after_paint(move |clock| {
+            let stale = current_epoch.get() != epoch;
+            let sample = if !stale { window.upgrade().map(|window| collect_native_geometry(&window, &nodes)) } else { None };
+            let frame = frames.get().saturating_add(1);
+            frames.set(frame);
+            let mut done = stale || sample.is_none();
+            if let Some(mut sample) = sample {
+                let window_size = sample["window"].as_array().expect("geometry window");
+                let width = window_size[0].as_f64().unwrap_or(0.0);
+                let height = window_size[1].as_f64().unwrap_or(0.0);
+                let regions = sample["regions"].as_object().expect("geometry regions");
+                let within = |rect: &serde_json::Value| {
+                    let x=rect["x"].as_f64().unwrap_or(-1.0); let y=rect["y"].as_f64().unwrap_or(-1.0);
+                    let w=rect["width"].as_f64().unwrap_or(0.0); let h=rect["height"].as_f64().unwrap_or(0.0);
+                    x>=0.0 && y>=0.0 && w>0.0 && h>0.0 && x+w<=width+0.5 && y+h<=height+0.5
+                };
+                let composer = regions.get("chat_composer").or_else(|| regions.get("block_composer"));
+                let valid = composer.is_some_and(within) && regions.get("footer").is_some_and(within);
+                let equal = last.borrow().as_ref() == Some(&sample);
+                stable.set(if valid { if equal { stable.get().saturating_add(1) } else { 1 } } else { 0 });
+                *last.borrow_mut() = Some(sample.clone());
+                sample["sample_phase"] = serde_json::json!("after-paint");
+                sample["sample_epoch"] = serde_json::json!(epoch);
+                sample["sample_frame"] = serde_json::json!(frame);
+                sample["stable_frames"] = serde_json::json!(stable.get());
+                sample["bounds_within_window"] = serde_json::json!(valid);
+                if stable.get() >= 2 {
+                    log::info!(target:"anvil::workspace_shell","native_shell_geometry {sample}");
+                    done = true;
+                } else {
+                    log::info!(target:"anvil::workspace_shell","native_shell_geometry_observation {sample}");
+                }
+            }
+            if frame >= 8 { done=true; }
+            if done {
+                let id = stored_handler.borrow_mut().take();
+                if let Some(id) = id { clock.disconnect(id); }
+                clock.end_updating();
+            }
+        });
+        *handler.borrow_mut() = Some(id);
+        // Diagnostic-only clock request. This is not a claim about ordinary
+        // startup frame continuity, native consumption, or prompt readiness.
+        clock.begin_updating();
+    });
+}
+
+fn collect_native_geometry(
+    window: &gtk::Window,
+    nodes: &[(&'static str, gtk::glib::WeakRef<gtk::Widget>)],
+) -> serde_json::Value {
+    fn mapped_child(widget: &gtk::Widget, class: &str) -> Option<gtk::Widget> {
+        if !widget.is_mapped() {
+            return None;
+        }
+        if widget.has_css_class(class) {
+            return Some(widget.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(node) = child {
+            if let Some(found) = mapped_child(&node, class) {
+                return Some(found);
+            }
+            child = node.next_sibling();
+        }
+        None
+    }
+    let bounds = |widget: &gtk::Widget| {
+        widget.compute_bounds(window).map(|rect| {
+            serde_json::json!({"x":rect.x(),"y":rect.y(),"width":rect.width(),"height":rect.height()})
+        })
+    };
+    let mut regions = serde_json::Map::new();
+    for (name, widget) in nodes {
+        if let Some(widget) = widget.upgrade().filter(|widget| widget.is_mapped()) {
+            if let Some(rect) = bounds(&widget) {
+                regions.insert(name.to_string(), rect);
+            }
+        }
+    }
+    for (name, class) in [
+        ("chat_composer", "chat-composer"),
+        ("header_title", "shell-canvas-title"),
+        ("live_toolbar", "block-reference-toolbar"),
+        ("footer", "reference-composer-controls"),
+        ("footer_model", "shell-composer-model"),
+        ("footer_send", "chat-send"),
+        ("footer_stop", "chat-stop"),
+        ("footer_tools", "reference-tools-button"),
+        ("inspector_overview", "reference-rich-inspector"),
+        ("inspector_scroll", "reference-inspector-scroll"),
+        (
+            "inspector_agent_heading",
+            "reference-inspector-agent-heading",
+        ),
+        ("inspector_metadata", "reference-inspector-metadata"),
+        ("inspector_current", "reference-inspector-current"),
+        ("inspector_queue", "reference-inspector-queue"),
+        (
+            "inspector_terminal_section",
+            "reference-inspector-terminal-section",
+        ),
+        (
+            "inspector_output_heading",
+            "reference-inspector-output-heading",
+        ),
+        ("inspector_output", "reference-inspector-output"),
+    ] {
+        if let Some(widget) = mapped_child(window.upcast_ref(), class) {
+            if let Some(rect) = bounds(&widget) {
+                regions.insert(name.to_string(), rect);
+            }
+        }
+    }
+    fn footer_buttons(
+        widget: &gtk::Widget,
+        window: &gtk::Window,
+        output: &mut Vec<serde_json::Value>,
+    ) {
+        if !widget.is_mapped() {
+            return;
+        }
+        if widget.is::<gtk::Button>() || widget.is::<gtk::MenuButton>() {
+            if let Some(rect) = widget.compute_bounds(window) {
+                output.push(serde_json::json!({
+                    "classes":widget.css_classes().iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    "bounds":[rect.x(),rect.y(),rect.width(),rect.height()],
+                    "sensitive":widget.is_sensitive(),
+                }));
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(node) = child {
+            footer_buttons(&node, window, output);
+            child = node.next_sibling();
+        }
+    }
+    let mut buttons = Vec::new();
+    if let Some(footer) = mapped_child(window.upcast_ref(), "reference-composer-controls") {
+        footer_buttons(&footer, window, &mut buttons);
+    }
+    let badge_style = mapped_child(window.upcast_ref(), "reference-neutral-badge").map(|badge| {
+        #[allow(deprecated)]
+        let color = badge.style_context().color();
+        serde_json::json!({
+            "bounds":bounds(&badge),
+            "foreground_rgba":[color.red(),color.green(),color.blue(),color.alpha()],
+            "font":badge.pango_context().font_description().map(|font| font.to_string()),
+        })
+    });
+    serde_json::json!({"window":[window.width(),window.height()],"dpr":window.scale_factor(),"regions":regions,"footer_buttons":buttons,"badge_style":badge_style,"window_opacity":window.opacity()})
 }
 
 #[cfg(test)]

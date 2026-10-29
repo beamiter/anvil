@@ -22,6 +22,32 @@ pub(super) fn trace_label_font(label: &gtk::Label, role: &'static str) {
     });
 }
 
+fn status_badge(text: &str, class: &str, role: &'static str) -> gtk::Box {
+    use jterm_core::reference_icons::Icon;
+    let badge = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    badge.set_valign(gtk::Align::Center);
+    badge.add_css_class("block-reference-status");
+    badge.add_css_class(class);
+    let symbol = match class {
+        "completed" => Some(Icon::Check),
+        "failed" => Some(Icon::Close),
+        "running" => Some(Icon::History),
+        _ => None,
+    };
+    if let Some(symbol) = symbol {
+        let icon = crate::workspace_shell::icon(symbol);
+        icon.set_content_width(12);
+        icon.set_content_height(12);
+        badge.append(&icon);
+    }
+    let label = gtk::Label::new(Some(text));
+    label.set_wrap(false);
+    trace_label_font(&label, role);
+    badge.append(&label);
+    badge.set_tooltip_text(Some(text));
+    badge
+}
+
 #[derive(Clone)]
 pub(super) struct LiveChrome {
     pub root: gtk::Box,
@@ -49,11 +75,7 @@ impl LiveChrome {
         command.add_css_class("block-reference-live-command");
         trace_label_font(&command, "running-command");
         root.append(&command);
-        let status = gtk::Label::new(Some("Running"));
-        status.set_valign(gtk::Align::Center);
-        status.add_css_class("block-reference-status");
-        status.add_css_class("running");
-        trace_label_font(&status, "running-status");
+        let status = status_badge("Running", "running", "running-status");
         root.append(&status);
         let elapsed = gtk::Label::new(None);
         elapsed.add_css_class("block-reference-elapsed");
@@ -289,17 +311,14 @@ pub(super) fn decorate_finished(chrome: FinishedChrome<'_>) {
     let icon = crate::workspace_shell::icon(jterm_core::reference_icons::Icon::Terminal);
     icon.set_size_request(24, 24);
     icon.add_css_class("block-reference-command-icon");
+    let (text, class) = status_text(status);
+    icon.add_css_class(class);
     header.append(&icon);
     header.append(command);
     if let Some(cwd) = cwd {
         command.set_tooltip_text(Some(cwd));
     }
-    let (text, class) = status_text(status);
-    let badge = gtk::Label::new(Some(text));
-    badge.set_valign(gtk::Align::Center);
-    badge.add_css_class("block-reference-status");
-    badge.add_css_class(class);
-    trace_label_font(&badge, "completed-status");
+    let badge = status_badge(text, class, "completed-status");
     header.append(&badge);
     if let Some(duration) = duration_ms {
         let elapsed = gtk::Label::new(Some(&super::format_block_duration(duration)));
@@ -309,6 +328,9 @@ pub(super) fn decorate_finished(chrome: FinishedChrome<'_>) {
     }
     more.add_css_class("block-reference-more");
     more.set_valign(gtk::Align::Center);
+    more.set_child(Some(&crate::workspace_shell::icon(
+        jterm_core::reference_icons::Icon::More,
+    )));
     header.append(more);
 }
 

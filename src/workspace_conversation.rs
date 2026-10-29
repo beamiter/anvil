@@ -374,11 +374,10 @@ pub(crate) fn inspector(model: &Inspector, is_fixture: bool) -> gtk::Box {
     root.set_vexpand(true);
     let heading = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     heading.add_css_class("reference-inspector-agent-heading");
-    heading.set_height_request(22);
-    heading.set_margin_top(9);
-    heading.append(&inspector_icon(
+    heading.set_height_request(14);
+    heading.append(&inspector_vector(
         jterm_core::reference_icons::Icon::Agent,
-        22,
+        14,
     ));
     let title = inspector_text(&model.title, "reference-card-title");
     title.set_wrap(false);
@@ -389,31 +388,48 @@ pub(crate) fn inspector(model: &Inspector, is_fixture: bool) -> gtk::Box {
     let badge = inspector_text(&model.badge, "reference-neutral-badge");
     badge.set_wrap(false);
     badge.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    badge.add_css_class(if model.total > 0 || model.current_step.is_some() {
+        "reference-agent-badge-active"
+    } else {
+        "reference-agent-badge-neutral"
+    });
     heading.append(&badge);
     root.append(&heading);
     root.append(&inspector_text(&model.subtitle, "reference-muted"));
-    // An idle workspace has no task progress to report. The same component
-    // renders observed task progress and the explicitly labeled fixture.
-    if model.total > 0 {
-        let progress_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        progress_row.set_height_request(12);
-        progress_row.set_margin_top(18);
-        let progress = gtk::ProgressBar::new();
-        progress.add_css_class("reference-inspector-progress");
-        progress.set_hexpand(true);
-        progress.set_valign(gtk::Align::Center);
-        progress.set_fraction(model.completed as f64 / model.total as f64);
-        progress_row.append(&progress);
-        progress_row.append(&inspector_text(
-            &format!("{} / {}", model.completed, model.total),
-            "reference-muted",
-        ));
-        root.append(&progress_row);
-    }
+    // The idle slot has an empty track and an honest neutral label. Its height
+    // matches observed-task progress without fabricating a count or activity.
+    let progress_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    progress_row.set_height_request(12);
+    // Compensate the shared badge's height against the original 14px heading,
+    // preserving the metadata text baseline and 19px row pitch.
+    progress_row.set_margin_top(
+        (jterm_core::developer_workspace::INSPECTOR_PROGRESS_EXTRA_TOP + 9.0
+            - (jterm_core::developer_workspace::INSPECTOR_BADGE_HEIGHT - 14.0))
+            .max(0.0) as i32,
+    );
+    let progress = gtk::ProgressBar::new();
+    progress.add_css_class("reference-inspector-progress");
+    progress.set_hexpand(true);
+    progress.set_valign(gtk::Align::Center);
+    progress.set_fraction(if model.total == 0 {
+        0.0
+    } else {
+        model.completed as f64 / model.total as f64
+    });
+    progress_row.append(&progress);
+    progress_row.append(&inspector_text(
+        &if model.total == 0 {
+            jterm_core::developer_workspace::NO_PROGRESS_LABEL.into()
+        } else {
+            format!("{} / {}", model.completed, model.total)
+        },
+        "reference-muted",
+    ));
+    root.append(&progress_row);
     let metadata = gtk::Grid::new();
     metadata.set_column_spacing(14);
-    metadata.set_row_spacing(3);
-    metadata.set_margin_top(23);
+    metadata.set_row_spacing(0);
+    metadata.set_margin_top(10);
     metadata.add_css_class("reference-inspector-metadata");
     for (row, (name, value)) in model.metadata.iter().enumerate() {
         let key = inspector_text(name, "reference-muted");
@@ -434,8 +450,8 @@ pub(crate) fn inspector(model: &Inspector, is_fixture: bool) -> gtk::Box {
     root.append(&metadata);
     let current_heading = inspector_text("CURRENT STEP", "reference-section-label");
     current_heading.add_css_class("reference-inspector-current-heading");
-    current_heading.set_margin_top(21);
-    current_heading.set_margin_bottom(12);
+    current_heading.set_margin_top(6);
+    current_heading.set_margin_bottom(7);
     root.append(&current_heading);
     let current = if let Some(step) = &model.current_step {
         inspector_step_row(step, true)
@@ -447,13 +463,11 @@ pub(crate) fn inspector(model: &Inspector, is_fixture: bool) -> gtk::Box {
         card.add_css_class("reference-current-step");
         card
     };
-    current.set_height_request(59);
+    current.set_height_request(jterm_core::developer_workspace::INSPECTOR_CURRENT_HEIGHT as i32);
     current.add_css_class("reference-inspector-current");
     root.append(&current);
     let queue_heading = inspector_text("TASK QUEUE", "reference-section-label");
     queue_heading.add_css_class("reference-inspector-queue-heading");
-    queue_heading.set_margin_top(22);
-    queue_heading.set_margin_bottom(12);
     root.append(&queue_heading);
     let queue = gtk::Box::new(
         gtk::Orientation::Vertical,
@@ -461,9 +475,9 @@ pub(crate) fn inspector(model: &Inspector, is_fixture: bool) -> gtk::Box {
     );
     queue.add_css_class("reference-inspector-queue");
     if model.queue.is_empty() {
-        let empty =
-            inspector_empty_card("No queued tasks", jterm_core::reference_icons::Icon::Files);
-        empty.set_height_request(58);
+        let empty = inspector_text("No queued tasks", "reference-muted");
+        empty
+            .set_height_request(jterm_core::developer_workspace::INSPECTOR_QUEUE_ROW_HEIGHT as i32);
         queue.append(&empty);
     }
     for step in &model.queue {
@@ -476,7 +490,7 @@ pub(crate) fn inspector(model: &Inspector, is_fixture: bool) -> gtk::Box {
     let fill = gtk::Box::new(gtk::Orientation::Vertical, 0);
     fill.set_vexpand(true);
     root.append(&fill);
-    let terminal_section = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let terminal_section = gtk::Box::new(gtk::Orientation::Vertical, 2);
     terminal_section.add_css_class("reference-inspector-terminal-section");
     // Only the inter-section fill grows. The centered empty output's child
     // must not make this whole section share the spare vertical space.
@@ -516,7 +530,7 @@ pub(crate) fn inspector(model: &Inspector, is_fixture: bool) -> gtk::Box {
     } else {
         output.append(&body);
     }
-    output.set_height_request(199);
+    output.set_height_request(jterm_core::developer_workspace::INSPECTOR_OUTPUT_HEIGHT as i32);
     terminal_section.append(&output);
     root.append(&terminal_section);
     root

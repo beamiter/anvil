@@ -58,7 +58,7 @@ fn current_step_centers_bounded_text_without_growing_the_inspector() {
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
     for long in [false, true] {
-        for height in [844, 607] {
+        for height in [850, 613] {
             let mut model = jterm_core::reference_conversation::acceptance_fixture().inspector;
             let step = model.current_step.as_mut().expect("fixture current step");
             if long {
@@ -71,7 +71,7 @@ fn current_step_centers_bounded_text_without_growing_the_inspector() {
             let detail_text = step.detail.clone();
             let window = gtk::Window::builder()
                 .title("Anvil Current Step visual acceptance fixture")
-                .default_width(298)
+                .default_width(306)
                 .default_height(height)
                 .decorated(false)
                 .build();
@@ -120,11 +120,11 @@ fn current_step_centers_bounded_text_without_growing_the_inspector() {
                     "surface":[surface.width(),surface.height()],"physical":physical
                 })
             );
-            assert_eq!((window.width(), window.height()), (297, height));
-            assert_eq!((surface.width(), surface.height()), (298, height));
-            assert_eq!(window_bounds.width(), 298.0);
-            assert_eq!(scroll_bounds.width(), 297.0);
-            assert!(physical.lines().any(|line| line == "WIDTH=298"));
+            assert_eq!((window.width(), window.height()), (305, height));
+            assert_eq!((surface.width(), surface.height()), (306, height));
+            assert_eq!(window_bounds.width(), 306.0);
+            assert_eq!(scroll_bounds.width(), 305.0);
+            assert!(physical.lines().any(|line| line == "WIDTH=306"));
             assert!(physical
                 .lines()
                 .any(|line| line == format!("HEIGHT={height}")));
@@ -156,10 +156,12 @@ fn current_step_centers_bounded_text_without_growing_the_inspector() {
                 "ellipsized":[title.layout().is_ellipsized(),detail.layout().is_ellipsized()]
             });
             println!("current_step_native {result}");
-            assert_eq!((c.width(), c.height()), (253.0, 59.0));
+            assert_eq!((c.width(), c.height()), (251.0, 45.0));
             assert!((center(&s) - center(&b)).abs() <= 1.0);
             assert!((center(&b) - center(&c)).abs() <= 1.0);
-            assert!(b.y() - c.y() >= 10.0 && c.y() + c.height() - b.y() - b.height() >= 10.0);
+            // New shared 45px card replaces the 59px variant. Two bounded
+            // lines retain at least 8px above/below, including the CJK case.
+            assert!(b.y() - c.y() >= 8.0 && c.y() + c.height() - b.y() - b.height() >= 8.0);
             assert!(s.x() + s.width() + 8.0 <= b.x() + 0.5);
             assert!(t.y() + t.height() + 3.0 <= d.y() + 0.5);
             assert!(d.y() + d.height() <= c.y() + c.height() - 1.0);
@@ -209,7 +211,7 @@ fn current_step_centers_bounded_text_without_growing_the_inspector() {
                 &find(view.upcast_ref(), "reference-inspector-output"),
                 &window,
             );
-            assert_eq!(output.height(), 199.0);
+            assert_eq!(output.height(), 140.0);
             assert!(output.y() >= 0.0 && output.y() + output.height() <= height as f32);
             adj.set_value(0.0);
             settle();

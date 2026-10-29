@@ -879,7 +879,7 @@ impl Config {
         let theme = &themes[0];
         Self {
             vim9: jterm_core::vim9::Vim9UiConfig::default(),
-            window_opacity: 0.95,
+            window_opacity: 1.0,
             terminal_scrollback_lines: 5_000,
             font_desc: DEFAULT_FONT_DESC.to_string(),
             icon_font: None,
@@ -2045,7 +2045,7 @@ fn resolve_file_config(fc: FileConfig) -> (Config, Vec<Theme>, KeybindingMap) {
         .unwrap_or(&themes[0]);
 
     // Priority: env var > config file > theme default
-    let window_opacity = finite_clamp_f64(env_f64("ANVIL_OPACITY").or(fc.opacity), 0.95, 0.01, 1.0);
+    let window_opacity = finite_clamp_f64(env_f64("ANVIL_OPACITY").or(fc.opacity), 1.0, 0.01, 1.0);
     let terminal_scrollback_lines = env_u32("ANVIL_SCROLLBACK")
         .or(fc.scrollback)
         .unwrap_or(5000)
@@ -2477,6 +2477,8 @@ mod tests {
 
     #[test]
     fn integer_presentation_numbers_match_the_validator_contract() {
+        assert_eq!(Config::safe_defaults().window_opacity, 1.0);
+        assert_eq!(file_config_from_table(&toml::Table::new()).opacity, None);
         for (text, opacity, scale) in [
             ("opacity = 1\nfont_scale = 2\n", 1.0, 2.0),
             ("opacity = 0.5\nfont_scale = 1.5\n", 0.5, 1.5),
