@@ -558,6 +558,10 @@ mod tests {
         assert_eq!(gestures.len(), 1);
         // Deterministic callback interleaving, not a physical-pointer claim.
         gestures[0].emit_by_name::<()>("pressed", &[&1_i32, &0.0_f64, &0.0_f64]);
+        // Replay Capture -> GtkButton's default press focus -> popup. Without
+        // default focus, older GTK can repair A's hidden child after B opens.
+        assert!(button.grab_focus());
+        assert!(owns_focus(button));
     }
 
     fn persistent_menu_sequences(view: &TermView, column: &gtk::Box) {
@@ -586,7 +590,13 @@ mod tests {
             if pump_while_b_open {
                 pump(); // A's idle must neither take nor drop B's shared owner.
                 assert!(popover.is_visible());
-                assert!(owns_focus(&action));
+                assert!(
+                    owns_focus(&action),
+                    "visible popover lost action focus: root={:?}, child={:?}, visible={}",
+                    popover.root().and_then(|root| root.focus()),
+                    popover.focus_child(),
+                    popover.is_visible()
+                );
             }
             popover.popdown();
             pump();
