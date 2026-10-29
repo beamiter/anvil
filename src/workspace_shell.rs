@@ -456,6 +456,7 @@ pub(crate) fn composer_tools(
     }
     popover.set_child(Some(&entries));
     tools.set_popover(Some(&popover));
+    crate::block_view::bind_persistent_menu_focus(&tools, &popover);
     let weak_tools = tools.downgrade();
     popover.connect_visible_notify(move |popover| {
         if !log::log_enabled!(target: "anvil::workspace_shell", log::Level::Debug) { return; }

@@ -47,7 +47,7 @@ mod focus_restore;
 mod fold_preview;
 mod session_export_io;
 mod shortcut_hints;
-pub(crate) use focus_restore::restore_live_focus_deferred;
+pub(crate) use focus_restore::{bind_persistent_menu_focus, restore_live_focus_deferred};
 mod history;
 mod ime_gate;
 mod onboarding;

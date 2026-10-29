@@ -3,7 +3,7 @@
 use gtk::prelude::*;
 use gtk::{glib, Widget, Window};
 use relm4::gtk;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 pub(super) struct FocusRestore {
@@ -145,6 +145,110 @@ pub(crate) fn restore_live_focus_deferred(target: &impl IsA<Widget>) {
     if let Some(restore) = FocusRestore::live(target) {
         restore.defer();
     }
+}
+
+/// A persistent menu returns pointer-opened focus only while it still owns it.
+/// GTK's popdown cascade focuses the launcher after `closed`, so the existing
+/// superseded-owner guard must survive through one idle, without unparenting.
+pub(crate) fn bind_persistent_menu_focus(button: &gtk::MenuButton, popover: &gtk::Popover) {
+    let saved = Rc::new(RefCell::new(None::<FocusRestore>));
+    let cycle = Rc::new(Cell::new(0_u64));
+    popover.connect_show({
+        let cycle = cycle.clone();
+        move |_| cycle.set(cycle.get().wrapping_add(1))
+    });
+    let press = gtk::GestureClick::new();
+    press.set_button(gtk::gdk::BUTTON_PRIMARY);
+    press.set_propagation_phase(gtk::PropagationPhase::Capture);
+    press.connect_pressed({
+        let saved = saved.clone();
+        let cycle = cycle.clone();
+        let button = button.downgrade();
+        let popover = popover.downgrade();
+        move |_, _, _, _| {
+            let (Some(button), Some(popover)) = (button.upgrade(), popover.upgrade()) else {
+                return;
+            };
+            if popover.is_visible() {
+                return;
+            }
+            // A new press also retires old close work while it is held,
+            // independently of whether this GTK version shows on release.
+            cycle.set(cycle.get().wrapping_add(1));
+            let owner = button
+                .root()
+                .and_downcast::<Window>()
+                .and_then(|window| gtk::prelude::GtkWindowExt::focus(&window));
+            if let Some(owner) = owner.filter(|owner| {
+                owner != button.upcast_ref::<Widget>() && !owner.is_ancestor(&button)
+            }) {
+                *saved.borrow_mut() = FocusRestore::capture(&owner, Some(button.upcast_ref()));
+            }
+        }
+    });
+    button.add_controller(press);
+    popover.connect_closed({
+        let button = button.downgrade();
+        move |popover| {
+            let closed_cycle = cycle.get();
+            let cycle = cycle.clone();
+            let saved = saved.clone();
+            let button = button.clone();
+            let popover = popover.downgrade();
+            glib::idle_add_local_once(move || {
+                let (Some(button), Some(popover)) = (button.upgrade(), popover.upgrade()) else {
+                    return;
+                };
+                if cycle.get() != closed_cycle || popover.is_visible() {
+                    return;
+                }
+                // Keep the guarded owner shared across a rapid reopen. Only
+                // the newest closed cycle may consume it, before focus writes.
+                let Some(restore) = saved.borrow_mut().take() else {
+                    return;
+                };
+                let (Some(target), Some(window)) =
+                    (restore.target.upgrade(), restore.window.upgrade())
+                else {
+                    return;
+                };
+                let focus = gtk::prelude::GtkWindowExt::focus(&window);
+                if !restore.superseded.get()
+                    && !popover.is_visible()
+                    && popover.parent().as_ref() == Some(button.upcast_ref())
+                    && button.root().as_ref() == Some(window.upcast_ref())
+                    && target.root().as_ref() == Some(window.upcast_ref())
+                    && target.is_mapped()
+                    && target.is_sensitive()
+                    && window.is_mapped()
+                    && window.is_active()
+                    && focus.as_ref().is_some_and(|owner| {
+                        owner == button.upcast_ref::<Widget>() || owner.is_ancestor(&button)
+                    })
+                {
+                    // Returning menu ownership is not a request to reveal an
+                    // offscreen terminal. Viewport listens to the synchronous
+                    // root focus notification, so mute only that automatic
+                    // reveal while preserving every original viewport policy.
+                    let mut parent = target.parent();
+                    let mut reveal = Vec::new();
+                    while let Some(widget) = parent {
+                        parent = widget.parent();
+                        if let Ok(viewport) = widget.downcast::<gtk::Viewport>() {
+                            if viewport.is_scroll_to_focus() {
+                                viewport.set_scroll_to_focus(false);
+                                reveal.push(viewport);
+                            }
+                        }
+                    }
+                    target.grab_focus();
+                    for viewport in reveal {
+                        viewport.set_scroll_to_focus(true);
+                    }
+                }
+            });
+        }
+    });
 }
 
 #[cfg(test)]
@@ -442,10 +546,68 @@ mod tests {
         pump();
     }
 
+    fn persistent_pointer_capture(button: &gtk::MenuButton) {
+        let controllers = button.observe_controllers();
+        let gestures = (0..controllers.n_items())
+            .filter_map(|i| controllers.item(i).and_downcast::<gtk::GestureClick>())
+            .filter(|gesture| {
+                gesture.propagation_phase() == gtk::PropagationPhase::Capture
+                    && gesture.button() == gtk::gdk::BUTTON_PRIMARY
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(gestures.len(), 1);
+        // Deterministic callback interleaving, not a physical-pointer claim.
+        gestures[0].emit_by_name::<()>("pressed", &[&1_i32, &0.0_f64, &0.0_f64]);
+    }
+
+    fn persistent_menu_sequences(view: &TermView, column: &gtk::Box) {
+        let button = gtk::MenuButton::new();
+        button.set_label("Tools fixture");
+        let popover = gtk::Popover::new();
+        let action = gtk::Button::with_label("Fixture action");
+        popover.set_child(Some(&action));
+        button.set_popover(Some(&popover));
+        bind_persistent_menu_focus(&button, &popover);
+        column.append(&button);
+        pump();
+        let owner = &view.active_vte;
+        for pump_while_b_open in [false, true] {
+            assert!(owner.grab_focus());
+            assert!(owns_focus(owner));
+            persistent_pointer_capture(&button);
+            button.popup();
+            pump();
+            assert!(popover.is_visible());
+            assert!(owns_focus(&action));
+            popover.popdown(); // A close idle remains pending.
+            persistent_pointer_capture(&button);
+            button.popup();
+            assert!(popover.is_visible());
+            if pump_while_b_open {
+                pump(); // A's idle must neither take nor drop B's shared owner.
+                assert!(popover.is_visible());
+                assert!(owns_focus(&action));
+            }
+            popover.popdown();
+            pump();
+            assert!(
+                owns_focus(owner),
+                "persistent reopen sequence pump_open={pump_while_b_open}"
+            );
+            assert_eq!(
+                popover.parent().as_ref(),
+                Some(button.upcast_ref::<Widget>())
+            );
+            println!("PERSISTENT_MENU_SEQUENCE pump_while_b_open={pump_while_b_open} owner_restored=true retained=true");
+        }
+        column.remove(&button);
+        pump();
+    }
+
     #[test]
     #[ignore = "requires DISPLAY; popover focus ownership"]
     fn popover_focus_return_retires_on_newer_owner() {
-        let (view, window, _, peers) = fixture(TerminalMode::Block);
+        let (view, window, column, peers) = fixture(TerminalMode::Block);
         let owners = [
             view.active_vte.clone().upcast::<Widget>(),
             peers[1].clone(),
@@ -518,6 +680,7 @@ mod tests {
                 );
             }
         }
+        persistent_menu_sequences(&view, &column);
         window.close();
         pump();
     }
