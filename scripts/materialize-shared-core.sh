@@ -3,6 +3,19 @@
 # Existing sibling checkouts (including explicit upgrade candidates) are preserved.
 set -euo pipefail
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+# Exact Git releases are acquired by Cargo, not the historical bundled archive.
+# Preserve the existing helper entrypoint used by CI without creating siblings.
+if python3 - "$repo_dir/Cargo.toml" <<'PY_CHECK'
+import sys, tomllib
+with open(sys.argv[1], 'rb') as stream:
+    dep = tomllib.load(stream)['dependencies']['jterm_core']
+raise SystemExit(0 if 'git' in dep else 1)
+PY_CHECK
+then
+  (cd "$repo_dir" && cargo fetch --locked)
+  printf 'Using Cargo-locked shared core; no sibling checkout created.\n'
+  exit 0
+fi
 core_dir=${1:-"$repo_dir/../jterm_core"}
 if [[ -f "$core_dir/Cargo.toml" ]]; then
   printf 'Using existing shared core: %s\n' "$core_dir"

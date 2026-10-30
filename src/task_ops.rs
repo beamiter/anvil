@@ -1107,6 +1107,7 @@ impl AppModel {
     /// Push the composed panel state. Rows are rebuilt from the domain every
     /// time; the panel never holds its own task copies.
     pub(crate) fn sync_tasks_panel(&self) {
+        { use relm4::gtk::prelude::*; crate::eva_companion::observe_task(self.window.upcast_ref(),self.task_manager.tasks().iter().find(|t|Some(t.id)==self.selected_task)); }
         self.refresh_workspace_task_overview();
         let policy = self.task_prompt_policy();
         let native_ai_enabled = policy.share_command_context;

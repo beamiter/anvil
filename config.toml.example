@@ -1,3 +1,6 @@
+# Shared Eva setting; switching modes takes effect after restart.
+eva_companion_enabled = false
+
 # anvil configuration example
 #
 # Install as:
@@ -283,3 +286,7 @@ buffer_tabs = false
 status_bar = false
 project_panel = false
 tool_panel = false
+
+# Cross-application Eva is explicit opt-in: launch with EVA_COMPANION_MODE=shared.
+# Shared mode disables this GUI's legacy ASCII body, including on IPC failure.
+# See docs/eva-companion.md for the coordinator, skins, controls and proof limits.

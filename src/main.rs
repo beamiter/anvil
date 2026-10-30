@@ -49,6 +49,9 @@ mod launch_path;
 mod navigation_ui;
 mod notebook;
 mod organism_ui;
+mod eva_companion;
+mod eva_companion_paint;
+mod eva_companion_clip;
 mod palette;
 mod pane_header;
 mod persistence;
@@ -873,6 +876,7 @@ impl SimpleComponent for AppModel {
         let session_persistence = init.execute.is_none() && !init.safe_mode;
         let window_opacity = config.window_opacity;
         let font_scale = config.default_font_scale;
+        crate::eva_companion::configure(config.eva_companion_enabled);
         let config = Rc::new(RefCell::new(config));
         let organism_hub = organism_ui::OrganismHub::new(config.clone());
         let care_sender = sender.clone();
@@ -1086,6 +1090,7 @@ impl SimpleComponent for AppModel {
                         as u32,
                     block_compact: config.borrow().block_compact,
                     command_history: config.borrow().command_history_enabled,
+                    eva_companion_enabled: config.borrow().eva_companion_enabled,
                     ascii_organism_enabled: config.borrow().ascii_organism_enabled,
                     ascii_organism_motion: match config.borrow().ascii_organism_motion {
                         None => 0,
@@ -1143,6 +1148,7 @@ impl SimpleComponent for AppModel {
                 dialogs::settings::SettingsOutput::CommandHistory(enabled) => {
                     AppMsg::SettingsCommandHistory(enabled)
                 }
+                dialogs::settings::SettingsOutput::EvaCompanion(enabled) => AppMsg::SettingsEvaCompanion(enabled),
                 dialogs::settings::SettingsOutput::AsciiOrganism(enabled) => {
                     AppMsg::SettingsAsciiOrganism(enabled)
                 }
@@ -1372,6 +1378,7 @@ impl SimpleComponent for AppModel {
         workspace_row.append(&content_paned);
         let workspace_body = gtk::Overlay::new();
         workspace_body.set_child(Some(&workspace_row));
+        eva_companion::install(root.upcast_ref(), &workspace_body, "anvil");
         content_paned.set_hexpand(true);
         workspace_shell::observe_layout(
             &workspace_body,
@@ -1543,6 +1550,7 @@ impl SimpleComponent for AppModel {
                     return glib::Propagation::Stop;
                 }
                 if quit_allowed.get() {
+                    if crate::eva_companion::defer_close(window.upcast_ref()){return glib::Propagation::Stop;}
                     glib::Propagation::Proceed
                 } else {
                     close_sender.input(AppMsg::Quit);
@@ -1633,6 +1641,7 @@ impl SimpleComponent for AppModel {
             let file_tree_config = model.config.clone();
             let cross_block_search_key_latch = cross_block_search_key_latch.clone();
             key_controller.connect_key_pressed(move |_c, keyval, keycode, state| {
+                if crate::eva_companion::owns_keyboard(window.upcast_ref()){return glib::Propagation::Proceed;}
                 // Embedded Vim owns Quick Open before the shell's global
                 // command-palette binding can consume this capture event.
                 if crate::vim9_ide::native_dialog_owns_keyboard(&window)
@@ -2464,6 +2473,7 @@ impl SimpleComponent for AppModel {
             AppMsg::SettingsTerminalMode(mode) => self.apply_settings_terminal_mode(mode),
             AppMsg::SettingsBlockCompact(enabled) => self.apply_settings_block_compact(enabled),
             AppMsg::SettingsCommandHistory(enabled) => self.apply_settings_command_history(enabled),
+            AppMsg::SettingsEvaCompanion(enabled) => {self.config.borrow_mut().eva_companion_enabled=enabled;self.persist_config();},
             AppMsg::SettingsAsciiOrganism(enabled) => self.apply_settings_ascii_organism(enabled),
             AppMsg::SettingsAsciiOrganismCare(enabled) => {
                 if !self.safe_mode {

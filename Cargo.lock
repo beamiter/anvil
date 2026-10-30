@@ -69,6 +69,7 @@ dependencies = [
  "crossbeam-channel",
  "dirs 6.0.0",
  "env_logger",
+ "eva-character-atlas",
  "fuzzy-matcher",
  "io-lifetimes 3.0.1",
  "jterm_core",
@@ -220,6 +221,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "companion-client"
+version = "0.1.0"
+source = "git+https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa569540091524d637a7115b64c587b9177a55b"
+dependencies = [
+ "companion-protocol",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "companion-core"
+version = "0.1.0"
+source = "git+https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa569540091524d637a7115b64c587b9177a55b"
+dependencies = [
+ "companion-protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "companion-protocol"
+version = "0.1.0"
+source = "git+https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa569540091524d637a7115b64c587b9177a55b"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -358,6 +389,11 @@ name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
+
+[[package]]
+name = "eva-character-atlas"
+version = "0.1.0"
+source = "git+https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa569540091524d637a7115b64c587b9177a55b"
 
 [[package]]
 name = "fastrand"
@@ -905,9 +941,14 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.2.0"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=974ccad203375032fe87706caecab39ad516c238#974ccad203375032fe87706caecab39ad516c238"
 dependencies = [
+ "companion-client",
+ "companion-core",
+ "companion-protocol",
  "crossbeam-channel",
  "dirs 7.0.0",
+ "eva-character-atlas",
  "fuzzy-matcher",
  "jagent",
  "libc",

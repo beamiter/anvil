@@ -788,6 +788,7 @@ pub struct Config {
     pub(crate) block_history_compress: bool,
     /// Compact (denser) block-mode spacing, matching Warp's compact density.
     pub(crate) block_compact: bool,
+    pub(crate) eva_companion_enabled: bool,
     pub(crate) ascii_organism_enabled: bool,
     /// Optional gentle breaks; one foreground clock for the whole window.
     pub(crate) ascii_organism_care_enabled: bool,
@@ -916,6 +917,7 @@ impl Config {
             block_history_path: None,
             block_history_compress: true,
             block_compact: false,
+            eva_companion_enabled: false,
             ascii_organism_enabled: false,
             ascii_organism_care_enabled: false,
             ascii_organism_motion: None,
@@ -1382,6 +1384,7 @@ struct FileConfig {
     block_history_path: Option<String>,
     block_history_compress: Option<bool>,
     block_compact: Option<bool>,
+    eva_companion_enabled: Option<bool>,
     ascii_organism_enabled: Option<bool>,
     ascii_organism_care_enabled: Option<bool>,
     ascii_organism_motion: Option<String>,
@@ -1574,6 +1577,7 @@ fn file_config_from_table(table: &toml::Table) -> FileConfig {
             .get("block_history_compress")
             .and_then(|v| v.as_bool()),
         block_compact: table.get("block_compact").and_then(|v| v.as_bool()),
+        eva_companion_enabled: table.get("eva_companion_enabled").and_then(|v|v.as_bool()),
         ascii_organism_enabled: table
             .get("ascii_organism_enabled")
             .and_then(|v| v.as_bool()),
@@ -2168,6 +2172,7 @@ fn resolve_file_config(fc: FileConfig) -> (Config, Vec<Theme>, KeybindingMap) {
     let sidebar_visible = resolve_sidebar_visibility(fc.sidebar_visible, tab_placement);
     let sidebar_width = fc.sidebar_width.unwrap_or(237).clamp(120, 800);
     let tab_width = fc.tab_width.unwrap_or(180).clamp(80, 480);
+    let eva_companion_enabled = fc.eva_companion_enabled.unwrap_or(false);
     let ascii_organism_enabled = env_bool("ANVIL_ASCII_ORGANISM_ENABLED")
         .or(fc.ascii_organism_enabled)
         .unwrap_or(true);
@@ -2256,6 +2261,7 @@ fn resolve_file_config(fc: FileConfig) -> (Config, Vec<Theme>, KeybindingMap) {
         block_history_path,
         block_history_compress,
         block_compact,
+        eva_companion_enabled,
         ascii_organism_enabled,
         ascii_organism_care_enabled,
         ascii_organism_motion,

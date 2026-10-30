@@ -427,6 +427,7 @@ impl AppModel {
                         terminal_mode: u32::from(config.terminal_mode == TerminalMode::Chat),
                         block_compact: config.block_compact,
                         command_history: config.command_history_enabled,
+                        eva_companion_enabled: self.config.borrow().eva_companion_enabled,
                         ascii_organism_enabled: config.ascii_organism_enabled,
                         ascii_organism_motion: match config.ascii_organism_motion {
                             None => 0,

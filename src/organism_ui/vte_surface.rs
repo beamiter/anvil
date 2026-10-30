@@ -147,6 +147,8 @@ impl VteCompanion {
         config: Rc<RefCell<Config>>,
         local: bool,
     ) -> Rc<Self> {
+        if !local {root.add_css_class("eva-remote-surface");}
+        crate::eva_companion::tag_pane(root);
         let card = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         card.set_can_target(false);
         card.set_focusable(false);
@@ -438,6 +440,7 @@ impl VteCompanion {
     }
 
     pub(crate) fn set_local(self: &Rc<Self>, local: bool) {
+        if let Some(root)=self.root.upgrade(){if local{root.remove_css_class("eva-remote-surface");}else{root.add_css_class("eva-remote-surface");}}
         if self.local.replace(local) != local {
             self.refresh();
         }
@@ -660,7 +663,7 @@ impl VteCompanion {
         }
         let (enabled, requested_motion) = {
             let config = self.config.borrow();
-            (config.ascii_organism_enabled, config.ascii_organism_motion)
+            (config.ascii_organism_enabled && !crate::eva_companion::shared_mode_requested(), config.ascii_organism_motion)
         };
         let motion = requested_motion.unwrap_or_else(|| {
             if gtk::Settings::default()

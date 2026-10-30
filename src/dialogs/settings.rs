@@ -86,6 +86,7 @@ mod organism_preview {
     const FRAME_INTERVAL: Duration = Duration::from_millis(100);
 
     fn motion_for_selection(selected: u32, animations: bool) -> OrganismMotion {
+        if crate::eva_companion::shared_mode_requested(){return OrganismMotion::Static;}
         match selected {
             1 => OrganismMotion::Full,
             2 => OrganismMotion::Calm,
@@ -96,6 +97,7 @@ mod organism_preview {
     }
 
     fn motion_policy(selected: u32, animations: Option<bool>) -> &'static str {
+        if crate::eva_companion::shared_mode_requested(){return "Shared Eva: static preview only; appearance and motion live in the Eva card.";}
         match (selected, animations) {
             (1, _) => "Full: animated movement and quiet hover greetings.",
             (2, _) => "Calm: still poses and quiet hover greetings.",
@@ -372,6 +374,7 @@ mod organism_preview {
         }
 
         fn active(&self) -> bool {
+            if crate::eva_companion::shared_mode_requested(){return false;}
             preview_active(
                 self.visible.get(),
                 self.group.upgrade().is_some_and(|group| group.is_mapped()),
@@ -1836,6 +1839,7 @@ pub(crate) struct SettingsValues {
     pub(crate) terminal_mode: u32,
     pub(crate) block_compact: bool,
     pub(crate) command_history: bool,
+    pub(crate) eva_companion_enabled: bool,
     pub(crate) ascii_organism_enabled: bool,
     /// 0 automatic, 1 full, 2 calm, 3 static.
     pub(crate) ascii_organism_motion: u32,
@@ -1990,6 +1994,7 @@ pub(crate) enum SettingsMsg {
     TerminalMode(u32),
     BlockCompact(bool),
     CommandHistory(bool),
+    EvaCompanion(bool),
     AsciiOrganism(bool),
     AsciiOrganismMotion(u32),
     AiEnabled(bool),
@@ -2035,6 +2040,7 @@ pub(crate) enum SettingsOutput {
     TerminalMode(usize),
     BlockCompact(bool),
     CommandHistory(bool),
+    EvaCompanion(bool),
     AsciiOrganism(bool),
     AsciiOrganismMotion(u32),
     AiEnabled(bool),
@@ -2252,6 +2258,13 @@ impl Component for SettingsModel {
                         },
                     },
 
+                    adw::SwitchRow {
+                        set_title: "Shared Eva Companion",
+                        set_subtitle: "One Eva across applications. Restart required; daemon must be running.",
+                        set_active: model.values.eva_companion_enabled,
+                        set_sensitive: !model.values.safe_mode,
+                        connect_active_notify[sender] => move |row| {sender.input(SettingsMsg::EvaCompanion(row.is_active()));},
+                    },
                     #[name(ascii_organism_row)]
                     adw::SwitchRow {
                         set_title: "ASCII Organism",
@@ -2754,6 +2767,7 @@ impl Component for SettingsModel {
                     self.values.safe_mode,
                 );
             }
+            SettingsMsg::EvaCompanion(enabled) => {self.values.eva_companion_enabled=enabled;let _=sender.output(SettingsOutput::EvaCompanion(enabled));},
             SettingsMsg::AsciiOrganism(enabled) => {
                 self.values.ascii_organism_enabled = enabled;
                 widgets
@@ -3521,6 +3535,7 @@ mod tests {
                 terminal_mode: 0,
                 block_compact: false,
                 command_history: true,
+                eva_companion_enabled: false,
                 ascii_organism_enabled: false,
                 ascii_organism_motion: 0,
                 ai_enabled: false,

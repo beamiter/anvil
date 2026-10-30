@@ -9,4 +9,4 @@ gio = "=0.22.8"
 glib = "=0.22.8"
 # The same shared core production builds against: the sibling checkout, or the
 # bundled snapshot CI materializes beside this repository.
-jterm_core = { version = "0.2.0", path = "../../../jterm_core" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "974ccad203375032fe87706caecab39ad516c238" }

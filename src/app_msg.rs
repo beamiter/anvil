@@ -134,6 +134,7 @@ pub(crate) enum AppMsg {
     SettingsTerminalMode(usize),
     SettingsBlockCompact(bool),
     SettingsCommandHistory(bool),
+    SettingsEvaCompanion(bool),
     SettingsAsciiOrganism(bool),
     SettingsAsciiOrganismCare(bool),
     SettingsAsciiOrganismMotion(u32),

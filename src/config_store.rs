@@ -838,6 +838,7 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         "block_compact".into(),
         toml::Value::Boolean(config.block_compact),
     );
+    table.insert("eva_companion_enabled".into(),toml::Value::Boolean(config.eva_companion_enabled));
     table.insert(
         "ascii_organism_enabled".into(),
         toml::Value::Boolean(config.ascii_organism_enabled),
@@ -1644,6 +1645,7 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "block_history_compress",
         "ui_font_size_absolute",
         "block_compact",
+        "eva_companion_enabled",
         "ascii_organism_enabled",
         "ascii_organism_care_enabled",
         "ascii_organism_motion",
@@ -1736,6 +1738,7 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "sidebar_visible",
         "ai_enabled",
         "ai_panel_visible",
+        "eva_companion_enabled",
         "ascii_organism_enabled",
         "ascii_organism_care_enabled",
         "ai_redact_secrets",
