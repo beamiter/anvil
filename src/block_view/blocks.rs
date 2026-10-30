@@ -5700,6 +5700,12 @@ impl FinishedBlock {
                 actions: &action_box,
                 collapse: &collapse_btn,
             });
+            // Forge keeps range review as a compact pill at the card's leading
+            // edge rather than a full-width shelf; the action is unchanged.
+            review_shelf.set_halign(gtk::Align::Start);
+            review_btn.set_hexpand(false);
+            // Forge offers no separate clear control: Esc ends the selection.
+            clear_review_btn.set_visible(false);
         }
 
         FinishedBlock {

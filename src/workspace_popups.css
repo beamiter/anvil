@@ -52,17 +52,24 @@ window.anvil-font-sync .workspace-center:not(.block-workspace) popover entry,win
 
 /* Dark Block canvas */
 window.anvil-font-sync .workspace-center.block-workspace popover { color:#d5deec; }
-window.anvil-font-sync .workspace-center.block-workspace popover > contents { background:#101c30; color:#d5deec; border:1px solid #293c57; }
-window.anvil-font-sync .workspace-center.block-workspace popover > arrow { background:#101c30; border-color:#293c57; }
+window.anvil-font-sync .workspace-center.block-workspace popover > contents { background:#1c293a; color:#d5deec; border:1px solid #344864; }
+window.anvil-font-sync .workspace-center.block-workspace popover > arrow { background:#1c293a; border-color:#344864; }
 window.anvil-font-sync .workspace-center.block-workspace popover button,window.anvil-font-sync .workspace-center.block-workspace popover row,window.anvil-font-sync .workspace-center.block-workspace #reference-tools-menu button.reference-tool-row { background:transparent; color:#d5deec; }
-window.anvil-font-sync .workspace-center.block-workspace popover button:hover,window.anvil-font-sync .workspace-center.block-workspace popover button:active,window.anvil-font-sync .workspace-center.block-workspace popover button:checked,window.anvil-font-sync .workspace-center.block-workspace popover button:focus-visible,window.anvil-font-sync .workspace-center.block-workspace popover row:hover,window.anvil-font-sync .workspace-center.block-workspace popover row:selected,window.anvil-font-sync .workspace-center.block-workspace #reference-tools-menu button.reference-tool-row:hover,window.anvil-font-sync .workspace-center.block-workspace #reference-tools-menu button.reference-tool-row:focus-visible { background:#1d304d; color:#d5deec; }
+window.anvil-font-sync .workspace-center.block-workspace popover button:hover,window.anvil-font-sync .workspace-center.block-workspace popover button:active,window.anvil-font-sync .workspace-center.block-workspace popover button:checked,window.anvil-font-sync .workspace-center.block-workspace popover button:focus-visible,window.anvil-font-sync .workspace-center.block-workspace popover row:hover,window.anvil-font-sync .workspace-center.block-workspace popover row:selected,window.anvil-font-sync .workspace-center.block-workspace #reference-tools-menu button.reference-tool-row:hover,window.anvil-font-sync .workspace-center.block-workspace #reference-tools-menu button.reference-tool-row:focus-visible { background:#283d6f; color:#d5deec; outline:1px solid #496bba; outline-offset:-1px; }
 window.anvil-font-sync .workspace-center.block-workspace popover button:focus-visible,window.anvil-font-sync .workspace-center.block-workspace dropdown > button:focus-visible { outline-color:#4199ff; }
 window.anvil-font-sync .workspace-center.block-workspace popover button:disabled,window.anvil-font-sync .workspace-center.block-workspace popover button:disabled *,window.anvil-font-sync .workspace-center.block-workspace popover .dim-label,window.anvil-font-sync .workspace-center.block-workspace popover .reference-tool-description,window.anvil-font-sync .workspace-center.block-workspace #reference-tools-menu button.reference-tool-row:disabled,window.anvil-font-sync .workspace-center.block-workspace #reference-tools-menu button.reference-tool-row:disabled *,window.anvil-font-sync .workspace-center.block-workspace #reference-tools-menu label.reference-tool-description { color:#91a4bf; }
 window.anvil-font-sync .workspace-center.block-workspace popover button:disabled,window.anvil-font-sync .workspace-center.block-workspace #reference-tools-menu button.reference-tool-row:disabled { background:transparent; }
-window.anvil-font-sync .workspace-center.block-workspace popover separator { background:#293c57; }
+window.anvil-font-sync .workspace-center.block-workspace popover separator { background:#344864; }
 window.anvil-font-sync .workspace-center.block-workspace popover scrollbar slider { background:alpha(#d5deec,0.3); }
 window.anvil-font-sync .workspace-center.block-workspace popover scrollbar slider:hover { background:alpha(#d5deec,0.5); }
-window.anvil-font-sync .workspace-center.block-workspace popover entry,window.anvil-font-sync .workspace-center.block-workspace popover searchentry,window.anvil-font-sync .workspace-center.block-workspace dropdown > button { background:alpha(#d5deec,0.06); color:#d5deec; border:1px solid #293c57; border-radius:6px; box-shadow:none; caret-color:#d5deec; }
+window.anvil-font-sync .workspace-center.block-workspace popover entry,window.anvil-font-sync .workspace-center.block-workspace popover searchentry,window.anvil-font-sync .workspace-center.block-workspace dropdown > button { background:alpha(#d5deec,0.06); color:#d5deec; border:1px solid #344864; border-radius:6px; box-shadow:none; caret-color:#d5deec; }
+
+/* A card menu is a raised layer of the navy chrome, like Forge's developer
+   Block menu: regular 12px chrome text, 28px rows, never the card's bold Main
+   font. The same rows keep their callbacks and keyboard ownership. */
+window.anvil-font-sync .workspace-center.block-workspace popover.block-reference-menu button,window.anvil-font-sync .workspace-center.block-workspace popover.block-reference-menu label { font-family:"DejaVu Sans",sans-serif; font-size:12px; font-weight:400; font-style:normal; }
+window.anvil-font-sync .workspace-center.block-workspace popover.block-reference-menu button { min-height:28px; padding:0 8px; border-radius:6px; }
+window.anvil-font-sync .workspace-center.block-workspace popover.block-reference-menu separator { margin:4px 0; }
 
 /* Workspace-owned dialogs use the navy side panels as their surface family.
    Lists, inputs and header content are explicit so an Adwaita light body cannot

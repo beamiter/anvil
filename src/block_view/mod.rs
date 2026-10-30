@@ -8326,6 +8326,15 @@ impl RenderBackend for BlockBackend {
             }
 
             let popover = gtk::Popover::new();
+            if finished_menu_clone
+                .widget()
+                .has_css_class("block-reference-card")
+            {
+                // Forge's developer card menu: a 264px navy layer with regular
+                // chrome text instead of the card's bold terminal font.
+                popover.add_css_class("block-reference-menu");
+                popover.set_width_request(264);
+            }
             *open_popover.borrow_mut() = popover.downgrade();
             let widget: &gtk::Widget =
                 &finished_menu_clone.widget().clone().upcast::<gtk::Widget>();
@@ -12145,6 +12154,12 @@ impl TermView {
                 .widget()
                 .add_css_class("block-reference-live");
             active.borrow().widget().prepend(&chrome.root);
+            // The one clip has the same 16px well in its prompt dock and its
+            // running card, as in Forge. Padding lives on the moved clip, not
+            // on either seat, so the grid width follows the clip allocation.
+            let clip = active.borrow().live_clip();
+            clip.set_margin_start(16);
+            clip.set_margin_end(16);
             chrome
         });
         // The caller owns the mode decision. Managed remote panes deliberately
@@ -12650,6 +12665,13 @@ impl TermView {
             status.set_hexpand(true);
             toolbar.append(&status);
             let find = icon_button("edit-find-symbolic", "Search terminal output");
+            // Forge draws the Live toolbar with the shared vector paths rather
+            // than whichever icon theme the desktop happens to provide.
+            find.set_child(Some(&crate::workspace_shell::icon(
+                jterm_core::reference_icons::Icon::Search,
+            )));
+            find.add_css_class("flat");
+            find.set_focus_on_click(false);
             let callbacks = workspace_action_callbacks.clone();
             find.connect_clicked(move |_| {
                 for callback in callbacks.borrow().iter() {
@@ -12658,6 +12680,11 @@ impl TermView {
             });
             toolbar.append(&find);
             let live = icon_button("go-bottom-symbolic", "Return to live output");
+            live.set_child(Some(&crate::workspace_shell::icon(
+                jterm_core::reference_icons::Icon::ChevronDown,
+            )));
+            live.add_css_class("flat");
+            live.set_focus_on_click(false);
             let debounce = scroll_debouncer.clone();
             let scroll = block_scroll.downgrade();
             live.connect_clicked(move |_| {
@@ -12681,8 +12708,9 @@ impl TermView {
                         .count()
                         + usize::from(state.get() == BlockState::CollectingOutput);
                     let text = format!(
-                        "{} · {count} commands",
-                        if reading.get() { "Reading" } else { "Live" }
+                        "{} · {count} {}",
+                        if reading.get() { "Reading" } else { "Live" },
+                        if count == 1 { "command" } else { "commands" }
                     );
                     if label.text().as_str() != text {
                         label.set_text(&text);

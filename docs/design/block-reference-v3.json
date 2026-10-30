@@ -16,51 +16,51 @@
       "anvil",
       "forge"
     ],
-    "outer_shell": "Shared by Block and Chat; Ember/Frost continue using reference_shell.",
+    "outer_shell": "One canonical Block/Chat shell delegated to reference_shell; new Block raster applies only to the dark central command canvas.",
     "core_module": "jterm_core::developer_workspace",
     "core_local_revision": "f7919f0ead723bccb81463cb1ed43a7855e7e05f",
     "publication": "Local commits and Library backup only for this batch; published master checkpoints remain unchanged."
   },
   "geometry": {
     "logical_reference": [
-      1672,
-      941
+      1356,
+      704
     ],
-    "titlebar": 55,
-    "rail": 53,
-    "navigation_including_boundary": 191,
-    "inspector": 298,
-    "center_header": 42,
+    "titlebar": 42,
+    "rail": 55,
+    "navigation_including_boundary": 237,
+    "inspector": 306,
+    "center_header": 49,
     "live_toolbar": 36,
     "card_horizontal_inset": 12,
     "card_gap": 10,
-    "composer_min_height": 68,
-    "composer_horizontal_inset": 12,
-    "composer_bottom": 8,
-    "inspector_inner_inset": 7,
-    "inspector_tabs_height": 42,
+    "composer_min_height": 80,
+    "composer_horizontal_inset": 28,
+    "composer_bottom": 11,
+    "inspector_inner_inset": 14,
+    "inspector_tabs_height": 49,
     "search": [
-      484,
-      36,
-      10
+      362,
+      28,
+      8
     ],
-    "search_center_offset": 0,
-    "mode_control_height": 34,
-    "mode_control_top": 11,
-    "mode_control_min_width": 72,
+    "search_center_offset": 9,
+    "mode_control_height": 28,
+    "mode_control_top": 7,
+    "mode_control_min_width": 52,
     "expected_center": [
-      244,
-      55,
-      1130,
-      886
+      292,
+      42,
+      758,
+      662
     ],
     "expected_composer": [
-      256,
-      865,
-      1106,
-      68
+      320,
+      613,
+      702,
+      80
     ],
-    "bounds_tolerance": "Measured raster edges are estimates, usually within about2px; no unsupported exact font/kernel provenance claim."
+    "bounds_tolerance": "Strict default logical native geometry; original pixels retained, client crop only from proven native surface transform."
   },
   "typography": {
     "default_content": "JetBrainsMono Nerd Font Mono 12px",
@@ -76,7 +76,14 @@
       "Missing UI values now use14pt/scale1 instead of inheriting only-Main font/zoom.",
       "Authored content uses a12px nominal baseline. Explicit configured native font sizes remain actual native sizes, while authored relative text extents can change from the prior14pt baseline.",
       "Settings font-size edits must preserve absolute/point units, native grid/cursor/text and independent Main/UI zoom authority."
-    ]
+    ],
+    "shared_message_text_colors": {
+      "heading_and_author": "#28344c",
+      "body": "#4e5c74",
+      "user_bubble_text": "#35445e",
+      "task_text": "#4e647f",
+      "scope": "Semantic GUI message text only; configured native terminal fonts and ANSI output colors retain their existing authority."
+    }
   },
   "responsive": {
     "minimum_center_for_sidebars": 480,
@@ -87,7 +94,7 @@
     "constraints": [
       "Search must shrink/hide to a reachable launcher without forcing a wide minimum window.",
       "Tool captions can compact while actions/tooltips and one send/stop owner remain reachable.",
-      "One empty input row may use68px minimum; multiline input grows within bounds and keeps the actual caret visible."
+      "One empty input row uses80px minimum; multiline input grows within bounds and keeps the actual caret visible."
     ]
   },
   "running_output": {
@@ -117,5 +124,6 @@
     "core_archive": "evidence/developer-workspace-core/archive-verification.json",
     "published_checkpoints": "evidence/github-connector-publication/checkpoint3/final-master-heads.json",
     "prior_backup": "libfile_f98775f44cf881918275de3a063e5979 version2"
-  }
+  },
+  "historical_evidence": "Earlier1672/55px/68px captures and input gates are preserved but superseded as outer-layout targets."
 }

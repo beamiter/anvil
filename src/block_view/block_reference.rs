@@ -26,6 +26,7 @@ fn status_badge(text: &str, class: &str, role: &'static str) -> gtk::Box {
     use jterm_core::reference_icons::Icon;
     let badge = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     badge.set_valign(gtk::Align::Center);
+    badge.set_height_request(20);
     badge.add_css_class("block-reference-status");
     badge.add_css_class(class);
     let symbol = match class {
@@ -57,14 +58,17 @@ pub(super) struct LiveChrome {
 
 impl LiveChrome {
     pub(super) fn new() -> Self {
-        let root = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+        // Forge's developer card: 16px leading inset, 12px trailing inset,
+        // 8px between the icon tile and command, 8px between every control.
+        let root = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         root.add_css_class("block-reference-header");
         root.add_css_class("anvil-ui-font");
         root.set_margin_start(16);
-        root.set_margin_end(16);
+        root.set_margin_end(12);
         root.set_height_request(HEADER_HEIGHT);
         let icon = crate::workspace_shell::icon(jterm_core::reference_icons::Icon::Terminal);
         icon.set_size_request(24, 24);
+        icon.set_margin_end(8);
         icon.add_css_class("block-reference-command-icon");
         root.append(&icon);
         let command = gtk::Label::new(None);
@@ -276,10 +280,10 @@ pub(super) fn decorate_finished(chrome: FinishedChrome<'_>) {
     header.add_css_class("anvil-ui-font");
     header.set_height_request(HEADER_HEIGHT);
     header.set_margin_start(16);
-    header.set_margin_end(16);
+    header.set_margin_end(12);
     header.set_margin_top(0);
     header.set_margin_bottom(0);
-    header.set_spacing(OUTPUT_GAP);
+    header.set_spacing(8);
     // Preserve action objects and callbacks. The existing native More menu
     // exposes them without reserving an invisible quick-action strip's width.
     actions.remove(more);
@@ -310,6 +314,7 @@ pub(super) fn decorate_finished(chrome: FinishedChrome<'_>) {
     command_vte.set_color_background(&gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
     let icon = crate::workspace_shell::icon(jterm_core::reference_icons::Icon::Terminal);
     icon.set_size_request(24, 24);
+    icon.set_margin_end(8);
     icon.add_css_class("block-reference-command-icon");
     let (text, class) = status_text(status);
     icon.add_css_class(class);

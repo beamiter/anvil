@@ -370,3 +370,49 @@ window.anvil-font-sync,window.anvil-font-sync decoration { padding:0; margin:0; 
 
 .workspace-drawer-resize-handle { min-width:6px; background:#263246; }
 .workspace-drawer-resize-handle:hover,.workspace-drawer-resize-handle:focus-visible { background:#5c7ef0; outline:1px solid #8fa4ff; outline-offset:-1px; }
+
+/* Forge parity for the Block canvas. Finished cards, the running card, the
+   Live toolbar, the docked composer and the card menu paint the same state
+   layers and tokens as Forge's developer Block. Card geometry, the terminal
+   input owner and every callback are unchanged; these rules only repaint. */
+.block-command-canvas .block-list { padding-top:12px; padding-bottom:0; }
+.block-command-canvas .block-reference-card-surface { transition:background-color 100ms ease,border-color 100ms ease,box-shadow 100ms ease; }
+.block-command-canvas .block-reference-card.block-hovered .block-reference-card-surface { border-color:#3a506e; background:#101b2b; }
+.block-command-canvas .block-reference-card:focus-within .block-reference-card-surface { outline:1px solid #6288bb; outline-offset:-1px; }
+.block-command-canvas .block-reference-card.block-selection-active .block-reference-card-surface { box-shadow:inset 0 0 0 1px alpha(#4199ff,0.45); }
+.block-command-canvas .block-reference-card.block-selected .block-reference-card-surface { outline:1px solid #4199ff; outline-offset:-1px; }
+.block-command-canvas .block-reference-header { border-bottom-color:#24334a; }
+.block-command-canvas .block-reference-command-icon { color:#a9c9fa; background:#20385d; border-color:#496bba; }
+.block-command-canvas .block-reference-command-icon.failed { color:#ff9b9f; background:#3c2632; border-color:#765057; }
+.block-command-canvas .block-reference-header label.block-reference-elapsed { font-size:9px; }
+.block-command-canvas .block-reference-more { border:0; background:transparent; background-image:none; box-shadow:none; padding:0 3px; }
+.block-command-canvas .block-reference-more:hover { background:#253852; }
+.block-command-canvas .block-reference-more:focus-visible { outline:1px solid #4199ff; outline-offset:0; }
+.block-command-canvas .block-reference-toolbar button:hover { background:#1d304d; border-radius:6px; }
+.block-workspace .workspace-canvas-header button { color:#91a4bf; }
+.block-command-canvas .block-selection-hint { font-family:"DejaVu Sans",sans-serif; font-size:10px; font-weight:400; color:#91a4bf; padding:0; }
+.block-command-canvas .block-review-shelf { background:transparent; border-radius:0; padding:0; margin:0 0 4px 8px; }
+.block-command-canvas .block-review-shelf button { font-family:"DejaVu Sans",sans-serif; font-size:12px; font-weight:400; color:#a9c9fa; background:alpha(#4199ff,0.16); border:1px solid alpha(#4199ff,0.42); border-radius:6px; min-height:24px; min-width:0; padding:2px 10px; }
+.block-command-canvas .block-review-shelf button:hover,.block-command-canvas .block-review-shelf button:focus-visible { background:alpha(#4199ff,0.28); outline:2px solid #4199ff; outline-offset:1px; }
+.block-command-canvas .sticky-running-header { background:#172338; border:1px solid #293c57; color:#91a4bf; }
+/* Docked composer: the prompt clip keeps a 16px well inside the dock and the
+   control row keeps the shared 12/10px insets, exactly like Forge's dock. */
+.workspace-center .block-command-canvas .chat-composer { border-radius:12px; padding:8px 0; }
+.workspace-center .block-command-canvas .chat-composer .chat-controls { padding:0 10px 0 12px; }
+.workspace-center .block-command-canvas label.chat-running-status { font-size:12px; color:#91a4bf; margin:0 12px 4px; }
+.workspace-center .block-command-canvas .chat-controls button:not(.chat-send):not(.chat-stop),.workspace-center .block-command-canvas .chat-controls .chat-terminal-capsule { background:#19283c; background-image:none; border-color:#344864; color:#91a4bf; }
+.workspace-center .block-command-canvas .chat-controls button:disabled,.workspace-center .block-command-canvas .chat-controls button:disabled * { color:#91a4bf; opacity:1; filter:none; }
+.workspace-center .block-command-canvas .chat-controls .chat-send { min-width:26px; min-height:26px; background:#366fdd; background-image:none; border:1px solid #4c8af2; color:#eff6ff; }
+.workspace-center .block-command-canvas .chat-controls .chat-send:disabled,.workspace-center .block-command-canvas .chat-controls .chat-send:disabled * { background:#203650; border-color:#345171; color:#9badc7; }
+.workspace-center .block-command-canvas .chat-controls .chat-stop { min-width:26px; min-height:26px; background:#19283c; background-image:none; border:1px solid #344864; color:#ff8d95; }
+.workspace-center .block-command-canvas .chat-controls .chat-stop:hover { background:#253852; }
+.workspace-center.block-workspace .shell-block-composer { border-radius:12px; }
+.workspace-center.block-workspace .shell-block-composer .chat-controls button:not(.chat-send):not(.chat-stop) { background:#19283c; border-color:#344864; }
+.workspace-center.block-workspace .shell-block-composer .chat-controls button.chat-send { background:#366fdd; border-color:#4c8af2; color:#eff6ff; }
+/* The Files tree is chrome: its rows use the inspector's 11px role, not the
+   14pt Main fallback, in both sidebars. Selection and scan logic unchanged. */
+.workspace-navigation treeview.file-tree,.workspace-inspector treeview.file-tree { font-family:"DejaVu Sans",sans-serif; font-size:11px; }
+/* Inspector overview actions are plain full-width buttons, as in Forge. */
+.workspace-inspector .reference-agent-actions { margin:10px 13px 0; }
+.workspace-inspector .reference-agent-actions button { min-height:28px; border-radius:8px; }
+.workspace-inspector .reference-agent-actions button label { font-family:"DejaVu Sans",sans-serif; font-size:10px; font-weight:400; }

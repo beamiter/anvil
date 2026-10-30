@@ -73,12 +73,16 @@ impl AppModel {
                     .and_then(crate::git_meta_ui::read_cached_and_refresh)
             })
             .flatten();
+        // The canvas breadcrumb names the tab, not the whole window title.
+        let canvas_title = if private {
+            "Private session".to_string()
+        } else {
+            tab.map(|tab| tab.display_title().to_string())
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or_else(|| "Terminal".to_string())
+        };
         self.shell.sync(
-            if tab.is_some_and(|tab| tab.private_title) {
-                "Private session"
-            } else {
-                &title.window_title
-            },
+            &canvas_title,
             pane.and_then(|pane| pane.cwd.as_deref())
                 .unwrap_or("Directory not reported"),
             presentation,

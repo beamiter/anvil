@@ -1,13 +1,16 @@
 # Developer workspace reference batch
 
-`block-reference-v3.json` records the new Anvil/Forge logical geometry. Both
-Block and Chat now use `jterm_core::developer_workspace`: a 55px toolbar,
-53px rail, 191px navigation, 298px inspector and 42px local header. At
-1672×941 the center starts at x244 and the inspector at x1374. Block's Live
-toolbar is 36px. The two composers share a 68px minimum height, 12px horizontal
-inset and 8px bottom inset; native multiline input and explicit user font
-sizes retain their existing bounded growth. Inspector-first and then
-navigation collapse retain the shared 480px center budget.
+`block-reference-v3.json` records the Anvil/Forge logical geometry. Both
+Block and Chat now use the common four-native outer shell through
+`jterm_core::developer_workspace`: a 42px titlebar, 55px rail, 237px
+navigation, 306px inspector and 49px local header. At 1356×704 the center
+starts at x292 and the inspector at x1050. Block's Live toolbar is 36px with
+12px card inset and 10px card gap. The two composers share an 80px minimum
+height, 28px horizontal inset and 11px bottom inset; native multiline input
+and explicit user font sizes retain their existing bounded growth.
+Inspector-first and then navigation collapse retain the shared 480px center
+budget. The earlier 55/53/191/298/42/68 shell captured at 1672×941 remains
+historical evidence only; see `../four-native-shell-unification.md`.
 
 The Main default is `JetBrainsMono Nerd Font Mono 12px`, using absolute
 logical pixels. Missing UI fields resolve independently to 14pt and scale 1,

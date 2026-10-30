@@ -7,6 +7,17 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- The Block canvas now matches Forge's developer Block: cards show the same
+  hover, focus and selection layers, compact 16/12px headers with a 20px
+  status badge, a flat More control, and a 16px margin around the prompt in
+  both the dock and the running card. The card menu is a 264px navy layer in
+  regular chrome text, and range review is a compact pill (Esc clears it).
+- The Inspector overview uses Forge's full-width action buttons and wording
+  ("Open AI assistant", "Saved agent sessions", "next action", "Other tasks"),
+  the canvas header reads "Workspace / <tab>" over "<mode> session · Local",
+  the Files tree uses the 11px chrome size, and the Live counter says
+  "1 command".
+
 - The Block workspace's bottom input now always reserves three full lines of
   text while idle instead of collapsing to the prompt's one or two rows. It
   still grows for multiline commands, completion menus and anything else the

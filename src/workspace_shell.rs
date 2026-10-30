@@ -412,6 +412,25 @@ fn action_row(
     row
 }
 
+/// Subtitle role names: `block` becomes `Block`, matching Forge's header.
+fn presentation_title(presentation: &str) -> String {
+    let mut chars = presentation.trim().chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => "Terminal".to_string(),
+    }
+}
+
+/// Inspector overview action: a plain full-width button, as in Forge's
+/// `reference-agent-actions`. Icons stay with navigation rows.
+fn overview_action(text: &str, sender: &ComponentSender<AppModel>, msg: AppMsg) -> gtk::Button {
+    let button = gtk::Button::with_label(text);
+    button.set_tooltip_text(Some(text));
+    let sender = sender.clone();
+    button.connect_clicked(move |_| sender.input(msg.clone()));
+    button
+}
+
 fn unavailable(text: &str) -> gtk::Button {
     let button = gtk::Button::with_label(text);
     button.add_css_class("flat");
@@ -1111,9 +1130,9 @@ impl Chrome {
         header.set_height_request(tokens::CANVAS_HEADER_HEIGHT as i32);
         let headings = gtk::Box::new(gtk::Orientation::Vertical, 3);
         headings.set_hexpand(true);
-        let title = label("Terminal workspace", "shell-canvas-title");
+        let title = label("Workspace  /  Terminal", "shell-canvas-title");
         title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        let mode = label("Block · Live local shell", "shell-canvas-subtitle");
+        let mode = label("Block session · Local", "shell-canvas-subtitle");
         headings.append(&title);
         headings.append(&mode);
         header.append(&headings);
@@ -1189,30 +1208,27 @@ impl Chrome {
             &inspector_model,
             fixture,
         ));
-        let overview_actions = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let overview_actions = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        overview_actions.add_css_class("reference-agent-actions");
         overview_actions.set_visible(!fixture);
         if !fixture {
-            overview_actions.append(&action_row(
-                "agent",
+            overview_actions.append(&overview_action(
                 "New agent task",
                 sender,
                 AppMsg::TaskPanelAction(crate::agent_task_ui::TaskPanelAction::ComposeProject),
             ));
-            overview_actions.append(&action_row(
-                "agent",
+            overview_actions.append(&overview_action(
                 "Manage agent tasks",
                 sender,
                 AppMsg::Action(Action::ToggleTasksPanel),
             ));
-            overview_actions.append(&action_row(
-                "conversation",
-                "Open AI chat",
+            overview_actions.append(&overview_action(
+                "Open AI assistant",
                 sender,
                 AppMsg::Action(Action::OpenAiPanel),
             ));
-            overview_actions.append(&action_row(
-                "recent",
-                "Browse agent sessions",
+            overview_actions.append(&overview_action(
+                "Saved agent sessions",
                 sender,
                 AppMsg::Action(Action::OpenAgentSessions),
             ));
@@ -1384,9 +1400,9 @@ impl Chrome {
                 "Manage agent tasks",
                 AppMsg::Action(Action::ToggleTasksPanel),
             ),
-            ("Open AI chat", AppMsg::Action(Action::OpenAiPanel)),
+            ("Open AI assistant", AppMsg::Action(Action::OpenAiPanel)),
             (
-                "Browse agent sessions",
+                "Saved agent sessions",
                 AppMsg::Action(Action::OpenAgentSessions),
             ),
             ("Settings", AppMsg::Action(Action::ToggleSettings)),
@@ -1510,10 +1526,10 @@ impl Chrome {
         );
         if !jterm_core::reference_conversation::fixture_enabled() {
             self.mode.set_label(&format!(
-                "{} · {}",
-                context.presentation,
+                "{} session · {}",
+                presentation_title(context.presentation),
                 if context.private {
-                    "Private session"
+                    "Private"
                 } else {
                     context.namespace
                 }
@@ -1635,8 +1651,7 @@ impl Chrome {
             });
             self.overview_actions.append(&row);
         }
-        let create = action_row(
-            "agent",
+        let create = overview_action(
             "New agent task",
             &self.sender,
             AppMsg::TaskPanelAction(TaskPanelAction::ComposeProject),
@@ -1648,23 +1663,20 @@ impl Chrome {
             "Agent tasks must be enabled in configuration and require normal mode"
         }));
         self.overview_actions.append(&create);
-        let manage = action_row(
-            "agent",
+        let manage = overview_action(
             "Manage agent tasks",
             &self.sender,
             AppMsg::Action(Action::ToggleTasksPanel),
         );
         manage.set_sensitive(allow_manage);
         self.overview_actions.append(&manage);
-        self.overview_actions.append(&action_row(
-            "conversation",
-            "Open AI chat",
+        self.overview_actions.append(&overview_action(
+            "Open AI assistant",
             &self.sender,
             AppMsg::Action(Action::OpenAiPanel),
         ));
-        self.overview_actions.append(&action_row(
-            "recent",
-            "Browse agent sessions",
+        self.overview_actions.append(&overview_action(
+            "Saved agent sessions",
             &self.sender,
             AppMsg::Action(Action::OpenAgentSessions),
         ));
@@ -1732,8 +1744,10 @@ impl Chrome {
             }
         }
         let path = if private { "Private session" } else { path };
-        self.title.set_label(title);
-        self.title.set_tooltip_text(Some(title));
+        // Same breadcrumb as Forge's canvas header.
+        let heading = format!("Workspace  /  {title}");
+        self.title.set_label(&heading);
+        self.title.set_tooltip_text(Some(&heading));
         self.path.set_label(path);
         self.path.set_tooltip_text(Some(path));
         self.workspace_name.set_label(if private {
@@ -1787,7 +1801,7 @@ impl Chrome {
             self.mode
                 .set_label(jterm_core::reference_conversation::FIXTURE_LABEL);
         } else {
-            self.mode.set_label(&format!("{mode} · Local session"));
+            self.mode.set_label(&format!("{mode} session · Local"));
         }
     }
 }
@@ -3083,7 +3097,7 @@ mod tests {
             for (mode, background, foreground, muted) in [
                 ("sidebar", "#162133", "#e1e9f6", "#91a2bb"),
                 ("chat", "#fefefe", "#35445e", "#728099"),
-                ("block", "#101c30", "#d5deec", "#91a4bf"),
+                ("block", "#1c293a", "#d5deec", "#91a4bf"),
                 ("chat", "#fefefe", "#35445e", "#728099"),
             ] {
                 for class in [
