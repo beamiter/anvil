@@ -311,7 +311,10 @@ pub(super) fn decorate_finished(chrome: FinishedChrome<'_>) {
     command.set_halign(gtk::Align::Fill);
     command.set_hexpand(true);
     command.add_css_class("block-reference-command");
-    command_vte.set_color_background(&gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
+    command_vte.add_css_class("block-command-terminal");
+    // A fully transparent VTE can clear its snapshot to the toolkit's light
+    // default. Give the read-only command the header's actual dark surface.
+    command_vte.set_color_background(&super::alt_screen::command_header_background());
     let icon = crate::workspace_shell::icon(jterm_core::reference_icons::Icon::Terminal);
     icon.set_size_request(24, 24);
     icon.set_margin_end(8);

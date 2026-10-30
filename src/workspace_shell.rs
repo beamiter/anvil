@@ -13,6 +13,14 @@ use jterm_core::developer_workspace as tokens;
 use relm4::{gtk, ComponentSender};
 use vte4::TerminalExt;
 
+const COMPOSER_CONTROL_HEIGHT: f32 = 22.0;
+
+fn composer_control_height(scale: f64) -> i32 {
+    f64::from(COMPOSER_CONTROL_HEIGHT)
+        .max(14.0 * scale + 6.0)
+        .ceil() as i32
+}
+
 pub(crate) struct Chrome {
     pub top: gtk::Overlay,
     pub rail: gtk::Box,
@@ -298,7 +306,7 @@ fn footer_icon(kind: jterm_core::reference_icons::Icon) -> gtk::DrawingArea {
         entries.retain(|(icon, _)| icon.upgrade().is_some());
         entries.push((icon.downgrade(), size));
     });
-    let size = (f64::from(size) * chrome_geometry_scale()).round() as i32;
+    let size = (f64::from(size) * chrome_geometry_scale().min(1.25)).round() as i32;
     icon.set_content_width(size);
     icon.set_content_height(size);
     icon
@@ -312,14 +320,16 @@ fn fixed_chrome_width(widget: &impl IsA<gtk::Widget>, width: f32) {
     let widget = widget.as_ref();
     let height = widget
         .has_css_class("reference-composer-fixed")
-        .then_some(tokens::CONTROL_HEIGHT);
+        .then_some(COMPOSER_CONTROL_HEIGHT);
     FIXED_CHROME_WIDTHS.with_borrow_mut(|entries| {
         entries.retain(|(widget, _, _)| widget.upgrade().is_some());
         entries.push((widget.downgrade(), width, height));
     });
     widget.set_width_request((f64::from(width) * chrome_geometry_scale()).round() as i32);
-    if let Some(height) = height {
-        widget.set_height_request((f64::from(height) * chrome_geometry_scale()).round() as i32);
+    if height.is_some() {
+        widget.set_height_request(composer_control_height(chrome_geometry_scale()));
+        widget.set_valign(gtk::Align::Center);
+        widget.set_overflow(gtk::Overflow::Hidden);
     }
 }
 
@@ -544,7 +554,9 @@ pub(crate) fn composer_tools(
     let secondary_scroll = gtk::ScrolledWindow::new();
     secondary_scroll.set_policy(gtk::PolicyType::External, gtk::PolicyType::Never);
     secondary_scroll.set_min_content_width(0);
-    secondary_scroll.set_max_content_width(400);
+    // A fixed 400px cap clips Terminal under Tools after UI font zoom.
+    // The native child now supplies its complete, already-scaled width.
+    secondary_scroll.set_max_content_width(i32::MAX);
     secondary_scroll.set_width_request(1);
     secondary_scroll.set_hexpand(false);
     secondary_scroll.set_propagate_natural_width(true);
@@ -754,7 +766,7 @@ pub(crate) fn composer_tools(
     controls.add_css_class("chat-controls");
     controls.add_css_class("reference-composer-controls");
     own_composer_chrome(&controls);
-    controls.set_height_request(tokens::CONTROL_HEIGHT as i32);
+    controls.set_height_request(composer_control_height(chrome_geometry_scale()));
     controls.set_vexpand(true);
     controls.set_valign(gtk::Align::End);
     controls.append(&overlay);
@@ -1943,8 +1955,8 @@ pub(crate) fn apply_ui_font_scale(scale: f64) {
     // Registry borrows end before setters can cause native size notifications.
     for (widget, width, height) in widths {
         widget.set_width_request((f64::from(width) * chrome_geometry_scale()).round() as i32);
-        if let Some(height) = height {
-            widget.set_height_request((f64::from(height) * chrome_geometry_scale()).round() as i32);
+        if height.is_some() {
+            widget.set_height_request(composer_control_height(chrome_geometry_scale()));
         }
     }
     let icons = FIXED_CHROME_ICONS.with_borrow_mut(|entries| {
@@ -1955,7 +1967,7 @@ pub(crate) fn apply_ui_font_scale(scale: f64) {
             .collect::<Vec<_>>()
     });
     for (icon, size) in icons {
-        let size = (f64::from(size) * chrome_geometry_scale()).round() as i32;
+        let size = (f64::from(size) * chrome_geometry_scale().min(1.25)).round() as i32;
         icon.set_content_width(size);
         icon.set_content_height(size);
     }

@@ -3951,9 +3951,9 @@ pub(crate) fn apply_finished_card_density(
 
 fn feed_snapshot_bytes(vte: &vte4::Terminal, bytes: &[u8]) {
     vte.feed(&snapshot_payload(bytes));
-    if vte.has_css_class("chat-command-terminal") || vte.has_css_class("chat-output-terminal") {
-        vte.feed(b"\x1b[?25l");
-    }
+    // RIS and captured command bytes may both show a cursor. Every caller
+    // renders a finished, read-only snapshot, so none owns a visible caret.
+    vte.feed(b"\x1b[?25l");
 }
 
 /// In-stream terminal reset carried at the head of every snapshot feed.

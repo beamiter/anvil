@@ -814,12 +814,18 @@ pub(crate) fn create_active_terminal(config: &Config) -> Terminal {
     terminal
 }
 
+pub(crate) fn command_header_background() -> RGBA {
+    RGBA::new(16.0 / 255.0, 28.0 / 255.0, 48.0 / 255.0, 1.0)
+}
+
 pub(crate) fn apply_snapshot_theme_to_vte(terminal: &Terminal, config: &Config) {
     apply_theme_to_vte(terminal, config);
     let mut transparent = config.background;
     transparent.set_alpha(0.0);
     terminal.set_color_cursor(Some(&transparent));
-    if terminal.has_css_class("chat-command-terminal")
+    if terminal.has_css_class("block-command-terminal") {
+        terminal.set_color_background(&command_header_background());
+    } else if terminal.has_css_class("chat-command-terminal")
         || terminal.has_css_class("chat-output-terminal")
     {
         terminal.set_color_background(&transparent);

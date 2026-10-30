@@ -56,7 +56,7 @@
 .workspace-center .chat-context .chat-meta-chip { font-size:9px; border-radius:5px; padding:2px 6px; background:#edf1fb; color:#6d7893; }
 .workspace-center .chat-composer { margin:4px 28px 11px; padding:8px 10px 1px; border-radius:14px; background:#fefefe; outline:1px solid #bdcce4; outline-offset:-1px; box-shadow:0 4px 12px rgba(57,80,135,0.08); }
 .workspace-center .chat-controls { background:transparent; min-height:28px; padding:0 0 0 2px; border-radius:0 0 12px 12px; }
-.workspace-center .chat-controls button { border-radius:7px; min-height:26px; min-width:24px; padding:0 5px; }
+.workspace-center .chat-controls button { border-radius:7px; min-height:0; min-width:24px; padding:0 5px; }
 .workspace-center .chat-send { background:#5c7ef0; color:white; }
 .workspace-center .chat-input-hint { color:#7e8ba1; font-size:9px; }
 .workspace-center .chat-mode .chat-composer:focus-within { outline:2px solid #8799f4; outline-offset:-2px; }
@@ -187,7 +187,7 @@ window.anvil-font-sync,window.anvil-font-sync decoration { padding:0; margin:0; 
 
 .shell-block-composer { min-height:65px; padding:10px 11px 3px; }
 .shell-block-composer .chat-controls { padding:0; }
-.workspace-center .chat-controls .chat-add,.workspace-center .chat-controls .chat-send,.workspace-center .chat-controls .chat-stop { padding:0; min-width:28px; min-height:28px; margin:0; }
+.workspace-center .chat-controls .chat-add,.workspace-center .chat-controls .chat-send,.workspace-center .chat-controls .chat-stop { padding:0; min-width:28px; min-height:0; margin:0; }
 .chat-terminal-capsule { border:1px solid #d4e0f0; background:#f7faff; padding:0 5px; border-radius:7px; min-height:26px; color:#596a87; }
 .chat-terminal-capsule label { font-size:10px; color:#596a87; }
 .shell-block-composer .chat-tool-capsule { padding:0 7px; }
@@ -213,7 +213,7 @@ window.anvil-font-sync,window.anvil-font-sync decoration { padding:0; margin:0; 
 .conversation-current-step { padding:3px 7px; }
 
 /* The outlined add control includes its two border pixels in 28px. */
-.workspace-center .chat-controls .chat-add { min-width:26px; min-height:26px; }
+.workspace-center .chat-controls .chat-add { min-width:26px; min-height:0; }
 
 .workspace-center .chat-controls .chat-send,.workspace-center .chat-controls .chat-stop { border:0; }
 .workspace-center .chat-controls .chat-send:disabled { background:#edf1f8; color:#71829a; }
@@ -254,7 +254,7 @@ window.anvil-font-sync,window.anvil-font-sync decoration { padding:0; margin:0; 
 .block-command-canvas .block-list .block-reference-card.block-selected { outline:1px solid #4199ff; outline-offset:-1px; }
 .block-command-canvas .block-reference-header { background:#101c30; border-bottom:1px solid #293c57; padding:0; color:#d5deec; }
 .block-command-canvas .block-reference-command { padding:0; margin:0; }
-.block-command-canvas .block-reference-command terminal { padding:0; margin:0; background:transparent; }
+.block-command-canvas .block-reference-command terminal { padding:0; margin:0; background:#101c30; }
 .block-command-canvas .block-reference-command-icon { color:#91baff; border:1px solid #34578a; border-radius:6px; background:#172c4d; }
 .block-command-canvas .block-reference-status { border-radius:5px; padding:3px 7px; color:#91a4bf; background:#1c2b40; }
 .block-command-canvas .block-reference-status.completed { color:#39dda0; background:#12352e; }
@@ -327,10 +327,10 @@ window.anvil-font-sync,window.anvil-font-sync decoration { padding:0; margin:0; 
    the opt-in shell diagnostics. The two action states share one 28px slot. */
 .workspace-center .chat-controls.reference-composer-controls button:not(.chat-add):not(.chat-send):not(.chat-stop) { min-width:0; padding-left:4px; padding-right:4px; }
 .workspace-center .reference-composer-controls .reference-composer-fixed { min-width:0; }
-.workspace-center .reference-composer-controls .chat-add { min-width:0; min-height:26px; padding:0; }
+.workspace-center .reference-composer-controls .chat-add { min-width:0; min-height:0; padding:0; }
 .workspace-center .chat-controls.reference-composer-controls .reference-tools-button > button:not(.chat-add):not(.chat-send):not(.chat-stop) { min-width:0; padding-left:2px; padding-right:2px; }
 .workspace-center .reference-composer-controls .chat-send,
-.workspace-center .reference-composer-controls .chat-stop { min-width:0; min-height:28px; padding:0; margin:0; border-width:0; }
+.workspace-center .reference-composer-controls .chat-stop { min-width:0; min-height:0; padding:0; margin:0; border-width:0; }
 
 /* Shared developer Inspector sections. Context/live pages keep their existing
    presentation; only this typed overview adopts the verified native mapping. */
@@ -402,9 +402,9 @@ window.anvil-font-sync,window.anvil-font-sync decoration { padding:0; margin:0; 
 .workspace-center .block-command-canvas label.chat-running-status { font-size:12px; color:#91a4bf; margin:0 12px 4px; }
 .workspace-center .block-command-canvas .chat-controls button:not(.chat-send):not(.chat-stop),.workspace-center .block-command-canvas .chat-controls .chat-terminal-capsule { background:#19283c; background-image:none; border-color:#344864; color:#91a4bf; }
 .workspace-center .block-command-canvas .chat-controls button:disabled,.workspace-center .block-command-canvas .chat-controls button:disabled * { color:#91a4bf; opacity:1; filter:none; }
-.workspace-center .block-command-canvas .chat-controls .chat-send { min-width:26px; min-height:26px; background:#366fdd; background-image:none; border:1px solid #4c8af2; color:#eff6ff; }
+.workspace-center .block-command-canvas .chat-controls .chat-send { min-width:26px; min-height:0; background:#366fdd; background-image:none; border:1px solid #4c8af2; color:#eff6ff; }
 .workspace-center .block-command-canvas .chat-controls .chat-send:disabled,.workspace-center .block-command-canvas .chat-controls .chat-send:disabled * { background:#203650; border-color:#345171; color:#9badc7; }
-.workspace-center .block-command-canvas .chat-controls .chat-stop { min-width:26px; min-height:26px; background:#19283c; background-image:none; border:1px solid #344864; color:#ff8d95; }
+.workspace-center .block-command-canvas .chat-controls .chat-stop { min-width:26px; min-height:0; background:#19283c; background-image:none; border:1px solid #344864; color:#ff8d95; }
 .workspace-center .block-command-canvas .chat-controls .chat-stop:hover { background:#253852; }
 .workspace-center.block-workspace .shell-block-composer { border-radius:12px; }
 .workspace-center.block-workspace .shell-block-composer .chat-controls button:not(.chat-send):not(.chat-stop) { background:#19283c; border-color:#344864; }
