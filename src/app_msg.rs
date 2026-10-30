@@ -382,8 +382,9 @@ pub(crate) enum AppMsg {
     FixBlockWithAgent(u64),
     AiConversationSnapshot(String),
     AiPanelCloseRequested,
+    NavigationWidthChanged(u32),
     AiPanelWidthChanged(u32),
-    PersistAiPanelWidth(u64),
+    PersistSidebarWidths(u64),
     /// One staged action from the agent Tasks panel, executed against the
     /// live task domain at message time.
     TaskPanelAction(crate::agent_task_ui::TaskPanelAction),

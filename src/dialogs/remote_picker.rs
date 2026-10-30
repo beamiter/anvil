@@ -157,6 +157,7 @@ impl Component for RemotePickerModel {
 
     view! {
         root = adw::Dialog {
+            add_css_class: "workspace-dialog",
             set_title: "Connect to Remote Host",
             set_content_width: 480,
             set_content_height: 480,

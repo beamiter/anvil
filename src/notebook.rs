@@ -804,6 +804,7 @@ impl Component for NotebookModel {
 
     view! {
         root = adw::Dialog {
+            add_css_class: "workspace-dialog",
             set_content_width: 880,
             set_content_height: 680,
             connect_closed => NotebookMsg::Closed,

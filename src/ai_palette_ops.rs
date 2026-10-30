@@ -645,16 +645,6 @@ impl AppModel {
             self.sync_side_panel();
             return;
         }
-        if !visible && self.ai_panel_visible.get() {
-            let measured = self
-                .ai_paned
-                .width()
-                .saturating_sub(self.ai_paned.position());
-            if measured >= MIN_AI_PANEL_WIDTH as i32 {
-                self.config.borrow_mut().ai_panel_width =
-                    (measured as u32).clamp(MIN_AI_PANEL_WIDTH, MAX_AI_PANEL_WIDTH);
-            }
-        }
         self.ai_panel_visible.set(visible);
         self.config.borrow_mut().ai_panel_visible = visible;
         self.sync_side_panel();

@@ -336,7 +336,6 @@ struct AppModel {
     /// authority back to `(source tab id, source pane id)`.
     pending_split_spawns: std::collections::HashMap<u64, (u64, u64)>,
     sidebar_visible: bool,
-    sidebar_last_width: Rc<std::cell::Cell<u32>>,
     font_scale: f64,
     /// Generation token for the debounced font-scale config write. Ctrl+wheel
     /// emits a step per notch, so only the last step in a burst reaches disk.
@@ -458,7 +457,7 @@ struct AppModel {
     workflow_dialog: Controller<dialogs::workflow::WorkflowModel>,
     ai_panel: Controller<dialogs::ai_panel::AiPanelModel>,
     ai_panel_visible: std::cell::Cell<bool>,
-    ai_panel_width_generation: Rc<std::cell::Cell<u64>>,
+    sidebar_width_persist_generation: Rc<std::cell::Cell<u64>>,
     /// Right-side stack holding the AI Chats panel and the agent Tasks panel;
     /// it is the `ai_paned` end child, so both share the persisted width.
     side_stack: gtk::Stack,
@@ -854,9 +853,6 @@ impl SimpleComponent for AppModel {
             config.terminal_mode = config.terminal_mode.workspace_backend();
         }
         config.tab_placement = config::TabPlacement::Sidebar;
-        config.sidebar_visible = true;
-        config.sidebar_width = jterm_core::developer_workspace::NAVIGATION_WIDTH as u32;
-        config.ai_panel_width = jterm_core::developer_workspace::INSPECTOR_WIDTH as u32;
         config.bottom_bar = false;
         let shell_argv = if init.safe_mode {
             Rc::new(vec!["sh".to_string()])
@@ -1039,19 +1035,6 @@ impl SimpleComponent for AppModel {
         sidebar::configure_layout(&sidebar_stack, &content_paned);
         content_paned.set_shrink_end_child(true);
         content_paned.set_position(sidebar_width);
-        let sidebar_last_width =
-            Rc::new(std::cell::Cell::new(sidebar_width.clamp(120, 800) as u32));
-        let measured_sidebar_width = sidebar_last_width.clone();
-        content_paned.connect_position_notify(move |paned| {
-            if paned.width() > 0 && paned.start_child().is_some_and(|child| child.is_visible()) {
-                let position =
-                    jterm_core::title_bar::sidebar_position(paned.position(), paned.width());
-                if position != paned.position() {
-                    paned.set_position(position);
-                }
-                measured_sidebar_width.set(position as u32);
-            }
-        });
 
         // Bottom status bar: left segments pack from the left edge, right
         // segments against the right edge, an expanding spacer between them.
@@ -1359,25 +1342,30 @@ impl SimpleComponent for AppModel {
         }
         ai_paned.set_start_child(None::<&gtk::Widget>);
         ai_paned.set_end_child(None::<&gtk::Widget>);
-        let shell = workspace_shell::Chrome::new(&sender, &stack, &sidebar_box, &side_stack);
+        let shell = workspace_shell::Chrome::new(
+            &sender,
+            &stack,
+            &sidebar_box,
+            &side_stack,
+            &config.borrow(),
+        );
+        shell.connect_files_browser(&files_page);
         content_paned.set_start_child(None::<&gtk::Widget>);
         let navigation_scroll = gtk::ScrolledWindow::new();
         navigation_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
         navigation_scroll.set_propagate_natural_height(false);
         navigation_scroll.set_child(Some(&sidebar_box));
         navigation_scroll
-            .set_width_request(jterm_core::developer_workspace::NAVIGATION_WIDTH as i32);
+            .set_width_request(jterm_core::developer_workspace::MIN_NAVIGATION_WIDTH as i32);
         navigation_scroll.set_vexpand(true);
         let navigation_column = gtk::Box::new(gtk::Orientation::Vertical, 0);
         navigation_column
-            .set_width_request(jterm_core::developer_workspace::NAVIGATION_WIDTH as i32);
+            .set_width_request(jterm_core::developer_workspace::MIN_NAVIGATION_WIDTH as i32);
         navigation_column.append(&navigation_scroll);
         navigation_column.append(&shell.status);
         content_paned.set_start_child(Some(&navigation_column));
         ai_paned.set_start_child(Some(&shell.center));
         ai_paned.set_end_child(Some(&shell.inspector));
-        ai_paned.set_wide_handle(false);
-        content_paned.set_wide_handle(false);
         let workspace_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         workspace_row.add_css_class("workspace-body");
         workspace_row.append(&shell.rail);
@@ -1392,6 +1380,7 @@ impl SimpleComponent for AppModel {
             &shell.inspector,
             &content_paned,
             &ai_paned,
+            &sender,
         );
         let mut model = AppModel {
             config,
@@ -1416,7 +1405,6 @@ impl SimpleComponent for AppModel {
             // With tabs in the top bar, keep the optional file sidebar closed
             // until the user explicitly opens it.
             sidebar_visible,
-            sidebar_last_width,
             font_scale,
             font_persist_generation: Rc::new(std::cell::Cell::new(0)),
             window_opacity,
@@ -1493,7 +1481,7 @@ impl SimpleComponent for AppModel {
             workflow_dialog,
             ai_panel,
             ai_panel_visible: std::cell::Cell::new(initial_ai_panel_visible),
-            ai_panel_width_generation: Rc::new(std::cell::Cell::new(0)),
+            sidebar_width_persist_generation: Rc::new(std::cell::Cell::new(0)),
             side_stack: side_stack.clone(),
             tasks_panel,
             tasks_panel_visible: std::cell::Cell::new(false),
@@ -1527,28 +1515,6 @@ impl SimpleComponent for AppModel {
         // explicit palette action asks for them.
         if !model.safe_mode {
             model.refresh_workflows_async(&sender);
-        }
-
-        {
-            let width_sender = sender.clone();
-            let panel = model.side_stack.downgrade();
-            let inspector = model.shell.inspector.downgrade();
-            model.ai_paned.connect_position_notify(move |paned| {
-                let (Some(panel), Some(inspector)) = (panel.upgrade(), inspector.upgrade()) else {
-                    return;
-                };
-                if !panel.is_visible()
-                    || !inspector.is_mapped()
-                    || paned.end_child().as_ref() != Some(inspector.upcast_ref::<gtk::Widget>())
-                {
-                    return;
-                }
-                if let Some(measured) =
-                    ai_panel_width_from_geometry(paned.width(), paned.position())
-                {
-                    width_sender.input(AppMsg::AiPanelWidthChanged(measured));
-                }
-            });
         }
 
         let search_bar = model.search.widget();
@@ -2796,27 +2762,23 @@ impl SimpleComponent for AppModel {
             AppMsg::AiPanelCloseRequested => {
                 self.set_ai_panel_visible(false, true);
             }
+            AppMsg::NavigationWidthChanged(width) => {
+                let width = width.clamp(120, 800);
+                if self.config.borrow().sidebar_width != width {
+                    self.config.borrow_mut().sidebar_width = width;
+                    self.persist_sidebar_widths_debounced(&sender);
+                }
+            }
             AppMsg::AiPanelWidthChanged(width) => {
                 let width = width.clamp(MIN_AI_PANEL_WIDTH, MAX_AI_PANEL_WIDTH);
                 if self.config.borrow().ai_panel_width == width {
                     return;
                 }
                 self.config.borrow_mut().ai_panel_width = width;
-                let generation = self.ai_panel_width_generation.get().wrapping_add(1);
-                self.ai_panel_width_generation.set(generation);
-                let sender = sender.clone();
-                let token = self.ai_panel_width_generation.clone();
-                gtk::glib::timeout_add_local_once(
-                    std::time::Duration::from_millis(300),
-                    move || {
-                        if token.get() == generation {
-                            sender.input(AppMsg::PersistAiPanelWidth(generation));
-                        }
-                    },
-                );
+                self.persist_sidebar_widths_debounced(&sender);
             }
-            AppMsg::PersistAiPanelWidth(generation) => {
-                if self.ai_panel_width_generation.get() == generation {
+            AppMsg::PersistSidebarWidths(generation) => {
+                if self.sidebar_width_persist_generation.get() == generation {
                     self.persist_config();
                 }
             }

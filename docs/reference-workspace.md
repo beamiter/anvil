@@ -8,9 +8,19 @@ also reproduced on the archived baseline; this is not an all-tests-passed claim.
 
 The window shell now binds the family contract in
 `jterm_core::reference_shell`: a 42 px titlebar, 55 px icon rail, 237 px
-navigation, 49 px canvas header and 306 px inspector. The center receives
-surplus width. Allocation changes collapse the inspector first and navigation
-second, without rebuilding the terminal or moving its PTY into another process.
+navigation, 49 px canvas header and 306 px inspector by default. Both sidebar
+edges have native six-pixel drag handles with a resize cursor and hover state.
+Their preferred widths use the existing `sidebar_width` and `ai_panel_width`
+settings and survive hiding, window resizing and restart; a temporary responsive
+clamp never replaces the saved preference. The center retains a 480 px budget
+where the window can provide it. Allocation changes collapse the inspector
+first and navigation second, without rebuilding the terminal or moving its PTY
+into another process.
+
+The native dividers retain GTK's F8/arrow-key resize interaction, with Enter to
+accept and Escape to cancel. Pointer dragging leaves terminal/IME focus alone.
+A narrow-window inspector drawer also has a six-pixel resize edge; when that
+edge has keyboard focus, Left/Right resize and Home restores the default width.
 
 `src/workspace_shell.rs` owns GTK presentation only. The existing Relm4 stack,
 session tabs, file tree, native command center, Vim entry, agent session manager,
@@ -33,8 +43,12 @@ has the unmodified default palette. It never changes shared/persisted Config,
 safe-mode VTE, explicit themes or custom colors. Block keeps its terminal colors
 inside the light surrounding canvas.
 
-The Block composer frame contains shared tool affordances and a hint directing
-input to the terminal. It is not a second editor. Unsupported attachments,
+The Block composer contains the pane's existing native terminal input, fixed
+below the history scroller, just like Forge. Scrolling completed commands does
+not move the input. The same VTE and PTY move between the prompt dock, running
+command card and full native viewport; no second editor is created. Send and
+Stop retain the current prompt/foreground identity and IME checks. The old
+window-level hint shelf is hidden for Block and Chat. Unsupported attachments,
 images and code insertion are visibly disabled. Context opens a real inspector
 page. The right Files tab is disabled until connected; the existing file tree
 remains available in the left navigation. The neutral agent card reports that
@@ -61,9 +75,9 @@ The existing real AI and task panels remain available through their original
 actions.
 
 The command capsule reserves wrapped text rows independently of the VTE's last
-full-pane grid. Chat Enter geometry uses a one-row minimum only in compact
-prompt-at-top mode; raw/full-screen and legacy Block retain their existing
-height floors. Native geometry tests load the production workspace CSS, so
+full-pane grid. Both docked modes use a one-row minimum in compact
+prompt-at-top mode; raw/full-screen applications retain their full native
+viewport. Native geometry tests load the production workspace CSS, so
 extra padding and toolbar widths cannot escape the narrow-window assertions.
 
 ## Remaining acceptance work
@@ -95,7 +109,7 @@ report; a build or fixture screenshot alone is not interaction acceptance.
 ## Shared composer and companion admission
 
 Both modes construct the same native `composer_tools` row. The caller supplies
-the existing guarded Chat Send/Stop controls or Block's disabled Send control;
+the existing guarded native Send/Stop controls in both Block and Chat;
 the factory never owns a PTY or another editor. Terminal is the same outlined
 pill and Model unavailable reserves the shared minimum width. Narrow retained
 canvas tests may hide secondary unavailable affordances into the same Tools

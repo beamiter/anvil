@@ -24,7 +24,7 @@
 .workspace-rail image { -gtk-icon-size:16px; }
 .shell-selected { background:#283d6f; color:#dce7ff; }
 .shell-profile { background:#35496d; border:1px solid #62769a; color:#dbe7ff; border-radius:50%; min-width:25px; min-height:25px; font-size:10px; }
-.workspace-navigation.tab-strip { background:#162133; color:#b6c3d8; padding:12px 14px 8px; min-width:209px; font-family:"DejaVu Sans",sans-serif; font-size:10px; }
+.workspace-navigation.tab-strip { background:#162133; color:#b6c3d8; padding:12px 14px 8px; min-width:92px; font-family:"DejaVu Sans",sans-serif; font-size:10px; }
 .workspace-navigation .shell-section { font-size:8px; letter-spacing:1.1px; color:#8290aa; font-weight:600; margin:5px 0 3px; }
 .workspace-navigation .shell-navigation-row { padding:0 8px; min-height:25px; border-radius:6px; color:#b8c7dd; }
 .workspace-navigation .shell-navigation-row image { -gtk-icon-size:13px; color:#8f9db6; }
@@ -134,6 +134,14 @@ window.anvil-font-sync,window.anvil-font-sync decoration { padding:0; margin:0; 
 .conversation-role-header label.conversation-author { font-size:12px; font-weight:700; }
 .conversation-role-header label.conversation-timing { font-size:9px; }
 .workspace-inspector { background:#0f1825; color:#bbc8db; border-left:1px solid #29374c; font-family:"DejaVu Sans",sans-serif; font-size:10px; }
+/* The retained native Files tree can live in either sidebar. Its own view
+   surface must follow that host instead of falling back to Adwaita light. */
+.workspace-navigation treeview.file-tree { background:#162133; color:#b6c3d8; }
+.workspace-inspector treeview.file-tree { background:#0f1825; color:#bbc8db; }
+.workspace-navigation treeview.file-tree:selected,
+.workspace-inspector treeview.file-tree:selected { background:#283d6f; color:#eff4ff; }
+.workspace-navigation treeview.file-tree > header > button,
+.workspace-inspector treeview.file-tree > header > button { background:#1d2b41; color:#b8c7dd; border-color:#34415b; }
 .shell-inspector-tabs { padding:0 13px; border-bottom:1px solid #29374c; }
 .shell-inspector-tabs button { min-height:25px; padding:0 12px; border-radius:6px; font-size:10px; color:#8e9fb9; }
 .shell-inspector-tabs .shell-selected { background:#263554; color:#cfddfa; }
@@ -149,7 +157,6 @@ window.anvil-font-sync,window.anvil-font-sync decoration { padding:0; margin:0; 
 .shell-agent-card progressbar trough { min-height:4px; background:#101a29; border-radius:4px; }
 .shell-agent-card progressbar progress { background:#7e8ef8; min-height:4px; border-radius:4px; }
 .workspace-titlebar button:focus-visible,.workspace-rail button:focus-visible,.workspace-navigation button:focus-visible,.workspace-inspector button:focus-visible { outline:2px solid #8fa4ff; outline-offset:-2px; }
-.workspace-body > paned > separator,.workspace-body > paned > paned > separator { min-width:0; min-height:0; padding:0; margin:0; background:transparent; }
 
 .native-conversation label.conversation-date { font-size:9px; color:#9ca8ba; }
 .conversation-chip { border:1px solid #d4deef; background:#edf2fc; border-radius:5px; padding:0 5px; color:#728099; }
@@ -170,15 +177,13 @@ window.anvil-font-sync,window.anvil-font-sync decoration { padding:0; margin:0; 
 
 .workspace-center .chat-controls button:disabled,.workspace-center .chat-controls button:disabled label,.workspace-center .chat-controls button:disabled drawingarea,.shell-block-composer button:disabled label,.shell-block-composer button:disabled drawingarea { color:#71829a; opacity:1; }
 
-.reference-tools-popover contents { background:#fefefe; color:#596a87; border:1px solid #dbe3f1; border-radius:8px; padding:7px; }
-.reference-tools-popover button:disabled,.reference-tools-popover button:disabled label { color:#71829a; opacity:1; }
 
 .workspace-center .chat-controls .chat-send,.workspace-center .chat-controls .chat-stop { margin:0; }
 
 /* Libadwaita uses a render filter independently of widget opacity. */
-.workspace-center .chat-controls button:disabled *,.shell-block-composer button:disabled *,.reference-tools-popover button:disabled * { opacity:1; color:#71829a; }
+.workspace-center .chat-controls button:disabled *,.shell-block-composer button:disabled * { opacity:1; color:#71829a; }
 
-.workspace-center .chat-controls button:disabled,.workspace-center .chat-controls button:disabled *,.shell-block-composer button:disabled,.shell-block-composer button:disabled *,.reference-tools-popover button:disabled,.reference-tools-popover button:disabled * { filter:none; opacity:1; color:#71829a; }
+.workspace-center .chat-controls button:disabled,.workspace-center .chat-controls button:disabled *,.shell-block-composer button:disabled,.shell-block-composer button:disabled * { filter:none; opacity:1; color:#71829a; }
 
 .shell-block-composer { min-height:65px; padding:10px 11px 3px; }
 .shell-block-composer .chat-controls { padding:0; }
@@ -220,33 +225,15 @@ window.anvil-font-sync,window.anvil-font-sync decoration { padding:0; margin:0; 
 .workspace-center .chat-controls button:not(.chat-add):not(.chat-send):not(.chat-stop) { padding-left:6px; padding-right:6px; }
 .workspace-center .chat-controls button label { font-family:"DejaVu Sans",sans-serif; font-size:10px; }
 .workspace-center .chat-controls .reference-tools-button arrow { -gtk-icon-size:0; min-width:0; min-height:0; opacity:0; }
-.reference-tools-popover contents { background:#162133; color:#e1e9f6; border:1px solid #394960; border-radius:12px; padding:8px; box-shadow:0 6px 20px rgba(4,10,20,0.24); }
-.reference-tools-popover .reference-tool-row { min-height:30px; min-width:0; padding:0 6px; border:0; border-radius:6px; background:transparent; box-shadow:none; color:#e1e9f6; }
-.reference-tools-popover .reference-tool-row:hover,.reference-tools-popover .reference-tool-row:focus { background:#283d6f; }
-.reference-tools-popover .reference-tool-row label { font-family:"DejaVu Sans",sans-serif; font-size:10px; color:#e1e9f6; }
-.reference-tools-popover .reference-tool-row label.reference-tool-description { font-size:9px; color:#91a2bb; }
-.reference-tools-popover .reference-tool-row:disabled,.reference-tools-popover .reference-tool-row:disabled * { color:#91a2bb; opacity:1; filter:none; }
-.reference-tools-popover separator { background:#394960; min-height:1px; }
 .native-conversation label.conversation-code-language { font-size:9px; color:#7b8ba4; }
 .conversation-code-header button.conversation-code-action { min-height:20px; padding:0 6px; border:1px solid #cdd8e8; border-radius:5px; background:#f8fbff; color:#63738b; }
 .conversation-code-header button.conversation-code-action:disabled,.conversation-code-header button.conversation-code-action:disabled * { color:#8292a8; opacity:1; filter:none; }
 
-/* Popovers inherit ancestry in GTK CSS: isolate them from footer button rules. */
-popover.reference-tools-popover { background:transparent; border:0; box-shadow:none; padding:0; }
-.workspace-center .chat-controls .reference-tools-popover .reference-tool-row { min-height:30px; padding:0 6px; border:0; background:transparent; box-shadow:none; color:#e1e9f6; }
-.workspace-center .chat-controls .reference-tools-popover .reference-tool-row:hover,.workspace-center .chat-controls .reference-tools-popover .reference-tool-row:focus { background:#283d6f; }
-.workspace-center .chat-controls .reference-tools-popover .reference-tool-row label,.workspace-center .chat-controls .reference-tools-popover .reference-tool-row drawingarea { color:#e1e9f6; }
-.workspace-center .chat-controls .reference-tools-popover .reference-tool-row label.reference-tool-description,.workspace-center .chat-controls .reference-tools-popover .reference-tool-row:disabled,.workspace-center .chat-controls .reference-tools-popover .reference-tool-row:disabled * { color:#91a2bb; opacity:1; filter:none; }
 
 .reference-organism-speech { background:rgba(22,33,51,0.97); border:1px solid #3f5377; border-radius:10px; padding:7px 8px; color:#dce7f8; }
 .reference-organism-speech label { font-family:"DejaVu Sans",sans-serif; font-size:10px; color:#dce7f8; }
 .reference-organism-speech button { min-width:20px; min-height:20px; padding:0; color:#91a2bb; }
 
-/* The menu has its own surface contract independent of footer ancestry. */
-#reference-tools-menu button.reference-tool-row { min-height:30px; min-width:0; padding:0 6px; border:0; border-radius:6px; background:transparent; box-shadow:none; color:#e1e9f6; }
-#reference-tools-menu button.reference-tool-row:hover,#reference-tools-menu button.reference-tool-row:focus { background:#283d6f; }
-#reference-tools-menu button.reference-tool-row label,#reference-tools-menu button.reference-tool-row drawingarea { color:#e1e9f6; }
-#reference-tools-menu button.reference-tool-row label.reference-tool-description,#reference-tools-menu button.reference-tool-row:disabled,#reference-tools-menu button.reference-tool-row:disabled * { color:#91a2bb; filter:none; opacity:1; }
 
 .workspace-center label.chat-running-status { font-family:"DejaVu Sans",sans-serif; font-size:11px; color:#8290a7; }
 
@@ -328,7 +315,7 @@ popover.reference-tools-popover { background:transparent; border:0; box-shadow:n
 .workspace-titlebar .shell-search { min-height:26px; }
 .workspace-titlebar .shell-modes button { min-height:26px; min-width:0; }
 .workspace-rail button { margin-left:10px; margin-right:10px; }
-.workspace-navigation.tab-strip { min-width:209px; }
+.workspace-navigation.tab-strip { min-width:92px; }
 .shell-inspector-tabs { padding-left:13px; padding-right:13px; }
 .shell-agent-card { margin-left:13px; margin-right:13px; }
 .workspace-center .chat-composer { min-height:64px; margin:4px 28px 11px; padding:8px 10px; }
@@ -368,3 +355,18 @@ popover.reference-tools-popover { background:transparent; border:0; box-shadow:n
 .workspace-inspector .reference-rich-inspector .reference-inspector-output-empty .reference-terminal-body { padding:0; }
 .workspace-inspector .reference-rich-inspector progressbar trough { min-height:4px; background:#34445c; }
 .workspace-inspector .reference-rich-inspector progressbar progress { background:#648bef; }
+
+/* Tools retains its compact, authored UI roles; all native menus now share
+   their surface/state paints through workspace_popups.css. */
+.reference-tools-popover .reference-tool-row { min-height:30px; min-width:0; padding:0 6px; border-radius:6px; }
+.reference-tools-popover .reference-tool-row label { font-family:"DejaVu Sans",sans-serif; font-size:10px; }
+.reference-tools-popover .reference-tool-row label.reference-tool-description { font-size:9px; }
+
+/* Six logical pixels are a real native splitter hit target, included by the
+   shared layout budget. Terminal splitters retain their own native styles. */
+.workspace-body paned.workspace-sidebar-split > separator { min-width:6px; min-height:0; padding:0; margin:0; border:0; background:#263246; }
+.workspace-body paned.workspace-sidebar-split > separator:hover { background:#5c7ef0; }
+.workspace-body paned.workspace-sidebar-split:focus > separator { background:#5c7ef0; outline:1px solid #8fa4ff; outline-offset:-1px; }
+
+.workspace-drawer-resize-handle { min-width:6px; background:#263246; }
+.workspace-drawer-resize-handle:hover,.workspace-drawer-resize-handle:focus-visible { background:#5c7ef0; outline:1px solid #8fa4ff; outline-offset:-1px; }

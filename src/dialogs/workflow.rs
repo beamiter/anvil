@@ -123,6 +123,7 @@ impl Component for WorkflowModel {
 
     view! {
         root = adw::Dialog {
+            add_css_class: "workspace-dialog",
             set_content_width: 520,
             set_content_height: 0,
 

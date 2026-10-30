@@ -28,11 +28,117 @@ pub(crate) struct Chrome {
     block_mode: gtk::Button,
     chat_mode: gtk::Button,
     context_details: gtk::Label,
+    context_state: gtk::Label,
+    context_copy: gtk::Button,
+    context_value: std::rc::Rc<std::cell::RefCell<String>>,
+    workspace_menu: gtk::Box,
+    workspace_popover: gtk::Popover,
+    workspace_entries: std::cell::RefCell<Vec<(u64, String, bool)>>,
+    overview_host: gtk::Box,
+    overview_model: std::cell::RefCell<Option<jterm_core::reference_conversation::Inspector>>,
+    overview_actions: gtk::Box,
+    overview_action_state: std::cell::RefCell<Vec<(String, crate::agent_task_ui::TaskPanelAction)>>,
+    task_actions_available: std::cell::Cell<Option<(bool, bool)>>,
+    sender: ComponentSender<AppModel>,
+    files_control: std::cell::RefCell<Option<std::rc::Rc<FilesControl>>>,
     block_shelf: gtk::Box,
     presentation_navigation: gtk::Label,
     search: gtk::Button,
     inspector_control: std::rc::Rc<InspectorControl>,
     inspector_pages: gtk::Stack,
+    sidebar_widths: std::rc::Rc<SidebarWidths>,
+}
+
+/// One authoritative browser moves between presentation hosts. Its model,
+/// filesystem authority, pending intents and selection are never replaced.
+struct FilesControl {
+    home: gtk::Box,
+    right: gtk::Box,
+    browser: gtk::Box,
+    notice: gtk::Box,
+}
+
+impl FilesControl {
+    fn show_in_inspector(&self, right: bool) {
+        let target = if right { &self.right } else { &self.home };
+        if self.browser.parent().as_ref() != Some(target.upcast_ref::<gtk::Widget>()) {
+            if let Some(parent) = self.browser.parent().and_downcast::<gtk::Box>() {
+                parent.remove(&self.browser);
+            }
+            target.append(&self.browser);
+        }
+        self.notice.set_visible(right);
+    }
+}
+
+pub(crate) struct SessionContext<'a> {
+    pub private: bool,
+    pub cwd: Option<&'a str>,
+    pub namespace: &'a str,
+    pub configured_shell: &'a str,
+    pub presentation: &'a str,
+    pub process: Option<&'a str>,
+    pub last_exit: Option<i32>,
+    pub duration_ms: Option<u64>,
+    pub grid: (u16, u16),
+    pub branch: Option<&'a str>,
+    pub share_command_context: bool,
+}
+
+/// This is a local, bounded view of observed state. Private tabs never place
+/// their directory, process or command result in the displayed/copyable text.
+pub(crate) fn session_context_text(context: &SessionContext<'_>) -> String {
+    if context.private {
+        return "Private session\nDirectory, process and command details are hidden.".into();
+    }
+    let safe = |value: &str| jterm_core::review_input::safe_inline_display(value, 1024);
+    let mut lines = vec![
+        format!("Directory: {}", safe(context.cwd.unwrap_or("Not reported"))),
+        format!("Filesystem: {}", safe(context.namespace)),
+        format!("Configured shell: {}", safe(context.configured_shell)),
+        format!("Presentation: {}", context.presentation),
+        format!(
+            "Foreground process: {}",
+            safe(context.process.unwrap_or("Not reported"))
+        ),
+        format!("Terminal: {} × {}", context.grid.0, context.grid.1),
+    ];
+    if let Some(branch) = context.branch {
+        lines.push(format!("Git branch: {}", safe(branch)));
+    }
+    if let Some(code) = context.last_exit {
+        lines.push(format!("Last command exit: {code}"));
+    }
+    if let Some(duration) = context.duration_ms {
+        lines.push(format!("Last command duration: {duration} ms"));
+    }
+    lines.push(format!(
+        "Command context sharing: {}",
+        if context.share_command_context {
+            "Enabled by your settings"
+        } else {
+            "Off"
+        }
+    ));
+    lines.join("\n")
+}
+
+fn update_session_context(
+    state: &gtk::Label,
+    copy: &gtk::Button,
+    value: &std::cell::RefCell<String>,
+    context: &SessionContext<'_>,
+) {
+    let summary = session_context_text(context);
+    if state.text().as_str() != summary {
+        state.set_label(&summary);
+    }
+    copy.set_sensitive(!context.private && !summary.is_empty());
+    *value.borrow_mut() = if context.private {
+        String::new()
+    } else {
+        summary
+    };
 }
 
 /// The outer inspector is independent of the provider/task page it contains.
@@ -44,6 +150,44 @@ struct InspectorControl {
     available: std::cell::Cell<bool>,
     button: gtk::ToggleButton,
     refresh: std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarEdge {
+    Navigation,
+    Inspector,
+}
+
+/// User preferences survive responsive clamps, hiding and drawer transitions.
+/// Only native handle input commits widths; allocation notifications do not.
+struct SidebarWidths {
+    navigation: std::cell::Cell<u32>,
+    inspector: std::cell::Cell<u32>,
+    navigation_visible: std::cell::Cell<bool>,
+    editing: std::cell::Cell<Option<SidebarEdge>>,
+    edit_start: std::cell::Cell<Option<i32>>,
+    drawer_preview: std::cell::Cell<Option<u32>>,
+    applying: std::cell::Cell<bool>,
+}
+
+impl SidebarWidths {
+    fn new(navigation: u32, inspector: u32, navigation_visible: bool) -> Self {
+        Self {
+            navigation: std::cell::Cell::new(navigation.clamp(
+                tokens::MIN_NAVIGATION_WIDTH as u32,
+                tokens::MAX_NAVIGATION_WIDTH as u32,
+            )),
+            inspector: std::cell::Cell::new(inspector.clamp(
+                tokens::MIN_INSPECTOR_WIDTH as u32,
+                tokens::MAX_INSPECTOR_WIDTH as u32,
+            )),
+            navigation_visible: std::cell::Cell::new(navigation_visible),
+            editing: std::cell::Cell::new(None),
+            edit_start: std::cell::Cell::new(None),
+            drawer_preview: std::cell::Cell::new(None),
+            applying: std::cell::Cell::new(false),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -257,6 +401,9 @@ fn action_row(
     content.append(&self::icon(icon_for_name(icon)));
     let title = label(text, "shell-navigation-title");
     title.set_hexpand(true);
+    title.set_width_chars(1);
+    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    row.set_tooltip_text(Some(text));
     content.append(&title);
     row.set_child(Some(&content));
     row.add_css_class("shell-navigation-row");
@@ -601,6 +748,7 @@ impl Chrome {
         terminal_stack: &gtk::Stack,
         navigation: &gtk::Box,
         side_stack: &gtk::Stack,
+        config: &Config,
     ) -> Self {
         let top = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         top.add_css_class("workspace-titlebar");
@@ -821,20 +969,28 @@ impl Chrome {
         rail.append(&profile);
 
         navigation.add_css_class("workspace-navigation");
-        navigation.set_width_request(
-            (tokens::NAVIGATION_WIDTH - 2.0 * tokens::NAVIGATION_PADDING) as i32,
-        );
+        navigation.set_width_request(-1);
         let navigation_heading = gtk::Box::new(
             gtk::Orientation::Vertical,
             tokens::NAVIGATION_ROW_GAP as i32,
         );
         navigation_heading.append(&label("WORKSPACE", "shell-section"));
-        let workspace = action_row(
-            "folder-symbolic",
-            "Local workspace",
-            sender,
-            AppMsg::Action(Action::ToggleCommandPalette),
-        );
+        let workspace = gtk::MenuButton::new();
+        workspace.set_tooltip_text(Some("Switch active workspace session"));
+        workspace.add_css_class("shell-navigation-row");
+        workspace.add_css_class("flat");
+        let workspace_menu = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        workspace_menu.set_width_request(240);
+        let workspace_popover = gtk::Popover::new();
+        let workspace_scroll = gtk::ScrolledWindow::new();
+        workspace_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        workspace_scroll.set_max_content_height(360);
+        workspace_scroll.set_propagate_natural_height(true);
+        workspace_scroll.set_child(Some(&workspace_menu));
+        workspace_popover.set_child(Some(&workspace_scroll));
+        workspace.set_popover(Some(&workspace_popover));
+        // This selector lists live session identities, so switching preserves
+        // each shell, split layout and draft.
         workspace.add_css_class("shell-workspace-selector");
         let selector = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         selector.append(&icon(jterm_core::reference_icons::Icon::Files));
@@ -842,9 +998,6 @@ impl Chrome {
         workspace_name.set_hexpand(true);
         workspace_name.set_ellipsize(gtk::pango::EllipsizeMode::End);
         selector.append(&workspace_name);
-        let branch = label("—", "shell-workspace-branch");
-        branch.set_tooltip_text(Some("Branch information is unavailable"));
-        selector.append(&branch);
         selector.append(&icon(jterm_core::reference_icons::Icon::ChevronDown));
         workspace.set_child(Some(&selector));
         workspace.set_margin_top(1);
@@ -909,11 +1062,19 @@ impl Chrome {
             identity.set_center_widget(Some(&glyph));
             row.append(&identity);
             let text = gtk::Box::new(gtk::Orientation::Vertical, 1);
+            text.set_hexpand(true);
             let name_line = gtk::Box::new(gtk::Orientation::Horizontal, 4);
             name_line.append(&label(name, "shell-navigation-title"));
-            name_line.append(&label("Unavailable", "shell-muted"));
+            let availability = label("Unavailable", "shell-muted");
+            availability.set_width_chars(1);
+            availability.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            name_line.append(&availability);
             text.append(&name_line);
-            text.append(&label(description, "shell-muted"));
+            let detail = label(description, "shell-muted");
+            detail.set_width_chars(1);
+            detail.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            text.append(&detail);
+            row.set_tooltip_text(Some(&format!("{name} · {description} · Unavailable")));
             row.append(&text);
             spaces.append(&row);
         }
@@ -1007,7 +1168,7 @@ impl Chrome {
         let inspector = gtk::Box::new(gtk::Orientation::Vertical, 0);
         inspector.add_css_class("workspace-inspector");
         inspector.add_css_class("anvil-ui-font");
-        inspector.set_width_request(tokens::INSPECTOR_WIDTH as i32);
+        inspector.set_width_request(tokens::MIN_INSPECTOR_WIDTH as i32);
         let inspector_tabs = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         inspector_tabs.add_css_class("shell-inspector-tabs");
         inspector_tabs.set_height_request(tokens::INSPECTOR_TABS_HEIGHT as i32);
@@ -1022,7 +1183,43 @@ impl Chrome {
         } else {
             jterm_core::reference_conversation::Inspector::empty()
         };
-        let overview = crate::workspace_conversation::inspector(&inspector_model, fixture);
+        let overview_host = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        overview_host.set_vexpand(true);
+        overview_host.append(&crate::workspace_conversation::inspector(
+            &inspector_model,
+            fixture,
+        ));
+        let overview_actions = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        overview_actions.set_visible(!fixture);
+        if !fixture {
+            overview_actions.append(&action_row(
+                "agent",
+                "New agent task",
+                sender,
+                AppMsg::TaskPanelAction(crate::agent_task_ui::TaskPanelAction::ComposeProject),
+            ));
+            overview_actions.append(&action_row(
+                "agent",
+                "Manage agent tasks",
+                sender,
+                AppMsg::Action(Action::ToggleTasksPanel),
+            ));
+            overview_actions.append(&action_row(
+                "conversation",
+                "Open AI chat",
+                sender,
+                AppMsg::Action(Action::OpenAiPanel),
+            ));
+            overview_actions.append(&action_row(
+                "recent",
+                "Browse agent sessions",
+                sender,
+                AppMsg::Action(Action::OpenAgentSessions),
+            ));
+        }
+        let overview = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        overview.append(&overview_actions);
+        overview.append(&overview_host);
         let overview_scroll = gtk::ScrolledWindow::new();
         overview_scroll.add_css_class("reference-inspector-scroll");
         overview_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
@@ -1048,11 +1245,56 @@ impl Chrome {
         context_details.set_wrap(true);
         context_details.set_selectable(true);
         context_page.append(&context_details);
+        let context_state = label("No active session", "shell-muted");
+        context_state.set_wrap(true);
+        context_state.set_selectable(true);
+        context_page.append(&context_state);
+        let context_value = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let context_copy = gtk::Button::with_label("Copy session context");
+        let copy_value = context_value.clone();
+        context_copy
+            .connect_clicked(move |button| button.clipboard().set_text(&copy_value.borrow()));
+        context_page.append(&context_copy);
+        let browse = action_row(
+            "folder",
+            "Browse session directory",
+            sender,
+            AppMsg::FileTreeGotoCwd,
+        );
+        let browse_panel = panel.downgrade();
+        browse.connect_clicked(move |_| {
+            if let Some(panel) = browse_panel.upgrade() {
+                panel.set_visible_child_name("files");
+            }
+        });
+        context_page.append(&browse);
+        context_page.append(&action_row(
+            "terminal",
+            "Focus terminal",
+            sender,
+            AppMsg::FocusShell,
+        ));
+        context_page.append(&action_row(
+            "search",
+            "Search terminal output",
+            sender,
+            AppMsg::Action(Action::ToggleSearch),
+        ));
+        context_page.append(&action_row(
+            "settings",
+            "Context sharing settings",
+            sender,
+            AppMsg::Action(Action::ToggleSettings),
+        ));
         let context_notice = label("No terminal content is sent automatically. Agent context sharing follows your consent settings.", "shell-muted");
         context_notice.set_wrap(true);
         context_page.append(&context_notice);
         context_page.set_valign(gtk::Align::Start);
-        panel.add_named(&context_page, Some("context"));
+        let context_scroll = gtk::ScrolledWindow::new();
+        context_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        context_scroll.set_vexpand(true);
+        context_scroll.set_child(Some(&context_page));
+        panel.add_named(&context_scroll, Some("context"));
         panel.set_visible_child_name(if side_stack.is_visible() {
             "live"
         } else {
@@ -1061,11 +1303,11 @@ impl Chrome {
         let live_panel = panel.downgrade();
         side_stack.connect_visible_notify(move |stack| {
             if let Some(panel) = live_panel.upgrade() {
-                panel.set_visible_child_name(if stack.is_visible() {
-                    "live"
-                } else {
-                    "overview"
-                });
+                if stack.is_visible() {
+                    panel.set_visible_child_name("live");
+                } else if panel.visible_child_name().as_deref() == Some("live") {
+                    panel.set_visible_child_name("overview");
+                }
             }
         });
         let agent_tab = gtk::Button::with_label("Agent");
@@ -1086,12 +1328,25 @@ impl Chrome {
             });
             inspector_tabs.append(tab);
         }
+        let files_tab = gtk::Button::with_label("Files");
+        files_tab.add_css_class("flat");
+        files_tab.set_tooltip_text(Some(
+            "Browse the current Files location in the right sidebar",
+        ));
+        let files_panel = panel.downgrade();
+        files_tab.connect_clicked(move |_| {
+            if let Some(panel) = files_panel.upgrade() {
+                panel.set_visible_child_name("files");
+            }
+        });
         let agent = agent_tab.downgrade();
         let context = context_tab.downgrade();
+        let files = files_tab.downgrade();
         panel.connect_visible_child_name_notify(move |panel| {
             let context_selected = panel.visible_child_name().as_deref() == Some("context");
+            let files_selected = panel.visible_child_name().as_deref() == Some("files");
             if let Some(agent) = agent.upgrade() {
-                if context_selected {
+                if context_selected || files_selected {
                     agent.remove_css_class("shell-selected");
                 } else {
                     agent.add_css_class("shell-selected");
@@ -1104,9 +1359,14 @@ impl Chrome {
                     context.remove_css_class("shell-selected");
                 }
             }
+            if let Some(files) = files.upgrade() {
+                if files_selected {
+                    files.add_css_class("shell-selected");
+                } else {
+                    files.remove_css_class("shell-selected");
+                }
+            }
         });
-        let files_tab = unavailable("Files");
-        files_tab.set_tooltip_text(Some("Right-side file inspection is not connected yet. Project files are available in the left navigation."));
         files_tab.set_width_request(tokens::INSPECTOR_TAB_WIDTH as i32);
         files_tab.set_valign(gtk::Align::Center);
         files_tab.set_height_request(28);
@@ -1114,7 +1374,31 @@ impl Chrome {
         let tab_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         tab_spacer.set_hexpand(true);
         inspector_tabs.append(&tab_spacer);
-        let inspector_options = unavailable("Options");
+        let inspector_options = gtk::MenuButton::new();
+        inspector_options.add_css_class("flat");
+        inspector_options.set_tooltip_text(Some("Inspector options"));
+        let options = gtk::Popover::new();
+        let options_list = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        for (title, msg) in [
+            (
+                "Manage agent tasks",
+                AppMsg::Action(Action::ToggleTasksPanel),
+            ),
+            ("Open AI chat", AppMsg::Action(Action::OpenAiPanel)),
+            (
+                "Browse agent sessions",
+                AppMsg::Action(Action::OpenAgentSessions),
+            ),
+            ("Settings", AppMsg::Action(Action::ToggleSettings)),
+            ("Hide right sidebar", AppMsg::ToggleInspector),
+        ] {
+            let option = action_row("settings", title, sender, msg);
+            let options = options.clone();
+            option.connect_clicked(move |_| options.popdown());
+            options_list.append(&option);
+        }
+        options.set_child(Some(&options_list));
+        inspector_options.set_popover(Some(&options));
         inspector_options.set_child(Some(&icon(jterm_core::reference_icons::Icon::Grid)));
         inspector_options.set_size_request(24, 24);
         inspector_options.set_valign(gtk::Align::Center);
@@ -1136,13 +1420,254 @@ impl Chrome {
             block_mode: mode_buttons.remove(0),
             chat_mode: mode_buttons.remove(0),
             context_details,
+            context_state,
+            context_copy,
+            context_value,
+            workspace_menu,
+            workspace_popover,
+            workspace_entries: std::cell::RefCell::new(Vec::new()),
+            overview_host,
+            overview_model: std::cell::RefCell::new(None),
+            overview_actions,
+            overview_action_state: std::cell::RefCell::new(Vec::new()),
+            task_actions_available: std::cell::Cell::new(None),
+            sender: sender.clone(),
+            files_control: std::cell::RefCell::new(None),
             block_shelf,
             presentation_navigation: presentation_navigation
                 .expect("presentation navigation label"),
             search,
             inspector_control,
             inspector_pages: panel,
+            sidebar_widths: std::rc::Rc::new(SidebarWidths::new(
+                config.sidebar_width,
+                config.ai_panel_width,
+                config.sidebar_visible,
+            )),
         }
+    }
+
+    pub(crate) fn connect_files_browser(&self, home: &gtk::Box) {
+        let browser = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        browser.set_vexpand(true);
+        while let Some(child) = home.first_child() {
+            home.remove(&child);
+            browser.append(&child);
+        }
+        let right = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        right.set_vexpand(true);
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
+        scroll.set_propagate_natural_width(false);
+        scroll.set_vexpand(true);
+        scroll.set_child(Some(&right));
+        self.inspector_pages.add_named(&scroll, Some("files"));
+        let notice = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let message = label("Files are open in the right sidebar", "shell-muted");
+        message.set_wrap(true);
+        notice.append(&message);
+        notice.append(&action_row(
+            "folder",
+            "Show files here",
+            &self.sender,
+            AppMsg::SetSidebarView(crate::config::SidebarView::Files),
+        ));
+        home.append(&notice);
+        let control = std::rc::Rc::new(FilesControl {
+            home: home.clone(),
+            right,
+            browser,
+            notice,
+        });
+        control.show_in_inspector(false);
+        let moved = control.clone();
+        let sender = self.sender.clone();
+        self.inspector_pages
+            .connect_visible_child_name_notify(move |panel| {
+                moved.show_in_inspector(panel.visible_child_name().as_deref() == Some("files"));
+                if panel.visible_child_name().as_deref() == Some("files") {
+                    sender.input(AppMsg::FileTreeTtlTick);
+                }
+            });
+        *self.files_control.borrow_mut() = Some(control);
+    }
+
+    pub(crate) fn show_files_navigation(&self) {
+        if self.inspector_pages.visible_child_name().as_deref() == Some("files") {
+            self.inspector_pages.set_visible_child_name("overview");
+        }
+        if let Some(control) = self.files_control.borrow().as_ref() {
+            control.show_in_inspector(false);
+        }
+    }
+
+    pub(crate) fn sync_session_context(&self, context: &SessionContext<'_>) {
+        update_session_context(
+            &self.context_state,
+            &self.context_copy,
+            &self.context_value,
+            context,
+        );
+        if !jterm_core::reference_conversation::fixture_enabled() {
+            self.mode.set_label(&format!(
+                "{} · {}",
+                context.presentation,
+                if context.private {
+                    "Private session"
+                } else {
+                    context.namespace
+                }
+            ));
+        }
+    }
+
+    pub(crate) fn sync_workspace_entries(&self, entries: &[(u64, String, bool)]) {
+        if self.workspace_entries.borrow().as_slice() == entries {
+            return;
+        }
+        *self.workspace_entries.borrow_mut() = entries.to_vec();
+        while let Some(child) = self.workspace_menu.first_child() {
+            self.workspace_menu.remove(&child);
+        }
+        self.workspace_menu
+            .append(&label("OPEN SESSIONS", "shell-section"));
+        for (id, title, selected) in entries {
+            let row = action_row("terminal", title, &self.sender, AppMsg::SelectTab(*id));
+            if *selected {
+                row.add_css_class("shell-selected");
+            }
+            let popover = self.workspace_popover.clone();
+            row.connect_clicked(move |_| popover.popdown());
+            self.workspace_menu.append(&row);
+        }
+        for (title, msg) in [
+            ("New session", AppMsg::NewTab),
+            ("Connect remote…", AppMsg::Action(Action::ShowRemotePicker)),
+        ] {
+            let row = action_row("workspace", title, &self.sender, msg);
+            let popover = self.workspace_popover.clone();
+            row.connect_clicked(move |_| popover.popdown());
+            self.workspace_menu.append(&row);
+        }
+    }
+
+    pub(crate) fn sync_task_overview(
+        &self,
+        model: &jterm_core::reference_conversation::Inspector,
+        detail: Option<&crate::dialogs::tasks_panel::TaskDetailSync>,
+        allow_create: bool,
+        allow_manage: bool,
+    ) {
+        if jterm_core::reference_conversation::fixture_enabled() {
+            return;
+        }
+        if self.overview_model.borrow().as_ref() != Some(model) {
+            *self.overview_model.borrow_mut() = Some(model.clone());
+            while let Some(child) = self.overview_host.first_child() {
+                self.overview_host.remove(&child);
+            }
+            self.overview_host
+                .append(&crate::workspace_conversation::inspector(model, false));
+        }
+        use crate::agent_task_ui::TaskPanelAction;
+        let mut actions = Vec::new();
+        if let Some(detail) = detail.filter(|detail| !detail.archived && allow_manage) {
+            actions.push((
+                "Manage selected task".into(),
+                TaskPanelAction::Select(detail.id),
+            ));
+            if detail.can_start_native && allow_create {
+                actions.push((
+                    "Start native agent".into(),
+                    TaskPanelAction::StartNative(detail.id),
+                ));
+            }
+            if detail.can_start_terminal && allow_create {
+                actions.push((
+                    "Start agent in terminal".into(),
+                    TaskPanelAction::StartTerminal(detail.id),
+                ));
+            }
+            if detail.can_focus_terminal {
+                actions.push((
+                    "Open agent terminal".into(),
+                    TaskPanelAction::FocusTerminal(detail.id),
+                ));
+            }
+            if detail.can_focus_validation {
+                actions.push((
+                    "Open validation output".into(),
+                    TaskPanelAction::FocusValidation(detail.id),
+                ));
+            }
+            if detail.can_run_validation && allow_create {
+                actions.push((
+                    "Run validation".into(),
+                    TaskPanelAction::RunValidation(detail.id),
+                ));
+            }
+            actions.push((
+                "Review task changes".into(),
+                TaskPanelAction::ReviewDiff(detail.id),
+            ));
+        }
+        if *self.overview_action_state.borrow() == actions
+            && self.task_actions_available.get() == Some((allow_create, allow_manage))
+        {
+            return;
+        }
+        self.task_actions_available
+            .set(Some((allow_create, allow_manage)));
+        *self.overview_action_state.borrow_mut() = actions.clone();
+        while let Some(child) = self.overview_actions.first_child() {
+            self.overview_actions.remove(&child);
+        }
+        for (title, action) in actions {
+            let row = gtk::Button::with_label(&title);
+            let sender = self.sender.clone();
+            let selected = detail.map(|detail| detail.id);
+            row.connect_clicked(move |_| {
+                sender.input(AppMsg::Action(Action::ToggleTasksPanel));
+                if let Some(id) = selected {
+                    sender.input(AppMsg::TaskPanelAction(TaskPanelAction::Select(id)));
+                }
+                sender.input(AppMsg::TaskPanelAction(action.clone()));
+            });
+            self.overview_actions.append(&row);
+        }
+        let create = action_row(
+            "agent",
+            "New agent task",
+            &self.sender,
+            AppMsg::TaskPanelAction(TaskPanelAction::ComposeProject),
+        );
+        create.set_sensitive(allow_create);
+        create.set_tooltip_text(Some(if allow_create {
+            "Create an isolated task with an explicit goal"
+        } else {
+            "Agent tasks must be enabled in configuration and require normal mode"
+        }));
+        self.overview_actions.append(&create);
+        let manage = action_row(
+            "agent",
+            "Manage agent tasks",
+            &self.sender,
+            AppMsg::Action(Action::ToggleTasksPanel),
+        );
+        manage.set_sensitive(allow_manage);
+        self.overview_actions.append(&manage);
+        self.overview_actions.append(&action_row(
+            "conversation",
+            "Open AI chat",
+            &self.sender,
+            AppMsg::Action(Action::OpenAiPanel),
+        ));
+        self.overview_actions.append(&action_row(
+            "recent",
+            "Browse agent sessions",
+            &self.sender,
+            AppMsg::Action(Action::OpenAgentSessions),
+        ));
     }
 
     pub(crate) fn toggle_inspector(&self) {
@@ -1166,6 +1691,30 @@ impl Chrome {
     pub(crate) fn show_inspector_live(&self) {
         self.inspector_control.requested.set(Some(true));
         self.inspector_pages.set_visible_child_name("live");
+        self.refresh_inspector_layout();
+    }
+
+    pub(crate) fn sidebar_widths(&self) -> (u32, u32) {
+        (
+            self.sidebar_widths.navigation.get(),
+            self.sidebar_widths.inspector.get(),
+        )
+    }
+
+    pub(crate) fn set_sidebar_widths(&self, navigation: u32, inspector: u32) {
+        self.sidebar_widths.navigation.set(navigation.clamp(
+            tokens::MIN_NAVIGATION_WIDTH as u32,
+            tokens::MAX_NAVIGATION_WIDTH as u32,
+        ));
+        self.sidebar_widths.inspector.set(inspector.clamp(
+            tokens::MIN_INSPECTOR_WIDTH as u32,
+            tokens::MAX_INSPECTOR_WIDTH as u32,
+        ));
+        self.refresh_inspector_layout();
+    }
+
+    pub(crate) fn set_navigation_visible(&self, visible: bool) {
+        self.sidebar_widths.navigation_visible.set(visible);
         self.refresh_inspector_layout();
     }
 
@@ -1203,8 +1752,10 @@ impl Chrome {
         } else {
             self.center.remove_css_class("block-workspace");
         }
-        // Block's unverified dock is not active in this checkpoint.
-        self.block_shelf.set_visible(mode != TerminalMode::Chat);
+        // Block and Chat own their real per-pane input dock; the outer shelf
+        // is only for the traditional native terminal presentation.
+        self.block_shelf
+            .set_visible(!matches!(mode, TerminalMode::Block | TerminalMode::Chat));
         self.canvas_header
             .set_height_request(tokens::CANVAS_HEADER_HEIGHT as i32);
         if mode != TerminalMode::Chat
@@ -1245,7 +1796,7 @@ impl Chrome {
 pub(crate) fn install_css() {
     let css = include_str!("workspace_shell.css");
     let provider = gtk::CssProvider::new();
-    provider.load_from_string(css);
+    provider.load_from_string(&format!("{css}\n{}", include_str!("workspace_popups.css")));
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
             &display,
@@ -1500,6 +2051,465 @@ pub(crate) fn recent_fixture() -> gtk::Box {
     list
 }
 
+/// Native Paned positions are relative to their current allocations. A parent
+/// resize can reach the window observer before the nested right pane has grown;
+/// ask for its desired end-content width, never a future center position.
+fn apply_sidebar_positions(
+    navigation: &gtk::Paned,
+    inspector: &gtk::Paned,
+    layout: &tokens::Layout,
+    widths: &SidebarWidths,
+) {
+    if widths.editing.get().is_some() {
+        return;
+    }
+    widths.applying.set(true);
+    navigation.set_position(layout.navigation.map_or(0, |rect| rect.width as i32));
+    let right_position = layout.inspector.map_or(inspector.width(), |rect| {
+        (inspector.width() - rect.width as i32 - tokens::SIDEBAR_DIVIDER_WIDTH as i32).max(0)
+    });
+    inspector.set_position(right_position);
+    widths.applying.set(false);
+}
+
+/// Reconcile once after native allocation/minimum changes. Coalescing avoids
+/// setters during the allocation that emitted notify and needs no frame timer.
+fn observe_sidebar_allocations(panes: &[&gtk::Paned], refresh: std::rc::Rc<dyn Fn()>) {
+    let pending = std::rc::Rc::new(std::cell::Cell::new(false));
+    let queue: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
+        if pending.replace(true) {
+            return;
+        }
+        let pending = pending.clone();
+        let refresh = refresh.clone();
+        gtk::glib::idle_add_local_once(move || {
+            pending.set(false);
+            refresh();
+        });
+    });
+    for pane in panes {
+        let changed = queue.clone();
+        pane.connect_max_position_notify(move |_| changed());
+        let changed = queue.clone();
+        pane.connect_min_position_notify(move |_| changed());
+    }
+}
+
+/// Observe native splitter input without claiming its gesture or rerouting any
+/// terminal key. GTK retains pointer grabs and its F8/arrow/Enter/Escape actions.
+fn install_sidebar_handle(
+    paned: &gtk::Paned,
+    edge: SidebarEdge,
+    widths: &std::rc::Rc<SidebarWidths>,
+    changed: std::rc::Rc<dyn Fn(SidebarEdge, u32)>,
+    refresh: std::rc::Rc<dyn Fn()>,
+) {
+    paned.add_css_class("workspace-sidebar-split");
+    paned.set_wide_handle(true);
+    paned.set_focusable(true);
+    paned.set_focus_on_click(false);
+    let name = if edge == SidebarEdge::Navigation {
+        "Resize left sidebar"
+    } else {
+        "Resize right sidebar"
+    };
+    paned.update_property(&[
+        gtk::accessible::Property::Label(name),
+        gtk::accessible::Property::Description("Drag the divider to resize. F8 focuses dividers; arrow keys resize, Enter accepts, and Escape cancels."),
+    ]);
+    let mut child = paned.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if widget.css_name() == "separator" {
+            widget.set_cursor_from_name(Some("col-resize"));
+            widget.set_tooltip_text(Some(&format!("{name} · Drag, or F8 then arrow keys")));
+        }
+    }
+    let finish: std::rc::Rc<dyn Fn()> = {
+        let paned = paned.downgrade();
+        let widths = widths.clone();
+        let changed = changed.clone();
+        let refresh = refresh.clone();
+        std::rc::Rc::new(move || {
+            if widths.editing.get() != Some(edge) {
+                return;
+            }
+            widths.editing.set(None);
+            let start_position = widths.edit_start.take();
+            let paned = paned.clone();
+            let widths = widths.clone();
+            let changed = changed.clone();
+            let refresh = refresh.clone();
+            gtk::glib::idle_add_local_once(move || {
+                let Some(paned) = paned.upgrade() else {
+                    return;
+                };
+                if !paned.is_mapped() || widths.editing.get().is_some() {
+                    return;
+                }
+                if start_position == Some(paned.position()) {
+                    refresh();
+                    return;
+                }
+                let width = if edge == SidebarEdge::Navigation {
+                    paned.position().clamp(
+                        tokens::MIN_NAVIGATION_WIDTH as i32,
+                        tokens::MAX_NAVIGATION_WIDTH as i32,
+                    ) as u32
+                } else {
+                    (paned.width() - paned.position() - tokens::SIDEBAR_DIVIDER_WIDTH as i32).clamp(
+                        tokens::MIN_INSPECTOR_WIDTH as i32,
+                        tokens::MAX_INSPECTOR_WIDTH as i32,
+                    ) as u32
+                };
+                if edge == SidebarEdge::Navigation {
+                    widths.navigation.set(width);
+                } else {
+                    widths.inspector.set(width);
+                }
+                changed(edge, width);
+                refresh();
+            });
+        })
+    };
+    let input = gtk::EventControllerLegacy::new();
+    input.set_propagation_phase(gtk::PropagationPhase::Capture);
+    input.set_propagation_limit(gtk::PropagationLimit::SameNative);
+    let observed = paned.downgrade();
+    let edit = widths.clone();
+    let released = finish.clone();
+    let cancelled = refresh.clone();
+    input.connect_event(move |_, event| {
+        if matches!(
+            event.event_type(),
+            gtk::gdk::EventType::GrabBroken | gtk::gdk::EventType::TouchCancel
+        ) {
+            if edit.editing.get() == Some(edge) {
+                edit.editing.set(None);
+                edit.edit_start.set(None);
+                let cancelled = cancelled.clone();
+                gtk::glib::idle_add_local_once(move || cancelled());
+            }
+            return gtk::glib::Propagation::Proceed;
+        }
+        if let Some(button) = event.downcast_ref::<gtk::gdk::ButtonEvent>() {
+            if button.button() == 1 {
+                match event.event_type() {
+                    gtk::gdk::EventType::ButtonPress => {
+                        if let (Some(paned), Some((x, y))) = (observed.upgrade(), event.position())
+                        {
+                            if let Some(window) = paned.root().and_downcast::<gtk::Window>() {
+                                if event.surface() != window.surface() {
+                                    return gtk::glib::Propagation::Proceed;
+                                }
+                                if let Some(origin) = paned
+                                    .compute_point(&window, &gtk::graphene::Point::new(0.0, 0.0))
+                                {
+                                    // GDK positions include native CSD/shadow insets;
+                                    // compute_point is in the Window widget's coordinates.
+                                    let (surface_x, surface_y) = window.surface_transform();
+                                    let mut picked = paned.pick(
+                                        x - surface_x - f64::from(origin.x()),
+                                        y - surface_y - f64::from(origin.y()),
+                                        gtk::PickFlags::DEFAULT,
+                                    );
+                                    while let Some(widget) = picked {
+                                        if widget.css_name() == "separator"
+                                            && widget.parent().as_ref()
+                                                == Some(paned.upcast_ref::<gtk::Widget>())
+                                        {
+                                            edit.edit_start.set(Some(paned.position()));
+                                            edit.editing.set(Some(edge));
+                                            break;
+                                        }
+                                        if widget == *paned.upcast_ref::<gtk::Widget>() {
+                                            break;
+                                        }
+                                        picked = widget.parent();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    gtk::gdk::EventType::ButtonRelease => released(),
+                    _ => {}
+                }
+            }
+        }
+        gtk::glib::Propagation::Proceed
+    });
+    paned.add_controller(input);
+    let edit = widths.clone();
+    paned.connect_move_handle(move |paned, _| {
+        if edit.editing.get() != Some(edge) {
+            edit.edit_start.set(Some(paned.position()));
+            edit.editing.set(Some(edge));
+        }
+        false
+    });
+    let accepted = finish.clone();
+    paned.connect_accept_position(move |_| {
+        accepted();
+        false
+    });
+    let accepted = finish.clone();
+    paned.connect_cycle_handle_focus(move |_, _| {
+        accepted();
+        false
+    });
+    let accepted = finish.clone();
+    paned.connect_toggle_handle_focus(move |_| {
+        accepted();
+        false
+    });
+    let accepted = finish.clone();
+    paned.connect_has_focus_notify(move |paned| {
+        if !paned.has_focus() {
+            accepted();
+        }
+    });
+    let edit = widths.clone();
+    let restore = refresh.clone();
+    paned.connect_cancel_position(move |_| {
+        edit.editing.set(None);
+        edit.edit_start.set(None);
+        let restore = restore.clone();
+        gtk::glib::idle_add_local_once(move || restore());
+        false
+    });
+    let edit = widths.clone();
+    paned.connect_position_notify(move |paned| {
+        if edit.applying.get() || edit.editing.get() != Some(edge) || paned.width() <= 0 {
+            return;
+        }
+        let other = if edge == SidebarEdge::Navigation {
+            paned
+                .end_child()
+                .and_downcast::<gtk::Paned>()
+                .and_then(|inner| inner.end_child())
+                .filter(|child| child.is_visible())
+                .map_or(0, |child| {
+                    child.width() + tokens::SIDEBAR_DIVIDER_WIDTH as i32
+                })
+        } else {
+            0
+        };
+        let minimum = if edge == SidebarEdge::Navigation {
+            tokens::MIN_NAVIGATION_WIDTH
+        } else {
+            tokens::MIN_INSPECTOR_WIDTH
+        } as i32;
+        let maximum = if edge == SidebarEdge::Navigation {
+            tokens::MAX_NAVIGATION_WIDTH
+        } else {
+            tokens::MAX_INSPECTOR_WIDTH
+        } as i32;
+        let available = (paned.width()
+            - tokens::SIDEBAR_DIVIDER_WIDTH as i32
+            - tokens::MIN_CENTER_WIDTH as i32
+            - other)
+            .max(minimum);
+        let size = if edge == SidebarEdge::Navigation {
+            paned.position()
+        } else {
+            paned.width() - paned.position() - tokens::SIDEBAR_DIVIDER_WIDTH as i32
+        };
+        let size = size.clamp(minimum, maximum.min(available));
+        let position = if edge == SidebarEdge::Navigation {
+            size
+        } else {
+            paned.width() - size - tokens::SIDEBAR_DIVIDER_WIDTH as i32
+        };
+        if position != paned.position() {
+            edit.applying.set(true);
+            paned.set_position(position);
+            edit.applying.set(false);
+        }
+    });
+    let edit = widths.clone();
+    paned.connect_unmap(move |_| {
+        if edit.editing.get() == Some(edge) {
+            edit.editing.set(None);
+            edit.edit_start.set(None);
+        }
+    });
+    let watched = std::rc::Rc::new(std::cell::Cell::new(false));
+    let edit = widths.clone();
+    paned.connect_map(move |paned| {
+        if watched.replace(true) {
+            return;
+        }
+        if let Some(window) = paned.root().and_downcast::<gtk::Window>() {
+            let edit = edit.clone();
+            let refresh = refresh.clone();
+            window.connect_is_active_notify(move |window| {
+                if !window.is_active() && edit.editing.get() == Some(edge) {
+                    edit.editing.set(None);
+                    edit.edit_start.set(None);
+                    let refresh = refresh.clone();
+                    gtk::glib::idle_add_local_once(move || refresh());
+                }
+            });
+        }
+    });
+}
+
+/// A narrow inspector is an overlay rather than a Paned end child. Its own
+/// six-pixel edge keeps the same preference and never captures canvas input.
+fn install_drawer_handle(
+    grip: &gtk::Box,
+    drawer: &gtk::ScrolledWindow,
+    widths: &std::rc::Rc<SidebarWidths>,
+    changed: std::rc::Rc<dyn Fn(SidebarEdge, u32)>,
+    refresh: std::rc::Rc<dyn Fn()>,
+) {
+    grip.add_css_class("workspace-drawer-resize-handle");
+    grip.set_width_request(tokens::SIDEBAR_DIVIDER_WIDTH as i32);
+    grip.set_cursor_from_name(Some("col-resize"));
+    grip.set_focusable(true);
+    grip.set_focus_on_click(false);
+    grip.set_accessible_role(gtk::AccessibleRole::Separator);
+    grip.update_property(&[
+        gtk::accessible::Property::Label("Resize right sidebar drawer"),
+        gtk::accessible::Property::Description("Drag to resize the right sidebar. Left and Right arrows resize when this divider has keyboard focus; Home restores the default width."),
+    ]);
+    grip.set_tooltip_text(Some(
+        "Resize right sidebar · Drag, or focus and use arrow keys",
+    ));
+    let start_x = std::rc::Rc::new(std::cell::Cell::new(0.0_f64));
+    let start_width = std::rc::Rc::new(std::cell::Cell::new(0_u32));
+    let drag = gtk::GestureDrag::new();
+    drag.set_button(1);
+    let preview = widths.clone();
+    let drawer_weak = drawer.downgrade();
+    let origin = start_x.clone();
+    let initial = start_width.clone();
+    drag.connect_drag_begin(move |gesture, _, _| {
+        if let (Some((x, _)), Some(drawer)) = (
+            gesture.current_event().and_then(|event| event.position()),
+            drawer_weak.upgrade(),
+        ) {
+            origin.set(x);
+            initial.set(drawer.width().max(0) as u32);
+            preview.editing.set(Some(SidebarEdge::Inspector));
+            preview.edit_start.set(None);
+            preview.drawer_preview.set(None);
+        }
+    });
+    let preview = widths.clone();
+    let repaint = refresh.clone();
+    let origin = start_x.clone();
+    let initial = start_width.clone();
+    drag.connect_drag_update(move |gesture, _, _| {
+        let Some((x, _)) = gesture.current_event().and_then(|event| event.position()) else {
+            return;
+        };
+        if preview.editing.get() != Some(SidebarEdge::Inspector)
+            || preview.edit_start.get().is_some()
+        {
+            return;
+        }
+        let delta = origin.get() - x;
+        if delta.abs() < 1.0 {
+            preview.drawer_preview.set(None);
+            repaint();
+            return;
+        }
+        let maximum = gesture
+            .widget()
+            .and_then(|widget| widget.root())
+            .and_downcast::<gtk::Window>()
+            .map_or(tokens::MAX_INSPECTOR_WIDTH, |window| {
+                (window.width() as f32
+                    - tokens::RAIL_WIDTH
+                    - tokens::SIDEBAR_DIVIDER_WIDTH
+                    - 2.0 * tokens::CONTROL_HEIGHT)
+                    .min(tokens::MAX_INSPECTOR_WIDTH)
+            })
+            .max(tokens::MIN_INSPECTOR_WIDTH);
+        let width = (f64::from(initial.get()) + delta)
+            .round()
+            .clamp(f64::from(tokens::MIN_INSPECTOR_WIDTH), f64::from(maximum))
+            as u32;
+        preview.drawer_preview.set(Some(width));
+        repaint();
+    });
+    let preview = widths.clone();
+    let repaint = refresh.clone();
+    let committed = changed.clone();
+    drag.connect_drag_end(move |_, _, _| {
+        preview.editing.set(None);
+        if let Some(width) = preview
+            .drawer_preview
+            .take()
+            .filter(|width| *width != start_width.get())
+        {
+            preview.inspector.set(width);
+            committed(SidebarEdge::Inspector, width);
+        }
+        repaint();
+    });
+    let preview = widths.clone();
+    let repaint = refresh.clone();
+    drag.connect_cancel(move |_, _| {
+        preview.editing.set(None);
+        preview.drawer_preview.set(None);
+        repaint();
+    });
+    grip.add_controller(drag);
+    let keys = gtk::EventControllerKey::new();
+    let preferred = widths.clone();
+    let keyboard_drawer = drawer.downgrade();
+    keys.connect_key_pressed(move |_, key, _, modifiers| {
+        let current = keyboard_drawer
+            .upgrade()
+            .map_or(preferred.inspector.get(), |drawer| {
+                drawer.width().max(tokens::MIN_INSPECTOR_WIDTH as i32) as u32
+            });
+        let step = if modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+            40
+        } else {
+            10
+        };
+        let width = match key {
+            gtk::gdk::Key::Left => current.saturating_add(step),
+            gtk::gdk::Key::Right => current.saturating_sub(step),
+            gtk::gdk::Key::Home => tokens::INSPECTOR_WIDTH as u32,
+            _ => return gtk::glib::Propagation::Proceed,
+        }
+        .clamp(
+            tokens::MIN_INSPECTOR_WIDTH as u32,
+            keyboard_drawer
+                .upgrade()
+                .and_then(|drawer| drawer.root())
+                .and_downcast::<gtk::Window>()
+                .map_or(tokens::MAX_INSPECTOR_WIDTH as u32, |window| {
+                    (window.width() as f32
+                        - tokens::RAIL_WIDTH
+                        - tokens::SIDEBAR_DIVIDER_WIDTH
+                        - 2.0 * tokens::CONTROL_HEIGHT)
+                        .clamp(tokens::MIN_INSPECTOR_WIDTH, tokens::MAX_INSPECTOR_WIDTH)
+                        as u32
+                }),
+        );
+        if width == current && key != gtk::gdk::Key::Home {
+            return gtk::glib::Propagation::Stop;
+        }
+        preferred.inspector.set(width);
+        changed(SidebarEdge::Inspector, width);
+        refresh();
+        gtk::glib::Propagation::Stop
+    });
+    grip.add_controller(keys);
+    let preview = widths.clone();
+    grip.connect_unmap(move |_| {
+        preview.drawer_preview.set(None);
+        if preview.edit_start.get().is_none() {
+            preview.editing.set(None);
+        }
+    });
+}
+
 /// GTK allocation signals observe size changes without a permanent frame tick.
 pub(crate) fn observe_layout(
     host: &gtk::Overlay,
@@ -1508,6 +2518,7 @@ pub(crate) fn observe_layout(
     inspector: &gtk::Box,
     navigation_split: &gtk::Paned,
     inspector_split: &gtk::Paned,
+    sender: &ComponentSender<AppModel>,
 ) {
     let observer = gtk::DrawingArea::new();
     observer.set_can_target(false);
@@ -1547,20 +2558,32 @@ pub(crate) fn observe_layout(
     drawer.set_propagate_natural_width(true);
     drawer.set_halign(gtk::Align::End);
     drawer.set_valign(gtk::Align::Fill);
-    drawer.set_visible(false);
+    let drawer_frame = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    drawer_frame.add_css_class("workspace-inspector-drawer-frame");
+    drawer_frame.set_halign(gtk::Align::End);
+    drawer_frame.set_valign(gtk::Align::Fill);
+    drawer_frame.set_visible(false);
+    let drawer_grip = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    drawer_frame.append(&drawer_grip);
+    drawer_frame.append(&drawer);
     let drawer_viewport = gtk::Viewport::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
     drawer_viewport.set_scroll_to_focus(false);
     drawer.set_child(Some(&drawer_viewport));
-    host.add_overlay(&drawer);
-    host.set_measure_overlay(&drawer, false);
+    host.add_overlay(&drawer_frame);
+    host.set_measure_overlay(&drawer_frame, false);
+    let native_navigation_split = navigation_split.clone();
+    let native_inspector_split = inspector_split.clone();
+    let native_drawer = drawer.clone();
     let navigation = navigation.downgrade();
     let inspector = inspector.downgrade();
     let navigation_split = navigation_split.downgrade();
     let inspector_split = inspector_split.downgrade();
     let drawer = drawer.downgrade();
+    let drawer_frame = drawer_frame.downgrade();
     let drawer_viewport = drawer_viewport.downgrade();
     let observer_weak = observer.downgrade();
     let control = std::rc::Rc::downgrade(&chrome.inspector_control);
+    let widths = chrome.sidebar_widths.clone();
     let diagnostic_epoch = std::rc::Rc::new(std::cell::Cell::new(0_u64));
     let apply: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
         let (
@@ -1569,6 +2592,7 @@ pub(crate) fn observe_layout(
             Some(inspector),
             Some(split),
             Some(drawer),
+            Some(drawer_frame),
             Some(drawer_viewport),
         ) = (
             observer_weak.upgrade(),
@@ -1576,6 +2600,7 @@ pub(crate) fn observe_layout(
             inspector.upgrade(),
             inspector_split.upgrade(),
             drawer.upgrade(),
+            drawer_frame.upgrade(),
             drawer_viewport.upgrade(),
         )
         else {
@@ -1586,7 +2611,20 @@ pub(crate) fn observe_layout(
         if width <= 0 || height <= 0 {
             return;
         }
-        let base = tokens::Layout::for_size(width as f32, height as f32 + tokens::TITLEBAR_HEIGHT);
+        let base = tokens::Layout::for_size_with_sidebars(
+            width as f32,
+            height as f32 + tokens::TITLEBAR_HEIGHT,
+            if widths.navigation_visible.get() {
+                widths.navigation.get() as f32
+            } else {
+                0.0
+            },
+            if control.requested.get() == Some(false) {
+                0.0
+            } else {
+                widths.inspector.get() as f32
+            },
+        );
         let panel_focus = observer
             .root()
             .and_downcast::<gtk::Window>()
@@ -1597,7 +2635,34 @@ pub(crate) fn observe_layout(
             // merely because the default presentation auto-collapses.
             control.requested.set(Some(true));
         }
-        let (placement, available) = inspector_placement(&base, control.requested.get());
+        let drawer_width = (width as f32
+            - tokens::RAIL_WIDTH
+            - tokens::SIDEBAR_DIVIDER_WIDTH
+            - 2.0 * tokens::CONTROL_HEIGHT)
+            .max(0.0)
+            .min(
+                widths
+                    .drawer_preview
+                    .get()
+                    .unwrap_or_else(|| widths.inspector.get()) as f32,
+            );
+        let drawer_available = drawer_width >= tokens::MIN_INSPECTOR_WIDTH
+            && height as f32 >= tokens::INSPECTOR_TABS_HEIGHT + tokens::CONTROL_HEIGHT;
+        let placement = if control.requested.get() == Some(false) {
+            InspectorPlacement::Hidden
+        } else if base.inspector.is_some() {
+            InspectorPlacement::Docked
+        } else if control.requested.get() == Some(true) && drawer_available {
+            InspectorPlacement::Drawer
+        } else {
+            InspectorPlacement::Hidden
+        };
+        let available = base.inspector.is_some() || drawer_available;
+        drawer.set_max_content_width(-1);
+        drawer.set_min_content_width(drawer_width as i32);
+        drawer.set_max_content_width(drawer_width as i32);
+        drawer.set_width_request(drawer_width as i32);
+        drawer_frame.set_width_request(drawer_width as i32 + tokens::SIDEBAR_DIVIDER_WIDTH as i32);
         let layout = if placement == InspectorPlacement::Docked {
             base
         } else {
@@ -1619,7 +2684,7 @@ pub(crate) fn observe_layout(
             _ => {}
         }
         inspector.set_visible(placement != InspectorPlacement::Hidden);
-        drawer.set_visible(placement == InspectorPlacement::Drawer);
+        drawer_frame.set_visible(placement == InspectorPlacement::Drawer);
         if moving {
             if let Some(focus) = panel_focus.filter(|focus| {
                 focus.is_mapped() && focus.root().as_ref() == observer.root().as_ref()
@@ -1635,10 +2700,9 @@ pub(crate) fn observe_layout(
         if let Some(navigation) = navigation.upgrade() {
             navigation.set_visible(layout.navigation.is_some());
         }
-        if let Some(split) = navigation_split.upgrade() {
-            split.set_position(layout.navigation.map_or(0, |rect| rect.width as i32));
+        if let Some(navigation) = navigation_split.upgrade() {
+            apply_sidebar_positions(&navigation, &split, &layout, &widths);
         }
-        split.set_position(layout.center.width as i32);
         control.sync_button(placement, available);
         if let Some(nodes) = &geometry {
             let epoch = diagnostic_epoch.get().wrapping_add(1);
@@ -1647,6 +2711,38 @@ pub(crate) fn observe_layout(
         }
     });
     *chrome.inspector_control.refresh.borrow_mut() = Some(apply.clone());
+    let width_sender = sender.clone();
+    let changed: std::rc::Rc<dyn Fn(SidebarEdge, u32)> = std::rc::Rc::new(move |edge, width| {
+        width_sender.input(match edge {
+            SidebarEdge::Navigation => AppMsg::NavigationWidthChanged(width),
+            SidebarEdge::Inspector => AppMsg::AiPanelWidthChanged(width),
+        });
+    });
+    install_sidebar_handle(
+        &native_navigation_split,
+        SidebarEdge::Navigation,
+        &chrome.sidebar_widths,
+        changed.clone(),
+        apply.clone(),
+    );
+    install_sidebar_handle(
+        &native_inspector_split,
+        SidebarEdge::Inspector,
+        &chrome.sidebar_widths,
+        changed.clone(),
+        apply.clone(),
+    );
+    install_drawer_handle(
+        &drawer_grip,
+        &native_drawer,
+        &chrome.sidebar_widths,
+        changed,
+        apply.clone(),
+    );
+    observe_sidebar_allocations(
+        &[&native_navigation_split, &native_inspector_split],
+        apply.clone(),
+    );
     observer.connect_resize(move |_, _, _| apply());
 }
 
@@ -1926,6 +3022,506 @@ fn collect_native_geometry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an isolated GTK display; real popup paint and live mode changes"]
+    fn workspace_popups_follow_launcher_palette_without_composer_style_leaks() {
+        use gtk::gdk::prelude::PaintableExt;
+
+        gtk::init().expect("GTK display");
+        install_css();
+        let settle = || {
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(200);
+            while std::time::Instant::now() < until {
+                while gtk::glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        let assert_color = |actual: gtk::gdk::RGBA, expected: &str| {
+            let expected = gtk::gdk::RGBA::parse(expected).unwrap();
+            for (actual, expected) in [
+                (actual.red(), expected.red()),
+                (actual.green(), expected.green()),
+                (actual.blue(), expected.blue()),
+            ] {
+                assert!((actual - expected).abs() < 0.01, "{actual} != {expected}");
+            }
+        };
+        for tools in [false, true] {
+            let window = gtk::Window::new();
+            window.add_css_class("anvil-font-sync");
+            window.set_default_size(640, 480);
+            let launcher_surface = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            let footer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            footer.add_css_class("chat-controls");
+            let anchor = gtk::MenuButton::new();
+            anchor.set_label("Menu");
+            footer.append(&anchor);
+            launcher_surface.append(&footer);
+            window.set_child(Some(&launcher_surface));
+            let popover = gtk::Popover::new();
+            popover.set_has_arrow(false);
+            if tools {
+                popover.add_css_class("reference-tools-popover");
+                popover.set_widget_name("reference-tools-menu");
+            }
+            let entries = gtk::Box::new(gtk::Orientation::Vertical, 4);
+            entries.set_width_request(280);
+            let item = gtk::Button::with_label("Run command");
+            let disabled = gtk::Button::with_label("Unavailable command");
+            disabled.set_sensitive(false);
+            if tools {
+                item.add_css_class("reference-tool-row");
+                disabled.add_css_class("reference-tool-row");
+            }
+            entries.append(&item);
+            entries.append(&disabled);
+            popover.set_child(Some(&entries));
+            anchor.set_popover(Some(&popover));
+            window.present();
+            anchor.popup();
+            for (mode, background, foreground, muted) in [
+                ("sidebar", "#162133", "#e1e9f6", "#91a2bb"),
+                ("chat", "#fefefe", "#35445e", "#728099"),
+                ("block", "#101c30", "#d5deec", "#91a4bf"),
+                ("chat", "#fefefe", "#35445e", "#728099"),
+            ] {
+                for class in [
+                    "workspace-navigation",
+                    "workspace-center",
+                    "block-workspace",
+                ] {
+                    launcher_surface.remove_css_class(class);
+                }
+                if mode == "sidebar" {
+                    launcher_surface.add_css_class("workspace-navigation");
+                } else {
+                    launcher_surface.add_css_class("workspace-center");
+                    if mode == "block" {
+                        launcher_surface.add_css_class("block-workspace");
+                    }
+                }
+                settle();
+                assert!(popover.is_mapped(), "mode changes keep the menu open");
+                assert_color(item.child().unwrap().color(), foreground);
+                assert_color(disabled.child().unwrap().color(), muted);
+                let snapshot = gtk::Snapshot::new();
+                gtk::WidgetPaintable::new(Some(&popover)).snapshot(
+                    &snapshot,
+                    f64::from(popover.width()),
+                    f64::from(popover.height()),
+                );
+                let node = snapshot.to_node().expect("mapped menu paint");
+                let renderer = gtk::gsk::Renderer::for_surface(&window.surface().unwrap()).unwrap();
+                let texture = renderer.render_texture(&node, None);
+                let stride = texture.width() as usize * 4;
+                let mut pixels = vec![0; stride * texture.height() as usize];
+                texture.download(&mut pixels, stride);
+                let color = gtk::gdk::RGBA::parse(background).unwrap();
+                let expected = [
+                    (color.red() * 255.0).round() as u8,
+                    (color.green() * 255.0).round() as u8,
+                    (color.blue() * 255.0).round() as u8,
+                ];
+                let matches = pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .filter(|pixel| {
+                        let argb = u32::from_ne_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]);
+                        [
+                            ((argb >> 16) & 255) as u8,
+                            ((argb >> 8) & 255) as u8,
+                            (argb & 255) as u8,
+                        ] == expected
+                    })
+                    .count();
+                assert!(
+                    matches > 100,
+                    "{mode}, tools={tools}: actual popup background"
+                );
+                renderer.unrealize();
+            }
+            popover.popdown();
+            window.close();
+            settle();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display; actual adaptive dialog and dimmed underlay"]
+    fn workspace_dialog_themes_its_sheet_without_painting_over_the_workspace() {
+        use relm4::adw;
+        use relm4::adw::prelude::*;
+
+        adw::init().expect("GTK display");
+        struct AnimationPreference(gtk::Settings, bool);
+        impl Drop for AnimationPreference {
+            fn drop(&mut self) {
+                self.0.set_gtk_enable_animations(self.1);
+            }
+        }
+        let settings = gtk::Settings::default().unwrap();
+        let _animations =
+            AnimationPreference(settings.clone(), settings.is_gtk_enable_animations());
+        settings.set_gtk_enable_animations(false);
+        install_css();
+        let display = gtk::gdk::Display::default().unwrap();
+        let underlay_css = gtk::CssProvider::new();
+        underlay_css.load_from_string(".popup-test-underlay { background:#49a78a; }");
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &underlay_css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 21,
+        );
+        let window = adw::Window::new();
+        window.set_decorated(false);
+        window.set_default_size(800, 600);
+        let underlay = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        underlay.add_css_class("popup-test-underlay");
+        window.set_content(Some(&underlay));
+        window.present();
+        let settle = || {
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            while std::time::Instant::now() < until {
+                while gtk::glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        let pixel = |x: usize, y: usize| {
+            let snapshot = gtk::Snapshot::new();
+            gtk::WidgetPaintable::new(Some(&window)).snapshot(
+                &snapshot,
+                f64::from(window.width()),
+                f64::from(window.height()),
+            );
+            let node = snapshot.to_node().expect("mapped native dialog host");
+            let renderer = gtk::gsk::Renderer::for_surface(&window.surface().unwrap()).unwrap();
+            let texture = renderer.render_texture(&node, None);
+            let stride = texture.width() as usize * 4;
+            let mut pixels = vec![0; stride * texture.height() as usize];
+            texture.download(&mut pixels, stride);
+            let offset = y * stride + x * 4;
+            let argb = u32::from_ne_bytes(pixels[offset..offset + 4].try_into().unwrap());
+            renderer.unrealize();
+            [
+                ((argb >> 16) & 255) as u8,
+                ((argb >> 8) & 255) as u8,
+                (argb & 255) as u8,
+            ]
+        };
+        settle();
+        assert_eq!(
+            pixel(20, 20),
+            [0x49, 0xa7, 0x8a],
+            "distinct workspace underlay"
+        );
+        let dialog = adw::Dialog::new();
+        dialog.add_css_class("workspace-dialog");
+        dialog.set_content_width(320);
+        dialog.set_content_height(240);
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&adw::HeaderBar::new());
+        toolbar.set_content(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
+        dialog.set_child(Some(&toolbar));
+        dialog.present(Some(&window));
+        settle();
+        assert!(dialog.is_mapped(), "actual AdwDialog presentation");
+        let corner = pixel(20, 20);
+        assert!(
+            u16::from(corner[1]) > u16::from(corner[0]) + 20
+                && u16::from(corner[1]) > u16::from(corner[2]) + 10,
+            "the modal corner retains the green workspace through Adwaita dimming: {corner:?}"
+        );
+        let sheet = pixel(
+            window.width() as usize / 2,
+            window.height() as usize / 2 + 60,
+        );
+        assert_eq!(
+            sheet,
+            [0x16, 0x21, 0x33],
+            "the actual dialog body uses workspace navy"
+        );
+        dialog.close();
+        window.close();
+        settle();
+        gtk::style_context_remove_provider_for_display(&display, &underlay_css);
+    }
+
+    #[test]
+    #[ignore = "requires isolated X11 DISPLAY and xdotool; actual sidebar drags and Block PTY"]
+    fn native_sidebar_drags_keep_preferences_and_terminal_draft_through_responsive_clamps() {
+        crate::child_env::capture_inherited_environment().expect("fixture child environment");
+        gtk::init().expect("GTK display");
+        install_css();
+        let view =
+            crate::block_view::organism_settings_test_view_for_mode(TerminalMode::Block, None);
+        let recorder = crate::block_view::organism_settings_test_recorder(&view);
+        let window = gtk::Window::new();
+        window.set_title(Some("anvil-sidebar-resize-native-test"));
+        // A custom titlebar exercises the same native CSD coordinate transform
+        // as the application, rather than a shadowless test-only surface.
+        window.set_titlebar(Some(&gtk::HeaderBar::new()));
+        window.set_default_size(1600, 650);
+        let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        body.add_css_class("workspace-body");
+        let rail = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        rail.set_width_request(tokens::RAIL_WIDTH as i32);
+        body.append(&rail);
+        let navigation = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        navigation.set_width_request(tokens::MIN_NAVIGATION_WIDTH as i32);
+        let inspector = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        inspector.set_width_request(tokens::MIN_INSPECTOR_WIDTH as i32);
+        let right = gtk::Paned::new(gtk::Orientation::Horizontal);
+        right.set_start_child(Some(&view.widget()));
+        right.set_end_child(Some(&inspector));
+        right.set_resize_start_child(true);
+        right.set_resize_end_child(false);
+        right.set_shrink_start_child(true);
+        right.set_shrink_end_child(false);
+        let left = gtk::Paned::new(gtk::Orientation::Horizontal);
+        left.set_start_child(Some(&navigation));
+        left.set_end_child(Some(&right));
+        left.set_resize_start_child(false);
+        left.set_resize_end_child(true);
+        left.set_shrink_start_child(false);
+        left.set_shrink_end_child(true);
+        left.set_hexpand(true);
+        body.append(&left);
+        let host = gtk::Overlay::new();
+        host.set_child(Some(&body));
+        let observer = gtk::DrawingArea::new();
+        observer.set_can_target(false);
+        observer.set_halign(gtk::Align::Fill);
+        observer.set_valign(gtk::Align::Fill);
+        host.add_overlay(&observer);
+        host.set_measure_overlay(&observer, false);
+        window.set_child(Some(&host));
+        let preferred = std::rc::Rc::new(SidebarWidths::new(237, 306, true));
+        let right_visible = std::rc::Rc::new(std::cell::Cell::new(true));
+        let refresh: std::rc::Rc<dyn Fn()> = {
+            let window = window.downgrade();
+            let left = left.downgrade();
+            let right = right.downgrade();
+            let preferred = preferred.clone();
+            let right_visible = right_visible.clone();
+            std::rc::Rc::new(move || {
+                let (Some(window), Some(left), Some(right)) =
+                    (window.upgrade(), left.upgrade(), right.upgrade())
+                else {
+                    return;
+                };
+                let layout = tokens::Layout::for_size_with_sidebars(
+                    window.width() as f32,
+                    window.height() as f32,
+                    preferred.navigation.get() as f32,
+                    if right_visible.get() {
+                        preferred.inspector.get() as f32
+                    } else {
+                        0.0
+                    },
+                );
+                left.start_child()
+                    .unwrap()
+                    .set_visible(layout.navigation.is_some());
+                right
+                    .end_child()
+                    .unwrap()
+                    .set_visible(layout.inspector.is_some());
+                apply_sidebar_positions(&left, &right, &layout, &preferred);
+            })
+        };
+        let commits = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let record = commits.clone();
+        let changed: std::rc::Rc<dyn Fn(SidebarEdge, u32)> =
+            std::rc::Rc::new(move |edge, width| record.borrow_mut().push((edge, width)));
+        install_sidebar_handle(
+            &left,
+            SidebarEdge::Navigation,
+            &preferred,
+            changed.clone(),
+            refresh.clone(),
+        );
+        install_sidebar_handle(
+            &right,
+            SidebarEdge::Inspector,
+            &preferred,
+            changed,
+            refresh.clone(),
+        );
+        observe_sidebar_allocations(&[&left, &right], refresh.clone());
+        let reflow = refresh.clone();
+        observer.connect_resize(move |_, _, _| reflow());
+        let settle = || {
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            while std::time::Instant::now() < until {
+                while gtk::glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        let xdo = |arguments: &[String]| {
+            let output = std::process::Command::new("xdotool")
+                .args(arguments)
+                .output()
+                .expect("native X11 input helper");
+            assert!(
+                output.status.success(),
+                "xdotool: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        window.present();
+        settle();
+        refresh();
+        settle();
+        let xid = xdo(&[
+            "search".into(),
+            "--onlyvisible".into(),
+            "--name".into(),
+            "^anvil-sidebar-resize-native-test$".into(),
+        ])
+        .lines()
+        .last()
+        .unwrap()
+        .to_owned();
+        xdo(&["windowfocus".into(), "--sync".into(), xid.clone()]);
+        settle();
+        recorder.emit_test_output(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        settle();
+        view.vte().grab_focus();
+        let draft = "printf KEEP_DRAFT";
+        view.vte()
+            .emit_by_name::<()>("commit", &[&draft, &(draft.len() as u32)]);
+        assert_eq!(
+            recorder.drain_test_slave(std::time::Duration::from_millis(80)),
+            b"printf KEEP_DRAFT"
+        );
+        recorder.emit_test_output(b"printf KEEP_DRAFT");
+        settle();
+        let original = view.vte().clone();
+        let fd = recorder.master_fd_raw();
+        let drag = |paned: &gtk::Paned, delta: i32| {
+            let mut child = paned.first_child();
+            let handle = loop {
+                let widget = child.expect("native sidebar separator");
+                if widget.css_name() == "separator" {
+                    break widget;
+                }
+                child = widget.next_sibling();
+            };
+            let bounds = handle.compute_bounds(&window).unwrap();
+            assert!(
+                bounds.width() >= tokens::SIDEBAR_DIVIDER_WIDTH - 0.5,
+                "real divider hit target"
+            );
+            let (surface_x, surface_y) = window.surface_transform();
+            let x = (f64::from(bounds.x() + bounds.width() / 2.0) + surface_x).round() as i32;
+            let y = (f64::from(bounds.y() + bounds.height() / 2.0) + surface_y).round() as i32;
+            xdo(&[
+                "mousemove".into(),
+                "--window".into(),
+                xid.clone(),
+                x.to_string(),
+                y.to_string(),
+                "mousedown".into(),
+                "1".into(),
+            ]);
+            settle();
+            if delta != 0 {
+                xdo(&[
+                    "mousemove".into(),
+                    "--window".into(),
+                    xid.clone(),
+                    (x + delta).to_string(),
+                    y.to_string(),
+                ]);
+                settle();
+            }
+            xdo(&["mouseup".into(), "1".into()]);
+            settle();
+        };
+        drag(&left, 90);
+        assert!(
+            preferred.navigation.get() > 300,
+            "left pointer drag commits a wider sidebar"
+        );
+        drag(&right, -60);
+        assert!(
+            preferred.inspector.get() > 350,
+            "right pointer drag commits a wider sidebar"
+        );
+        let saved = (preferred.navigation.get(), preferred.inspector.get());
+        assert!(
+            view.vte().has_focus(),
+            "pointer divider drag does not steal terminal/IME focus"
+        );
+        assert!(commits
+            .borrow()
+            .iter()
+            .any(|(edge, _)| *edge == SidebarEdge::Navigation));
+        assert!(commits
+            .borrow()
+            .iter()
+            .any(|(edge, _)| *edge == SidebarEdge::Inspector));
+        right_visible.set(false);
+        refresh();
+        settle();
+        right_visible.set(true);
+        refresh();
+        settle();
+        assert_eq!(
+            preferred.inspector.get(),
+            saved.1,
+            "hide/show keeps requested right width"
+        );
+        window.set_default_size(760, 650);
+        settle();
+        assert!(
+            left.position() < saved.0 as i32,
+            "narrow allocation temporarily clamps navigation"
+        );
+        let count = commits.borrow().len();
+        drag(&left, 0);
+        assert_eq!(
+            commits.borrow().len(),
+            count,
+            "a no-motion click on a clamp is not a new preference"
+        );
+        assert_eq!(
+            (preferred.navigation.get(), preferred.inspector.get()),
+            saved
+        );
+        window.set_default_size(1600, 650);
+        settle();
+        assert_eq!(
+            left.position(),
+            saved.0 as i32,
+            "left preferred width returns after grow"
+        );
+        assert_eq!(
+            inspector.width(),
+            saved.1 as i32,
+            "right preferred width returns after grow"
+        );
+        assert_eq!(view.vte(), &original);
+        assert_eq!(recorder.master_fd_raw(), fd);
+        assert!(
+            view.vte()
+                .text_format(vte4::Format::Text)
+                .unwrap()
+                .contains("KEEP_DRAFT"),
+            "native draft remains displayed"
+        );
+        assert!(
+            recorder
+                .drain_test_slave(std::time::Duration::from_millis(80))
+                .is_empty(),
+            "resizing does not submit or retype the shell draft"
+        );
+        window.close();
+        recorder.kill();
+    }
 
     #[test]
     fn inspector_toggle_uses_narrow_drawer_and_keeps_the_explicit_choice() {
@@ -2344,3 +3940,7 @@ mod tests {
         window.close();
     }
 }
+
+#[cfg(test)]
+#[path = "workspace_panels_tests.rs"]
+mod panel_tests;

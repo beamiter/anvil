@@ -123,7 +123,9 @@ fn native_chat_passthrough_initial_focus_accepts_composition() {
 #[ignore = "requires isolated X11 DISPLAY and GTK_IM_MODULE=simple; run through test-gtk-display.sh"]
 fn native_ime_commit_cancel_and_independent_ptys() {
     assert_eq!(std::env::var("GTK_IM_MODULE").as_deref(), Ok("simple"));
-    let (first, window, _) = fixture();
+    // Exercise the new Block dock and existing Chat dock with independent
+    // native IM contexts and PTYs in the same window.
+    let (first, window, _) = fixture_for_mode(crate::config::TerminalMode::Block);
     let (second, second_window, _) = fixture();
     let old_parent = second
         .root
@@ -204,7 +206,9 @@ fn native_ime_commit_cancel_and_independent_ptys() {
 #[ignore = "requires isolated X11 DISPLAY, GTK_IM_MODULE=simple and xdotool"]
 fn native_ime_send_button_preserves_composition() {
     assert_eq!(std::env::var("GTK_IM_MODULE").as_deref(), Ok("simple"));
-    let (first, window, _) = fixture();
+    // Exercise the new Block dock and existing Chat dock with independent
+    // native IM contexts and PTYs in the same window.
+    let (first, window, _) = fixture_for_mode(crate::config::TerminalMode::Block);
     let (second, second_window, _) = fixture();
     let old_parent = second
         .root

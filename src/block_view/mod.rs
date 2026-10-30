@@ -10600,10 +10600,14 @@ fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
     let chrome = active_card_vchrome_for_classes(|class| {
         holder.as_ref().is_some_and(|h| h.has_css_class(class))
     });
-    let block_canvas = scroll
-        .ancestor(gtk::Box::static_type())
+    let canvas = scroll.ancestor(gtk::Box::static_type());
+    let block_canvas = canvas
+        .as_ref()
         .is_some_and(|widget| widget.has_css_class("block-native-canvas"));
-    let chrome = if block_canvas {
+    let native_surface = canvas
+        .as_ref()
+        .is_some_and(|widget| widget.has_css_class("chat-native-surface"));
+    let chrome = if block_canvas && !native_surface {
         block_reference::HEADER_HEIGHT + 2 + 12
     } else if chat::canvas_height(scroll).is_some() {
         0
@@ -12081,11 +12085,10 @@ impl TermView {
         let config = &pane_config;
         let chat_mode = *mode == crate::config::TerminalMode::Chat;
         let block_mode = *mode == crate::config::TerminalMode::Block;
-        // The Block dock remains an unapplied follow-up until real resize /
-        // command-capture provenance passes. Keep its source recoverable while
-        // this checkpoint runs the established single-VTE Block input surface.
-        const BLOCK_DOCK_VERIFIED: bool = false;
-        let docked_input = chat_mode || (block_mode && BLOCK_DOCK_VERIFIED);
+        // Block and Chat share the fixed native input seat. Move only the
+        // existing live clip: the VTE, PTY and submission authority stay owned
+        // by this pane throughout prompt, command and native-app transitions.
+        let docked_input = chat_mode || block_mode;
 
         ime_gate::install();
         // ── Build widget tree ──────────────────────────────────────────────
@@ -12421,14 +12424,13 @@ impl TermView {
                 }
             });
         }
-        // Chat alone owns an independent transcript + bottom live-terminal dock.
+        // Both command presentations keep history above the same native dock.
         // The stable canvas, not the shrinking transcript viewport, owns PTY size.
         let chat_canvas = gtk::Box::new(Orientation::Vertical, 0);
         chat_canvas.set_hexpand(true);
         chat_canvas.set_vexpand(true);
         if block_mode && docked_input {
             chat_canvas.add_css_class("block-native-canvas");
-            active.borrow().bind_block_grid_canvas(&chat_canvas);
         }
         let chat_dock = gtk::Box::new(Orientation::Vertical, 0);
         chat_dock.set_hexpand(true);

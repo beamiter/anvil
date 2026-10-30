@@ -181,6 +181,7 @@ impl AppModel {
     /// Keep the top-bar Tasks button in step with the domain. It is shown
     /// only where tasks can be used and counts attention by the shared rule.
     pub(crate) fn sync_task_badge(&self) {
+        self.refresh_workspace_task_overview();
         let visible = !self.safe_mode
             && (self.config.borrow().agent_tasks_enabled || !self.task_manager.tasks().is_empty());
         let counts = self.task_manager.attention_counts();
@@ -543,6 +544,7 @@ impl AppModel {
                     self.show_toast("Task is no longer available");
                     return;
                 };
+                self.tasks_panel.emit(TasksPanelMsg::ShowPage("diff"));
                 self.agent_diff.is_open = true;
                 if let Err(error) = self.agent_diff.request_from(worktree, base_commit) {
                     self.show_toast(format!("Could not open task diff: {error}"));
@@ -1105,6 +1107,7 @@ impl AppModel {
     /// Push the composed panel state. Rows are rebuilt from the domain every
     /// time; the panel never holds its own task copies.
     pub(crate) fn sync_tasks_panel(&self) {
+        self.refresh_workspace_task_overview();
         let policy = self.task_prompt_policy();
         let native_ai_enabled = policy.share_command_context;
         let mut agent_terminals = HashSet::new();
@@ -1210,6 +1213,63 @@ impl AppModel {
             pending_creation: self.pending_task_creation.is_some(),
         };
         self.tasks_panel.emit(TasksPanelMsg::Sync(Box::new(sync)));
+    }
+
+    /// The compact Agent page and full Tasks page share the same selected
+    /// identity and runtime permission gates.
+    pub(crate) fn refresh_workspace_task_overview(&self) {
+        let tasks = self.task_manager.tasks();
+        let selected =
+            jterm_core::reference_conversation::observed_inspector_task(tasks, self.selected_task);
+        let mut model = jterm_core::reference_conversation::observed_task_inspector(
+            tasks,
+            self.selected_task,
+            |id| crate::agent_task::DashboardActivity {
+                has_active_agent_stream: self.task_manager.has_active_agent_event_stream(id),
+                native_preparing: self.agent_runtime.has_preparing(id),
+                ..Default::default()
+            },
+        );
+        let private = self
+            .tabs
+            .get(self.active)
+            .is_some_and(|tab| tab.private_title);
+        if private {
+            model = jterm_core::reference_conversation::Inspector::empty();
+            model.title = "Private session".into();
+            model.subtitle =
+                "Task details are hidden. Open Tasks explicitly to inspect them.".into();
+            model.metadata.clear();
+            model.output_title = "Task details".into();
+            model.output = "Task details are hidden in a private session.".into();
+        }
+        let detail = selected
+            .filter(|_| !private && !self.safe_mode)
+            .and_then(|task| {
+                let agent = task.terminal_session_id.as_deref().is_some_and(|id| {
+                    self.existing_task_terminal(Some(id), TaskTerminalRole::Agent)
+                        .is_some()
+                });
+                let validation = task
+                    .validation
+                    .terminal_session_id
+                    .as_deref()
+                    .is_some_and(|id| {
+                        self.existing_task_terminal(Some(id), TaskTerminalRole::Validation)
+                            .is_some()
+                    });
+                self.task_detail_sync(
+                    task.id,
+                    self.task_prompt_policy().share_command_context,
+                    agent,
+                    validation,
+                )
+            });
+        let allow_create = !self.safe_mode && self.config.borrow().agent_tasks_enabled;
+        let allow_manage =
+            !self.safe_mode && (self.config.borrow().agent_tasks_enabled || !tasks.is_empty());
+        self.shell
+            .sync_task_overview(&model, detail.as_ref(), allow_create, allow_manage);
     }
 
     fn task_detail_sync(

@@ -901,7 +901,7 @@ impl Config {
             // Recovery mode must not initiate network or shared-cache work.
             jsh_update_check: JshUpdateCheck::Never,
             sidebar_visible: true,
-            sidebar_width: 220,
+            sidebar_width: 237,
             tab_width: 180,
             max_visible_blocks: 200,
             lazy_load_threshold: 1_000,
@@ -926,7 +926,7 @@ impl Config {
             preserve_live_scrollback: false,
             ai_enabled: false,
             ai_panel_visible: false,
-            ai_panel_width: 360,
+            ai_panel_width: 306,
             agent_enabled: false,
             agent_tasks_enabled: false,
             ai_share_command_context: false,
@@ -2166,7 +2166,7 @@ fn resolve_file_config(fc: FileConfig) -> (Config, Vec<Theme>, KeybindingMap) {
         &resolve_setting_text(None, fc.jsh_update_check, 64).unwrap_or_else(|| "daily".to_string()),
     );
     let sidebar_visible = resolve_sidebar_visibility(fc.sidebar_visible, tab_placement);
-    let sidebar_width = fc.sidebar_width.unwrap_or(220).clamp(120, 800);
+    let sidebar_width = fc.sidebar_width.unwrap_or(237).clamp(120, 800);
     let tab_width = fc.tab_width.unwrap_or(180).clamp(80, 480);
     let ascii_organism_enabled = env_bool("ANVIL_ASCII_ORGANISM_ENABLED")
         .or(fc.ascii_organism_enabled)
@@ -2268,7 +2268,7 @@ fn resolve_file_config(fc: FileConfig) -> (Config, Vec<Theme>, KeybindingMap) {
             .or(fc.ai_enabled)
             .unwrap_or(true),
         ai_panel_visible: fc.ai_panel_visible.unwrap_or(false),
-        ai_panel_width: fc.ai_panel_width.unwrap_or(360).clamp(240, 1_200),
+        ai_panel_width: fc.ai_panel_width.unwrap_or(306).clamp(240, 1_200),
         agent_enabled: env_bool("ANVIL_AGENT_ENABLED")
             .or(fc.agent_enabled)
             .unwrap_or(true),
@@ -3432,7 +3432,7 @@ mod tests {
     fn forge_compatible_panel_and_organism_defaults_are_safe() {
         let config = Config::safe_defaults();
         assert!(!config.ai_panel_visible);
-        assert_eq!(config.ai_panel_width, 360);
+        assert_eq!(config.ai_panel_width, 306);
         assert!(!config.ascii_organism_enabled);
         assert_eq!(config.ascii_organism_motion, None);
         assert_eq!(OrganismMotion::parse("FULL"), Some(OrganismMotion::Full));

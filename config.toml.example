@@ -37,10 +37,10 @@ terminal_mode = "block"     # applies to new/restored local panes
 tab_placement = "sidebar"   # "sidebar" or "top"
 sidebar_view = "tabs"       # "tabs" or "files"
 sidebar_visible = true
-sidebar_width = 220
+sidebar_width = 237
 tab_width = 180
 ai_panel_visible = false
-ai_panel_width = 360
+ai_panel_width = 306
 
 # Shell selection and commands automatically submitted in every new tab.
 # When shell is omitted, anvil tries jsh, bash -l, then sh.

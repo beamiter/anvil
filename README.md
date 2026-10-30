@@ -271,8 +271,10 @@ wide result cards, and a bottom-docked live shell. Select `--mode chat` or
 `terminal_mode = "chat"`; see [Chat mode](docs/chat-mode.md). It applies to
 new/restored local panes and never replaces a running shell.
 
-Block mode is the default. It keeps a live VTE input cell at the bottom and
-promotes each finished command into a separate block:
+Block mode is the default. Its live shell input is docked in the fixed bottom
+composer, independently of history scrolling, and each finished command becomes
+a separate block. The same native terminal owns editing, completion, history
+and IME; foreground full-screen applications take over the terminal viewport.
 
 The total-history scrollbar adds short theme-red marks at the approximate
 positions of failed completed commands. Block cards, marker/navigation actions,

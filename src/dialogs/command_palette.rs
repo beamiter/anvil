@@ -236,6 +236,7 @@ impl Component for PaletteModel {
 
     view! {
         root = adw::Dialog {
+            add_css_class: "workspace-dialog",
             set_title: "Palette",
             set_content_width: 560,
             set_content_height: 520,

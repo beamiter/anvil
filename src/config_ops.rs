@@ -77,7 +77,6 @@ impl AppModel {
         let tab_placement = new_config.tab_placement;
         let sidebar_view = new_config.sidebar_view;
         let sidebar_visible = new_config.sidebar_visible;
-        let sidebar_width = new_config.sidebar_width.clamp(120, 800) as i32;
         let old_remote_hosts = self.config.borrow().remote_hosts.clone();
         *self.config.borrow_mut() = new_config.clone();
         *self.config_revision.borrow_mut() = Some(revision);
@@ -110,8 +109,9 @@ impl AppModel {
         self.set_window_opacity(new_config.window_opacity);
         self.tab_placement.set(tab_placement);
         self.sidebar_view.set(sidebar_view);
-        self.sidebar_box.set_width_request(120);
-        self.content_paned.set_position(sidebar_width);
+        self.sidebar_box.set_width_request(-1);
+        self.shell
+            .set_sidebar_widths(new_config.sidebar_width, new_config.ai_panel_width);
         self.apply_tab_placement();
         self.set_sidebar_visible(sidebar_visible, false);
         self.set_bottom_bar_visible(new_config.bottom_bar);

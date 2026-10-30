@@ -6318,7 +6318,6 @@ pub(crate) struct ActiveBlock {
     live_geometry: Cell<(i32, i32, i32)>,
     /// Stable pane canvas for v2's physical grid. The clip may change seats;
     /// neither input/output insets nor content height may resize the child.
-    block_grid_canvas: glib::WeakRef<gtk::Box>,
     /// High-water row extent of the command in flight. Monotone within one
     /// command so a `\r` progress bar, an `ESC[1A` redraw or a mid-command
     /// `clear` can never make the card shrink under the output already on
@@ -6566,7 +6565,6 @@ impl ActiveBlock {
             live_spacer,
             live_clip,
             live_geometry: Cell::new((0, 0, 0)),
-            block_grid_canvas: glib::WeakRef::new(),
             live_extent_rows: Rc::new(Cell::new(0)),
             live_cursor_origin: Rc::new(Cell::new(None)),
             live_cursor_high: Rc::new(Cell::new(0)),
@@ -6624,12 +6622,11 @@ impl ActiveBlock {
         let cell_h = cell_h.max(1);
         let grid_rows = grid_rows.max(1);
         let visible_rows = visible_rows.clamp(1, grid_rows);
-        let width_px = self
-            .block_grid_canvas
-            .upgrade()
-            .map(|canvas| canvas.width().saturating_sub(2 * 12 + 2 + 2 * 16 + 24 + 16))
-            .filter(|width| *width > 0)
-            .unwrap_or_else(|| self.live_clip.width());
+        // The same clip can be docked, mounted in a running card, or own the
+        // full native viewport. Its real allocation includes the current CSS
+        // and split width; a canvas-minus-fixed-insets estimate cannot follow
+        // those seats and leaves full-screen applications on a stale grid.
+        let width_px = self.live_clip.width();
         let insets = terminal_vertical_insets(&self.active_vte);
         let visible_px = live_rows_height_px(cell_h, visible_rows, insets);
         if width_px <= 0 {
@@ -6652,10 +6649,6 @@ impl ActiveBlock {
         self.vte_overlay.set_size_request(width_px, grid_px);
         self.live_spacer.set_height_request(visible_px);
         true
-    }
-
-    pub(crate) fn bind_block_grid_canvas(&self, canvas: &gtk::Box) {
-        self.block_grid_canvas.set(Some(canvas));
     }
 
     /// The measured live card. The pane resize watcher keys off its width:

@@ -289,9 +289,8 @@ impl AppModel {
         }
         let width = width.clamp(MIN_AI_PANEL_WIDTH, MAX_AI_PANEL_WIDTH);
         self.config.borrow_mut().ai_panel_width = width;
-        if self.ai_panel_visible.get() {
-            self.restore_ai_panel_width();
-        }
+        self.shell
+            .set_sidebar_widths(self.config.borrow().sidebar_width, width);
         self.persist_config();
     }
 

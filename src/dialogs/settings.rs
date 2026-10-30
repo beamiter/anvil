@@ -2086,6 +2086,7 @@ impl Component for SettingsModel {
 
     view! {
         root = adw::PreferencesDialog {
+            add_css_class: "workspace-dialog",
             set_title: "Settings",
 
             add = &adw::PreferencesPage {
@@ -3004,6 +3005,7 @@ impl SettingsModel {
             })
             .content_width(420)
             .build();
+        dialog.add_css_class("workspace-dialog");
         let name = adw::EntryRow::new();
         name.set_title("Name (optional)");
         name.set_text(&self.remote_draft.name);

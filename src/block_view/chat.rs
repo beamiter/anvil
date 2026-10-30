@@ -980,6 +980,12 @@ mod tests {
     }
 
     fn fixture() -> (Rc<TermView>, gtk::Window, gtk::Entry) {
+        fixture_for_mode(crate::config::TerminalMode::Chat)
+    }
+
+    fn fixture_for_mode(
+        mode: crate::config::TerminalMode,
+    ) -> (Rc<TermView>, gtk::Window, gtk::Entry) {
         // Freeze the process environment before GTK, not once per window.
         // The refusal test creates separate full-queue and Closed PTYs in the
         // same process; neither fixture may recapture toolkit-mutated state.
@@ -991,7 +997,7 @@ mod tests {
         crate::workspace_shell::install_css();
         let view: Rc<TermView> = TermView::new_with_spawner(
             &crate::config::Config::safe_defaults(),
-            &crate::config::TerminalMode::Chat,
+            &mode,
             &["sh".to_string()],
             None,
             false,
@@ -1009,6 +1015,9 @@ mod tests {
         entry.set_text("other pane retains focus");
         let box_ = gtk::Box::new(gtk::Orientation::Vertical, 0);
         box_.add_css_class("workspace-center");
+        if mode == crate::config::TerminalMode::Block {
+            box_.add_css_class("block-workspace");
+        }
         box_.append(&entry);
         box_.append(&view.root);
         let window = gtk::Window::builder()
@@ -1142,6 +1151,27 @@ mod tests {
     }
 
     fn assert_finished_long_output(view: &TermView, expected_count: usize) {
+        {
+            let records = view.block_data.borrow();
+            assert_eq!(
+                records.len(),
+                expected_count,
+                "one retained record per command"
+            );
+            let record = records.back().expect("completed command record");
+            assert_eq!(
+                record.cmd, "echo hello",
+                "shell command survives resize and native takeover"
+            );
+            assert!(
+                record.command_exact,
+                "the fixture's shell-reported command keeps its provenance"
+            );
+            assert!(
+                !record.command_truncated,
+                "resize must not invent command truncation"
+            );
+        }
         let terminal = {
             let blocks = view.finished_blocks.borrow();
             assert_eq!(blocks.len(), expected_count, "command became a real card");
@@ -1503,7 +1533,17 @@ mod tests {
     #[test]
     #[ignore = "requires DISPLAY; production window, parser and real PTY winsize"]
     fn chat_reparents_only_live_clip_and_hides_submit_for_native_takeover() {
-        let (view, window, other) = fixture();
+        docked_reparent_scroll_and_resize_lifecycle(crate::config::TerminalMode::Chat);
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; production window, parser and real PTY winsize"]
+    fn block_reparents_only_live_clip_and_keeps_bottom_input_fixed() {
+        docked_reparent_scroll_and_resize_lifecycle(crate::config::TerminalMode::Block);
+    }
+
+    fn docked_reparent_scroll_and_resize_lifecycle(mode: crate::config::TerminalMode) {
+        let (view, window, other) = fixture_for_mode(mode);
         let terminal = view.active_vte.clone();
         let holder = view.active.borrow().widget().clone();
         let send = button(&view, "chat-send");
@@ -1672,7 +1712,23 @@ mod tests {
     #[test]
     #[ignore = "requires DISPLAY; real native reparent allocation and PTY winsize"]
     fn chat_raw_takeover_updates_columns_without_resizing_the_window() {
-        let (view, window, other) = fixture();
+        docked_raw_takeover_updates_columns_without_resizing_the_window(
+            crate::config::TerminalMode::Chat,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; real native reparent allocation and PTY winsize"]
+    fn block_raw_takeover_updates_columns_without_resizing_the_window() {
+        docked_raw_takeover_updates_columns_without_resizing_the_window(
+            crate::config::TerminalMode::Block,
+        );
+    }
+
+    fn docked_raw_takeover_updates_columns_without_resizing_the_window(
+        mode: crate::config::TerminalMode,
+    ) {
+        let (view, window, other) = fixture_for_mode(mode);
         other.grab_focus();
         drive(&view, PROMPT, BlockState::AwaitingCommand);
         let terminal = view.active_vte.clone();
@@ -1730,7 +1786,23 @@ mod tests {
     #[test]
     #[ignore = "requires DISPLAY; production commit/admission and real PTY recorder"]
     fn chat_submit_uses_one_native_commit_and_refuses_a_stale_button() {
-        let (view, window, _) = fixture();
+        docked_submit_uses_one_native_commit_and_refuses_a_stale_button(
+            crate::config::TerminalMode::Chat,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires DISPLAY; production commit/admission and real PTY recorder"]
+    fn block_submit_uses_one_native_commit_and_refuses_a_stale_button() {
+        docked_submit_uses_one_native_commit_and_refuses_a_stale_button(
+            crate::config::TerminalMode::Block,
+        );
+    }
+
+    fn docked_submit_uses_one_native_commit_and_refuses_a_stale_button(
+        mode: crate::config::TerminalMode,
+    ) {
+        let (view, window, _) = fixture_for_mode(mode);
         drive(&view, PROMPT, BlockState::AwaitingCommand);
         let button = button(&view, "chat-send");
         let received = Rc::new(Cell::new(0));

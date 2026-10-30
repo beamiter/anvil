@@ -14,9 +14,7 @@ impl AppModel {
         }
         self.sidebar_visible = visible;
         self.sidebar_box.set_visible(visible);
-        if let Some(navigation) = self.content_paned.start_child() {
-            navigation.set_visible(visible);
-        }
+        self.shell.set_navigation_visible(visible);
         if visible && self.sidebar_view.get() == config::SidebarView::Files {
             self.file_tree_revalidate_due();
         }
@@ -24,6 +22,18 @@ impl AppModel {
             self.config.borrow_mut().sidebar_visible = visible;
             self.persist_config();
         }
+    }
+
+    pub(crate) fn persist_sidebar_widths_debounced(&self, sender: &ComponentSender<AppModel>) {
+        let generation = self.sidebar_width_persist_generation.get().wrapping_add(1);
+        self.sidebar_width_persist_generation.set(generation);
+        let sender = sender.clone();
+        let token = self.sidebar_width_persist_generation.clone();
+        gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+            if token.get() == generation {
+                sender.input(AppMsg::PersistSidebarWidths(generation));
+            }
+        });
     }
 
     /// Move the tab strip into the holder matching the current placement and
@@ -95,6 +105,9 @@ impl AppModel {
                 },
             ),
             SidebarView::Files => {
+                if persist {
+                    self.shell.show_files_navigation();
+                }
                 self.sidebar_stack.set_visible_child_name("files");
                 self.file_tree_revalidate_due();
             }

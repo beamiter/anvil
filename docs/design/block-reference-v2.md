@@ -1,5 +1,11 @@
 # Block native card checkpoint
 
+The checkpoint records below predate the fixed Block input dock. Current Block
+panes use the shared native bottom composer described in
+[Reference workspace](../reference-workspace.md). The earlier captures and
+excluded prototype remain historical evidence; the dock now uses the actual
+live clip allocation rather than the prototype's fixed canvas-width estimate.
+
 ## Default-font migration
 
 The next reference batch changes the built-in Main default to

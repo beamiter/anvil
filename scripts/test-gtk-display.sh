@@ -53,6 +53,9 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    workspace_shell::panel_tests::files_inspector_roundtrip_preserves_browser_model_selection_and_draft
+    workspace_shell::panel_tests::session_context_private_transition_clears_copy_source_and_restores_public_state
+    workspace_shell::panel_tests::task_overview_renders_observed_evidence_and_attention_state
     block_view::chat_layout_tests::chat_bubbles_keep_alignment_through_resize_and_font_changes
     sidebar::layout_tests::sidebar_resize_and_vertical_scroll_keep_the_leading_edge_visible
     block_view::chat::tests::chat_completion_never_expands_between_shell_markers
@@ -128,14 +131,20 @@ tests=(
     organism_ui::tests::idle_refresh_skips_unchanged_tooltip_and_non_owner_spatial_render
     organism_ui::tests::hidden_sticky_heartbeat_catches_up_on_map_without_retaining_pane
     block_view::chat::tests::chat_reparents_only_live_clip_and_hides_submit_for_native_takeover
+    block_view::chat::tests::block_reparents_only_live_clip_and_keeps_bottom_input_fixed
     block_view::chat::tests::chat_raw_takeover_updates_columns_without_resizing_the_window
+    block_view::chat::tests::block_raw_takeover_updates_columns_without_resizing_the_window
     block_view::chat::tests::chat_submit_uses_one_native_commit_and_refuses_a_stale_button
+    block_view::chat::tests::block_submit_uses_one_native_commit_and_refuses_a_stale_button
     block_view::chat::tests::chat_buttons_preserve_input_and_feedback_when_writer_refuses
     block_view::chat::tests::chat_stop_is_bound_to_displayed_command_and_foreground
     block_view::chat::tests::chat_buttons_never_queue_behind_inflight_keyboard_input
     block_view::chat::tests::chat_native_activation_never_rebinds_a_delayed_stop
     block_view::chat::tests::chat_native_activation_never_rebinds_send_to_a_new_prompt
     font::tests::context_menu_tracks_live_theme_and_font_without_parent_emphasis
+    workspace_shell::tests::workspace_popups_follow_launcher_palette_without_composer_style_leaks
+    workspace_shell::tests::workspace_dialog_themes_its_sheet_without_painting_over_the_workspace
+    workspace_shell::tests::native_sidebar_drags_keep_preferences_and_terminal_draft_through_responsive_clamps
     dialogs::settings::organism_preview::tests::preview_lifecycle_keeps_motion_local_and_stops_hidden_sources
     organism_ui::tests::deferred_agent_loss_retires_closed_panes_but_keeps_hidden_outcomes
     organism_ui::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers

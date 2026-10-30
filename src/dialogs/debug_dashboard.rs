@@ -26,6 +26,7 @@ impl Component for DebugDashboardModel {
 
     view! {
         root = adw::Dialog {
+            add_css_class: "workspace-dialog",
             set_title: "Debug Dashboard",
             set_content_width: 480,
             set_content_height: 560,

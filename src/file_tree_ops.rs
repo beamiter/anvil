@@ -2654,10 +2654,7 @@ impl AppModel {
     /// per-tick cap prevents a long-lived remote tree from flooding the queue.
     #[allow(deprecated)]
     pub(crate) fn file_tree_revalidate_due(&self) {
-        if !self.sidebar_visible
-            || self.sidebar_view.get() != config::SidebarView::Files
-            || !self.window.is_active()
-        {
+        if !self.file_tree_view.is_mapped() || !self.window.is_active() {
             return;
         }
         let root = self.file_tree_root.borrow().clone();

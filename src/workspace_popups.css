@@ -1,0 +1,93 @@
+/* Native menus and dialogs belong to the same workspace as their launcher.
+   Keep the existing navy chrome, pale Chat canvas and dark Block canvas.
+   Explicit application/dialog scope leaves system and file chooser UI alone. */
+window.anvil-font-sync popover,.workspace-dialog popover { background:transparent; border:0; box-shadow:none; padding:0; }
+window.anvil-font-sync popover > contents,.workspace-dialog popover > contents { border-radius:12px; padding:8px; box-shadow:0 6px 20px rgba(4,10,20,0.24); }
+window.anvil-font-sync popover button,.workspace-dialog popover button { min-height:26px; border:0; border-radius:6px; background-image:none; box-shadow:none; }
+window.anvil-font-sync popover label,.workspace-dialog popover label,
+window.anvil-font-sync popover drawingarea,.workspace-dialog popover drawingarea { color:inherit; }
+window.anvil-font-sync popover button:focus-visible,.workspace-dialog popover button:focus-visible,
+window.anvil-font-sync dropdown > button:focus-visible,.workspace-dialog dropdown > button:focus-visible { outline:2px solid #8fa4ff; outline-offset:-2px; }
+window.anvil-font-sync popover button:disabled,.workspace-dialog popover button:disabled,
+window.anvil-font-sync popover button:disabled *,.workspace-dialog popover button:disabled * { opacity:1; filter:none; }
+window.anvil-font-sync popover scrolledwindow,.workspace-dialog popover scrolledwindow,
+window.anvil-font-sync popover viewport,.workspace-dialog popover viewport,
+window.anvil-font-sync popover listview,.workspace-dialog popover listview,
+window.anvil-font-sync popover scrollbar,.workspace-dialog popover scrollbar,
+window.anvil-font-sync popover scrollbar trough,.workspace-dialog popover scrollbar trough { background:transparent; }
+window.anvil-font-sync popover separator,.workspace-dialog popover separator { min-height:1px; margin:4px 0; }
+/* A Tools popup is descended from the composer: its rows must not inherit
+   the composer's outlined controls, pressed fills or disabled filters. */
+#reference-tools-menu button.reference-tool-row { min-height:30px; min-width:0; padding:0 6px; border:0; border-radius:6px; background-image:none; box-shadow:none; }
+#reference-tools-menu button.reference-tool-row label,#reference-tools-menu button.reference-tool-row drawingarea { color:inherit; }
+#reference-tools-menu button.reference-tool-row:disabled,#reference-tools-menu button.reference-tool-row:disabled * { opacity:1; filter:none; }
+
+/* Navy workspace chrome */
+window.anvil-font-sync popover,.workspace-dialog popover { color:#e1e9f6; }
+window.anvil-font-sync popover > contents,.workspace-dialog popover > contents { background:#162133; color:#e1e9f6; border:1px solid #394960; }
+window.anvil-font-sync popover > arrow,.workspace-dialog popover > arrow { background:#162133; border-color:#394960; }
+window.anvil-font-sync popover button,window.anvil-font-sync popover row,window.anvil-font-sync #reference-tools-menu button.reference-tool-row,.workspace-dialog popover button,.workspace-dialog popover row,.workspace-dialog #reference-tools-menu button.reference-tool-row { background:transparent; color:#e1e9f6; }
+window.anvil-font-sync popover button:hover,window.anvil-font-sync popover button:active,window.anvil-font-sync popover button:checked,window.anvil-font-sync popover button:focus-visible,window.anvil-font-sync popover row:hover,window.anvil-font-sync popover row:selected,window.anvil-font-sync #reference-tools-menu button.reference-tool-row:hover,window.anvil-font-sync #reference-tools-menu button.reference-tool-row:focus-visible,.workspace-dialog popover button:hover,.workspace-dialog popover button:active,.workspace-dialog popover button:checked,.workspace-dialog popover button:focus-visible,.workspace-dialog popover row:hover,.workspace-dialog popover row:selected,.workspace-dialog #reference-tools-menu button.reference-tool-row:hover,.workspace-dialog #reference-tools-menu button.reference-tool-row:focus-visible { background:#283d6f; color:#e1e9f6; }
+window.anvil-font-sync popover button:focus-visible,window.anvil-font-sync dropdown > button:focus-visible,.workspace-dialog popover button:focus-visible,.workspace-dialog dropdown > button:focus-visible { outline-color:#8fa4ff; }
+window.anvil-font-sync popover button:disabled,window.anvil-font-sync popover button:disabled *,window.anvil-font-sync popover .dim-label,window.anvil-font-sync popover .reference-tool-description,window.anvil-font-sync #reference-tools-menu button.reference-tool-row:disabled,window.anvil-font-sync #reference-tools-menu button.reference-tool-row:disabled *,window.anvil-font-sync #reference-tools-menu label.reference-tool-description,.workspace-dialog popover button:disabled,.workspace-dialog popover button:disabled *,.workspace-dialog popover .dim-label,.workspace-dialog popover .reference-tool-description,.workspace-dialog #reference-tools-menu button.reference-tool-row:disabled,.workspace-dialog #reference-tools-menu button.reference-tool-row:disabled *,.workspace-dialog #reference-tools-menu label.reference-tool-description { color:#91a2bb; }
+window.anvil-font-sync popover button:disabled,window.anvil-font-sync #reference-tools-menu button.reference-tool-row:disabled,.workspace-dialog popover button:disabled,.workspace-dialog #reference-tools-menu button.reference-tool-row:disabled { background:transparent; }
+window.anvil-font-sync popover separator,.workspace-dialog popover separator { background:#394960; }
+window.anvil-font-sync popover scrollbar slider,.workspace-dialog popover scrollbar slider { background:alpha(#e1e9f6,0.3); }
+window.anvil-font-sync popover scrollbar slider:hover,.workspace-dialog popover scrollbar slider:hover { background:alpha(#e1e9f6,0.5); }
+window.anvil-font-sync popover entry,window.anvil-font-sync popover searchentry,window.anvil-font-sync dropdown > button,.workspace-dialog popover entry,.workspace-dialog popover searchentry,.workspace-dialog dropdown > button { background:alpha(#e1e9f6,0.06); color:#e1e9f6; border:1px solid #394960; border-radius:6px; box-shadow:none; caret-color:#e1e9f6; }
+
+/* Pale Chat canvas */
+window.anvil-font-sync .workspace-center:not(.block-workspace) popover { color:#35445e; }
+window.anvil-font-sync .workspace-center:not(.block-workspace) popover > contents { background:#fefefe; color:#35445e; border:1px solid #bdcce4; }
+window.anvil-font-sync .workspace-center:not(.block-workspace) popover > arrow { background:#fefefe; border-color:#bdcce4; }
+window.anvil-font-sync .workspace-center:not(.block-workspace) popover button,window.anvil-font-sync .workspace-center:not(.block-workspace) popover row,window.anvil-font-sync .workspace-center:not(.block-workspace) #reference-tools-menu button.reference-tool-row { background:transparent; color:#35445e; }
+window.anvil-font-sync .workspace-center:not(.block-workspace) popover button:hover,window.anvil-font-sync .workspace-center:not(.block-workspace) popover button:active,window.anvil-font-sync .workspace-center:not(.block-workspace) popover button:checked,window.anvil-font-sync .workspace-center:not(.block-workspace) popover button:focus-visible,window.anvil-font-sync .workspace-center:not(.block-workspace) popover row:hover,window.anvil-font-sync .workspace-center:not(.block-workspace) popover row:selected,window.anvil-font-sync .workspace-center:not(.block-workspace) #reference-tools-menu button.reference-tool-row:hover,window.anvil-font-sync .workspace-center:not(.block-workspace) #reference-tools-menu button.reference-tool-row:focus-visible { background:#d9e4fa; color:#35445e; }
+window.anvil-font-sync .workspace-center:not(.block-workspace) popover button:focus-visible,window.anvil-font-sync .workspace-center:not(.block-workspace) dropdown > button:focus-visible { outline-color:#5c7ef0; }
+window.anvil-font-sync .workspace-center:not(.block-workspace) popover button:disabled,window.anvil-font-sync .workspace-center:not(.block-workspace) popover button:disabled *,window.anvil-font-sync .workspace-center:not(.block-workspace) popover .dim-label,window.anvil-font-sync .workspace-center:not(.block-workspace) popover .reference-tool-description,window.anvil-font-sync .workspace-center:not(.block-workspace) #reference-tools-menu button.reference-tool-row:disabled,window.anvil-font-sync .workspace-center:not(.block-workspace) #reference-tools-menu button.reference-tool-row:disabled *,window.anvil-font-sync .workspace-center:not(.block-workspace) #reference-tools-menu label.reference-tool-description { color:#728099; }
+window.anvil-font-sync .workspace-center:not(.block-workspace) popover button:disabled,window.anvil-font-sync .workspace-center:not(.block-workspace) #reference-tools-menu button.reference-tool-row:disabled { background:transparent; }
+window.anvil-font-sync .workspace-center:not(.block-workspace) popover separator { background:#bdcce4; }
+window.anvil-font-sync .workspace-center:not(.block-workspace) popover scrollbar slider { background:alpha(#35445e,0.3); }
+window.anvil-font-sync .workspace-center:not(.block-workspace) popover scrollbar slider:hover { background:alpha(#35445e,0.5); }
+window.anvil-font-sync .workspace-center:not(.block-workspace) popover entry,window.anvil-font-sync .workspace-center:not(.block-workspace) popover searchentry,window.anvil-font-sync .workspace-center:not(.block-workspace) dropdown > button { background:alpha(#35445e,0.06); color:#35445e; border:1px solid #bdcce4; border-radius:6px; box-shadow:none; caret-color:#35445e; }
+
+/* Dark Block canvas */
+window.anvil-font-sync .workspace-center.block-workspace popover { color:#d5deec; }
+window.anvil-font-sync .workspace-center.block-workspace popover > contents { background:#101c30; color:#d5deec; border:1px solid #293c57; }
+window.anvil-font-sync .workspace-center.block-workspace popover > arrow { background:#101c30; border-color:#293c57; }
+window.anvil-font-sync .workspace-center.block-workspace popover button,window.anvil-font-sync .workspace-center.block-workspace popover row,window.anvil-font-sync .workspace-center.block-workspace #reference-tools-menu button.reference-tool-row { background:transparent; color:#d5deec; }
+window.anvil-font-sync .workspace-center.block-workspace popover button:hover,window.anvil-font-sync .workspace-center.block-workspace popover button:active,window.anvil-font-sync .workspace-center.block-workspace popover button:checked,window.anvil-font-sync .workspace-center.block-workspace popover button:focus-visible,window.anvil-font-sync .workspace-center.block-workspace popover row:hover,window.anvil-font-sync .workspace-center.block-workspace popover row:selected,window.anvil-font-sync .workspace-center.block-workspace #reference-tools-menu button.reference-tool-row:hover,window.anvil-font-sync .workspace-center.block-workspace #reference-tools-menu button.reference-tool-row:focus-visible { background:#1d304d; color:#d5deec; }
+window.anvil-font-sync .workspace-center.block-workspace popover button:focus-visible,window.anvil-font-sync .workspace-center.block-workspace dropdown > button:focus-visible { outline-color:#4199ff; }
+window.anvil-font-sync .workspace-center.block-workspace popover button:disabled,window.anvil-font-sync .workspace-center.block-workspace popover button:disabled *,window.anvil-font-sync .workspace-center.block-workspace popover .dim-label,window.anvil-font-sync .workspace-center.block-workspace popover .reference-tool-description,window.anvil-font-sync .workspace-center.block-workspace #reference-tools-menu button.reference-tool-row:disabled,window.anvil-font-sync .workspace-center.block-workspace #reference-tools-menu button.reference-tool-row:disabled *,window.anvil-font-sync .workspace-center.block-workspace #reference-tools-menu label.reference-tool-description { color:#91a4bf; }
+window.anvil-font-sync .workspace-center.block-workspace popover button:disabled,window.anvil-font-sync .workspace-center.block-workspace #reference-tools-menu button.reference-tool-row:disabled { background:transparent; }
+window.anvil-font-sync .workspace-center.block-workspace popover separator { background:#293c57; }
+window.anvil-font-sync .workspace-center.block-workspace popover scrollbar slider { background:alpha(#d5deec,0.3); }
+window.anvil-font-sync .workspace-center.block-workspace popover scrollbar slider:hover { background:alpha(#d5deec,0.5); }
+window.anvil-font-sync .workspace-center.block-workspace popover entry,window.anvil-font-sync .workspace-center.block-workspace popover searchentry,window.anvil-font-sync .workspace-center.block-workspace dropdown > button { background:alpha(#d5deec,0.06); color:#d5deec; border:1px solid #293c57; border-radius:6px; box-shadow:none; caret-color:#d5deec; }
+
+/* Workspace-owned dialogs use the navy side panels as their surface family.
+   Lists, inputs and header content are explicit so an Adwaita light body cannot
+   appear beneath the workspace header. Text size remains native/user-owned. */
+/* AdwDialog spans the host window; only its sheet is a painted surface.
+   Dimming/scrim and the workspace behind it remain owned by libadwaita. */
+.workspace-dialog { background:transparent; color:#e1e9f6; }
+.workspace-dialog sheet.background { background:#162133; color:#e1e9f6; }
+.workspace-dialog toolbarview,.workspace-dialog .view,
+.workspace-dialog preferencespage,.workspace-dialog preferencesgroup { background:#162133; color:#e1e9f6; }
+.workspace-dialog toolbarview > .top-bar,.workspace-dialog toolbarview > .bottom-bar { background:#162133; color:#e1e9f6; }
+.workspace-dialog headerbar { background:#0f1726; color:#d7dfed; box-shadow:none; border-bottom:1px solid #29374c; }
+.workspace-dialog .boxed-list,.workspace-dialog .boxed-list > row { background:#1c293a; color:#e1e9f6; border-color:#394960; }
+.workspace-dialog row:hover,.workspace-dialog row:selected,.workspace-dialog .boxed-list > row:hover,.workspace-dialog .boxed-list > row:selected { background:#283d6f; color:#e1e9f6; }
+.workspace-dialog .dim-label,.workspace-dialog .subtitle { color:#91a2bb; opacity:1; }
+.workspace-dialog entry,.workspace-dialog searchentry,.workspace-dialog spinbutton,
+.workspace-dialog textview,.workspace-dialog textview text,.workspace-dialog dropdown > button { background:#111d2e; color:#e1e9f6; border-color:#394960; caret-color:#e1e9f6; box-shadow:none; }
+.workspace-dialog button { color:#c0cbe0; }
+.workspace-dialog button:not(.suggested-action):not(.destructive-action):hover { background:#283d6f; }
+.workspace-dialog button:focus-visible,.workspace-dialog entry:focus-within,.workspace-dialog searchentry:focus-within { outline:2px solid #8fa4ff; outline-offset:-2px; }
+.workspace-dialog button:disabled,.workspace-dialog entry:disabled { color:#91a2bb; }
+.workspace-dialog button.suggested-action:not(:disabled) { background:#5c7ef0; color:white; }
+.workspace-dialog button.suggested-action:not(:disabled):hover { background:#648bef; }
+.workspace-dialog button.destructive-action:not(:disabled) { background:#3b222e; color:#ff646f; }
+.workspace-dialog button.destructive-action:not(:disabled):hover { background:#462538; }
+.workspace-dialog button.suggested-action:disabled,.workspace-dialog button.destructive-action:disabled { background:#263349; color:#91a2bb; opacity:1; filter:none; }
+.workspace-dialog checkbutton check:checked,.workspace-dialog switch:checked { background:#5c7ef0; color:white; }
+.workspace-dialog separator { background:#394960; }

@@ -66,26 +66,72 @@ impl AppModel {
             Some(TermCtl::Block(controller)) => controller.model().mode(),
             _ => TerminalMode::Block,
         };
+        let private = tab.is_some_and(|tab| tab.private_title);
+        let git = (!private)
+            .then(|| {
+                cwd.as_deref()
+                    .and_then(crate::git_meta_ui::read_cached_and_refresh)
+            })
+            .flatten();
         self.shell.sync(
             if tab.is_some_and(|tab| tab.private_title) {
                 "Private session"
             } else {
                 &title.window_title
             },
-            cwd.as_deref()
-                .and_then(|path| path.to_str())
-                .unwrap_or("Local terminal"),
+            pane.and_then(|pane| pane.cwd.as_deref())
+                .unwrap_or("Directory not reported"),
             presentation,
             tab.is_some_and(|tab| tab.private_title),
         );
+        let process = (!private)
+            .then(|| pane.and_then(Pane::foreground_process))
+            .flatten();
+        let remote = tab
+            .and_then(|tab| tab.remote.as_ref())
+            .filter(|remote| pane.is_some_and(|pane| pane.id == remote.pane_id));
+        let namespace = if let Some(remote) = remote {
+            format!("Remote · {}", remote.host.name)
+        } else if pane.is_some_and(|pane| pane.cwd_external) {
+            "External session (reported directory)".into()
+        } else {
+            "Local".into()
+        };
+        let context = workspace_shell::SessionContext {
+            private,
+            cwd: pane.and_then(|pane| pane.cwd.as_deref()),
+            namespace: &namespace,
+            configured_shell: self
+                .shell_argv
+                .first()
+                .map(String::as_str)
+                .unwrap_or("Not reported"),
+            presentation: pane
+                .map(|pane| pane.terminal.mode().as_str())
+                .unwrap_or("No session"),
+            process: process.as_deref(),
+            last_exit: pane.and_then(|pane| pane.last_exit),
+            duration_ms: pane.and_then(|pane| pane.last_duration_ms),
+            grid: pane.map(|pane| pane.terminal.grid_size()).unwrap_or((0, 0)),
+            branch: git.as_ref().map(|meta| meta.branch.as_str()),
+            share_command_context: crate::agent_task_ui::prompt_policy(&self.config.borrow())
+                .share_command_context,
+        };
+        self.shell.sync_session_context(&context);
+        self.shell.sync_workspace_entries(
+            &self
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(index, tab)| (tab.id, tab.display_title().to_owned(), index == self.active))
+                .collect::<Vec<_>>(),
+        );
+        self.refresh_workspace_task_overview();
         // The own visible property, not effective visibility: the initial
         // refresh runs before the window is mapped.
         if !self.bottom_bar.get_visible() {
             return;
         }
-        let git = cwd
-            .as_deref()
-            .and_then(crate::git_meta_ui::read_cached_and_refresh);
         let (cols, rows) = pane.map(|p| p.terminal.grid_size()).unwrap_or((0, 0));
         let content = bottom_bar::compose(&bottom_bar::Snapshot {
             cwd: cwd.as_deref(),
