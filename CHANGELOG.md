@@ -7,6 +7,12 @@ versioning for tagged releases while it remains experimental.
 
 ### Added
 
+- The Block workspace's bottom input now always reserves three full lines of
+  text while idle instead of collapsing to the prompt's one or two rows. It
+  still grows for multiline commands, completion menus and anything else the
+  shell draws, and shrinks only when the pane itself is shorter than three
+  rows. Chat's one-row composer is unchanged.
+
 - Soft-wrapped lines are painted natively in the Vim9 editor instead of
   switching the buffer to the compatibility view: continuation rows,
   `showbreak`, `breakindent` and `smoothscroll` partial lines keep Vim's exact

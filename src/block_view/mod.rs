@@ -12997,7 +12997,9 @@ impl TermView {
                 // card is that grid too. Normal command output is rendered into
                 // the running block above, so the live input cell can still stay
                 // compact — it is only the visible height that collapses.
-                let compact_rows = if docked_input {
+                let compact_rows = if block_mode {
+                    chat::block_composer_rows
+                } else if docked_input {
                     chat::composer_rows
                 } else {
                     compact_card_rows

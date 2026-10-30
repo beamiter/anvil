@@ -16,6 +16,20 @@ pub(super) fn composer_rows(input: i64, drawn: i64, viewport: i64) -> i64 {
     input.max(drawn).clamp(1, viewport.max(1))
 }
 
+/// Rows the Block composer always keeps when idle: a prompt plus one command
+/// line leaves no visible room to type into, so the editor reserves three full
+/// lines of text (fewer only when the whole pane is shorter than that).
+pub(super) const BLOCK_INPUT_MIN_ROWS: i64 = 3;
+
+/// Block's docked input: the same shell-owned growth as [`composer_rows`],
+/// never below [`BLOCK_INPUT_MIN_ROWS`]. Chat keeps its one-row composer.
+pub(super) fn block_composer_rows(input: i64, drawn: i64, viewport: i64) -> i64 {
+    let viewport = viewport.max(1);
+    input
+        .max(drawn)
+        .clamp(BLOCK_INPUT_MIN_ROWS.min(viewport), viewport)
+}
+
 /// Read the lifecycle owner's *current* state. In particular, an OSC marker
 /// seen earlier in this session is not evidence of a ready prompt now.
 pub(super) fn surface(state: BlockState) -> ChatSurface {
@@ -645,6 +659,25 @@ fn submit_allowed(state: BlockState, shell_foreground: Option<bool>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_input_rows_keep_three_lines_and_chat_keeps_one() {
+        // An empty prompt, a one-line prompt and a two-line prompt all leave
+        // three full lines of room to type into in Block.
+        assert_eq!(block_composer_rows(1, 1, 30), BLOCK_INPUT_MIN_ROWS);
+        assert_eq!(block_composer_rows(1, 2, 30), BLOCK_INPUT_MIN_ROWS);
+        assert_eq!(block_composer_rows(2, 1, 30), BLOCK_INPUT_MIN_ROWS);
+        // Beyond the floor the editor follows typed and drawn content.
+        assert_eq!(block_composer_rows(4, 1, 30), 4);
+        assert_eq!(block_composer_rows(1, 12, 30), 12);
+        assert_eq!(block_composer_rows(1, 100, 30), 30);
+        // A pane shorter than the floor never asks for more than it has.
+        assert_eq!(block_composer_rows(1, 1, 2), 2);
+        assert_eq!(block_composer_rows(1, 1, 0), 1);
+        // Chat's companion composer is unchanged.
+        assert_eq!(composer_rows(1, 1, 30), 1);
+        assert_eq!(composer_rows(1, 2, 30), 2);
+    }
 
     #[test]
     fn completion_presentation_survives_normal_and_coalesced_commands() {
