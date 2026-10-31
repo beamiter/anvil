@@ -2070,7 +2070,10 @@ mod tests {
         drop(pty);
         let deadline = Instant::now() + Duration::from_secs(3);
         while child.exit_code().is_none() {
-            assert!(Instant::now() < deadline, "the fixture child must be reaped");
+            assert!(
+                Instant::now() < deadline,
+                "the fixture child must be reaped"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
     }
