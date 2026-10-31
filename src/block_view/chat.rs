@@ -17,16 +17,18 @@ pub(super) fn composer_rows(input: i64, drawn: i64, viewport: i64) -> i64 {
 }
 
 /// Rows the Block composer always keeps when idle: a prompt plus one command
-/// line leaves no visible room to type into, so the editor reserves three full
+/// line leaves no visible room to type into, so the editor reserves four full
 /// lines of text (fewer only when the whole pane is shorter than that).
-pub(super) const BLOCK_INPUT_MIN_ROWS: i64 = 3;
+pub(super) const BLOCK_INPUT_MIN_ROWS: i64 = 4;
 
 /// Block's docked input: the same shell-owned growth as [`composer_rows`],
-/// never below [`BLOCK_INPUT_MIN_ROWS`]. Chat keeps its one-row composer.
+/// with a blank row below the content, never below [`BLOCK_INPUT_MIN_ROWS`].
+/// Chat keeps its one-row composer.
 pub(super) fn block_composer_rows(input: i64, drawn: i64, viewport: i64) -> i64 {
     let viewport = viewport.max(1);
     input
         .max(drawn)
+        .saturating_add(1)
         .clamp(BLOCK_INPUT_MIN_ROWS.min(viewport), viewport)
 }
 
@@ -661,15 +663,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn block_input_rows_keep_three_lines_and_chat_keeps_one() {
+    fn block_input_rows_keep_four_lines_and_bottom_space() {
         // An empty prompt, a one-line prompt and a two-line prompt all leave
-        // three full lines of room to type into in Block.
+        // four full lines of room to type into in Block.
         assert_eq!(block_composer_rows(1, 1, 30), BLOCK_INPUT_MIN_ROWS);
         assert_eq!(block_composer_rows(1, 2, 30), BLOCK_INPUT_MIN_ROWS);
         assert_eq!(block_composer_rows(2, 1, 30), BLOCK_INPUT_MIN_ROWS);
-        // Beyond the floor the editor follows typed and drawn content.
-        assert_eq!(block_composer_rows(4, 1, 30), 4);
-        assert_eq!(block_composer_rows(1, 12, 30), 12);
+        // Beyond the floor the editor keeps a blank row below the content.
+        assert_eq!(block_composer_rows(4, 1, 30), 5);
+        assert_eq!(block_composer_rows(1, 12, 30), 13);
         assert_eq!(block_composer_rows(1, 100, 30), 30);
         // A pane shorter than the floor never asks for more than it has.
         assert_eq!(block_composer_rows(1, 1, 2), 2);
