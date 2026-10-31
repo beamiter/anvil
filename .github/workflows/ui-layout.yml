@@ -73,6 +73,7 @@ jobs:
         run: |
           set -euo pipefail
           tests=(
+            pty::tests::live_display_recorder_uses_owned_child_teardown
             block_view::chat::tests::block_input_rows_keep_four_lines_and_bottom_space
             block_view::chat_layout_tests::chat_bubbles_keep_alignment_through_resize_and_font_changes
             workspace_conversation::tests::user_capsules_follow_reading_edge_and_wrap_in_narrow_windows

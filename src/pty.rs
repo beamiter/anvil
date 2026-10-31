@@ -1835,18 +1835,60 @@ fn signal_eventfd(eventfd: RawFd) -> io::Result<()> {
 #[cfg(test)]
 impl OwnedPty {
     pub(crate) fn from_openpty(foreground: Option<bool>) -> io::Result<Self> {
+        Self::from_openpty_inner(foreground, false)
+    }
+
+    /// A nonexecuting session leader for asynchronous native display fixtures.
+    /// The production reader must see a live child until the fixture closes;
+    /// otherwise its exit guard correctly retires the parser before GTK maps.
+    /// Existing kill/Drop ownership terminates and reaps this idle child.
+    pub(crate) fn from_live_openpty(foreground: Option<bool>) -> io::Result<Self> {
+        Self::from_openpty_inner(foreground, true)
+    }
+
+    fn from_openpty_inner(foreground: Option<bool>, keep_child_alive: bool) -> io::Result<Self> {
         let OpenptyResult { master, slave } = openpty_cloexec(None)?;
         prepare_test_slave(&slave);
         // SAFETY: the child uses only async-signal-safe syscalls after fork.
         let (exec_read, exec_write) = crate::gtk_process::exec_barrier()?;
+        let child_fds = [
+            master.as_raw_fd(),
+            slave.as_raw_fd(),
+            exec_read.as_raw_fd(),
+            exec_write.as_raw_fd(),
+        ];
+        #[cfg(target_os = "linux")]
+        let parent_pid = unsafe { libc::getpid() };
         let child = match unsafe { unistd::fork() }.map_err(io::Error::other)? {
             ForkResult::Child => unsafe {
                 libc::setsid();
+                if keep_child_alive {
+                    // A panicking test process may exit before its normal
+                    // owner drops. Do not leave the inert fixture behind.
+                    #[cfg(target_os = "linux")]
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
+                        || libc::getppid() != parent_pid
+                    {
+                        libc::_exit(1);
+                    }
+                    // No terminal endpoints are owned by this placeholder.
+                    // Closing the barrier after setsid publishes its session
+                    // identity without exec or a Rust destructor after fork.
+                    for fd in child_fds {
+                        libc::close(fd);
+                    }
+                    loop {
+                        libc::pause();
+                    }
+                }
                 libc::_exit(0);
             },
             ForkResult::Parent { child } => child,
         };
-        crate::gtk_process::wait_exec_barrier(exec_read, exec_write)?;
+        if let Err(error) = crate::gtk_process::wait_exec_barrier(exec_read, exec_write) {
+            kill_and_reap_unreferenced_child(child);
+            return Err(error);
+        }
         let child_lifecycle = match ChildLifecycle::new(child.as_raw(), ReapOwner::Ours) {
             Ok(lifecycle) => lifecycle,
             Err(error) => {
@@ -2017,6 +2059,21 @@ impl Drop for OwnedPty {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_display_recorder_uses_owned_child_teardown() {
+        use std::time::{Duration, Instant};
+
+        let pty = OwnedPty::from_live_openpty(Some(true)).unwrap();
+        let child = pty.lifecycle();
+        assert!(child.exit_code().is_none());
+        assert!(!pty.guard.ready_to_reap(&child));
+        drop(pty);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child.exit_code().is_none() {
+            assert!(Instant::now() < deadline, "the fixture child must be reaped");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 
     #[test]
     fn guarded_chat_dispatch_refuses_inflight_without_delaying_actions_and_keeps_fifo() {
