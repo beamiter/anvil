@@ -38,6 +38,8 @@ pub enum HostFeature {
     WithdrawalResumeV1,
     /// Explicit read-only dialogue history pages. Requires `WithdrawalResumeV1`.
     DialogueHistoryV1,
+    /// Explicit review of Eva's retained spoken reply for memory. Requires history.
+    VoiceTextV1,
 }
 /// The only accepted feature sets; order is fixed so a list cannot smuggle duplicates.
 pub fn valid_host_features(features: &[HostFeature]) -> bool {
@@ -47,6 +49,11 @@ pub fn valid_host_features(features: &[HostFeature]) -> bool {
             | [
                 HostFeature::WithdrawalResumeV1,
                 HostFeature::DialogueHistoryV1
+            ]
+            | [
+                HostFeature::WithdrawalResumeV1,
+                HostFeature::DialogueHistoryV1,
+                HostFeature::VoiceTextV1
             ]
     )
 }
@@ -344,6 +351,18 @@ pub enum Request {
         scope: history::Scope,
         before: Option<String>,
     },
+    /// Ask Eva, through the coordinator, for its latest retained spoken reply
+    /// and turn it into an ordinary exact-change memory review for `scope`.
+    VoiceTextReview {
+        request_id: u64,
+        context: ContextRef,
+        scope: MemoryScope,
+    },
+    /// Ask Eva to drop every retained spoken reply now.
+    VoiceTextForget {
+        request_id: u64,
+        context: ContextRef,
+    },
     EvaHello,
     Audio {
         turn_id: String,
@@ -530,6 +549,12 @@ pub enum Reply {
         entries: Vec<history::Entry>,
         next_before: Option<String>,
     },
+    /// Outcome of a voice text request. A ready review arrives separately as
+    /// `MemoryReview` and still needs explicit approval.
+    VoiceText {
+        request_id: u64,
+        status: String,
+    },
     /// Sent to negotiated hosts when the desktop locks or becomes unknown.
     /// A host must clear every displayed history page.
     DialogueHistoryWithdrawn {
@@ -695,6 +720,19 @@ pub fn decode(bytes: &[u8]) -> Result<Envelope, String> {
             || before.as_ref().is_some_and(|c| !history::cursor_valid(c)) =>
         {
             return Err("invalid_history_request".into())
+        }
+        Request::VoiceTextReview {
+            request_id,
+            context,
+            scope,
+        } if *request_id == 0 || !valid_context(context) || !valid_scope(scope) => {
+            return Err("invalid_voice_text_request".into())
+        }
+        Request::VoiceTextForget {
+            request_id,
+            context,
+        } if *request_id == 0 || !valid_context(context) => {
+            return Err("invalid_voice_text_request".into())
         }
         Request::MemoryScopes { after: Some(after) }
             if !(after == "global"
@@ -970,6 +1008,33 @@ mod host_feature_tests {
         unknown["scope"] = "voice".into();
         unknown["include_text"] = true.into();
         assert!(decode(&wire(unknown)).is_err());
+    }
+    #[test]
+    fn voice_text_feature_extends_history_and_requests_are_bounded() {
+        assert!(valid_host_features(&[
+            HostFeature::WithdrawalResumeV1,
+            HostFeature::DialogueHistoryV1,
+            HostFeature::VoiceTextV1
+        ]));
+        assert!(!valid_host_features(&[
+            HostFeature::WithdrawalResumeV1,
+            HostFeature::VoiceTextV1
+        ]));
+        let context = serde_json::json!({"host_id":"h","pane_id":"p","task_id":null,"project_id":"a","revision":1});
+        let review = |id: u64, scope: serde_json::Value| {
+            wire(
+                serde_json::json!({"type":"voice_text_review","request_id":id,"context":context,"scope":scope}),
+            )
+        };
+        assert!(decode(&review(1, serde_json::json!({"kind":"global"}))).is_ok());
+        assert!(decode(&review(1, serde_json::json!({"kind":"project","id":"a"}))).is_ok());
+        assert!(decode(&review(0, serde_json::json!({"kind":"global"}))).is_err());
+        assert!(decode(&review(1, serde_json::json!({"kind":"project","id":"a b"}))).is_err());
+        assert!(decode(&wire(
+            serde_json::json!({"type":"voice_text_forget","request_id":1,"context":context})
+        ))
+        .is_ok());
+        assert!(decode(&wire(serde_json::json!({"type":"voice_text_forget","request_id":1,"context":context,"text":"x"}))).is_err());
     }
     #[test]
     fn connection_and_intent_fields_cannot_be_omitted_zero_or_exhausted() {

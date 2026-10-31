@@ -4,6 +4,7 @@ pub mod dialogue_save;
 pub mod history;
 pub mod pty_session;
 pub mod shell_identity;
+pub mod voice_text;
 pub use companion_core::geometry::{choose, Placement};
 pub use companion_protocol::*;
 pub use dialogue_save::DialogueSave;
@@ -127,6 +128,7 @@ pub struct HostGate {
     night: bool,
     operation_error: Option<String>,
     history_supported: bool,
+    voice_text_supported: bool,
 }
 impl HostGate {
     pub fn new(host: Host) -> Self {
@@ -160,7 +162,12 @@ impl HostGate {
             night: false,
             operation_error: None,
             history_supported: false,
+            voice_text_supported: false,
         }
+    }
+    /// The current connection negotiated `VoiceTextV1`.
+    pub fn voice_text_supported(&self) -> bool {
+        self.voice_text_supported
     }
     /// The current connection negotiated `DialogueHistoryV1`.
     pub fn history_supported(&self) -> bool {
@@ -355,6 +362,7 @@ impl HostGate {
     }
     pub fn disconnect(&mut self) {
         self.history_supported = false;
+        self.voice_text_supported = false;
         self.connection_nonce = None;
         self.admitted = false;
         self.admission_epoch = 0;
@@ -387,6 +395,7 @@ impl HostGate {
                     return None;
                 }
                 self.history_supported = features.contains(&HostFeature::DialogueHistoryV1);
+                self.voice_text_supported = features.contains(&HostFeature::VoiceTextV1);
                 self.connection_generation = self.connection_generation.saturating_add(1);
                 self.admission_generation = self.admission_generation.saturating_add(1);
                 self.admitted = false;
@@ -663,21 +672,21 @@ pub struct SharedHost {
     context_access: std::collections::VecDeque<Reply>,
     /// Read-only history page for this window; see [`history::HistoryView`].
     pub history: history::HistoryView,
+    /// Outcome of explicit voice-text requests; see [`voice_text::VoiceTextStatus`].
+    pub voice_text: voice_text::VoiceTextStatus,
 }
-/// Features a modern host asks for. A coordinator that predates history
-/// rejects the extended list as a schema error before admission; the worker
-/// then retries with the base feature and history stays unavailable.
-fn worker_features(history: bool) -> Vec<HostFeature> {
-    if history {
-        vec![
-            HostFeature::WithdrawalResumeV1,
-            HostFeature::DialogueHistoryV1,
-        ]
-    } else {
-        vec![HostFeature::WithdrawalResumeV1]
-    }
+const FEATURES: [HostFeature; 3] = [
+    HostFeature::WithdrawalResumeV1,
+    HostFeature::DialogueHistoryV1,
+    HostFeature::VoiceTextV1,
+];
+/// The first `level` features a modern host asks for. An older coordinator
+/// rejects a longer list as a schema error before admission; the worker then
+/// retries one level shorter and the missing features stay unavailable.
+fn worker_features(level: usize) -> Vec<HostFeature> {
+    FEATURES[..level.clamp(1, FEATURES.len())].to_vec()
 }
-fn predates_history(replies: &[Reply], accepted: bool) -> bool {
+fn predates_features(replies: &[Reply], accepted: bool) -> bool {
     !accepted
         && replies.iter().any(|reply| {
             matches!(reply, Reply::Rejected { reason }
@@ -717,14 +726,14 @@ impl SharedHost {
                         .join("jcompanion/eva.sock")
                     });
                 let mut disconnected_notice = false;
-                let mut request_history = true;
+                let mut level = FEATURES.len();
                 while !stopping.load(std::sync::atomic::Ordering::Relaxed) {
                     let result = (|| -> std::io::Result<()> {
                         let mut client = companion_client::Client::connect_with_features(
                             &path,
                             &session,
                             worker_host.clone(),
-                            worker_features(request_history),
+                            worker_features(level),
                         )?;
                         let mut accepted = false;
                         while !stopping.load(std::sync::atomic::Ordering::Relaxed) {
@@ -745,8 +754,8 @@ impl SharedHost {
                             }
                             let replies = client.poll()?;
                             if !replies.is_empty() {
-                                if request_history && predates_history(&replies, accepted) {
-                                    request_history = false;
+                                if level > 1 && predates_features(&replies, accepted) {
+                                    level -= 1;
                                 }
                                 accepted |= replies
                                     .iter()
@@ -801,7 +810,44 @@ impl SharedHost {
             memory: Default::default(),
             context_access: Default::default(),
             history: Default::default(),
+            voice_text: Default::default(),
         }
+    }
+    /// Asks Eva, through the coordinator, for its latest retained spoken reply.
+    /// A ready review arrives as an ordinary `MemoryReview` for `context`.
+    pub fn request_voice_text_review(
+        &mut self,
+        context: &ContextRef,
+        scope: MemoryScope,
+    ) -> Result<(), &'static str> {
+        if self.failed || !self.gate.admitted {
+            return Err("Eva is not connected.");
+        }
+        if !self.gate.voice_text_supported {
+            return Err("Update the Eva coordinator to review spoken replies.");
+        }
+        let request_id = self.voice_text.begin()?;
+        self.send(Request::VoiceTextReview {
+            request_id,
+            context: context.clone(),
+            scope,
+        });
+        Ok(())
+    }
+    /// Asks Eva to drop every retained spoken reply now.
+    pub fn forget_voice_text(&mut self, context: &ContextRef) -> Result<(), &'static str> {
+        if self.failed || !self.gate.admitted {
+            return Err("Eva is not connected.");
+        }
+        if !self.gate.voice_text_supported {
+            return Err("Update the Eva coordinator to manage spoken replies.");
+        }
+        let request_id = self.voice_text.begin()?;
+        self.send(Request::VoiceTextForget {
+            request_id,
+            context: context.clone(),
+        });
+        Ok(())
     }
     /// Sends one explicit history page request for the window's current,
     /// already registered context.
@@ -836,7 +882,7 @@ impl SharedHost {
             match self.rx.try_recv() {
                 Ok(WorkerEvent::Reply(r)) => {
                     changed = true;
-                    if self.history.observe(&r) {
+                    if self.history.observe(&r) || self.voice_text.observe(&r) {
                         continue;
                     }
                     if matches!(&r, Reply::ContextAccessReview { .. }) {
@@ -901,6 +947,9 @@ impl SharedHost {
         if !self.gate.history_supported || self.failed {
             // Every disconnect path, including bounded-queue failures.
             self.history.disconnected();
+        }
+        if !self.gate.voice_text_supported || self.failed {
+            self.voice_text.disconnected();
         }
         self.flush_controls();
         changed
@@ -1235,6 +1284,7 @@ mod tests {
             memory: Default::default(),
             context_access: Default::default(),
             history: Default::default(),
+            voice_text: Default::default(),
         };
         for n in 0..1000 {
             h.send(Request::Focus {
@@ -1277,6 +1327,7 @@ mod tests {
             memory: Default::default(),
             context_access: Default::default(),
             history: Default::default(),
+            voice_text: Default::default(),
         };
         let discovery = Reply::MemoryScopes {
             scopes: vec![MemoryScope::Project("project-without-task".into())],
@@ -1418,16 +1469,19 @@ mod modern_admission_tests {
         let schema = [Reply::Rejected {
             reason: "invalid_schema".into(),
         }];
-        assert!(predates_history(&schema, false));
-        assert!(!predates_history(&schema, true), "after admission");
-        assert!(!predates_history(
+        assert!(predates_features(&schema, false));
+        assert!(!predates_features(&schema, true), "after admission");
+        assert!(!predates_features(
             &[Reply::Rejected {
                 reason: "host_already_connected".into()
             }],
             false
         ));
-        assert_eq!(worker_features(false), [HostFeature::WithdrawalResumeV1]);
-        assert!(valid_host_features(&worker_features(true)));
+        assert_eq!(worker_features(1), [HostFeature::WithdrawalResumeV1]);
+        for level in 1..=FEATURES.len() {
+            assert!(valid_host_features(&worker_features(level)));
+        }
+        assert_eq!(worker_features(9).len(), FEATURES.len());
     }
     fn ready(nonce: &str, intent: u64, retired_token: Option<Token>) -> Reply {
         Reply::WithdrawalReady {

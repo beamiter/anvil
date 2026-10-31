@@ -19,6 +19,7 @@ struct State {
     active_turn: Option<(String, host::ContextRef)>,
     dialogue_save: host::DialogueSave,
     history_rendered: u64,
+    voice_text_rendered: u64,
     pending_displayed: Option<String>,
     body: gtk::glib::WeakRef<gtk::Label>,
     close: close_rules::CloseIntent,
@@ -197,6 +198,7 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
         active_turn: None,
         dialogue_save: Default::default(),
         history_rendered: 0,
+        voice_text_rendered: 0,
         pending_displayed: None,
         body: body.downgrade(),
         close: close_rules::CloseIntent::default(),
@@ -774,6 +776,11 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
             if revision != s.history_rendered {
                 s.history_rendered = revision;
                 history.render(&s.client.history, current.as_ref());
+            }
+            let revision = s.client.voice_text.revision();
+            if revision != s.voice_text_rendered {
+                s.voice_text_rendered = revision;
+                memory.voice_status.set_text(s.client.voice_text.status());
             }
         }
 
@@ -1433,6 +1440,7 @@ struct MemoryUi {
     persisted: gtk::DropDown,
     scope_status: gtk::Label,
     scope_approve: gtk::Button,
+    voice_status: gtk::Label,
 }
 fn memory_controls(controls: &gtk::Box, state: &Rc<RefCell<State>>) -> MemoryUi {
     let group = gtk::Expander::new(Some("Memory · inspect / propose / review"));
@@ -1779,6 +1787,56 @@ fn memory_controls(controls: &gtk::Box, state: &Rc<RefCell<State>>) -> MemoryUi 
         });
     }
     panel.append(&save_exchange);
+    // Eva's spoken replies stay only briefly in Eva's memory. The coordinator
+    // verifies the text against the recorded reply; the normal review below
+    // still decides whether anything is saved.
+    let voice_status = gtk::Label::new(Some(
+        "Eva keeps recent spoken replies only briefly in memory. Nothing is saved unless you review it here.",
+    ));
+    voice_status.set_wrap(true);
+    voice_status.set_max_width_chars(42);
+    voice_status.set_xalign(0.0);
+    let save_voice = gtk::Button::with_label("Review saving Eva's last spoken reply");
+    {
+        let state = state.clone();
+        let get = selected_scope.clone();
+        let voice_status = voice_status.clone();
+        save_voice.connect_clicked(move |_| {
+            let Some(scope) = get() else {
+                voice_status
+                    .set_text("Choose the current task/project or explicitly choose Global.");
+                return;
+            };
+            let mut s = state.borrow_mut();
+            let Some(context) = s.current_context.clone() else {
+                voice_status.set_text("Focus a terminal pane first.");
+                return;
+            };
+            s.memory_review = None;
+            s.memory_context = Some(context.clone());
+            if let Err(reason) = s.client.request_voice_text_review(&context, scope) {
+                voice_status.set_text(reason);
+            }
+        });
+    }
+    let forget_voice = gtk::Button::with_label("Forget Eva's retained spoken text");
+    {
+        let state = state.clone();
+        let voice_status = voice_status.clone();
+        forget_voice.connect_clicked(move |_| {
+            let mut s = state.borrow_mut();
+            let Some(context) = s.current_context.clone() else {
+                voice_status.set_text("Focus a terminal pane first.");
+                return;
+            };
+            if let Err(reason) = s.client.forget_voice_text(&context) {
+                voice_status.set_text(reason);
+            }
+        });
+    }
+    panel.append(&save_voice);
+    panel.append(&forget_voice);
+    panel.append(&voice_status);
     for (label, clear) in [
         ("Review delete shown entry", false),
         ("Review clear this scope", true),
@@ -1867,6 +1925,7 @@ fn memory_controls(controls: &gtk::Box, state: &Rc<RefCell<State>>) -> MemoryUi 
         persisted,
         scope_status,
         scope_approve,
+        voice_status,
     }
 }
 struct HistoryUi {
