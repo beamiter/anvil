@@ -8,9 +8,7 @@
 use gtk::gdk::ffi::GDK_BUTTON_PRIMARY;
 use gtk::gdk::ModifierType;
 use gtk::gdk::RGBA;
-use gtk::gio::{self, Cancellable};
-use gtk::glib::translate::IntoGlib;
-use gtk::glib::SpawnFlags;
+use gtk::gio;
 use gtk::prelude::*;
 use gtk::GestureClick;
 use gtk::Orientation;
@@ -18,7 +16,7 @@ use relm4::gtk;
 use relm4::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use vte4::{CursorBlinkMode, CursorShape, PtyFlags, Terminal};
+use vte4::{CursorBlinkMode, CursorShape, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
 
 use crate::child_env;
@@ -297,12 +295,9 @@ pub(crate) fn spawn_shell(
 
     // `vte_envv_from_captured` is the child's complete environment, built from
     // the launch-time snapshot `main` froze; the cwd-authentication token rides
-    // along as the per-call extra. VTE_SPAWN_NO_PARENT_ENVV below stops libvte
-    // from merging the live, GTK-mutated process environment back in, which
-    // would reintroduce the frontend-private writes the freeze exists to
-    // exclude (ANVIL_CONFIG and anvil's own input-method overrides; values the
-    // user launched with stay frozen and intact). libvte's own TERM/VTE_VERSION
-    // injection loses to explicit envv entries.
+    // along as the per-call extra. The owned launcher passes that complete
+    // block directly to execve, keeping later GTK/frontend environment writes
+    // out of the shell. Explicit TERM/VTE_VERSION entries remain intact.
     let envv_owned: Vec<String> = match child_env::vte_envv_from_captured(
         &child_env::ChildEnv::from_identity(),
         &host_environment,
@@ -318,15 +313,6 @@ pub(crate) fn spawn_shell(
         }
     };
     let envv: Vec<&str> = envv_owned.iter().map(String::as_str).collect();
-    // gtk-rs predates VTE 0.60's VTE_SPAWN_NO_PARENT_ENVV, so OR the numeric
-    // flag jterm_core pins into the ordinary GLib spawn flags. SEARCH_PATH
-    // resolves argv[0] against the parent's live PATH while the child receives
-    // the frozen one; the two cannot diverge today because nothing mutates
-    // PATH after the capture.
-    let spawn_flags = SpawnFlags::from_bits_retain(
-        SpawnFlags::SEARCH_PATH.bits() | child_env::VTE_SPAWN_NO_PARENT_ENVV_BITS,
-    );
-    let cancellable: Option<&Cancellable> = None;
     let spawn_working_directory = if crate::host::is_flatpak() {
         None
     } else {
@@ -335,51 +321,52 @@ pub(crate) fn spawn_shell(
     let terminal_for_pid = terminal.clone();
 
     let init_cmds = initial_commands.to_vec();
-    let terminal_for_init = terminal.clone();
 
-    terminal.spawn_async(
-        PtyFlags::DEFAULT,
-        spawn_working_directory,
+    crate::gtk_spawn::spawn(
+        terminal,
         &argv,
         &envv,
-        spawn_flags,
-        || {},
-        -1,
-        cancellable,
-        move |res| {
-            log::debug!("spawn_async: {res:?}");
-            match res {
-                Ok(pid) => {
-                    let pid_i32: i32 = pid.into_glib();
-                    unsafe {
-                        terminal_for_pid.set_data::<i32>("child-pid", pid_i32);
+        false,
+        spawn_working_directory,
+        move |result| {
+            log::debug!(
+                "owned terminal launch: {:?}",
+                result.as_ref().map(|child| child.pid())
+            );
+            let launched_child = match result {
+                Ok(child) => {
+                    if crate::gtk_process::vte_closed(&terminal_for_pid) {
+                        return;
                     }
-                    probe.shell_pid.set(pid_i32);
+                    let pid = child.pid();
+                    unsafe {
+                        terminal_for_pid.set_data::<i32>("child-pid", pid);
+                    }
+                    probe.shell_pid.set(pid);
                     if let Some(pty) = terminal_for_pid.pty() {
                         use std::os::fd::AsRawFd;
                         probe.pty_fd.set(pty.fd().as_raw_fd());
                     }
                     let _ = sender.output(VteOutput::Launched);
+                    child
                 }
                 Err(error) => {
                     on_launch_failed();
+                    if crate::gtk_process::vte_closed(&terminal_for_pid) {
+                        return;
+                    }
                     let message = launch_failure_message(&error);
                     log::error!("{message}");
-                    let terminal_message = format!("\r\nanvil: {message}\r\n");
-                    terminal_for_pid.feed(terminal_message.as_bytes());
+                    terminal_for_pid.feed(format!("\r\nanvil: {message}\r\n").as_bytes());
                     let _ = sender.output(VteOutput::LaunchFailed(message));
                     return;
                 }
-            }
+            };
             if !init_cmds.is_empty() {
-                gtk::glib::timeout_add_local_once(
-                    std::time::Duration::from_millis(500),
-                    move || {
-                        for command in init_cmds {
-                            let text = format!("{command}\r");
-                            terminal_for_init.feed_child(text.as_bytes());
-                        }
-                    },
+                crate::gtk_process::schedule_initial_commands(
+                    &terminal_for_pid,
+                    launched_child,
+                    move || init_cmds,
                 );
             }
         },
@@ -626,6 +613,12 @@ pub struct VteTerminal {
     companion: Rc<crate::organism_ui::vte_surface::VteCompanion>,
 }
 
+impl Drop for VteTerminal {
+    fn drop(&mut self) {
+        crate::gtk_process::close_vte(&self.terminal);
+    }
+}
+
 impl VteTerminal {
     pub(crate) fn companion(&self) -> Rc<crate::organism_ui::vte_surface::VteCompanion> {
         Rc::clone(&self.companion)
@@ -696,11 +689,16 @@ impl Component for VteTerminal {
         {
             let sender = sender.clone();
             let companion = Rc::downgrade(&companion);
-            terminal.connect_child_exited(move |_term, status| {
+            terminal.connect_child_exited(move |term, status| {
+                let Some(code) = jterm_core::process::exit_code_from_wait_status(status) else {
+                    return;
+                };
                 if let Some(companion) = companion.upgrade() {
                     companion.close();
                 }
-                let _ = sender.output(VteOutput::Exited(status));
+                if !crate::gtk_process::vte_closed(term) {
+                    let _ = sender.output(VteOutput::Exited(code));
+                }
             });
         }
         {
@@ -838,12 +836,7 @@ impl Component for VteTerminal {
             VteInput::SyncConfig => self.companion.refresh(),
             VteInput::Kill => {
                 self.companion.close();
-                if let Some(pid) = unsafe { self.terminal.data::<i32>("child-pid") } {
-                    let pid_val = unsafe { *pid.as_ref() };
-                    unsafe {
-                        nix::libc::kill(pid_val, nix::libc::SIGHUP);
-                    }
-                }
+                crate::gtk_process::close_vte(&self.terminal);
             }
             VteInput::ReinputSelectedCommands => {
                 let _ = sender.output(VteOutput::Notice(vte_block_mode_only_notice(

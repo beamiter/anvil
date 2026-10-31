@@ -1577,7 +1577,7 @@ fn file_config_from_table(table: &toml::Table) -> FileConfig {
             .get("block_history_compress")
             .and_then(|v| v.as_bool()),
         block_compact: table.get("block_compact").and_then(|v| v.as_bool()),
-        eva_companion_enabled: table.get("eva_companion_enabled").and_then(|v|v.as_bool()),
+        eva_companion_enabled: table.get("eva_companion_enabled").and_then(|v| v.as_bool()),
         ascii_organism_enabled: table
             .get("ascii_organism_enabled")
             .and_then(|v| v.as_bool()),

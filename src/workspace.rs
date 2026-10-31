@@ -250,6 +250,45 @@ impl Pane {
         process::observed_ssh_command(self.probe.pty_fd.get(), self.probe.shell_pid.get())
     }
 
+    pub(crate) fn child_cleanup(&self) -> Option<crate::gtk_process::ChildDrain> {
+        match &self.terminal {
+            TermCtl::Block(controller) => controller
+                .model()
+                .term_view()
+                .map(|view| view.child_lifecycle().into()),
+            TermCtl::Vte(controller) => {
+                crate::gtk_process::vte_cleanup(controller.model().terminal())
+            }
+        }
+    }
+
+    pub(crate) fn close_blocker(&self) -> Option<String> {
+        let foreground = self.foreground_process();
+        match &self.terminal {
+            TermCtl::Block(controller) => foreground.or_else(|| {
+                controller.model().term_view().map_or_else(
+                    || Some("Shell activity could not be verified".into()),
+                    |view| view.close_blocker(),
+                )
+            }),
+            TermCtl::Vte(controller) => {
+                crate::gtk_process::vte_blocker(controller.model().terminal(), foreground)
+            }
+        }
+    }
+
+    pub(crate) fn withdrawal_work_probe(&self) -> Box<dyn Fn() -> bool> {
+        match &self.terminal {
+            TermCtl::Block(controller) => controller.model().term_view().map_or_else(
+                || Box::new(|| true) as Box<dyn Fn() -> bool>,
+                |view| view.withdrawal_work_probe(),
+            ),
+            TermCtl::Vte(controller) => {
+                crate::gtk_process::vte_withdrawal_work_probe(controller.model().terminal())
+            }
+        }
+    }
+
     pub(crate) fn foreground_process(&self) -> Option<String> {
         process::foreground_process_name(self.probe.pty_fd.get(), self.probe.shell_pid.get())
     }

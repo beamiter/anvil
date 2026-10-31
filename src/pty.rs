@@ -31,6 +31,7 @@ pub struct OwnedPty {
     /// away from GTK without letting a query storm grow memory indefinitely.
     input_tx: FdWriter,
     child_lifecycle: Arc<ChildLifecycle>,
+    guard: Arc<crate::gtk_process::Guard>,
     /// Host-bridged shells live in another PID namespace, so their foreground
     /// process-group number cannot be compared with this local child PID.
     foreground_identity_available: bool,
@@ -228,8 +229,8 @@ fn create_reader_cancel_eventfd() -> Option<Arc<OwnedFd>> {
 
 /// Wait until the PTY can be read or teardown requests reader cancellation.
 ///
-/// With a cancel fd this blocks indefinitely, so an idle reader has no timer
-/// wakeups. Without one it preserves the historical 50 ms atomic check. PTY
+/// Poll the parent at least every 200 ms even if a background job holds the
+/// slave open. Without a cancel fd preserve the 50 ms cancellation bound. PTY
 /// HUP/ERR are reported as readable so the following `read` observes EOF/EIO;
 /// an invalid PTY fd remains a real reader failure.
 fn poll_pty_or_reader_cancel(pty_fd: RawFd, cancel_fd: Option<RawFd>) -> io::Result<ReaderPoll> {
@@ -249,7 +250,7 @@ fn poll_pty_or_reader_cancel(pty_fd: RawFd, cancel_fd: Option<RawFd>) -> io::Res
         let has_cancel_fd = cancel_fd.is_some();
         let descriptor_count: libc::nfds_t = if has_cancel_fd { 2 } else { 1 };
         let timeout = if has_cancel_fd {
-            -1
+            200
         } else {
             READER_CANCEL_FALLBACK_POLL_MS
         };
@@ -1032,6 +1033,7 @@ impl OwnedPty {
         };
         let OpenptyResult { master, slave } = openpty_cloexec(Some(&initial_size))?;
 
+        let (exec_read, exec_write) = crate::gtk_process::exec_barrier()?;
         match unsafe { unistd::fork() } {
             Ok(ForkResult::Child) => {
                 drop(master);
@@ -1089,6 +1091,10 @@ impl OwnedPty {
                 }
             }
             Ok(ForkResult::Parent { child }) => {
+                if let Err(error) = crate::gtk_process::wait_exec_barrier(exec_read, exec_write) {
+                    kill_and_reap_unreferenced_child(child);
+                    return Err(error);
+                }
                 let shell_integration_token =
                     if let Some((token, read_fd, write_fd)) = token_channel {
                         drop(read_fd);
@@ -1141,6 +1147,10 @@ impl OwnedPty {
                 Ok(OwnedPty {
                     master: Arc::new(std::sync::Mutex::new(Some(master))),
                     input_tx,
+                    guard: crate::gtk_process::Guard::capture(
+                        child.as_raw(),
+                        Some(executable_path.as_path()),
+                    ),
                     child_lifecycle,
                     foreground_identity_available: !host_bridge,
                     agent_launch_limitation,
@@ -1374,6 +1384,24 @@ impl OwnedPty {
         }
     }
 
+    pub(crate) fn lifecycle(&self) -> Arc<ChildLifecycle> {
+        Arc::clone(&self.child_lifecycle)
+    }
+
+    pub(crate) fn withdrawal_work_probe(&self) -> Box<dyn Fn() -> bool> {
+        let child = self.child_lifecycle.clone();
+        let work = self.guard.withdrawal_work_probe();
+        Box::new(move || child.exit_code().is_none() && work())
+    }
+
+    pub(crate) fn close_blocker(&self, empty_prompt: bool) -> Option<String> {
+        if self.child_lifecycle.exit_code().is_some() {
+            None
+        } else {
+            self.guard.blocker(empty_prompt, None)
+        }
+    }
+
     pub fn kill(&self) {
         self.input_tx.cancel();
         request_reader_cancel(
@@ -1441,6 +1469,7 @@ impl OwnedPty {
         E: FnOnce(i32) + 'static,
     {
         let reader_cancel_eventfd = self.reader_cancel_eventfd.as_ref().map(Arc::clone);
+        let guard = Arc::clone(&self.guard);
         #[cfg(target_os = "linux")]
         let eventfd = {
             // SAFETY: eventfd returns a fresh descriptor on success; ownership
@@ -1472,6 +1501,14 @@ impl OwnedPty {
                 let mut buf = [0u8; PTY_READ_CHUNK_BYTES];
                 loop {
                     if reader_cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if guard.ready_to_reap(&child_lifecycle) {
+                        crate::gtk_process::drain_tail(&mut file, |data| {
+                            let sent = tx.send(PtyMsg::Data(data)).is_ok();
+                            if sent { notify(); }
+                            sent
+                        });
                         break;
                     }
                     match poll_pty_or_reader_cancel(
@@ -1526,7 +1563,7 @@ impl OwnedPty {
                     notify();
                     return;
                 }
-                reap_child(&child_lifecycle, &tx);
+                reap_child(&child_lifecycle, &guard, &tx);
                 notify();
             });
         if let Err(error) = reader {
@@ -1637,11 +1674,15 @@ impl OwnedPty {
     }
 }
 
-fn reap_child(child_lifecycle: &Arc<ChildLifecycle>, tx: &mpsc::SyncSender<PtyMsg>) {
+fn reap_child(
+    child_lifecycle: &Arc<ChildLifecycle>,
+    guard: &crate::gtk_process::Guard,
+    tx: &mpsc::SyncSender<PtyMsg>,
+) {
     let started = std::time::Instant::now();
     let mut termination_requested = false;
     loop {
-        if let Some(code) = child_lifecycle.poll_reap() {
+        if let Some(code) = guard.poll_reap(child_lifecycle) {
             let _ = tx.send(PtyMsg::Exit(code));
             return;
         }
@@ -1797,13 +1838,15 @@ impl OwnedPty {
         let OpenptyResult { master, slave } = openpty_cloexec(None)?;
         prepare_test_slave(&slave);
         // SAFETY: the child uses only async-signal-safe syscalls after fork.
+        let (exec_read, exec_write) = crate::gtk_process::exec_barrier()?;
         let child = match unsafe { unistd::fork() }.map_err(io::Error::other)? {
             ForkResult::Child => unsafe {
-                libc::setpgid(0, 0);
+                libc::setsid();
                 libc::_exit(0);
             },
             ForkResult::Parent { child } => child,
         };
+        crate::gtk_process::wait_exec_barrier(exec_read, exec_write)?;
         let child_lifecycle = match ChildLifecycle::new(child.as_raw(), ReapOwner::Ours) {
             Ok(lifecycle) => lifecycle,
             Err(error) => {
@@ -1828,6 +1871,7 @@ impl OwnedPty {
         Ok(Self {
             master: Arc::new(Mutex::new(Some(master))),
             input_tx,
+            guard: crate::gtk_process::Guard::capture(child.as_raw(), None),
             child_lifecycle,
             foreground_identity_available: true,
             agent_launch_limitation: None,
@@ -2488,7 +2532,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn reader_cancel_eventfd_keeps_idle_poll_asleep_and_wakes_it() {
+    fn reader_cancel_eventfd_wakes_the_bounded_parent_probe() {
         let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
         let cancel_eventfd = create_reader_cancel_eventfd().expect("create cancel eventfd");
         let cancel_for_reader = Arc::clone(&cancel_eventfd);
@@ -2525,6 +2569,19 @@ mod tests {
         reader.join().unwrap();
         assert!(cancelled.load(Ordering::Acquire));
         assert!(matches!(result, Ok(ReaderPoll::Cancelled)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn idle_reader_probes_parent_even_while_a_slave_stays_open() {
+        let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let cancel = create_reader_cancel_eventfd().unwrap();
+        let start = Instant::now();
+        let result =
+            poll_pty_or_reader_cancel(reader.as_raw_fd(), Some(cancel.as_raw_fd())).unwrap();
+        assert!(matches!(result, ReaderPoll::TimedOut));
+        assert!(start.elapsed() >= Duration::from_millis(150));
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     #[cfg(target_os = "linux")]

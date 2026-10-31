@@ -33,6 +33,12 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Verify versioned host adapter bundle
+        run: python3 tools/check-host-bundle.py
+
+      - name: Verify versioned PTY process bundle
+        run: python3 tools/check-process-bundle.py
+
       - name: Materialize bundled shared core
         shell: bash
         run: |

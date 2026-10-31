@@ -101,6 +101,7 @@ case "${CMD}" in
         # shellcheck disable=SC2016
         run_in_nix bash -c '
             set -euo pipefail
+            python3 tools/check-process-bundle.py
             cargo fmt --all -- --check
             cargo check --all-targets --locked
             cargo test --all-targets --locked --no-fail-fast

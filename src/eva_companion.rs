@@ -1,9 +1,11 @@
 use relm4::gtk;
+#[path = "gtk_close.rs"]
+mod close_rules;
 #[path = "eva_companion_scope.rs"]
 mod scope_rules;
 // One window-owned shared body. No PTY, output text, history or audio access.
+use companion_host::{self as host, atlas, Presence, Rect, Request};
 use gtk::prelude::*;
-use jterm_core::companion_host::{self as host, atlas, Presence, Rect, Request};
 use std::{
     cell::RefCell,
     rc::Rc,
@@ -15,10 +17,17 @@ struct State {
     generation: u64,
     last_task: Option<(String, u64, host::TaskStatus)>,
     active_turn: Option<(String, host::ContextRef)>,
+    dialogue_save: host::DialogueSave,
     pending_displayed: Option<String>,
     body: gtk::glib::WeakRef<gtk::Label>,
-    closing_token: Option<host::Token>,
-    close_ready: bool,
+    close: close_rules::CloseIntent,
+    close_work: Option<Box<dyn Fn() -> bool>>,
+    on_close_ready: Option<Rc<dyn Fn(u64)>>,
+    on_close_cancel: Option<Box<dyn FnOnce()>>,
+    cancel_key: host::CancelKeyLease,
+    close_focus: gtk::glib::WeakRef<gtk::Widget>,
+    pressed_keys: std::collections::HashSet<u32>,
+    admission_generation: u64,
     current_context: Option<host::ContextRef>,
     context_serial: u64,
     pending_recall: bool,
@@ -57,7 +66,108 @@ struct State {
     pango_serial: u32,
     pango_context_id: usize,
     revision: u64,
-    cleared_frames: Vec<i64>,
+    pending_frames: crate::gtk_presentation::PendingFrames<FrameDomain>,
+    frame_sequence: crate::gtk_presentation::FrameSequence<FrameDomain>,
+    frame_clock_binding: Option<FrameClockBinding>,
+    surface_lease: crate::gtk_presentation::SurfaceLease<gtk::gdk::Surface>,
+}
+
+#[derive(Clone, PartialEq)]
+struct FrameDomain {
+    clock: gtk::gdk::FrameClock,
+    surface: gtk::gdk::Surface,
+}
+
+struct FrameClockBinding {
+    domain: FrameDomain,
+    before: Option<gtk::glib::SignalHandlerId>,
+    after: Option<gtk::glib::SignalHandlerId>,
+}
+
+impl Drop for FrameClockBinding {
+    fn drop(&mut self) {
+        if let Some(id) = self.before.take() {
+            self.domain.clock.disconnect(id);
+        }
+        if let Some(id) = self.after.take() {
+            self.domain.clock.disconnect(id);
+        }
+    }
+}
+
+fn refresh_frame_clock(state: &Rc<RefCell<State>>, overlay: &gtk::Overlay, body: &gtk::Label) {
+    let domain = overlay
+        .is_mapped()
+        .then(|| {
+            Some(FrameDomain {
+                clock: overlay.frame_clock()?,
+                surface: overlay
+                    .native()?
+                    .surface()
+                    .filter(|surface| !surface.is_destroyed())?,
+            })
+        })
+        .flatten();
+    let Ok(mut s) = state.try_borrow_mut() else {
+        return;
+    };
+    if !s.frame_sequence.select(domain.clone()) {
+        return;
+    }
+    s.pending_frames.clear();
+    s.frame_clock_binding = None;
+    s.geometry.0 = -1;
+    s.geometry.1 = -1;
+    body.set_visible(false);
+    let Some(domain) = domain else {
+        log::debug!(target: "eva_native_host", "GTK native clock detached; no retirement receipt inferred");
+        return;
+    };
+    drop(s);
+    let weak = Rc::downgrade(state);
+    let surface = domain.surface.downgrade();
+    let before = domain.clock.connect_before_paint(move |clock| {
+        let (Some(state), Some(surface)) = (weak.upgrade(), surface.upgrade()) else { return; };
+        if surface.is_destroyed() { return; }
+        let Ok(mut s) = state.try_borrow_mut() else { return; };
+        let domain = FrameDomain { clock: clock.clone(), surface };
+        if let Some(stamp) = s.frame_sequence.begin(&domain, clock.frame_counter()) {
+            s.client.begin_frame(stamp.serial());
+            log::debug!(target: "eva_native_host", "GTK frame began frame={} serial={} native_generation={}", clock.frame_counter(), stamp.serial(), stamp.generation());
+        }
+    });
+    let weak = Rc::downgrade(state);
+    let surface = domain.surface.downgrade();
+    let weak_body = body.downgrade();
+    let after = domain.clock.connect_after_paint(move |clock| {
+        let (Some(state), Some(surface), Some(body)) = (weak.upgrade(), surface.upgrade(), weak_body.upgrade()) else { return; };
+        if surface.is_destroyed() { return; }
+        let Ok(mut s) = state.try_borrow_mut() else { return; };
+        let domain = FrameDomain { clock: clock.clone(), surface };
+        let mapped = body.is_mapped() && body.native().and_then(|native| native.surface()).as_ref() == Some(&domain.surface);
+        if mapped {
+            let Some(token) = s.client.gate.token().cloned() else { return; };
+            if !s.surface_lease.record_body(token, domain.surface.clone()) { return; }
+        } else if !s.client.gate.pending_retirement_boundary().is_some_and(|(token, _)| s.surface_lease.can_clear(token, &domain.surface)) {
+            return;
+        }
+        let Some(stamp) = s.frame_sequence.after_paint(&domain, clock.frame_counter()) else { return; };
+        if let Some(frame) = crate::gtk_presentation::CapturedFrame::capture(stamp, mapped, &s.client.gate) {
+            if s.pending_frames.record(domain, frame.clone()) {
+                if frame.is_retirement() {
+                    log::debug!(target: "eva_native_host", "GTK clearance submitted frame={}", frame.frame());
+                }
+                log::debug!(target: "eva_native_host", "GTK frame captured {frame:?}");
+            }
+        }
+    });
+    log::debug!(target: "eva_native_host", "GTK native clock bound surface={:p} clock={:p}", domain.surface.as_ptr(), domain.clock.as_ptr());
+    state.borrow_mut().frame_clock_binding = Some(FrameClockBinding {
+        domain,
+        before: Some(before),
+        after: Some(after),
+    });
+    overlay.queue_draw();
 }
 
 /// Called exactly once per GUI, never from pane construction or paint.
@@ -84,10 +194,17 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
         generation: 0,
         last_task: None,
         active_turn: None,
+        dialogue_save: Default::default(),
         pending_displayed: None,
         body: body.downgrade(),
-        closing_token: None,
-        close_ready: false,
+        close: close_rules::CloseIntent::default(),
+        close_work: None,
+        on_close_ready: None,
+        on_close_cancel: None,
+        cancel_key: host::CancelKeyLease::default(),
+        close_focus: gtk::glib::WeakRef::new(),
+        pressed_keys: std::collections::HashSet::new(),
+        admission_generation: 0,
         current_context: None,
         context_serial: 0,
         pending_recall: false,
@@ -133,7 +250,10 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
         pango_serial: 0,
         pango_context_id: 0,
         revision: 0,
-        cleared_frames: Vec::new(),
+        pending_frames: crate::gtk_presentation::PendingFrames::default(),
+        frame_sequence: crate::gtk_presentation::FrameSequence::default(),
+        frame_clock_binding: None,
+        surface_lease: crate::gtk_presentation::SurfaceLease::default(),
     }));
     {
         let weak = Rc::downgrade(&state);
@@ -337,6 +457,7 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
             let context = s.register_context(context);
             s.pending_displayed = None;
             s.active_turn = Some((turn_id.clone(), context.clone()));
+            s.dialogue_save.begin(&turn_id, &context, &text);
             s.client.send(Request::DialogueStart {
                 turn_id,
                 context,
@@ -400,19 +521,77 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
     let memory = memory_controls(&controls, &state);
     let scroll = gtk::ScrolledWindow::new();
     scroll.set_max_content_height(560);
+    scroll.set_min_content_width(440);
+    scroll.set_max_content_width(560);
+    scroll.set_propagate_natural_width(true);
     scroll.set_propagate_natural_height(true);
     scroll.set_child(Some(&controls));
     pop.set_child(Some(&scroll));
     menu.set_popover(Some(&pop));
     overlay.add_overlay(&menu);
     overlay.set_measure_overlay(&menu, false);
+    let close_bar = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    close_bar.set_halign(gtk::Align::Center);
+    close_bar.set_valign(gtk::Align::Start);
+    close_bar.add_css_class("eva-companion-card");
+    close_bar.add_css_class("card");
+    close_bar.append(&gtk::Label::new(Some(
+        "Closing window — waiting for Eva to leave",
+    )));
+    let keep = gtk::Button::with_label("Keep window open");
+    {
+        let state = state.clone();
+        keep.connect_clicked(move |_| {
+            let (focus, revision) = {
+                let mut s = state.borrow_mut();
+                if !s.close.waiting() {
+                    return;
+                }
+                let saved = (s.close_focus.clone(), s.close.revision());
+                s.cancel_close();
+                saved
+            };
+            restore_close_focus(&state, focus, revision);
+        });
+    }
+    close_bar.append(&keep);
+    close_bar.set_visible(false);
+    overlay.add_overlay(&close_bar);
+    overlay.set_measure_overlay(&close_bar, false);
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     {
         let state = state.clone();
         let body = body.clone();
-        keys.connect_key_pressed(move |_, _, _, _| {
+        keys.connect_key_pressed(move |_, key, code, _| {
             let mut s = state.borrow_mut();
+            let repeat = !s.pressed_keys.insert(code);
+            let busy = s.close_work.as_ref().is_some_and(|probe| probe());
+            if s.close.should_cancel_for_work(busy) {
+                s.cancel_close();
+            }
+            if key == gtk::gdk::Key::Escape {
+                let available = s.close.waiting() && !busy;
+                match s.cancel_key.press(available, repeat) {
+                    host::CancelKeyAction::Cancel => {
+                        let focus = s.close_focus.clone();
+                        let revision = s.close.revision();
+                        s.cancel_close();
+                        drop(s);
+                        restore_close_focus(&state, focus, revision);
+                        return gtk::glib::Propagation::Stop;
+                    }
+                    host::CancelKeyAction::Suppress => return gtk::glib::Propagation::Stop,
+                    host::CancelKeyAction::Pass => {}
+                }
+            } else {
+                s.cancel_key.other_input();
+            }
+            // New native input revokes GUI-exit permission while continuing
+            // through the original terminal/control. Clearance stays intact.
+            if s.close.waiting() {
+                s.cancel_close();
+            }
             s.input_until = Instant::now() + Duration::from_secs(3);
             let selecting = s.selecting;
             s.client.send(Request::Input {
@@ -421,6 +600,18 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
             });
             body.set_visible(false);
             gtk::glib::Propagation::Proceed
+        });
+    }
+    {
+        let state = state.clone();
+        let window = window.downgrade();
+        keys.connect_key_released(move |_, key, code, _| {
+            let mut s = state.borrow_mut();
+            s.pressed_keys.remove(&code);
+            if key == gtk::gdk::Key::Escape {
+                s.cancel_key
+                    .release(window.upgrade().is_some_and(|w| w.is_active()));
+            }
         });
     }
     window.add_controller(keys);
@@ -447,43 +638,31 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
     {
         let state = state.clone();
         window.connect_is_active_notify(move |w| {
-            state.borrow_mut().client.send(Request::Focus {
+            let mut s = state.borrow_mut();
+            if !w.is_active() {
+                s.cancel_key.focus_lost();
+                s.pressed_keys.clear();
+            }
+            s.client.send(Request::Focus {
                 focused: w.is_active(),
             })
         });
     }
-    // after-paint only identifies the cleared submission. It is NOT the proof.
-    // Proof waits for GDK's completed timing with a nonzero presentation time.
-    {
+    // Each mapped native surface gets its own signal binding. Missing clocks
+    // are retried by the normal poll; neither map nor a poll acknowledges paint.
+    for mapped in [true, false] {
         let state = Rc::downgrade(&state);
         let body = body.downgrade();
-        let attached = std::cell::Cell::new(false);
-        overlay.connect_map(move |w| {
-            if attached.replace(true) {
-                return;
+        let changed = move |overlay: &gtk::Overlay| {
+            if let (Some(state), Some(body)) = (state.upgrade(), body.upgrade()) {
+                refresh_frame_clock(&state, overlay, &body);
             }
-            if let Some(clock) = w.frame_clock() {
-                let state = state.clone();
-                let body = body.clone();
-                clock.connect_after_paint(move |clock| {
-                    if let (Some(state), Some(body)) = (state.upgrade(), body.upgrade()) {
-                        let mut s = state.borrow_mut();
-                        if body.is_mapped() || s.client.gate.pending_retirement() {
-                            let frame = clock.frame_counter();
-                            if body.is_mapped() {
-                                s.client.body_submitted(frame.max(0) as u64 + 1);
-                            }
-                            if !s.cleared_frames.contains(&frame) {
-                                s.cleared_frames.push(frame);
-                                if s.cleared_frames.len() > 8 {
-                                    s.cleared_frames.remove(0);
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-        });
+        };
+        if mapped {
+            overlay.connect_map(changed);
+        } else {
+            overlay.connect_unmap(changed);
+        }
     }
     let mut full_layout = body.create_pango_layout(None);
     let mut compact_layout = body.create_pango_layout(None);
@@ -496,6 +675,7 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
         else {
             return gtk::glib::ControlFlow::Break;
         };
+        refresh_frame_clock(&state, &overlay, &body);
         let mut s = state.borrow_mut();
         let now = Instant::now();
         if now.duration_since(s.last_poll) > Duration::from_secs(2) {
@@ -503,24 +683,51 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
             s.next = Some(now);
         }
         s.last_poll = now;
-        if let Some(clock) = overlay.frame_clock() {
-            s.client
-                .begin_frame(clock.frame_counter().max(0) as u64 + 1);
-            let frames = std::mem::take(&mut s.cleared_frames);
-            for frame in frames {
-                if let Some(t) = clock.timings(frame) {
-                    if presentation_evidence(t.is_complete(), t.presentation_time()) {
-                        s.client.frame_presented(frame.max(0) as u64 + 1);
-                    } else {
-                        s.cleared_frames.push(frame);
-                        if s.cleared_frames.len() > 8 {
-                            s.cleared_frames.remove(0);
-                        }
+        let frames = s.pending_frames.take();
+        for (origin, frame) in frames {
+            if !s.frame_sequence.accepts(&origin, frame.stamp())
+                || !frame.is_current(&s.client.gate)
+            {
+                continue;
+            }
+            if let Some(t) = origin.clock.timings(frame.frame()) {
+                if presentation_evidence(t.is_complete(), t.presentation_time()) {
+                    if frame.prepare(&mut s.client.gate) {
+                        log::debug!(target: "eva_native_host", "GTK presentation receipt frame={} presentation_time={} retirement={} serial={} native_generation={} surface={:p} clock={:p} token={:?}", frame.frame(), t.presentation_time(), frame.is_retirement(), frame.serial(), frame.stamp().generation(), origin.surface.as_ptr(), origin.clock.as_ptr(), s.client.gate.possible_body_token());
+                        s.client.frame_presented(frame.serial());
                     }
+                } else if !t.is_complete() {
+                    s.pending_frames.record(origin, frame);
+                } else {
+                    log::debug!(target: "eva_native_host", "GTK completed timing has no presentation evidence frame={}", frame.frame());
                 }
+            } else {
+                log::debug!(target: "eva_native_host", "GTK timing unavailable frame={}", frame.frame());
             }
         }
+        let prior_body = if log::log_enabled!(target: "eva_native_host", log::Level::Debug) {
+            s.client.gate.possible_body_token().cloned()
+        } else {
+            None
+        };
         let changed = s.client.poll();
+        {
+            let State {
+                surface_lease,
+                client,
+                ..
+            } = &mut *s;
+            surface_lease.refresh(&client.gate);
+        }
+        if changed {
+            log::debug!(target: "eva_native_host", "GTK state observed frame={} token={:?} retirement={:?} connection={} admission={}", overlay.frame_clock().map(|c| c.frame_counter()).unwrap_or(-1), s.client.gate.token(), s.client.gate.pending_retirement_boundary(), s.client.gate.connection_generation(), s.client.gate.admission_generation());
+        }
+        if let Some(token) = prior_body.filter(|token| s.client.gate.retirement_accepted(token)) {
+            log::debug!(target: "eva_native_host", "GTK retirement acknowledged token={token:?}");
+        }
+        if changed && s.client.gate.pending_retirement() {
+            log::debug!(target: "eva_native_host", "GTK retirement awaiting native presentation boundary={:?}", s.client.gate.pending_retirement_boundary());
+        }
         while let Some(host::Reply::Dialogue {
             turn_id,
             context,
@@ -528,6 +735,8 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
             reply,
         }) = s.client.take_dialogue()
         {
+            s.dialogue_save
+                .observe(&turn_id, &context, &reply_status, reply.as_deref());
             if s.active_turn.as_ref() == Some(&(turn_id.clone(), context.clone())) {
                 dialogue.set_text(&format!(
                     "Eva · {} · source {} / {}\n{}",
@@ -667,12 +876,27 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
             }
         }
         let generation = s.client.gate.connection_generation();
-        if generation != s.generation {
+        let admission = s.client.gate.admission_generation();
+        if generation != s.generation || admission != s.admission_generation {
             s.generation = generation;
+            s.admission_generation = admission;
             s.geometry = (0, 0, false, 0, 0, 0, 0);
             s.last_exclusions.clear();
             s.last_task = None;
             s.current_context = None;
+            s.dialogue_save.clear();
+            if let Some(pane_id) =
+                gtk::prelude::GtkWindowExt::focus(&window).and_then(|focus| native_pane_id(&focus))
+            {
+                let context = host::ContextRef {
+                    host_id: s.client.gate.host_id().into(),
+                    pane_id,
+                    task_id: None,
+                    project_id: None,
+                    revision: 0,
+                };
+                s.register_context(context);
+            }
             s.invalidate_memory_management();
             s.memory_review = None;
             s.selection_request = None;
@@ -710,16 +934,39 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
                 .operation_error()
                 .unwrap_or(s.client.gate.status()),
         );
-        if s.closing_token
-            .as_ref()
-            .is_some_and(|t| s.client.gate.retirement_accepted(t))
-        {
-            s.closing_token = None;
-            s.close_ready = true;
-            let window = window.downgrade();
+        let busy = s.close_work.as_ref().is_some_and(|probe| probe());
+        if s.close.should_cancel_for_work(busy) {
+            log::debug!(target: "eva_native_host", "GTK close cancelled by new terminal work");
+            s.cancel_close();
+        }
+        close_bar.set_visible(s.close.waiting());
+        let accepted = s.ready_to_close();
+        if let Some(revision) = s.close.queue_completion(accepted) {
+            let state = Rc::downgrade(&state);
             gtk::glib::idle_add_local_once(move || {
-                if let Some(w) = window.upgrade() {
-                    w.close();
+                let Some(state) = state.upgrade() else {
+                    return;
+                };
+                let ready = {
+                    let mut s = state.borrow_mut();
+                    if !s.close.completion_current(revision) {
+                        return;
+                    }
+                    if !s.ready_to_close() {
+                        s.close.retry_completion(revision);
+                        return;
+                    }
+                    let busy = s.close_work.as_ref().is_some_and(|probe| probe());
+                    if s.close.should_cancel_for_work(busy) {
+                        s.cancel_close();
+                        return;
+                    }
+                    s.on_close_ready.clone()
+                };
+                // Reentering the application's ordinary guards must not keep
+                // the State RefCell borrowed or trust an obsolete callback.
+                if let Some(ready) = ready {
+                    ready(revision);
                 }
             });
         }
@@ -780,7 +1027,13 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
         let editable = gtk::prelude::GtkWindowExt::focus(&window)
             .is_some_and(|w| w.is::<gtk::TextView>() || w.is::<gtk::Entry>());
         let (protected, exclusions) = protections(overlay.upcast_ref(), &overlay);
-        let blocked = s.closing_token.is_some()
+        let surface_conflict = s.client.gate.possible_body_token().is_some_and(|token| {
+            s.frame_clock_binding
+                .as_ref()
+                .is_some_and(|binding| !s.surface_lease.can_paint(token, &binding.domain.surface))
+        });
+        let blocked = s.client.gate.withdrawal_pending()
+            || surface_conflict
             || protected
             || s.selecting
             || now < s.input_until
@@ -864,6 +1117,21 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
             }
             return gtk::glib::ControlFlow::Continue;
         }
+        let Some(surface) = s
+            .frame_clock_binding
+            .as_ref()
+            .map(|binding| binding.domain.surface.clone())
+        else {
+            body.set_visible(false);
+            return gtk::glib::ControlFlow::Continue;
+        };
+        let Some(token) = s.client.gate.token().cloned() else {
+            return gtk::glib::ControlFlow::Continue;
+        };
+        if !s.surface_lease.record_body(token, surface) {
+            body.set_visible(false);
+            return gtk::glib::ControlFlow::Continue;
+        }
         if paint_changed || !body.is_visible() || mode_changed {
             let text = if compact {
                 &s.compact_markup
@@ -882,11 +1150,20 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
             }
             body.set_visible(true);
         }
+        if s.client.gate.body_presentation_pending() {
+            // Retry an actual native frame after unavailable/evicted timing,
+            // including static motion. The timer itself supplies no proof.
+            overlay.queue_draw();
+        }
         gtk::glib::ControlFlow::Continue
     });
 }
 
 use crate::eva_companion_paint::markup;
+
+#[cfg(test)]
+#[path = "gtk_clock_fixture.rs"]
+mod clock_fixture;
 
 fn motion_key(m: atlas::Motion) -> &'static str {
     match m {
@@ -1458,6 +1735,38 @@ fn memory_controls(controls: &gtk::Box, state: &Rc<RefCell<State>>) -> MemoryUi 
         });
     }
     panel.append(&propose);
+    let save_exchange = gtk::Button::with_label("Review saving this exchange");
+    {
+        let state = state.clone();
+        let get = selected_scope.clone();
+        let status = status.clone();
+        save_exchange.connect_clicked(move |_| {
+            let Some(scope) = get() else {
+                status.set_text("Choose the current task/project or explicitly choose Global.");
+                return;
+            };
+            let mut s = state.borrow_mut();
+            let Some(context) = s.current_context.clone() else {
+                return;
+            };
+            let Some(turn) = s.dialogue_save.turn_id().map(str::to_owned) else {
+                status.set_text("Wait for a complete reply before saving this exchange.");
+                return;
+            };
+            match s.dialogue_save.proposal(&turn, &context, scope) {
+                Ok(change) => {
+                    s.memory_review = None;
+                    s.memory_context = Some(context.clone());
+                    s.client.send(Request::MemoryPropose { context, change });
+                    status.set_text(
+                        "Review the full exchange and scope below. Nothing has been saved yet.",
+                    );
+                }
+                Err(reason) => status.set_text(reason),
+            }
+        });
+    }
+    panel.append(&save_exchange);
     for (label, clear) in [
         ("Review delete shown entry", false),
         ("Review clear this scope", true),
@@ -1666,6 +1975,33 @@ fn capture_one_selection(root: &gtk::Widget) -> Option<(String, String)> {
     found
 }
 impl State {
+    fn ready_to_close(&self) -> bool {
+        self.client.gate.withdrawal_accepted()
+            || (!self.client.gate.has_connection()
+                && self.client.gate.possible_body_token().is_none())
+    }
+    fn commit_close_if_ready(&mut self) -> bool {
+        let ready = self.ready_to_close();
+        if !self.close.commit(ready) {
+            return false;
+        }
+        self.close_work = None;
+        self.on_close_cancel = None;
+        self.on_close_ready = None;
+        true
+    }
+    fn cancel_close(&mut self) {
+        if !self.close.cancel() {
+            return;
+        }
+        self.on_close_ready = None;
+        self.close_work = None;
+        self.client.cancel_withdrawal();
+        log::debug!(target: "eva_native_host", "GTK close cancelled; original retirement continues");
+        if let Some(cancel) = self.on_close_cancel.take() {
+            cancel();
+        }
+    }
     fn invalidate_memory_management(&mut self) {
         self.managed_scope = None;
         self.scope_request = None;
@@ -1742,31 +2078,111 @@ pub(crate) fn owns_keyboard(window: &gtk::Window) -> bool {
     false
 }
 
-/// Called only after the app's existing unsaved/process guards have accepted close.
-/// No timeout counts as removal proof; unknown native timing keeps this close pending.
-pub(crate) fn defer_close(window: &gtk::Window) -> bool {
+/// Called only after the app's existing unsaved/process guards accept close.
+/// A possible body requires native retirement and negotiated WithdrawalReady.
+/// Without a possible body, a disconnected control channel cannot hold the
+/// window open. Withdraw still suppresses later admission during child cleanup.
+/// Requests during resumption stay serialized on the same host.
+pub(crate) fn defer_close(
+    window: &gtk::Window,
+    guarded: bool,
+    work: impl Fn() -> bool + 'static,
+    on_ready: impl Fn(u64) + 'static,
+    on_cancel: impl FnOnce() + 'static,
+) -> bool {
+    HOSTS.with(|hosts| {
+        for (w, s) in hosts.borrow().iter() {
+            if w.upgrade().as_ref() != Some(window) { continue; }
+            let Some(s) = s.upgrade() else { continue; };
+            let mut s = s.borrow_mut();
+            let busy = work();
+            let original_work = s.close_work.as_ref().is_some_and(|probe| probe());
+            if s.close.should_cancel_for_work(busy || original_work) {
+                s.cancel_close();
+                return true;
+            }
+            if s.commit_close_if_ready() { return false; }
+            // An explicitly confirmed VTE close may have an unverified prompt
+            // but no actual work. Protect work that appears after that point.
+            let guarded = guarded || !busy;
+            if s.close.begin(guarded) {
+                s.close_focus.set(gtk::prelude::GtkWindowExt::focus(window).as_ref());
+                s.close_work = Some(Box::new(work));
+                s.on_close_ready = Some(Rc::new(on_ready));
+                s.on_close_cancel = Some(Box::new(on_cancel));
+                if let Some(body) = s.body.upgrade() { body.set_visible(false); }
+                s.client.send(Request::Withdraw);
+                let current_work = s.close_work.as_ref().is_some_and(|probe| probe());
+                if s.close.should_cancel_for_work(current_work) {
+                    s.cancel_close();
+                    return true;
+                }
+                if s.commit_close_if_ready() { return false; }
+                log::debug!(target: "eva_native_host", "GTK negotiated close started guarded={guarded}");
+            }
+            return true;
+        }
+        false
+    })
+}
+
+/// The model additionally observes its current full pane set, including panes
+/// created after the close began. A completed job never rearms GUI exit.
+pub(crate) fn observe_close_work(window: &gtk::Window, busy: bool) {
     HOSTS.with(|hosts| {
         for (w, s) in hosts.borrow().iter() {
             if w.upgrade().as_ref() == Some(window) {
                 if let Some(s) = s.upgrade() {
                     let mut s = s.borrow_mut();
-                    if s.close_ready {
-                        return false;
-                    }
-                    if s.closing_token.is_some() {
-                        return true;
-                    }
-                    if let Some(token) = s.client.gate.possible_body_token().cloned() {
-                        s.closing_token = Some(token);
-                        if let Some(body) = s.body.upgrade() {
-                            body.set_visible(false);
-                        }
-                        s.client.send(Request::Withdraw);
-                        return true;
+                    if s.close.should_cancel_for_work(busy) {
+                        s.cancel_close();
                     }
                 }
             }
         }
-        false
+    });
+}
+
+pub(crate) fn close_waiting(window: &gtk::Window) -> bool {
+    HOSTS.with(|hosts| {
+        hosts.borrow().iter().any(|(w, s)| {
+            w.upgrade().as_ref() == Some(window)
+                && s.upgrade().is_some_and(|s| s.borrow().close.waiting())
+        })
     })
+}
+
+pub(crate) fn close_callback_current(window: &gtk::Window, revision: u64) -> bool {
+    HOSTS.with(|hosts| {
+        hosts.borrow().iter().any(|(w, s)| {
+            w.upgrade().as_ref() == Some(window)
+                && s.upgrade().is_some_and(|s| {
+                    let s = s.borrow();
+                    s.close.completion_current(revision) && s.ready_to_close()
+                })
+        })
+    })
+}
+
+fn restore_close_focus(
+    state: &Rc<RefCell<State>>,
+    focus: gtk::glib::WeakRef<gtk::Widget>,
+    revision: u64,
+) {
+    let state = Rc::downgrade(state);
+    gtk::glib::idle_add_local_once(move || {
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+        if !state.borrow().close.cancelled_current(revision) {
+            return;
+        }
+        // Focus notification reenters State; release its borrow first.
+        if let Some(focus) = focus
+            .upgrade()
+            .filter(|w| w.is_mapped() && w.is_sensitive())
+        {
+            focus.grab_focus();
+        }
+    });
 }

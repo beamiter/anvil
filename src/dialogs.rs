@@ -23,7 +23,9 @@ pub(crate) fn confirm_close(
     on_confirm: AppMsg,
     sender: &ComponentSender<AppModel>,
 ) {
-    let body = format!("A process is still running here:\n\n{running}\n\nClose anyway?");
+    let body = format!(
+        "Running work or unverified shell activity remains here:\n\n{running}\n\nClose anyway?"
+    );
     let dialog = adw::AlertDialog::new(Some("Close with running process?"), Some(&body));
     dialog.add_responses(&[("cancel", "Cancel"), ("close", "Close")]);
     dialog.set_response_appearance("close", adw::ResponseAppearance::Destructive);

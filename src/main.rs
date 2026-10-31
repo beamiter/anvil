@@ -1,5 +1,9 @@
 #![allow(dead_code)]
 
+mod gtk_presentation;
+mod gtk_process;
+mod gtk_spawn;
+
 mod action_ops;
 mod agent;
 mod agent_capability;
@@ -43,15 +47,15 @@ mod host {
     pub const APP_NAME: &str = "anvil";
 }
 
+mod eva_companion;
+mod eva_companion_clip;
+mod eva_companion_paint;
 mod jsh_ops;
 mod keybindings;
 mod launch_path;
 mod navigation_ui;
 mod notebook;
 mod organism_ui;
-mod eva_companion;
-mod eva_companion_paint;
-mod eva_companion_clip;
 mod palette;
 mod pane_header;
 mod persistence;
@@ -1148,7 +1152,9 @@ impl SimpleComponent for AppModel {
                 dialogs::settings::SettingsOutput::CommandHistory(enabled) => {
                     AppMsg::SettingsCommandHistory(enabled)
                 }
-                dialogs::settings::SettingsOutput::EvaCompanion(enabled) => AppMsg::SettingsEvaCompanion(enabled),
+                dialogs::settings::SettingsOutput::EvaCompanion(enabled) => {
+                    AppMsg::SettingsEvaCompanion(enabled)
+                }
                 dialogs::settings::SettingsOutput::AsciiOrganism(enabled) => {
                     AppMsg::SettingsAsciiOrganism(enabled)
                 }
@@ -1550,7 +1556,6 @@ impl SimpleComponent for AppModel {
                     return glib::Propagation::Stop;
                 }
                 if quit_allowed.get() {
-                    if crate::eva_companion::defer_close(window.upcast_ref()){return glib::Propagation::Stop;}
                     glib::Propagation::Proceed
                 } else {
                     close_sender.input(AppMsg::Quit);
@@ -1641,7 +1646,9 @@ impl SimpleComponent for AppModel {
             let file_tree_config = model.config.clone();
             let cross_block_search_key_latch = cross_block_search_key_latch.clone();
             key_controller.connect_key_pressed(move |_c, keyval, keycode, state| {
-                if crate::eva_companion::owns_keyboard(window.upcast_ref()){return glib::Propagation::Proceed;}
+                if crate::eva_companion::owns_keyboard(window.upcast_ref()) {
+                    return glib::Propagation::Proceed;
+                }
                 // Embedded Vim owns Quick Open before the shell's global
                 // command-palette binding can consume this capture event.
                 if crate::vim9_ide::native_dialog_owns_keyboard(&window)
@@ -1956,6 +1963,22 @@ impl SimpleComponent for AppModel {
             });
         }
 
+        {
+            let sender = sender.clone();
+            let window = root.downgrade();
+            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                if window.upgrade().is_none() {
+                    return glib::ControlFlow::Break;
+                }
+                if window
+                    .upgrade()
+                    .is_some_and(|w| eva_companion::close_waiting(w.upcast_ref()))
+                {
+                    sender.input(AppMsg::EvaClosePoll);
+                }
+                glib::ControlFlow::Continue
+            });
+        }
         ComponentParts { model, widgets }
     }
 
@@ -2024,7 +2047,25 @@ impl SimpleComponent for AppModel {
             AppMsg::Quit => {
                 self.request_quit(&sender);
             }
-            AppMsg::ForceQuit => self.force_quit(),
+            AppMsg::ForceQuit => self.force_quit(&sender),
+            AppMsg::GuardedQuit => self.guarded_quit(&sender),
+            AppMsg::EvaClosePoll => {
+                let busy = self
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| tab.panes.iter())
+                    .any(|pane| (pane.withdrawal_work_probe())());
+                eva_companion::observe_close_work(self.window.upcast_ref(), busy);
+            }
+            AppMsg::EvaCloseReady(revision, guarded) => {
+                if eva_companion::close_callback_current(self.window.upcast_ref(), revision) {
+                    if guarded {
+                        self.guarded_quit(&sender);
+                    } else {
+                        self.force_quit(&sender);
+                    }
+                }
+            }
             AppMsg::Toast(message) => self.show_toast(message),
             AppMsg::RetryBlockHistory => self.retry_block_history(),
             AppMsg::ToastWithUndo {
@@ -2473,7 +2514,10 @@ impl SimpleComponent for AppModel {
             AppMsg::SettingsTerminalMode(mode) => self.apply_settings_terminal_mode(mode),
             AppMsg::SettingsBlockCompact(enabled) => self.apply_settings_block_compact(enabled),
             AppMsg::SettingsCommandHistory(enabled) => self.apply_settings_command_history(enabled),
-            AppMsg::SettingsEvaCompanion(enabled) => {self.config.borrow_mut().eva_companion_enabled=enabled;self.persist_config();},
+            AppMsg::SettingsEvaCompanion(enabled) => {
+                self.config.borrow_mut().eva_companion_enabled = enabled;
+                self.persist_config();
+            }
             AppMsg::SettingsAsciiOrganism(enabled) => self.apply_settings_ascii_organism(enabled),
             AppMsg::SettingsAsciiOrganismCare(enabled) => {
                 if !self.safe_mode {
@@ -3600,7 +3644,7 @@ mod startup_wiring_tests {
     fn force_quit_flushes_the_execution_journal_before_the_window_closes() {
         let source = include_str!("workspace_ops.rs");
         let body = source
-            .split_once("pub(crate) fn force_quit(&self) {")
+            .split_once("pub(crate) fn force_quit(")
             .expect("force_quit exists")
             .1;
         let body = &body[..body

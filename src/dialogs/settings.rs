@@ -86,7 +86,9 @@ mod organism_preview {
     const FRAME_INTERVAL: Duration = Duration::from_millis(100);
 
     fn motion_for_selection(selected: u32, animations: bool) -> OrganismMotion {
-        if crate::eva_companion::shared_mode_requested(){return OrganismMotion::Static;}
+        if crate::eva_companion::shared_mode_requested() {
+            return OrganismMotion::Static;
+        }
         match selected {
             1 => OrganismMotion::Full,
             2 => OrganismMotion::Calm,
@@ -97,7 +99,9 @@ mod organism_preview {
     }
 
     fn motion_policy(selected: u32, animations: Option<bool>) -> &'static str {
-        if crate::eva_companion::shared_mode_requested(){return "Shared Eva: static preview only; appearance and motion live in the Eva card.";}
+        if crate::eva_companion::shared_mode_requested() {
+            return "Shared Eva: static preview only; appearance and motion live in the Eva card.";
+        }
         match (selected, animations) {
             (1, _) => "Full: animated movement and quiet hover greetings.",
             (2, _) => "Calm: still poses and quiet hover greetings.",
@@ -374,7 +378,9 @@ mod organism_preview {
         }
 
         fn active(&self) -> bool {
-            if crate::eva_companion::shared_mode_requested(){return false;}
+            if crate::eva_companion::shared_mode_requested() {
+                return false;
+            }
             preview_active(
                 self.visible.get(),
                 self.group.upgrade().is_some_and(|group| group.is_mapped()),
@@ -2767,7 +2773,10 @@ impl Component for SettingsModel {
                     self.values.safe_mode,
                 );
             }
-            SettingsMsg::EvaCompanion(enabled) => {self.values.eva_companion_enabled=enabled;let _=sender.output(SettingsOutput::EvaCompanion(enabled));},
+            SettingsMsg::EvaCompanion(enabled) => {
+                self.values.eva_companion_enabled = enabled;
+                let _ = sender.output(SettingsOutput::EvaCompanion(enabled));
+            }
             SettingsMsg::AsciiOrganism(enabled) => {
                 self.values.ascii_organism_enabled = enabled;
                 widgets

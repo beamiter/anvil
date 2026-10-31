@@ -1,0 +1,14 @@
+[package]
+name = "companion-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GUI-owned Eva host transport and presentation gate"
+
+[dependencies]
+libc.workspace = true
+companion-protocol.workspace = true
+companion-client.workspace = true
+companion-core.workspace = true
+eva-character-atlas = { path = "../eva-character-atlas" }
+uuid = { version = "~1.26.0", features = ["v4"] }

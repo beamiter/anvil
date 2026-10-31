@@ -1,0 +1,17 @@
+{
+  "bundle": "pty-process-v1",
+  "files_sha256": {
+    "src/gtk_process.rs": "d04bc567730d352c00a8feb9da72211553c0f6fda6a484fa389c5fa61cd84015",
+    "src/gtk_spawn.rs": "2e4668330a6b8510713944ccc4d07a381531d029233a84bf0ba857ac5d36c2cb",
+    "tools/check-process-bundle.py": "72e4641349af09b2ac91ad92a80aedc0c4599c9cce11082f9f4d9aa823ccff19",
+    "vendor/companion-process/Cargo.toml": "46cfd243bd73a0b8d0c94e10a4c456e719123d153008b02f043ad122ee7c66e2",
+    "vendor/companion-process/LICENSE": "df864a86870c22b4a37004850372cd147b82495362f64676fecbe28f27f58d42",
+    "vendor/companion-process/src/lib.rs": "f1ef41de8ba3f4646e43c5ddd4dad41b098bcd49ff46322e96f6c0fcb61854a5",
+    "vendor/companion-process/src/pty_session.rs": "34ef861a92c1afe27059f491664802f932b996306f09d5a04e91db94b8661a2f",
+    "vendor/companion-process/src/shell_identity.rs": "cff15f40ec159f8c099a74335d51bc236d524e4166088f9d1bf785ebff28435f"
+  },
+  "public_core_base": "974ccad203375032fe87706caecab39ad516c238",
+  "schema": 1,
+  "scope": "Local versioned process observer and GTK launch ownership. No protocol or presentation proof; no change to published Git bases.",
+  "version": "0.1.0"
+}

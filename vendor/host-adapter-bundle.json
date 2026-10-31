@@ -1,0 +1,31 @@
+{
+  "bundle": "withdrawal-resume-v1",
+  "files_sha256": {
+    "src/gtk_clock_fixture.rs": "3e1c4827a77cac5d79ebe2d40c5dc9ecbfdf5a88c72c0d3b43785cb32858126d",
+    "src/gtk_close.rs": "4bbee5053b58a0b93a784a24f48c5b8a74a4f0db2fb83e617353d8a0cb417cd8",
+    "src/gtk_presentation.rs": "15ea7451fb5437ef99d35ed58e37d190f315e3dc96e4ca2015858c005edcf9e1",
+    "tools/check-host-bundle.py": "2e7aabaa31915190dc4422f4558ab7b6a49e436ab5cf9cab1b6cfce582827486",
+    "vendor/companion-client/Cargo.toml": "ff89400987a917d5d7d9d8bc5ba5f1c52ebee44f10848476815f67caa8a701a8",
+    "vendor/companion-client/LICENSE": "df864a86870c22b4a37004850372cd147b82495362f64676fecbe28f27f58d42",
+    "vendor/companion-client/src/lib.rs": "7197122c55a45c5a9bd50695f3347a60b0a572bd47e64caf3d411e529114bcdf",
+    "vendor/companion-client/upstream-Cargo.toml": "922f7858b1e1714394db43e171c10418c630c6c5f2650cfa4f9c6f1dd7df6bc3",
+    "vendor/companion-host/Cargo.toml": "572552c56668ee89691d19473d403c022cc7c5e874fa15c1563619e8bf2969ea",
+    "vendor/companion-host/LICENSE": "df864a86870c22b4a37004850372cd147b82495362f64676fecbe28f27f58d42",
+    "vendor/companion-host/origin.json": "5a342fecbd0032b5d241a24d32845f2bc3a16679f755ee23cc851a4e1c5b581f",
+    "vendor/companion-host/src/dialogue_save.rs": "8a0265ab1afd368f34e705f835abe2ccaaab9dcca5f7441798ded744dab178c9",
+    "vendor/companion-host/src/lib.rs": "db9991639a16e9c100b062a49906caea074d48ec4f66938b93c4c5bada562f0e",
+    "vendor/companion-host/src/pty_session.rs": "34ef861a92c1afe27059f491664802f932b996306f09d5a04e91db94b8661a2f",
+    "vendor/companion-host/src/shell_identity.rs": "cff15f40ec159f8c099a74335d51bc236d524e4166088f9d1bf785ebff28435f",
+    "vendor/companion-host/upstream-Cargo.toml": "0b8bdf1195c69bc1caa16a1d415f0a130529f3b95a5dfc4e9836473f300d2be7",
+    "vendor/companion-protocol/Cargo.toml": "3c577f5143a2f8cc3ccb514bba17440c2bdcf37dcc4668d16cd788990767f01b",
+    "vendor/companion-protocol/LICENSE": "df864a86870c22b4a37004850372cd147b82495362f64676fecbe28f27f58d42",
+    "vendor/companion-protocol/src/lib.rs": "ac42a525c8c65ec80fff3aa18bb17395c13762c5493cb7875751cb8b18ba4440",
+    "vendor/companion-protocol/src/strict_json.rs": "164ee7f85ea1922492afb845f2ec56311511a8950985546ed2785be8f98504a1",
+    "vendor/companion-protocol/upstream-Cargo.toml": "89c06787e200d75685facc835f0bb000186549b1b35eb62768d876e10eea6428"
+  },
+  "public_companion_base": "9aa569540091524d637a7115b64c587b9177a55b",
+  "public_core_base": "974ccad203375032fe87706caecab39ad516c238",
+  "schema": 1,
+  "scope": "Exact versioned host/protocol/client source overlay with GTK frame identity and negotiated withdrawal resumption. Public core/atlas/jterm_core pins stay immutable. This is local reviewable source, not a published Git revision or installation.",
+  "version": "0.1.0"
+}

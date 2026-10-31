@@ -708,7 +708,7 @@ fn running_process_summary_for_tabs<'a>(tabs: impl IntoIterator<Item = &'a Tab>)
     let mut running = Vec::new();
     for tab in tabs {
         for (pane_index, pane) in tab.panes.iter().enumerate() {
-            if let Some(process) = pane.foreground_process() {
+            if let Some(process) = pane.close_blocker() {
                 let location = if tab.panes.len() > 1 {
                     format!("{} (pane {})", tab.display_title(), pane_index + 1)
                 } else {
@@ -1462,14 +1462,57 @@ impl AppModel {
         if let Some(running) = self.running_process_summary() {
             dialogs::confirm_close(&self.window, &running, AppMsg::ForceQuit, sender);
         } else {
-            sender.input(AppMsg::ForceQuit);
+            sender.input(AppMsg::GuardedQuit);
         }
     }
 
-    pub(crate) fn force_quit(&self) {
+    pub(crate) fn force_quit(&self, sender: &ComponentSender<AppModel>) {
+        self.finish_quit(sender, false);
+    }
+
+    pub(crate) fn guarded_quit(&self, sender: &ComponentSender<AppModel>) {
+        self.finish_quit(sender, true);
+    }
+
+    fn finish_quit(&self, sender: &ComponentSender<AppModel>, guarded: bool) {
         if crate::vim9_ide::request_embedded_close(&self.window) {
             return;
         }
+        let probes: Vec<_> = self
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter())
+            .map(|pane| pane.withdrawal_work_probe())
+            .collect();
+        let ready_sender = sender.clone();
+        let action = if guarded {
+            AppMsg::GuardedQuit
+        } else {
+            AppMsg::ForceQuit
+        };
+        if crate::eva_companion::defer_close(
+            self.window.upcast_ref(),
+            guarded,
+            move || probes.iter().any(|probe| probe()),
+            move |revision| ready_sender.input(AppMsg::EvaCloseReady(revision, guarded)),
+            || {},
+        ) {
+            return;
+        }
+
+        let ready_sender = sender.clone();
+        let children = self
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter())
+            .filter_map(|pane| pane.child_cleanup())
+            .collect();
+        if crate::gtk_process::defer_children(self.window.upcast_ref(), children, move || {
+            ready_sender.input(action)
+        }) {
+            return;
+        }
+
         if !self.safe_mode {
             let (width, inspector_width) = self.shell.sidebar_widths();
             let ai_width = Some(inspector_width);
@@ -2005,12 +2048,20 @@ impl AppModel {
         if closes_agent {
             self.agent_close();
         }
+        crate::gtk_process::retain_children(
+            self.window.upcast_ref(),
+            self.tabs[idx]
+                .panes
+                .iter()
+                .filter_map(|pane| pane.child_cleanup())
+                .collect(),
+        );
         let tab = self.tabs.remove(idx);
         self.stack.remove(&tab.holder);
         drop(tab);
 
         if self.tabs.is_empty() {
-            self.force_quit();
+            self.force_quit(sender);
             return;
         }
         let remaining_ids: Vec<_> = self.tabs.iter().map(|tab| tab.id).collect();
@@ -2291,7 +2342,7 @@ impl AppModel {
     /// Close a pane, first confirming if a process is still running in it.
     pub(crate) fn request_close_pane(&mut self, pane_id: u64, sender: &ComponentSender<AppModel>) {
         if let Some((ti, pi)) = self.find_pane(pane_id) {
-            if let Some(process) = self.tabs[ti].panes[pi].foreground_process() {
+            if let Some(process) = self.tabs[ti].panes[pi].close_blocker() {
                 dialogs::confirm_close(
                     &self.window,
                     &process,
@@ -2499,6 +2550,14 @@ impl AppModel {
         let mut index = 0;
         while index < self.tabs.len() {
             if selected.contains(&self.tabs[index].id) {
+                crate::gtk_process::retain_children(
+                    self.window.upcast_ref(),
+                    self.tabs[index]
+                        .panes
+                        .iter()
+                        .filter_map(|pane| pane.child_cleanup())
+                        .collect(),
+                );
                 let tab = self.tabs.remove(index);
                 self.stack.remove(&tab.holder);
                 drop(tab);
@@ -2507,7 +2566,7 @@ impl AppModel {
             }
         }
         if self.tabs.is_empty() {
-            self.force_quit();
+            self.force_quit(sender);
             return;
         }
         let remaining_ids: Vec<_> = self.tabs.iter().map(|tab| tab.id).collect();
@@ -2790,6 +2849,13 @@ impl AppModel {
             .map(|pane| pane.id);
         let search_transition =
             ti == self.active && self.begin_search_pane_transition(next_pane_id);
+        crate::gtk_process::retain_children(
+            self.window.upcast_ref(),
+            self.tabs[ti].panes[pi]
+                .child_cleanup()
+                .into_iter()
+                .collect(),
+        );
         let Some(removed) = self.detach_pane_from_tab(ti, pi) else {
             self.finish_search_pane_transition(search_transition);
             log::error!("Failed to detach pane {pane_id} from tab widget tree");
@@ -4134,7 +4200,7 @@ mod pane_tree_tests {
         assert!(!preserved.contains("self.select_tab"));
         assert!(!preserved.contains("begin_organism_focus_transfer("));
         assert!(!preserved.contains("GrabFocus"));
-        assert!(close.contains("self.force_quit()"));
+        assert!(close.contains("self.force_quit(sender)"));
     }
     #[test]
     fn batch_background_removals_preserve_foreground_on_both_sides() {
@@ -4178,7 +4244,7 @@ mod pane_tree_tests {
             .unwrap();
         assert!(close.contains("if ids.is_empty()"));
         assert!(close.contains("let Some(first_removed)"));
-        assert!(close.contains("self.force_quit()"));
+        assert!(close.contains("self.force_quit(sender)"));
         assert!(
             close.find("let active_id =").unwrap() < close.find("self.tabs.remove(index)").unwrap()
         );

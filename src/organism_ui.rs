@@ -4539,7 +4539,10 @@ impl OrganismHub {
                     OrganismMotion::Calm
                 }
             });
-            (config.ascii_organism_enabled && !crate::eva_companion::shared_mode_requested(), motion)
+            (
+                config.ascii_organism_enabled && !crate::eva_companion::shared_mode_requested(),
+                motion,
+            )
         };
         for view in self.organism_presence.eligible_views() {
             if enabled {
@@ -4553,7 +4556,11 @@ impl OrganismHub {
 
     pub(crate) fn attach_ascii_organism_to_view(&self, view: &Rc<TermView>, remote: bool) {
         crate::eva_companion::tag_pane(&view.widget());
-        if remote {view.widget().add_css_class("eva-remote-surface");}else{view.widget().remove_css_class("eva-remote-surface");}
+        if remote {
+            view.widget().add_css_class("eva-remote-surface");
+        } else {
+            view.widget().remove_css_class("eva-remote-surface");
+        }
         if remote || crate::eva_companion::shared_mode_requested() {
             return;
         }

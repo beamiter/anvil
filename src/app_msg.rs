@@ -27,6 +27,10 @@ pub(crate) enum AppMsg {
     WindowActive(bool),
     Quit,
     ForceQuit,
+    /// Ordinary idle close; new work during native withdrawal revokes it.
+    GuardedQuit,
+    EvaClosePoll,
+    EvaCloseReady(u64, bool),
     Toast(String),
     /// Answer the Block-history sticky failure bar: ask every Block pane to
     /// retry load/save. Synchronous refusals raise the bar again.

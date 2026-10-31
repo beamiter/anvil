@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "origin_repository": "https://github.com/beamiter/jterm_core.git",
+  "origin_commit": "974ccad203375032fe87706caecab39ad516c238",
+  "origin_path": "src/companion_host.rs",
+  "origin_file_sha256": "004d07ed7fe1dd2f56ab8d87284827a8d6c9ed04dd88d9475cd8b9e449a3723c",
+  "scope": "Initial extraction before explicit negotiated withdrawal/resume changes. The legacy pinned jterm_core adapter remains unchanged; companion-host is the maintained adapter for opt-in modern hosts."
+}

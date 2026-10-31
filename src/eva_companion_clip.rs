@@ -1,7 +1,7 @@
 use relm4::gtk;
 // Exact native allocation and snapshot clip for an admitted Eva rectangle.
-use gtk::prelude::*;
 use gtk::glib;
+use gtk::prelude::*;
 mod imp {
     use super::*;
     use gtk::subclass::prelude::*;

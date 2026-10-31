@@ -1,0 +1,12 @@
+[package]
+name = "companion-client"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+companion-protocol = { version = "0.1.0", git = "https://github.com/beamiter/jcompanion.git", rev = "9aa569540091524d637a7115b64c587b9177a55b" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
