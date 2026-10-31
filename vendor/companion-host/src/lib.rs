@@ -1,6 +1,7 @@
 //! One GUI-owned Eva adapter. Transport work never runs on the rendering thread.
 //! A native presentation acknowledgement is not a compositor scanout guarantee.
 pub mod dialogue_save;
+pub mod history;
 pub mod pty_session;
 pub mod shell_identity;
 pub use companion_core::geometry::{choose, Placement};
@@ -125,6 +126,7 @@ pub struct HostGate {
     quiet: bool,
     night: bool,
     operation_error: Option<String>,
+    history_supported: bool,
 }
 impl HostGate {
     pub fn new(host: Host) -> Self {
@@ -157,7 +159,12 @@ impl HostGate {
             quiet: false,
             night: false,
             operation_error: None,
+            history_supported: false,
         }
+    }
+    /// The current connection negotiated `DialogueHistoryV1`.
+    pub fn history_supported(&self) -> bool {
+        self.history_supported
     }
     pub fn withdrawal_accepted(&self) -> bool {
         if self.modern {
@@ -347,6 +354,7 @@ impl HostGate {
                 .is_some_and(|token| self.presented.as_ref() != Some(token))
     }
     pub fn disconnect(&mut self) {
+        self.history_supported = false;
         self.connection_nonce = None;
         self.admitted = false;
         self.admission_epoch = 0;
@@ -373,13 +381,12 @@ impl HostGate {
                 connection_nonce,
                 ..
             } if self.modern => {
-                if features.as_slice() != [HostFeature::WithdrawalResumeV1]
-                    || !identifier(&connection_nonce)
-                {
+                if !valid_host_features(&features) || !identifier(&connection_nonce) {
                     self.disconnect();
                     self.status = "Eva host capabilities unavailable".into();
                     return None;
                 }
+                self.history_supported = features.contains(&HostFeature::DialogueHistoryV1);
                 self.connection_generation = self.connection_generation.saturating_add(1);
                 self.admission_generation = self.admission_generation.saturating_add(1);
                 self.admitted = false;
@@ -654,6 +661,28 @@ pub struct SharedHost {
     dialogue: std::collections::VecDeque<Reply>,
     memory: std::collections::VecDeque<Reply>,
     context_access: std::collections::VecDeque<Reply>,
+    /// Read-only history page for this window; see [`history::HistoryView`].
+    pub history: history::HistoryView,
+}
+/// Features a modern host asks for. A coordinator that predates history
+/// rejects the extended list as a schema error before admission; the worker
+/// then retries with the base feature and history stays unavailable.
+fn worker_features(history: bool) -> Vec<HostFeature> {
+    if history {
+        vec![
+            HostFeature::WithdrawalResumeV1,
+            HostFeature::DialogueHistoryV1,
+        ]
+    } else {
+        vec![HostFeature::WithdrawalResumeV1]
+    }
+}
+fn predates_history(replies: &[Reply], accepted: bool) -> bool {
+    !accepted
+        && replies.iter().any(|reply| {
+            matches!(reply, Reply::Rejected { reason }
+                if reason == "invalid_schema" || reason == "invalid_host_features")
+        })
 }
 impl SharedHost {
     pub fn from_env(
@@ -688,14 +717,16 @@ impl SharedHost {
                         .join("jcompanion/eva.sock")
                     });
                 let mut disconnected_notice = false;
+                let mut request_history = true;
                 while !stopping.load(std::sync::atomic::Ordering::Relaxed) {
                     let result = (|| -> std::io::Result<()> {
                         let mut client = companion_client::Client::connect_with_features(
                             &path,
                             &session,
                             worker_host.clone(),
-                            vec![HostFeature::WithdrawalResumeV1],
+                            worker_features(request_history),
                         )?;
+                        let mut accepted = false;
                         while !stopping.load(std::sync::atomic::Ordering::Relaxed) {
                             if !client.boot_id().is_empty() {
                                 let pending = if let Ok(mut latest) = worker_metadata.lock() {
@@ -714,6 +745,12 @@ impl SharedHost {
                             }
                             let replies = client.poll()?;
                             if !replies.is_empty() {
+                                if request_history && predates_history(&replies, accepted) {
+                                    request_history = false;
+                                }
+                                accepted |= replies
+                                    .iter()
+                                    .any(|r| matches!(r, Reply::HostAccepted { .. }));
                                 let reconnect = replies.iter().any(requires_reconnect);
                                 for reply in replies {
                                     events.try_send(WorkerEvent::Reply(reply)).map_err(|_| {
@@ -763,7 +800,25 @@ impl SharedHost {
             dialogue: Default::default(),
             memory: Default::default(),
             context_access: Default::default(),
+            history: Default::default(),
         }
+    }
+    /// Sends one explicit history page request for the window's current,
+    /// already registered context.
+    pub fn request_history(
+        &mut self,
+        context: &ContextRef,
+        older: bool,
+    ) -> Result<(), &'static str> {
+        if self.failed || !self.gate.admitted {
+            return Err("Eva is not connected. History is unavailable.");
+        }
+        if !self.gate.history_supported {
+            return Err("Update the Eva coordinator to view history.");
+        }
+        let request = self.history.request(context, older)?;
+        self.send(request);
+        Ok(())
     }
     pub fn begin_frame(&mut self, serial: u64) {
         self.gate.begin_frame(serial)
@@ -781,6 +836,9 @@ impl SharedHost {
             match self.rx.try_recv() {
                 Ok(WorkerEvent::Reply(r)) => {
                     changed = true;
+                    if self.history.observe(&r) {
+                        continue;
+                    }
                     if matches!(&r, Reply::ContextAccessReview { .. }) {
                         if self.context_access.len() >= 8 {
                             self.gate.disconnect();
@@ -828,15 +886,21 @@ impl SharedHost {
                 }
                 Ok(WorkerEvent::Disconnected) => {
                     self.gate.disconnect();
+                    self.history.disconnected();
                     changed = true;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.gate.disconnect();
+                    self.history.disconnected();
                     self.failed = true;
                     return true;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
             }
+        }
+        if !self.gate.history_supported || self.failed {
+            // Every disconnect path, including bounded-queue failures.
+            self.history.disconnected();
         }
         self.flush_controls();
         changed
@@ -1170,6 +1234,7 @@ mod tests {
             dialogue: Default::default(),
             memory: Default::default(),
             context_access: Default::default(),
+            history: Default::default(),
         };
         for n in 0..1000 {
             h.send(Request::Focus {
@@ -1211,6 +1276,7 @@ mod tests {
             dialogue: Default::default(),
             memory: Default::default(),
             context_access: Default::default(),
+            history: Default::default(),
         };
         let discovery = Reply::MemoryScopes {
             scopes: vec![MemoryScope::Project("project-without-task".into())],
@@ -1325,6 +1391,43 @@ mod modern_admission_tests {
             features: vec![HostFeature::WithdrawalResumeV1],
             connection_nonce: nonce.into(),
         }
+    }
+    #[test]
+    fn history_is_available_only_on_a_connection_that_negotiated_it() {
+        let mut gate = HostGate::new_modern(host());
+        gate.receive(accepted("n1", "boot"));
+        assert!(!gate.history_supported());
+        let mut extended = accepted("n2", "boot");
+        if let Reply::HostAccepted { features, .. } = &mut extended {
+            features.push(HostFeature::DialogueHistoryV1);
+        }
+        gate.receive(extended);
+        assert!(gate.history_supported());
+        gate.disconnect();
+        assert!(!gate.history_supported());
+        let mut alone = accepted("n3", "boot");
+        if let Reply::HostAccepted { features, .. } = &mut alone {
+            *features = vec![HostFeature::DialogueHistoryV1];
+        }
+        gate.receive(alone);
+        assert!(!gate.history_supported());
+        assert_eq!(gate.status, "Eva host capabilities unavailable");
+    }
+    #[test]
+    fn only_a_pre_admission_schema_rejection_drops_the_history_request() {
+        let schema = [Reply::Rejected {
+            reason: "invalid_schema".into(),
+        }];
+        assert!(predates_history(&schema, false));
+        assert!(!predates_history(&schema, true), "after admission");
+        assert!(!predates_history(
+            &[Reply::Rejected {
+                reason: "host_already_connected".into()
+            }],
+            false
+        ));
+        assert_eq!(worker_features(false), [HostFeature::WithdrawalResumeV1]);
+        assert!(valid_host_features(&worker_features(true)));
     }
     fn ready(nonce: &str, intent: u64, retired_token: Option<Token>) -> Reply {
         Reply::WithdrawalReady {

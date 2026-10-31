@@ -18,6 +18,7 @@ struct State {
     last_task: Option<(String, u64, host::TaskStatus)>,
     active_turn: Option<(String, host::ContextRef)>,
     dialogue_save: host::DialogueSave,
+    history_rendered: u64,
     pending_displayed: Option<String>,
     body: gtk::glib::WeakRef<gtk::Label>,
     close: close_rules::CloseIntent,
@@ -195,6 +196,7 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
         last_task: None,
         active_turn: None,
         dialogue_save: Default::default(),
+        history_rendered: 0,
         pending_displayed: None,
         body: body.downgrade(),
         close: close_rules::CloseIntent::default(),
@@ -414,6 +416,7 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
     earlier.set_wrap(true);
     earlier.set_max_width_chars(42);
     controls.append(&earlier);
+    let history = history_controls(&controls, &state);
     let input = gtk::Entry::builder()
         .placeholder_text("Message Eva — never sent to the shell")
         .max_length(8192)
@@ -762,6 +765,15 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
         if dialogue.is_mapped() && window.is_mapped() {
             if let Some(turn_id) = s.pending_displayed.take() {
                 s.client.send(Request::DialogueDisplayed { turn_id });
+            }
+        }
+        {
+            let current = s.current_context.clone();
+            s.client.history.context_changed(current.as_ref());
+            let revision = s.client.history.revision();
+            if revision != s.history_rendered {
+                s.history_rendered = revision;
+                history.render(&s.client.history, current.as_ref());
             }
         }
 
@@ -1855,6 +1867,96 @@ fn memory_controls(controls: &gtk::Box, state: &Rc<RefCell<State>>) -> MemoryUi 
         persisted,
         scope_status,
         scope_approve,
+    }
+}
+struct HistoryUi {
+    status: gtk::Label,
+    content: gtk::Label,
+    area: gtk::ScrolledWindow,
+    older: gtk::Button,
+}
+impl HistoryUi {
+    fn render(&self, view: &host::history::HistoryView, viewer: Option<&host::ContextRef>) {
+        if !view.status().is_empty() {
+            self.status.set_text(view.status());
+        }
+        self.content.set_text(&view.text(viewer));
+        self.area.set_visible(!view.entries().is_empty());
+        self.older.set_sensitive(view.can_load_older());
+    }
+}
+/// Static, read-only history. Loading never moves focus or adds an avatar.
+fn history_controls(controls: &gtk::Box, state: &Rc<RefCell<State>>) -> HistoryUi {
+    let group = gtk::Expander::new(Some("Conversation history · read-only"));
+    let panel = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    let scope = gtk::DropDown::from_strings(&host::history::SCOPES.map(host::history::scope_label));
+    scope.set_tooltip_text(Some(
+        "Eva dialogue only. Terminal output and voice transcripts are never included.",
+    ));
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let load = gtk::Button::with_label("Load history");
+    let older = gtk::Button::with_label("Older");
+    older.set_sensitive(false);
+    let status = gtk::Label::new(Some("Nothing is loaded until you choose Load history."));
+    status.set_wrap(true);
+    status.set_max_width_chars(42);
+    status.set_xalign(0.0);
+    let content = gtk::Label::new(None);
+    content.set_wrap(true);
+    content.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    content.set_selectable(true);
+    content.set_max_width_chars(42);
+    content.set_xalign(0.0);
+    // A fixed, readable area: wrapped labels under nested scrolling do not
+    // reliably report their natural height.
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .min_content_height(220)
+        .max_content_height(320)
+        .child(&content)
+        .visible(false)
+        .build();
+    {
+        let state = state.clone();
+        scope.connect_selected_notify(move |scope| {
+            if let Some(scope) = host::history::SCOPES.get(scope.selected() as usize) {
+                state.borrow_mut().client.history.set_scope(*scope);
+            }
+        });
+    }
+    for (button, older_page) in [(&load, false), (&older, true)] {
+        let state = state.clone();
+        let status = status.clone();
+        button.connect_clicked(move |_| {
+            let mut s = state.borrow_mut();
+            let context = s
+                .current_context
+                .clone()
+                .unwrap_or_else(|| host::ContextRef {
+                    host_id: s.client.gate.host_id().into(),
+                    pane_id: "companion-card".into(),
+                    task_id: None,
+                    project_id: None,
+                    revision: s.revision,
+                });
+            let context = s.register_context(context);
+            if let Err(message) = s.client.request_history(&context, older_page) {
+                status.set_text(message);
+            }
+        });
+        buttons.append(button);
+    }
+    panel.append(&scope);
+    panel.append(&buttons);
+    panel.append(&status);
+    panel.append(&scroll);
+    group.set_child(Some(&panel));
+    controls.append(&group);
+    HistoryUi {
+        status,
+        content,
+        area: scroll,
+        older,
     }
 }
 fn active_memory_context(s: &mut State) -> host::ContextRef {

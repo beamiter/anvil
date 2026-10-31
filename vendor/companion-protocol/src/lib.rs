@@ -1,5 +1,6 @@
 //! Bounded, content-free coordination protocol. Same-UID peers are not a security boundary.
 use serde::{Deserialize, Serialize};
+pub mod history;
 pub mod strict_json;
 pub const VERSION: u16 = 1;
 pub const MAX_FRAME: usize = 65536;
@@ -35,6 +36,19 @@ pub struct Host {
 #[serde(rename_all = "snake_case")]
 pub enum HostFeature {
     WithdrawalResumeV1,
+    /// Explicit read-only dialogue history pages. Requires `WithdrawalResumeV1`.
+    DialogueHistoryV1,
+}
+/// The only accepted feature sets; order is fixed so a list cannot smuggle duplicates.
+pub fn valid_host_features(features: &[HostFeature]) -> bool {
+    matches!(
+        features,
+        [HostFeature::WithdrawalResumeV1]
+            | [
+                HostFeature::WithdrawalResumeV1,
+                HostFeature::DialogueHistoryV1
+            ]
+    )
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -323,6 +337,13 @@ pub enum Request {
     DialogueDisplayed {
         turn_id: String,
     },
+    /// One explicit page request. `before` is an opaque cursor from the previous page.
+    DialogueHistory {
+        request_id: u64,
+        context: ContextRef,
+        scope: history::Scope,
+        before: Option<String>,
+    },
     EvaHello,
     Audio {
         turn_id: String,
@@ -501,6 +522,19 @@ pub enum Reply {
         status: String,
         reply: Option<String>,
     },
+    DialogueHistory {
+        request_id: u64,
+        context: ContextRef,
+        scope: history::Scope,
+        status: String,
+        entries: Vec<history::Entry>,
+        next_before: Option<String>,
+    },
+    /// Sent to negotiated hosts when the desktop locks or becomes unknown.
+    /// A host must clear every displayed history page.
+    DialogueHistoryWithdrawn {
+        reason: String,
+    },
     Accepted {
         boot_id: String,
         companion_id: String,
@@ -648,10 +682,19 @@ pub fn decode(bytes: &[u8]) -> Result<Envelope, String> {
         {
             return Err("invalid_host_metadata".into())
         }
-        Request::HelloWithFeatures { features, .. }
-            if features.as_slice() != [HostFeature::WithdrawalResumeV1] =>
-        {
+        Request::HelloWithFeatures { features, .. } if !valid_host_features(features) => {
             return Err("invalid_host_features".into())
+        }
+        Request::DialogueHistory {
+            request_id,
+            context,
+            before,
+            ..
+        } if *request_id == 0
+            || !valid_context(context)
+            || before.as_ref().is_some_and(|c| !history::cursor_valid(c)) =>
+        {
+            return Err("invalid_history_request".into())
         }
         Request::MemoryScopes { after: Some(after) }
             if !(after == "global"
@@ -889,6 +932,44 @@ mod host_feature_tests {
             serde_json::json!({"type":"hello","host":host(),"features":[]})
         ))
         .is_err());
+    }
+    #[test]
+    fn history_feature_is_ordered_and_requests_are_bounded() {
+        assert!(decode(&wire(serde_json::json!({"type":"hello_with_features","host":host(),"features":["withdrawal_resume_v1","dialogue_history_v1"]}))).is_ok());
+        for features in [
+            serde_json::json!(["dialogue_history_v1"]),
+            serde_json::json!(["dialogue_history_v1", "withdrawal_resume_v1"]),
+            serde_json::json!([
+                "withdrawal_resume_v1",
+                "dialogue_history_v1",
+                "dialogue_history_v1"
+            ]),
+        ] {
+            assert!(decode(&wire(
+                serde_json::json!({"type":"hello_with_features","host":host(),"features":features})
+            ))
+            .is_err());
+        }
+        let context = serde_json::json!({"host_id":"h","pane_id":"p","task_id":null,"project_id":"a","revision":1});
+        let request = |id: u64, before: serde_json::Value, context: serde_json::Value| {
+            wire(
+                serde_json::json!({"type":"dialogue_history","request_id":id,"context":context,"scope":"project","before":before}),
+            )
+        };
+        assert!(decode(&request(1, serde_json::Value::Null, context.clone())).is_ok());
+        assert!(decode(&request(1, "ab".repeat(32).into(), context.clone())).is_ok());
+        assert!(decode(&request(0, serde_json::Value::Null, context.clone())).is_err());
+        for cursor in ["AB".repeat(32), "ab".repeat(33), "../".into()] {
+            assert!(decode(&request(1, cursor.into(), context.clone())).is_err());
+        }
+        let mut foreign = context.clone();
+        foreign["pane_id"] = "".into();
+        assert!(decode(&request(1, serde_json::Value::Null, foreign)).is_err());
+        let mut unknown = serde_json::json!({"type":"dialogue_history","request_id":1,"context":context,"scope":"everything","before":null});
+        assert!(decode(&wire(unknown.clone())).is_err());
+        unknown["scope"] = "voice".into();
+        unknown["include_text"] = true.into();
+        assert!(decode(&wire(unknown)).is_err());
     }
     #[test]
     fn connection_and_intent_fields_cannot_be_omitted_zero_or_exhausted() {
