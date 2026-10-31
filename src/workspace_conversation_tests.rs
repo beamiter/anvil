@@ -89,7 +89,9 @@ fn user_capsules_follow_reading_edge_and_wrap_in_narrow_windows() {
             "user messages must not impose their old fixed width"
         );
         for (index, row) in rows.iter().enumerate() {
-            let rectangle = row.compute_bounds(&document).expect("native message bounds");
+            let rectangle = row
+                .compute_bounds(&document)
+                .expect("native message bounds");
             assert!(rectangle.x().abs() <= 1.0, "shared reading edge");
             assert!(
                 rectangle.x() + rectangle.width() <= document.width() as f32 + 1.0,
