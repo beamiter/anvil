@@ -1,0 +1,79 @@
+name: Baseline native lifecycle probe
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  baseline-lifecycle:
+    name: Unmodified baseline lifecycle frames
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out immutable baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 3ad5fb285778918ae414efd4f3e6b940251f1374
+          persist-credentials: false
+
+      - name: Verify baseline identity
+        run: |
+          git rev-parse HEAD
+          test "$(git rev-parse HEAD)" = 3ad5fb285778918ae414efd4f3e6b940251f1374
+
+      - name: Materialize bundled shared core
+        run: bash scripts/materialize-shared-core.sh
+
+      - name: Install GTK, VTE, and isolated display
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            pkg-config libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev \
+            dbus-x11 xauth xvfb fonts-dejavu-core
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo data
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-ui-baseline-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-ui-layout-
+            ${{ runner.os }}-cargo-
+
+      - name: Compile baseline application tests
+        run: cargo test --locked --bin anvil --no-run
+
+      - name: Check unmodified lifecycle frame test
+        env:
+          GDK_BACKEND: x11
+          GSK_RENDERER: cairo
+          GTK_A11Y: none
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          set -euo pipefail
+          test_name=block_view::chat::tests::chat_completion_never_expands_between_shell_markers
+          listed_tests="$(cargo test --locked --bin anvil -- --list --include-ignored)"
+          grep -Fx "${test_name}: test" <<< "$listed_tests"
+          dbus-run-session -- xvfb-run --auto-servernum \
+            cargo test --locked --bin anvil "$test_name" \
+            -- --exact --include-ignored --test-threads=1 --nocapture
