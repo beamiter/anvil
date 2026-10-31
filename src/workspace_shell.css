@@ -52,7 +52,7 @@
 .workspace-center .chat-mode .block-list { padding:16px 28px 8px; }
 .workspace-center .chat-turn { padding:8px 0; margin:0; }
 .workspace-center .chat-result-card { border-radius:0; background:transparent; outline:none; box-shadow:none; padding:8px 12px 16px; }
-.workspace-center .chat-command-capsule { background:#d9e4fa; border-radius:12px; padding:10px 14px; }
+.workspace-center .chat-command-capsule { background:#d9e4fa; border-radius:12px; padding:8px 12px; }
 .workspace-center .chat-context .chat-meta-chip { font-size:9px; border-radius:5px; padding:2px 6px; background:#edf1fb; color:#6d7893; }
 .workspace-center .chat-composer { margin:4px 28px 11px; padding:8px 10px 1px; border-radius:14px; background:#fefefe; outline:1px solid #bdcce4; outline-offset:-1px; box-shadow:0 4px 12px rgba(57,80,135,0.08); }
 .workspace-center .chat-controls { background:transparent; min-height:28px; padding:0 0 0 2px; border-radius:0 0 12px 12px; }

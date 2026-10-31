@@ -76,8 +76,12 @@ fn chat_bubbles_keep_alignment_through_resize_and_font_changes() {
             let bounds = command.compute_bounds(&content).unwrap();
             let content_width = content.width() as f32;
             assert!(
-                (bounds.x() + bounds.width() - content_width).abs() <= 1.0,
-                "command must meet the right edge at {width}: {bounds:?}, content={content_width}"
+                bounds.x().abs() <= 1.0,
+                "command must meet the reading edge at {width}: {bounds:?}, content={content_width}"
+            );
+            assert!(
+                bounds.x() + bounds.width() <= content_width + 1.0,
+                "wrapped commands must stay inside the viewport at {width}: {bounds:?}"
             );
             if i == 0 {
                 assert!(

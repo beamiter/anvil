@@ -169,7 +169,9 @@ pub(super) fn fit(row: &CommandRow, terminal: &Terminal, columns: i64, command: 
     row.imp().terminal.set(Some(terminal));
     row.imp().columns.set(columns.max(2));
     *row.imp().command.borrow_mut() = command.to_owned();
-    row.set_halign(gtk::Align::End);
+    // Keep short commands content-sized on the same reading edge as output.
+    // Long commands still consume the available width and reflow natively.
+    row.set_halign(gtk::Align::Start);
     row.set_hexpand(false);
     row.set_overflow(gtk::Overflow::Hidden);
     terminal.set_hexpand(false);

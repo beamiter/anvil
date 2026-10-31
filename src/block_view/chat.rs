@@ -10,26 +10,24 @@ use vte4::{Terminal, TerminalExt};
 
 pub(super) const CONTROLS_HEIGHT: i32 = 28;
 
-/// Keep room for the companion while letting wrapped input and completion
-/// menus grow through the same shell-owned measurements as Block mode.
-pub(super) fn composer_rows(input: i64, drawn: i64, viewport: i64) -> i64 {
-    input.max(drawn).clamp(1, viewport.max(1))
-}
-
-/// Rows the Block composer always keeps when idle: a prompt plus one command
-/// line leaves no visible room to type into, so the editor reserves four full
-/// lines of text (fewer only when the whole pane is shorter than that).
+/// Three usable input rows plus one row of breathing room. Both layouts use
+/// the native cell height, so the floor follows font zoom instead of relying
+/// on a fixed pixel height in the surrounding chrome.
 pub(super) const BLOCK_INPUT_MIN_ROWS: i64 = 4;
 
-/// Block's docked input: the same shell-owned growth as [`composer_rows`],
-/// with a blank row below the content, never below [`BLOCK_INPUT_MIN_ROWS`].
-/// Chat keeps its one-row composer.
-pub(super) fn block_composer_rows(input: i64, drawn: i64, viewport: i64) -> i64 {
+/// Keep a blank row below shell-owned input or completion content, bounded by
+/// the real pane budget so a short split can still shrink below the floor.
+pub(super) fn composer_rows(input: i64, drawn: i64, viewport: i64) -> i64 {
     let viewport = viewport.max(1);
     input
         .max(drawn)
         .saturating_add(1)
         .clamp(BLOCK_INPUT_MIN_ROWS.min(viewport), viewport)
+}
+
+/// Block and Chat keep the same editable room through layout switches.
+pub(super) fn block_composer_rows(input: i64, drawn: i64, viewport: i64) -> i64 {
+    composer_rows(input, drawn, viewport)
 }
 
 /// Read the lifecycle owner's *current* state. In particular, an OSC marker
@@ -676,9 +674,20 @@ mod tests {
         // A pane shorter than the floor never asks for more than it has.
         assert_eq!(block_composer_rows(1, 1, 2), 2);
         assert_eq!(block_composer_rows(1, 1, 0), 1);
-        // Chat's companion composer is unchanged.
-        assert_eq!(composer_rows(1, 1, 30), 1);
-        assert_eq!(composer_rows(1, 2, 30), 2);
+        // Chat retains exactly the same room when the user changes layouts.
+        for (input, drawn, viewport, expected) in [
+            (1, 1, 30, 4),
+            (1, 2, 30, 4),
+            (4, 1, 30, 5),
+            (1, 12, 30, 13),
+            (1, 100, 30, 30),
+            (1, 1, 2, 2),
+            (1, 1, 0, 1),
+            (i64::MAX, 1, 30, 30),
+        ] {
+            assert_eq!(composer_rows(input, drawn, viewport), expected);
+            assert_eq!(block_composer_rows(input, drawn, viewport), expected);
+        }
     }
 
     #[test]

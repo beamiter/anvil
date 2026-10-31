@@ -57,6 +57,7 @@ tests=(
     workspace_shell::panel_tests::session_context_private_transition_clears_copy_source_and_restores_public_state
     workspace_shell::panel_tests::task_overview_renders_observed_evidence_and_attention_state
     block_view::chat_layout_tests::chat_bubbles_keep_alignment_through_resize_and_font_changes
+    workspace_conversation::tests::user_capsules_follow_reading_edge_and_wrap_in_narrow_windows
     sidebar::layout_tests::sidebar_resize_and_vertical_scroll_keep_the_leading_edge_visible
     block_view::chat::tests::chat_completion_never_expands_between_shell_markers
     block_view::scroll::canvas_native_tests::capped_output_hands_remaining_pixels_to_retained_canvas

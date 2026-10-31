@@ -47,6 +47,82 @@ fn center(rect: &gtk::graphene::Rect) -> f32 {
 }
 
 #[test]
+#[ignore = "requires isolated DISPLAY; native user messages and production CSS"]
+fn user_capsules_follow_reading_edge_and_wrap_in_narrow_windows() {
+    gtk::init().expect("GTK display");
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(include_str!("workspace_shell.css"));
+    gtk::style_context_add_provider_for_display(
+        &gtk::gdk::Display::default().expect("display"),
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+    let document = gtk::Box::new(gtk::Orientation::Vertical, 11);
+    document.add_css_class("native-conversation");
+    let values = ["pwd".to_owned(), "LongToken界面".repeat(80)];
+    let mut rows = Vec::new();
+    for value in &values {
+        let mut message = jterm_core::reference_conversation::acceptance_fixture()
+            .messages
+            .into_iter()
+            .find(|message| message.role == Role::User)
+            .expect("fixture user message");
+        message.parts = vec![Part::Paragraph(value.clone())];
+        let row = message_view(&message);
+        document.append(&row);
+        rows.push(row);
+    }
+    let scroll = gtk::ScrolledWindow::new();
+    scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    scroll.set_child(Some(&document));
+    let window = gtk::Window::builder()
+        .default_width(900)
+        .default_height(480)
+        .child(&scroll)
+        .build();
+    window.present();
+    for width in [900, 320, 640] {
+        window.set_default_size(width, 480);
+        settle();
+        assert!(
+            window.width() <= width + 1,
+            "user messages must not impose their old fixed width"
+        );
+        for (index, row) in rows.iter().enumerate() {
+            let rectangle = row.compute_bounds(&document).expect("native message bounds");
+            assert!(rectangle.x().abs() <= 1.0, "shared reading edge");
+            assert!(
+                rectangle.x() + rectangle.width() <= document.width() as f32 + 1.0,
+                "the complete message, including avatar, stays inside the pane"
+            );
+            let body = find(row.upcast_ref(), "conversation-user-bubble");
+            let label = find(&body, "conversation-paragraph")
+                .downcast::<gtk::Label>()
+                .unwrap();
+            assert_eq!(label.text().as_str(), values[index].as_str());
+            assert!(
+                !label.layout().is_ellipsized(),
+                "messages wrap without truncation"
+            );
+            let (_, logical) = label.layout().pixel_extents();
+            assert!(
+                logical.height() <= label.height(),
+                "all wrapped lines remain visible"
+            );
+            if index == 0 {
+                assert!(
+                    body.width() < document.width() / 2,
+                    "short messages retain a compact content-sized capsule"
+                );
+            } else {
+                assert!(label.layout().line_count() > 1, "long tokens and CJK wrap");
+            }
+        }
+    }
+    window.close();
+}
+
+#[test]
 #[ignore = "requires isolated DISPLAY; actual Current Step component and production CSS"]
 fn current_step_centers_bounded_text_without_growing_the_inspector() {
     gtk::init().expect("GTK display");

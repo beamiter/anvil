@@ -190,7 +190,7 @@ fn message_view(message: &Message) -> gtk::Box {
     row.add_css_class("conversation-message");
     let user = message.role == Role::User;
     row.set_halign(if user {
-        gtk::Align::End
+        gtk::Align::Start
     } else {
         gtk::Align::Fill
     });
@@ -205,8 +205,6 @@ fn message_view(message: &Message) -> gtk::Box {
     body.set_hexpand(!user);
     if user {
         body.add_css_class("conversation-user-bubble");
-        body.set_width_request(jterm_core::reference_shell::USER_BUBBLE_WIDTH as i32);
-        body.set_height_request(jterm_core::reference_shell::USER_BUBBLE_HEIGHT as i32);
     } else {
         row.set_margin_top(10);
         avatar.set_margin_start(8);
@@ -224,6 +222,9 @@ fn message_view(message: &Message) -> gtk::Box {
             Part::Paragraph(value) => {
                 let paragraph = paragraph(value, "conversation-paragraph");
                 if user {
+                    // A natural-width capsule can shrink inside a narrow
+                    // split; long words and CJK still wrap without truncation.
+                    paragraph.set_width_chars(1);
                     paragraph.set_max_width_chars(44);
                 }
                 body.append(&paragraph);

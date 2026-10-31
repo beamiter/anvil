@@ -956,9 +956,9 @@ fn block_css(config: &Config) -> String {
             outline-offset: -1px;
         }}
         .chat-command-capsule {{
-            margin: 0 0 10px 36px;
-            padding: 10px 16px;
-            border-radius: 18px 18px 5px 18px;
+            margin: 0 0 8px;
+            padding: 8px 12px;
+            border-radius: 12px;
             background-color: rgba({acc_r},{acc_g},{acc_b},0.24);
         }}
         .chat-command-terminal {{ background-color: transparent; }}
@@ -1612,12 +1612,12 @@ mod tests {
         let css = block_css(&Config::safe_defaults());
         let command = rule_body(&css, ".chat-command-capsule");
         let result = rule_body(&css, ".chat-result-card");
-        assert!(command.contains("border-radius: 18px 18px 5px 18px;"));
+        assert!(command.contains("border-radius: 12px;"));
         assert!(result.contains("border-radius: 18px 18px 18px 5px;"));
         assert!(result.contains("background-color: rgba("));
         assert!(rule_body(&css, ".chat-composer").contains("border-radius: 18px;"));
-        assert!(command.contains("padding: 10px 16px;"));
-        assert!(command.contains("margin: 0 0 10px 36px;"));
+        assert!(command.contains("padding: 8px 12px;"));
+        assert!(command.contains("margin: 0 0 8px;"));
         assert!(result.contains("padding: 8px 12px 12px;"));
     }
 

@@ -5027,7 +5027,6 @@ impl FinishedBlock {
         if chat {
             super::command_row::fit(&cmd_row, &command_vte, command_cols, cmd);
             cmd_row.add_css_class("chat-command-capsule");
-            cmd_row.set_halign(gtk::Align::End);
             cmd_row.set_hexpand(false);
         }
 
