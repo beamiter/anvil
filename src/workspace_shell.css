@@ -416,3 +416,9 @@ window.anvil-font-sync,window.anvil-font-sync decoration { padding:0; margin:0; 
 .workspace-inspector .reference-agent-actions { margin:10px 13px 0; }
 .workspace-inspector .reference-agent-actions button { min-height:28px; border-radius:8px; }
 .workspace-inspector .reference-agent-actions button label { font-family:"DejaVu Sans",sans-serif; font-size:10px; font-weight:400; }
+
+/* Eva is a native toolbar control, with its own allocated hit area. */
+menubutton.eva-companion-dock > button { min-height:26px; min-width:36px; padding:0 8px; border:1px solid #344864; border-radius:6px; background:#19283c; color:#d5deec; box-shadow:none; }
+menubutton.eva-companion-dock > button:hover, menubutton.eva-companion-dock > button:checked { background:#283d6f; color:#eff4ff; }
+menubutton.eva-companion-dock label { color:inherit; font-size:11px; }
+.eva-companion-card { padding:8px; }

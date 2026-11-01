@@ -62,6 +62,7 @@ struct State {
     last_exclusions: Vec<Rect>,
     compact: bool,
     high_contrast: bool,
+    on_light: bool,
     frame: Option<atlas::Frame>,
     full_markup: String,
     compact_markup: String,
@@ -178,6 +179,7 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
         return;
     }
     let body = gtk::Label::new(None);
+    body.add_css_class("eva-companion-body");
     body.set_halign(gtk::Align::Start);
     body.set_valign(gtk::Align::Start);
     body.set_margin_top(0);
@@ -248,6 +250,7 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
         last_exclusions: Vec::new(),
         compact: false,
         high_contrast: false,
+        on_light: false,
         frame: None,
         full_markup: String::new(),
         compact_markup: String::new(),
@@ -301,11 +304,13 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
     // A plain, keyboard-accessible menu is not a second living avatar.
     let menu = gtk::MenuButton::builder()
         .label("Eva")
-        .halign(gtk::Align::End)
-        .valign(gtk::Align::Start)
-        .margin_end(24)
+        .valign(gtk::Align::Center)
         .build();
+    menu.add_css_class("eva-companion-dock");
+    menu.set_tooltip_text(Some("Open Eva companion"));
     let pop = gtk::Popover::new();
+    pop.add_css_class("eva-companion-popover");
+    pop.add_css_class("forge-popup");
     let controls = gtk::Box::new(gtk::Orientation::Vertical, 6);
     controls.add_css_class("eva-companion-card");
     let status = gtk::Label::new(Some("Eva connecting — shared body hidden"));
@@ -533,8 +538,39 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
     scroll.set_child(Some(&controls));
     pop.set_child(Some(&scroll));
     menu.set_popover(Some(&pop));
-    overlay.add_overlay(&menu);
-    overlay.set_measure_overlay(&menu, false);
+    // Participate in the real toolbar allocation. An overlay at the window's
+    // top-right covered mode/settings controls and inherited no chrome colors.
+    if let Some(toolbar) = companion_toolbar(window.upcast_ref()) {
+        toolbar.append(&menu);
+    } else {
+        menu.set_halign(gtk::Align::End);
+        menu.set_valign(gtk::Align::Start);
+        menu.set_margin_top(48);
+        menu.set_margin_end(16);
+        overlay.add_overlay(&menu);
+        overlay.set_measure_overlay(&menu, false);
+        // Both frontends assemble their final window tree after install().
+        // Reparent before ordinary interaction once that native toolbar exists.
+        let weak_window = window.downgrade();
+        let weak_overlay = overlay.downgrade();
+        let weak_menu = menu.downgrade();
+        gtk::glib::idle_add_local_once(move || {
+            let (Some(window), Some(overlay), Some(menu)) = (
+                weak_window.upgrade(),
+                weak_overlay.upgrade(),
+                weak_menu.upgrade(),
+            ) else {
+                return;
+            };
+            if let Some(toolbar) = companion_toolbar(window.upcast_ref()) {
+                overlay.remove_overlay(&menu);
+                menu.set_margin_top(0);
+                menu.set_margin_end(0);
+                menu.set_valign(gtk::Align::Center);
+                toolbar.append(&menu);
+            }
+        });
+    }
     let close_bar = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     close_bar.set_halign(gtk::Align::Center);
     close_bar.set_valign(gtk::Align::Start);
@@ -1001,7 +1037,7 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
             s.started = now;
             s.next = Some(now);
         }
-        let paint_changed = changed || s.frame.is_none() || s.next.is_some_and(|t| now >= t);
+        let mut paint_changed = changed || s.frame.is_none() || s.next.is_some_and(|t| now >= t);
         if paint_changed {
             let mut request = atlas::Request::new(s.skin, known_pose);
             request.motion = s.motion;
@@ -1009,8 +1045,16 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
             request.reduced_motion =
                 gtk::Settings::default().is_some_and(|v| !v.is_gtk_enable_animations());
             let frame = atlas::sample(request).expect("visible native frame request");
-            let full = markup(&frame, s.skin, s.high_contrast);
-            let [r, g, b] = s.skin.palette(s.high_contrast).color(atlas::Ink::Outline);
+            let full = if s.on_light {
+                crate::eva_companion_paint::markup_on_surface(&frame, s.skin, s.high_contrast, true)
+            } else {
+                markup(&frame, s.skin, s.high_contrast)
+            };
+            let [r, g, b] = crate::eva_companion_paint::surface_color(
+                s.skin.palette(s.high_contrast).color(atlas::Ink::Outline),
+                s.high_contrast,
+                s.on_light,
+            );
             let compact=format!("<span font_family=\"monospace\" size=\"9000\" foreground=\"#{r:02x}{g:02x}{b:02x}\">{}</span>",gtk::glib::markup_escape_text(s.skin.original_sketch()));
             if full != s.full_markup {
                 full_layout.set_markup(&full);
@@ -1081,6 +1125,27 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
             },
             false,
         ));
+        let on_light = safe && light_surface(overlay.upcast_ref(), &overlay, candidate);
+        if on_light != s.on_light {
+            s.on_light = on_light;
+            if let Some(frame) = s.frame.as_ref() {
+                s.full_markup = crate::eva_companion_paint::markup_on_surface(
+                    frame,
+                    s.skin,
+                    s.high_contrast,
+                    on_light,
+                );
+                let [r, g, b] = crate::eva_companion_paint::surface_color(
+                    s.skin.palette(s.high_contrast).color(atlas::Ink::Outline),
+                    s.high_contrast,
+                    on_light,
+                );
+                s.compact_markup = format!("<span font_family=\"monospace\" size=\"9000\" foreground=\"#{r:02x}{g:02x}{b:02x}\">{}</span>", gtk::glib::markup_escape_text(s.skin.original_sketch()));
+                full_layout.set_markup(&s.full_markup);
+                compact_layout.set_markup(&s.compact_markup);
+                paint_changed = true;
+            }
+        }
         let layout = (
             size.0,
             size.1,
@@ -1268,6 +1333,9 @@ fn protections(root: &gtk::Widget, overlay: &gtk::Overlay) -> (bool, Vec<Rect>) 
         if !w.is_mapped() {
             continue;
         }
+        if w.has_css_class("eva-companion-body") {
+            continue;
+        }
         blocked |= w.has_css_class("eva-remote-surface")
             || w.has_css_class("block-selection-active")
             || w.has_css_class("block-alt-screen")
@@ -1276,7 +1344,22 @@ fn protections(root: &gtk::Widget, overlay: &gtk::Overlay) -> (bool, Vec<Rect>) 
         if let Some(vte) = w.downcast_ref::<vte4::Terminal>() {
             blocked |= vte.has_selection();
         }
-        if w.is::<gtk::Entry>()
+        let chrome = [
+            "reference-inspector",
+            "workspace-inspector",
+            "reference-navigation",
+            "workspace-navigation",
+            "reference-rail",
+            "workspace-rail",
+            "reference-toolbar",
+            "workspace-titlebar",
+        ]
+        .iter()
+        .any(|class| w.has_css_class(class));
+        if chrome
+            || w.is::<vte4::Terminal>()
+            || w.is::<gtk::Label>()
+            || w.is::<gtk::Entry>()
             || w.is::<gtk::TextView>()
             || w.is::<gtk::Button>()
             || w.is::<gtk::Scrollbar>()
@@ -1292,6 +1375,9 @@ fn protections(root: &gtk::Widget, overlay: &gtk::Overlay) -> (bool, Vec<Rect>) 
                 }
             }
         }
+        if chrome || w.is::<vte4::Terminal>() {
+            continue;
+        }
         let mut child = w.first_child();
         while let Some(c) = child {
             child = c.next_sibling();
@@ -1302,6 +1388,52 @@ fn protections(root: &gtk::Widget, overlay: &gtk::Overlay) -> (bool, Vec<Rect>) 
         }
     }
     (blocked, exclusions)
+}
+
+fn companion_toolbar(root: &gtk::Widget) -> Option<gtk::Box> {
+    let mut pending = vec![root.clone()];
+    while let Some(widget) = pending.pop() {
+        if widget.has_css_class("reference-toolbar") || widget.has_css_class("workspace-titlebar") {
+            if let Ok(toolbar) = widget.clone().downcast::<gtk::Box>() {
+                return Some(toolbar);
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            child = current.next_sibling();
+            pending.push(current);
+        }
+    }
+    None
+}
+
+fn light_surface(root: &gtk::Widget, overlay: &gtk::Overlay, body: Rect) -> bool {
+    let mut pending = vec![root.clone()];
+    while let Some(widget) = pending.pop() {
+        if !widget.is_mapped() {
+            continue;
+        }
+        if widget.has_css_class("chat-mode") || widget.has_css_class("term-chat-root") {
+            if let Some(r) = widget.compute_bounds(overlay) {
+                if (Rect {
+                    x: r.x() as f64,
+                    y: r.y() as f64,
+                    width: r.width() as f64,
+                    height: r.height() as f64,
+                })
+                .contains(body)
+                {
+                    return true;
+                }
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            child = current.next_sibling();
+            pending.push(current);
+        }
+    }
+    false
 }
 
 fn task_status(value: jterm_core::agent_task::TaskStatus) -> host::TaskStatus {
@@ -1353,6 +1485,40 @@ mod tests {
         .is_none());
         assert!(safe_edge((220, 240), &[], (280, 264), (100, 72)).unwrap().1);
         assert!(!safe_edge((800, 600), &[], (280, 264), (100, 72)).unwrap().1);
+    }
+    #[test]
+    fn companion_uses_canvas_gap_without_covering_inspector_or_output() {
+        let exclusions = [
+            Rect {
+                x: 0.,
+                y: 0.,
+                width: 300.,
+                height: 1000.,
+            },
+            Rect {
+                x: 1360.,
+                y: 0.,
+                width: 312.,
+                height: 1000.,
+            },
+            Rect {
+                x: 300.,
+                y: 0.,
+                width: 1060.,
+                height: 220.,
+            },
+            Rect {
+                x: 300.,
+                y: 840.,
+                width: 1060.,
+                height: 160.,
+            },
+        ];
+        let (body, compact) = safe_edge((1672, 1000), &exclusions, (240, 242), (120, 121)).unwrap();
+        assert!(!compact);
+        assert!(body.x >= 300. && body.y >= 220.);
+        assert!(body.x + body.width <= 1360. && body.y + body.height <= 840.);
+        assert!(exclusions.iter().all(|r| !r.overlaps(body)));
     }
     #[test]
     fn only_actual_receipts_map_to_success() {
@@ -1412,11 +1578,21 @@ fn safe_edge(
         (full.0 as f64, full.1 as f64, false),
         (compact_size.0 as f64, compact_size.1 as f64, true),
     ] {
-        for (x, y) in [
-            (viewport.width - width - 24., viewport.height - height - 86.),
-            (viewport.width - width - 24., 80.),
-            (24., viewport.height - height - 86.),
-        ] {
+        let mut xs = vec![24., viewport.width - width - 24.];
+        let mut ys = vec![80., viewport.height - height - 86.];
+        for exclusion in exclusions {
+            xs.extend([
+                exclusion.x - width - 12.,
+                exclusion.x + exclusion.width + 12.,
+            ]);
+            ys.extend([
+                exclusion.y - height - 12.,
+                exclusion.y + exclusion.height + 12.,
+            ]);
+        }
+        xs.sort_by(|a, b| b.total_cmp(a));
+        ys.sort_by(|a, b| b.total_cmp(a));
+        for (x, y) in ys.iter().flat_map(|y| xs.iter().map(move |x| (*x, *y))) {
             let r = Rect {
                 x,
                 y,
