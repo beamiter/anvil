@@ -2,8 +2,9 @@
 """Run actual AppModel pane transitions against deterministic widget boundaries.
 
 No GTK/PTY or model services are launched. Rust methods are extracted unchanged
-from workspace_ops.rs; the geometry selector is loaded from the locked core
-dependency. Only external controllers/tree operations are stubbed.
+from workspace_ops.rs and agent_workspace_ui.rs; the geometry selector is loaded
+from the locked core dependency. Only external controllers/tree operations are
+stubbed, including process retention and central-surface widget boundaries.
 """
 from pathlib import Path
 import json
@@ -49,7 +50,10 @@ def main():
         assert split.index('begin_search_pane_transition') < split.index('slot.replace_with_split')
         assert split.index('tab.active_pane =') < split.index('finish_search_pane_transition')
         assert split.index('finish_search_pane_transition') < split.index('.emit(VteInput::GrabFocus)')
-    fixture = fixture.replace('// @methods' , '\n'.join(item(source, marker) for marker in methods))
+    workspace_ui = (ROOT / 'src/agent_workspace_ui.rs').read_text()
+    extracted = '\n'.join(item(source, marker) for marker in methods)
+    extracted += '\n' + item(workspace_ui, 'pub(crate) fn show_terminal_workspace(')
+    fixture = fixture.replace('// @methods', extracted)
     fixture = fixture.replace('// @index', item(source, 'fn active_index_after_remove(') + '\n' + item(source, 'fn tab_selection_after_close('))
     fixture = fixture.replace('// @changed', item((ROOT / 'src/search.rs').read_text(), 'pub(crate) fn active_pane_changed('))
     with tempfile.TemporaryDirectory(prefix='workspace-search-') as d:
