@@ -273,6 +273,7 @@ pub(crate) fn spawn_shell(
     // The integration marker and cwd-authentication token must be encoded in
     // the host wrapper as well as VTE's environment. The shell integration
     // immediately removes the token from its exported environment.
+    let argv_vec = crate::agent_cli::inline_argv(&argv_vec);
     let vim_environment = if env_extra.is_empty() {
         crate::vim9_ide::shell_environment(argv_owned, auto_gui)
     } else {
@@ -312,6 +313,7 @@ pub(crate) fn spawn_shell(
             return;
         }
     };
+    let envv_owned = crate::agent_cli::vte_environment(envv_owned);
     let envv: Vec<&str> = envv_owned.iter().map(String::as_str).collect();
     let spawn_working_directory = if crate::host::is_flatpak() {
         None

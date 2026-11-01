@@ -891,6 +891,7 @@ impl OwnedPty {
         enable_shell_token: bool,
     ) -> io::Result<Self> {
         let argv_owned: Vec<String> = argv.iter().map(|value| (*value).to_string()).collect();
+        let argv_owned = crate::agent_cli::inline_argv(&argv_owned);
         let host_bridge = crate::host::is_flatpak();
         let sanitized_extra: Vec<(&str, &str)> = env_extra
             .iter()
@@ -955,8 +956,10 @@ impl OwnedPty {
         let bridged_extra: &[(&str, &str)] = if host_bridge { &[] } else { &sanitized_extra };
         // Strict frozen variant: the block comes from the launch-time snapshot
         // `main` captured, never from the live GTK-mutated process environment.
-        let mut c_environment =
-            child_env::envp_from_captured(&child_environment_options(), bridged_extra)?;
+        let mut c_environment = crate::agent_cli::environment(child_env::envp_from_captured(
+            &child_environment_options(),
+            bridged_extra,
+        )?);
         let token_channel = if host_bridge || !enable_shell_token {
             None
         } else {
