@@ -3743,7 +3743,7 @@ mod tests {
             .split("SettingsMsg::SyncAsciiOrganism { enabled, motion } => {")
             .nth(1)
             .unwrap()
-            .split("SettingsMsg::AsciiOrganism(enabled)")
+            .split("\n            SettingsMsg::")
             .next()
             .unwrap();
         assert!(sync.contains("self.values.ascii_organism_enabled = enabled"));
