@@ -1,6 +1,6 @@
 # Shared Eva native integration
 
-Opt in in Settings → Shared Eva Companion (restart required), or set the root TOML key `eva_companion_enabled = true`. `EVA_COMPANION_MODE=shared` also explicitly opts in. Mode is frozen for this GUI lifetime; turning the setting off requires restart, not an unsafe live fallback. The profile daemon must already be running in the same local graphical session; `EVA_COMPANION_SOCKET` can identify its Unix socket. Disabled is the release default. In shared mode legacy Block and VTE bodies are disabled **even if the daemon cannot connect**. Restart without this environment variable to explicitly choose the legacy local implementation; disconnect is never a mode switch.
+Shared Eva is enabled by default. JWM starts or reuses `jcompaniond` for the same local graphical session; terminals only connect. Set `eva_companion_enabled = false` and restart the window to disable it. Explicit saved values remain authoritative. The mode is fixed for each window lifetime, and a missing coordinator never revives the legacy organism. `EVA_COMPANION_SOCKET` selects an externally managed socket; JWM does not auto-start a coordinator for that override.
 
 One `SharedHost` belongs to the window, not to its panes, replies, tasks or history. The native overlay is non-measuring and pointer-transparent. It neither writes a PTY nor alters CanvasMotion, scrollback, document heights, sidebar tabs or focus. The keyboard-accessible **Eva** menu offers Follow me / Stay here / Hide / Recall, all eight atlas skins and Full / Calm / Static motion. The menu is text only, not a second animated preview. Appearance changes go to the coordinator; the renderer uses its authoritative appearance reply. Desktop reduced motion wins over animation choice. Anvil starts gently static until the authoritative profile arrives.
 
@@ -47,8 +47,9 @@ commit `9aa569540091524d637a7115b64c587b9177a55b` (protocol 1).
 Release manifests and Cargo.lock use immutable Git sources; Cargo acquires them
 for source builds without an unversioned sibling companion checkout. Use
 `cargo build --locked` and preserve existing user configuration during upgrades.
-Coordinator installation and opt-in startup are documented in jcompanion's
-`docs/deployment.md`; native application installation does not silently enable it.
+Coordinator installation and JWM session startup are documented in jcompanion's
+`docs/deployment.md`; JWM owns the coordinator process, and frontend installation
+does not create a separate coordinator or service.
 Focused render/unit fixtures are not physical display, voice, or live API acceptance.
 
 Shared terminal core is pinned to `beamiter/jterm_core` commit `974ccad203375032fe87706caecab39ad516c238`; normal and dev/fixture dependency identities are aligned.

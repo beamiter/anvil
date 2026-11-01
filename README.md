@@ -1,5 +1,7 @@
 # anvil
 
+新版 Shared Eva 默认启用，由 JWM 随图形会话启动共享协调器。四端只连接同一协调器；设置 `eva_companion_enabled = false` 并重启窗口可关闭。旧本地 Organism 仅在显式关闭 Shared Eva 后使用。
+
 anvil is an experimental Linux terminal emulator built with Rust, GTK 4,
 libadwaita, Relm4, and VTE. It can behave like a conventional VTE terminal or
 turn completed commands into navigable blocks with their command, output, exit

@@ -2172,7 +2172,7 @@ fn resolve_file_config(fc: FileConfig) -> (Config, Vec<Theme>, KeybindingMap) {
     let sidebar_visible = resolve_sidebar_visibility(fc.sidebar_visible, tab_placement);
     let sidebar_width = fc.sidebar_width.unwrap_or(237).clamp(120, 800);
     let tab_width = fc.tab_width.unwrap_or(180).clamp(80, 480);
-    let eva_companion_enabled = fc.eva_companion_enabled.unwrap_or(false);
+    let eva_companion_enabled = fc.eva_companion_enabled.unwrap_or(true);
     let ascii_organism_enabled = env_bool("ANVIL_ASCII_ORGANISM_ENABLED")
         .or(fc.ascii_organism_enabled)
         .unwrap_or(true);
@@ -2431,6 +2431,17 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_eva_defaults_on_and_respects_explicit_disable() {
+        assert!(super::load_config_from_table(None).0.eva_companion_enabled);
+        let table: toml::Table = toml::from_str("eva_companion_enabled = false").unwrap();
+        assert!(
+            !super::load_config_from_table(Some(&table))
+                .0
+                .eva_companion_enabled
+        );
+    }
 
     #[test]
     fn vim9_settings_load_independently_from_terminal_and_workbench_defaults() {
