@@ -603,7 +603,8 @@ impl AppModel {
         // a restored panel stays visible and explains provider errors in
         // place instead of silently changing the saved preference.
         self.set_ai_panel_visible(true, true);
-        self.shell.show_inspector_live();
+        self.tasks_panel_visible.set(false);
+        self.sync_side_panel();
         let client = match ai::client_from_config(&self.config.borrow()) {
             Ok(client) => client,
             Err(error) => {
@@ -631,9 +632,14 @@ impl AppModel {
     pub(crate) fn sync_side_panel(&self) {
         let tasks = self.tasks_panel_visible.get();
         let chats = self.ai_panel_visible.get();
-        self.side_stack.set_visible(tasks || chats);
-        self.side_stack
-            .set_visible_child_name(if tasks { "tasks" } else { "chats" });
+        self.side_stack.set_visible(false);
+        self.workspace_stack.set_visible_child_name(if tasks {
+            "tasks"
+        } else if chats {
+            "chats"
+        } else {
+            "terminal"
+        });
     }
 
     pub(crate) fn set_ai_panel_visible(&self, visible: bool, persist: bool) {

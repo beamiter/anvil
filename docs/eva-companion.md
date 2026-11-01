@@ -52,5 +52,5 @@ Coordinator installation and JWM session startup are documented in jcompanion's
 does not create a separate coordinator or service.
 Focused render/unit fixtures are not physical display, voice, or live API acceptance.
 
-Shared terminal core is pinned to `beamiter/jterm_core` commit `974ccad203375032fe87706caecab39ad516c238`; normal and dev/fixture dependency identities are aligned.
+Shared terminal core is pinned to `beamiter/jterm_core` commit `589a26658f548ec96ff60a53ea65804901ed5c7b`; normal and dev/fixture dependency identities are aligned.
 Nix Git-source NAR hashes are derived from the exact published source trees; Flatpak Cargo source manifests were regenerated with the repository's checksum-pinned generator. Full Nix/Flatpak sandbox builds were not executed in this environment and are not certified by Cargo checks.

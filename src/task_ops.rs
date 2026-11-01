@@ -111,6 +111,7 @@ fn task_action_allowed(enabled: bool, action: &TaskPanelAction) -> bool {
             action,
             TaskPanelAction::Select(_)
                 | TaskPanelAction::Close
+                | TaskPanelAction::LoadNativeHistory(_, _)
                 | TaskPanelAction::StopCodex(_)
                 | TaskPanelAction::FinishCodex(_)
                 | TaskPanelAction::Deny(_, _)
@@ -209,13 +210,11 @@ impl AppModel {
             );
             return;
         }
-        let visible = !self.tasks_panel_visible.get()
-            || !self.shell.inspector_is_shown()
-            || !self.shell.inspector_live_is_selected();
+        let visible = self.workspace_stack.visible_child_name().as_deref() != Some("tasks");
         self.tasks_panel_visible.set(visible);
         self.sync_side_panel();
         if visible {
-            self.shell.show_inspector_live();
+            self.workspace_stack.set_visible_child_name("tasks");
             // Opening the panel (for example from the attention badge) shows
             // the ordinary views, never a hidden-tasks list left from before.
             self.tasks_panel.emit(TasksPanelMsg::LeaveHidden);
@@ -429,6 +428,12 @@ impl AppModel {
                 self.tasks_panel_visible.set(false);
                 self.sync_side_panel();
             }
+            TaskPanelAction::LoadNativeHistory(task_id, reset) => {
+                let result = self.agent_runtime.load_native_history(task_id, reset);
+                if let Err(error) = result {
+                    self.show_toast(format!("Could not load provider history: {error}"));
+                }
+            }
             TaskPanelAction::StartNative(task_id) => {
                 let Some(provider) = self.task_manager.get(task_id).map(|task| task.provider)
                 else {
@@ -492,7 +497,7 @@ impl AppModel {
                 let policy = self.task_prompt_policy();
                 let result = self
                     .agent_runtime
-                    .prompt_codex(&self.task_manager, request.task_id, &request.text, policy)
+                    .prompt_native(&self.task_manager, request.task_id, &request.text, policy)
                     .map_err(|error| error.to_string());
                 match &result {
                     Ok(()) => self.show_toast(format!(
@@ -1190,7 +1195,7 @@ impl AppModel {
         let create_hint = if self.pending_task_creation.is_some() {
             "Creating the isolated task worktree…".to_string()
         } else if !native_ai_enabled {
-            "Native Agents need AI enabled plus command-context sharing consent (config: ai_enabled, ai_share_command_context)"
+            "Enable AI and command-context sharing in Settings to start a native Agent. Existing terminal sessions remain available."
                 .to_string()
         } else {
             String::new()
@@ -1358,7 +1363,7 @@ impl AppModel {
             "Enable AI features and command-context sharing before sending another turn".to_string()
         } else if native_idle {
             format!(
-                "Send another turn on this loaded {} session, or finish the session to unlock validation",
+                "{} session · Enter for a new line · Ctrl+Enter to send. Finish the session when ready to validate.",
                 task.provider.display_name()
             )
         } else {
@@ -1413,7 +1418,11 @@ impl AppModel {
                     native_preparing,
                 },
             ),
-            native_label: format!("Start {}", task.provider.display_name()),
+            native_label: if self.agent_runtime.can_resume_codex(task_id) {
+                "Resume native".into()
+            } else {
+                format!("Start {}", task.provider.display_name())
+            },
             manual_review: task.requires_manual_review(),
             can_accept_review: task.requires_manual_review()
                 && task.status == TaskStatus::ReadyForReview
@@ -1425,12 +1434,13 @@ impl AppModel {
                 .unwrap_or_default(),
             completed_turns: view.as_ref().map_or(0, |snapshot| snapshot.completed_turns),
             stream: view,
-            can_start_native: task.provider.supports_native_driver()
-                && (task.brief.is_some() || task.source_context.is_some())
-                && task.status == TaskStatus::Created
-                && task.runtime_kind == TaskRuntimeKind::Unassigned
+            can_start_native: native_ai_enabled
                 && !native_preparing
-                && native_ai_enabled,
+                && (self.agent_runtime.can_resume_codex(task_id)
+                    || (task.provider.supports_native_driver()
+                        && (task.brief.is_some() || task.source_context.is_some())
+                        && task.status == TaskStatus::Created
+                        && task.runtime_kind == TaskRuntimeKind::Unassigned)),
             can_start_terminal,
             can_focus_terminal,
             can_focus_validation,
@@ -1443,7 +1453,9 @@ impl AppModel {
             can_complete: task.status == TaskStatus::ReadyForReview
                 && task.validation.status == TaskValidationStatus::Passed
                 && !has_stream,
-            can_follow_up: native_idle && native_ai_enabled,
+            can_follow_up: native_idle
+                && native_ai_enabled
+                && self.agent_runtime.can_prompt_native(task_id),
             follow_up_hint,
             diff,
         })

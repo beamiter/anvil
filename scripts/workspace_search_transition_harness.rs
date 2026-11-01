@@ -1,5 +1,10 @@
 #![allow(dead_code)]
-use std::{cell::RefCell, collections::HashMap, marker::PhantomData, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    marker::PhantomData,
+    rc::Rc,
+};
 // @pane_layout
 extern crate self as log;
 #[macro_export]
@@ -12,6 +17,8 @@ enum VteInput {
 #[derive(Debug, PartialEq)]
 enum Event {
     Terminal(u64, VteInput),
+    Surface(String),
+    Retained(Vec<u64>),
     Replay,
     Removed(u64),
     Quit,
@@ -109,6 +116,27 @@ impl Pane {
     fn widget(&self) -> gtk::Widget {
         gtk::Widget(self.id)
     }
+    fn child_cleanup(&self) -> Option<u64> {
+        Some(self.id)
+    }
+}
+// Process handles are an external boundary. Record the exact identities and
+// their ordering relative to destruction; no operating-system child is spawned.
+struct Window {
+    events: Events,
+}
+impl Window {
+    fn upcast_ref(&self) -> &Self {
+        self
+    }
+}
+mod gtk_process {
+    pub fn retain_children(window: &super::Window, children: Vec<u64>) {
+        window
+            .events
+            .borrow_mut()
+            .push(super::Event::Retained(children));
+    }
 }
 struct Remote {
     pane_id: u64,
@@ -137,8 +165,24 @@ impl Stack {
         self.events.borrow_mut().push(Event::Removed(holder.0));
     }
 }
+struct WorkspaceStack {
+    visible: RefCell<String>,
+    events: Events,
+}
+impl WorkspaceStack {
+    fn set_visible_child_name(&self, name: &str) {
+        *self.visible.borrow_mut() = name.to_owned();
+        self.events
+            .borrow_mut()
+            .push(Event::Surface(name.to_owned()));
+    }
+}
 struct AppModel {
+    window: Window,
     stack: Stack,
+    workspace_stack: WorkspaceStack,
+    tasks_panel_visible: Cell<bool>,
+    ai_panel_visible: Cell<bool>,
     tabs: Vec<Tab>,
     active: usize,
     search: Search,
@@ -175,7 +219,7 @@ impl AppModel {
     }
     fn sync_organism_focus(&self) {}
     fn note_task_terminal_closed(&self, _: u64) {}
-    fn force_quit(&self) {
+    fn force_quit(&self, _: &ComponentSender<Self>) {
         self.search.events.borrow_mut().push(Event::Quit);
     }
     fn file_tree_goto_current_cwd(&self, _: &ComponentSender<Self>) {}
@@ -206,9 +250,18 @@ fn model() -> (AppModel, Events) {
         .collect();
     (
         AppModel {
+            window: Window {
+                events: events.clone(),
+            },
             stack: Stack {
                 events: events.clone(),
             },
+            workspace_stack: WorkspaceStack {
+                visible: RefCell::new("terminal".into()),
+                events: events.clone(),
+            },
+            tasks_panel_visible: Cell::new(false),
+            ai_panel_visible: Cell::new(false),
             tabs: vec![Tab {
                 bell: false,
                 activity: false,
@@ -262,7 +315,15 @@ fn identity_stable_cycle_does_not_clear_or_replay() {
 fn closing_active_split_replays_after_removal() {
     let (mut m, e) = model();
     m.close_pane(1, &ComponentSender(PhantomData));
-    assert_eq!(*e.borrow(), expected(1, 2));
+    assert_eq!(
+        *e.borrow(),
+        vec![
+            Event::Terminal(1, VteInput::SearchClear),
+            Event::Retained(vec![1]),
+            Event::Replay,
+            Event::Terminal(2, VteInput::GrabFocus),
+        ]
+    );
     assert_eq!(m.active_pane_id(), Some(2));
     assert_eq!(m.tabs[0].panes[0].terminal.draft, "draft 2");
 }
@@ -270,7 +331,13 @@ fn closing_active_split_replays_after_removal() {
 fn closing_inactive_split_does_not_clear_search() {
     let (mut m, e) = model();
     m.close_pane(2, &ComponentSender(PhantomData));
-    assert_eq!(*e.borrow(), vec![Event::Terminal(1, VteInput::GrabFocus)]);
+    assert_eq!(
+        *e.borrow(),
+        vec![
+            Event::Retained(vec![2]),
+            Event::Terminal(1, VteInput::GrabFocus)
+        ]
+    );
 }
 #[test]
 fn embedded_editor_close_preserves_pane_and_search_until_confirmation() {
@@ -292,7 +359,11 @@ fn failed_detachment_restores_original_search() {
     m.close_pane(1, &ComponentSender(PhantomData));
     assert_eq!(
         *e.borrow(),
-        vec![Event::Terminal(1, VteInput::SearchClear), Event::Replay]
+        vec![
+            Event::Terminal(1, VteInput::SearchClear),
+            Event::Retained(vec![1]),
+            Event::Replay
+        ]
     );
     assert_eq!(m.active_pane_id(), Some(1));
 }
@@ -359,6 +430,7 @@ fn closing_selected_first_tab_clears_destroyed_owner_and_replays_once() {
         *e.borrow(),
         vec![
             Event::Terminal(11, VteInput::SearchClear),
+            Event::Retained(vec![10, 11]),
             Event::Removed(10),
             Event::Terminal(21, VteInput::GrabFocus),
             Event::Replay
@@ -385,6 +457,7 @@ fn closing_selected_last_tab_uses_previous_pane_identity() {
         *e.borrow(),
         vec![
             Event::Terminal(31, VteInput::SearchClear),
+            Event::Retained(vec![30, 31]),
             Event::Removed(30),
             Event::Terminal(21, VteInput::GrabFocus),
             Event::Replay
@@ -397,7 +470,10 @@ fn background_tab_close_preserves_focus_and_search() {
     m.active = 1;
     m.close_tab(10, &ComponentSender(PhantomData));
     assert_eq!(m.active_pane_id(), Some(21));
-    assert_eq!(*e.borrow(), vec![Event::Removed(10)]);
+    assert_eq!(
+        *e.borrow(),
+        vec![Event::Retained(vec![10, 11]), Event::Removed(10)]
+    );
 }
 #[test]
 fn batch_selected_close_replays_only_once_after_all_removals() {
@@ -408,7 +484,9 @@ fn batch_selected_close_replays_only_once_after_all_removals() {
         *e.borrow(),
         vec![
             Event::Terminal(11, VteInput::SearchClear),
+            Event::Retained(vec![10, 11]),
             Event::Removed(10),
+            Event::Retained(vec![20, 21]),
             Event::Removed(20),
             Event::Terminal(31, VteInput::GrabFocus),
             Event::Replay
@@ -431,7 +509,15 @@ fn batch_background_close_does_not_replay_or_grab_focus() {
     m.active = 1;
     m.close_tabs(vec![10, 30], &ComponentSender(PhantomData));
     assert_eq!(m.active_pane_id(), Some(21));
-    assert_eq!(*e.borrow(), vec![Event::Removed(10), Event::Removed(30)]);
+    assert_eq!(
+        *e.borrow(),
+        vec![
+            Event::Retained(vec![10, 11]),
+            Event::Removed(10),
+            Event::Retained(vec![30, 31]),
+            Event::Removed(30),
+        ]
+    );
 }
 #[test]
 fn closing_last_tab_does_not_replay_to_missing_destination() {
@@ -442,6 +528,7 @@ fn closing_last_tab_does_not_replay_to_missing_destination() {
         *e.borrow(),
         vec![
             Event::Terminal(11, VteInput::SearchClear),
+            Event::Retained(vec![10, 11]),
             Event::Removed(10),
             Event::Quit
         ]
@@ -454,6 +541,7 @@ fn normal_tab_selection_clears_exact_original_controller() {
     assert_eq!(
         *e.borrow(),
         vec![
+            Event::Surface("terminal".into()),
             Event::Terminal(11, VteInput::SearchClear),
             Event::Terminal(31, VteInput::GrabFocus),
             Event::Replay
@@ -461,5 +549,74 @@ fn normal_tab_selection_clears_exact_original_controller() {
     );
     e.borrow_mut().clear();
     m.select_tab(30, &ComponentSender(PhantomData));
-    assert_eq!(*e.borrow(), vec![Event::Terminal(31, VteInput::GrabFocus)]);
+    assert_eq!(
+        *e.borrow(),
+        vec![
+            Event::Surface("terminal".into()),
+            Event::Terminal(31, VteInput::GrabFocus)
+        ]
+    );
+}
+
+#[test]
+fn selecting_a_terminal_reveals_the_center_before_transferring_focus() {
+    for previous in ["chats", "tasks"] {
+        let (mut m, e) = tabs_model();
+        *m.workspace_stack.visible.borrow_mut() = previous.into();
+        m.ai_panel_visible.set(previous == "chats");
+        m.tasks_panel_visible.set(previous == "tasks");
+        m.select_tab(30, &ComponentSender(PhantomData));
+        assert_eq!(m.workspace_stack.visible.borrow().as_str(), "terminal");
+        assert!(!m.ai_panel_visible.get());
+        assert!(!m.tasks_panel_visible.get());
+        assert_eq!(m.active_pane_id(), Some(31));
+        assert_eq!(
+            *e.borrow(),
+            vec![
+                Event::Surface("terminal".into()),
+                Event::Terminal(11, VteInput::SearchClear),
+                Event::Terminal(31, VteInput::GrabFocus),
+                Event::Replay,
+            ]
+        );
+        for pane in m.tabs.iter().flat_map(|tab| &tab.panes) {
+            assert_eq!(pane.terminal.draft, format!("draft {}", pane.id));
+        }
+    }
+}
+
+#[test]
+fn returning_to_the_same_terminal_reveals_it_without_replaying_search() {
+    let (mut m, e) = tabs_model();
+    *m.workspace_stack.visible.borrow_mut() = "chats".into();
+    m.ai_panel_visible.set(true);
+    m.select_tab(10, &ComponentSender(PhantomData));
+    assert_eq!(m.workspace_stack.visible.borrow().as_str(), "terminal");
+    assert!(!m.ai_panel_visible.get());
+    assert!(!m.tasks_panel_visible.get());
+    assert_eq!(
+        *e.borrow(),
+        vec![
+            Event::Surface("terminal".into()),
+            Event::Terminal(11, VteInput::GrabFocus),
+        ]
+    );
+}
+
+#[test]
+fn closing_background_terminals_preserves_the_native_surface() {
+    for previous in ["chats", "tasks"] {
+        let (mut m, e) = tabs_model();
+        *m.workspace_stack.visible.borrow_mut() = previous.into();
+        m.ai_panel_visible.set(previous == "chats");
+        m.tasks_panel_visible.set(previous == "tasks");
+        m.close_tab(30, &ComponentSender(PhantomData));
+        assert_eq!(m.workspace_stack.visible.borrow().as_str(), previous);
+        assert_eq!(m.ai_panel_visible.get(), previous == "chats");
+        assert_eq!(m.tasks_panel_visible.get(), previous == "tasks");
+        assert_eq!(
+            *e.borrow(),
+            vec![Event::Retained(vec![30, 31]), Event::Removed(30)]
+        );
+    }
 }

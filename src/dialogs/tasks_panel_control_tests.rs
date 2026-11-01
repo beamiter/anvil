@@ -176,6 +176,7 @@ fn task_control_center_preserves_search_action_identity_and_rejected_drafts() {
     controller
         .widgets()
         .follow_up_entry
+        .buffer()
         .set_text("Keep this instruction if the session closes");
     drain();
     controller.widgets().follow_up_send.emit_clicked();
@@ -187,13 +188,17 @@ fn task_control_center_preserves_search_action_identity_and_rejected_drafts() {
     assert_eq!(request.task_id, task);
     assert_eq!(controller.model().follow_up_drafts[&task], request.text);
     assert!(!controller.widgets().follow_up_send.is_sensitive());
-    controller.widgets().follow_up_entry.set_text("");
+    controller.widgets().follow_up_entry.buffer().set_text("");
     drain();
     assert!(
         !controller.widgets().primary_action.is_visible(),
         "a pending follow-up must not recommend finishing the session"
     );
-    controller.widgets().follow_up_entry.set_text(&request.text);
+    controller
+        .widgets()
+        .follow_up_entry
+        .buffer()
+        .set_text(&request.text);
     drain();
     controller.widgets().follow_up_send.emit_clicked();
     drain();
@@ -207,7 +212,16 @@ fn task_control_center_preserves_search_action_identity_and_rejected_drafts() {
     ));
     drain();
     assert_eq!(
-        controller.widgets().follow_up_entry.text().as_str(),
+        controller
+            .widgets()
+            .follow_up_entry
+            .buffer()
+            .text(
+                &controller.widgets().follow_up_entry.buffer().start_iter(),
+                &controller.widgets().follow_up_entry.buffer().end_iter(),
+                true
+            )
+            .as_str(),
         request.text
     );
     assert!(controller.widgets().follow_up_send.is_sensitive());
@@ -226,6 +240,7 @@ fn task_control_center_preserves_search_action_identity_and_rejected_drafts() {
     controller
         .widgets()
         .follow_up_entry
+        .buffer()
         .set_text("New correction typed while submitting");
     drain();
     controller.emit(TasksPanelMsg::FollowUpResolved(request, Ok(())));
@@ -237,7 +252,16 @@ fn task_control_center_preserves_search_action_identity_and_rejected_drafts() {
     controller.emit(TasksPanelMsg::FollowUpResolved(retry, Ok(())));
     drain();
     assert_eq!(
-        controller.widgets().follow_up_entry.text().as_str(),
+        controller
+            .widgets()
+            .follow_up_entry
+            .buffer()
+            .text(
+                &controller.widgets().follow_up_entry.buffer().start_iter(),
+                &controller.widgets().follow_up_entry.buffer().end_iter(),
+                true
+            )
+            .as_str(),
         "New correction typed while submitting"
     );
     assert!(controller.widgets().follow_up_send.is_sensitive());
@@ -255,7 +279,7 @@ fn task_control_center_preserves_search_action_identity_and_rejected_drafts() {
         !controller.widgets().primary_action.is_visible(),
         "an unsent draft must not recommend finishing the session"
     );
-    controller.widgets().follow_up_entry.set_text("");
+    controller.widgets().follow_up_entry.buffer().set_text("");
     drain();
     assert!(controller.widgets().primary_action.is_visible());
     assert!(!controller.widgets().actions_expander.is_expanded());
@@ -290,6 +314,7 @@ fn task_control_center_preserves_search_action_identity_and_rejected_drafts() {
     controller
         .widgets()
         .follow_up_entry
+        .buffer()
         .set_text("New correction typed while submitting");
     drain();
     assert!(!controller.widgets().primary_action.is_visible());
@@ -308,13 +333,31 @@ fn task_control_center_preserves_search_action_identity_and_rejected_drafts() {
         "Late edit belongs to the original task"
     );
     assert_ne!(
-        controller.widgets().follow_up_entry.text().as_str(),
+        controller
+            .widgets()
+            .follow_up_entry
+            .buffer()
+            .text(
+                &controller.widgets().follow_up_entry.buffer().start_iter(),
+                &controller.widgets().follow_up_entry.buffer().end_iter(),
+                true
+            )
+            .as_str(),
         "Late edit belongs to the original task"
     );
     controller.emit(TasksPanelMsg::Sync(Box::new(original)));
     drain();
     assert_eq!(
-        controller.widgets().follow_up_entry.text().as_str(),
+        controller
+            .widgets()
+            .follow_up_entry
+            .buffer()
+            .text(
+                &controller.widgets().follow_up_entry.buffer().start_iter(),
+                &controller.widgets().follow_up_entry.buffer().end_iter(),
+                true
+            )
+            .as_str(),
         "Late edit belongs to the original task"
     );
     assert!(actions.borrow().is_empty());

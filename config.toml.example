@@ -126,7 +126,7 @@ ai_enabled = true
 agent_enabled = true
 # Native Codex task panel (Ctrl+Alt+Shift+T), each task in its own isolated
 # worktree. Off by default; enable it explicitly.
-agent_tasks_enabled = false
+agent_tasks_enabled = true    # 原生 Agent 工作区；显式 false 可关闭，发送上下文仍需 ai_share_command_context 同意
 # Allow the command and terminal evidence to travel with the provider prompt.
 # Off by default: this is a consent gate, not a convenience toggle.
 ai_share_command_context = false

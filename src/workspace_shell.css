@@ -422,3 +422,26 @@ menubutton.eva-companion-dock > button { min-height:26px; min-width:36px; paddin
 menubutton.eva-companion-dock > button:hover, menubutton.eva-companion-dock > button:checked { background:#283d6f; color:#eff4ff; }
 menubutton.eva-companion-dock label { color:inherit; font-size:11px; }
 .eva-companion-card { padding:8px; }
+
+/* Agent workspace: stable native navigation beside the central transcript. */
+.agent-workspace-navigation searchentry, .agent-workspace-navigation searchentry text { font-family: "DejaVu Sans", sans-serif; font-size: 12px; min-width: 0; }
+.agent-workspace-navigation button, .agent-workspace-navigation menubutton > button { min-width: 0; min-height: 24px; padding: 2px 5px; }
+.agent-workspace-navigation button label, .agent-workspace-navigation label { font-family: "DejaVu Sans", sans-serif; font-size: 10px; }
+.agent-workspace-navigation .navigation-sidebar { background: transparent; }
+.agent-workspace-navigation .navigation-sidebar row { border-radius: 7px; margin: 2px 0; padding: 0; }
+.agent-workspace-navigation .navigation-sidebar row.active-conversation { background: #263c63; }
+.agent-workspace-navigation .navigation-sidebar row:selected { outline: 1px solid #7d9ff1; outline-offset: -1px; }
+.agent-workspace-navigation .navigation-sidebar row label { font-size: 11px; }
+.agent-workspace-navigation .navigation-sidebar row label.dim-label { font-size: 9px; color: #92a6c3; }
+
+.workspace-center .ai-panel { background: #101927; color: #d4e2f8; }
+.workspace-center .ai-panel label, .workspace-center .ai-panel button label { font-family: "DejaVu Sans", sans-serif; font-size: 12px; color: #d4e2f8; }
+.workspace-center .ai-panel label.dim-label, .workspace-center .ai-panel label.caption, .workspace-center .ai-panel label.ai-panel-subtitle { color: #91a5c1; font-size: 11px; }
+.workspace-center .ai-panel .ai-panel-header { padding: 12px 16px; border-bottom: 1px solid #2a3a52; }
+.workspace-center .ai-panel textview, .workspace-center .ai-panel textview text { background: #101927; color: #d4e2f8; caret-color: #d4e2f8; font-size: 13px; }
+.workspace-center .ai-panel .ai-panel-input, .workspace-center .ai-panel .ai-panel-entry { background: #16243a; border: 1px solid #354a6b; border-radius: 10px; }
+.workspace-center .ai-panel button { min-height: 28px; min-width: 0; padding: 3px 9px; border-radius: 7px; }
+.workspace-center .ai-panel .ai-empty-state { padding: 28px; }
+.workspace-center .ai-panel .ai-panel-composer { padding: 12px 16px; border-top: 1px solid #2a3a52; }
+
+.workspace-center .ai-panel .card { background: #18283e; border: 1px solid #354a6b; box-shadow: none; }

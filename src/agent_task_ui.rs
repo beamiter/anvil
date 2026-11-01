@@ -122,6 +122,7 @@ pub(crate) enum TaskPanelAction {
     ComposeProject,
     CreateProject(TaskProjectRequest),
     StartNative(TaskId),
+    LoadNativeHistory(TaskId, bool),
     StartTerminal(TaskId),
     FocusTerminal(TaskId),
     FocusValidation(TaskId),
@@ -623,6 +624,24 @@ pub(crate) fn render_stream_history(
     ordinal: Option<usize>,
 ) -> String {
     let mut out = StreamDisplay::default();
+    if !snapshot.persisted_history.is_empty() {
+        out.push_str("Provider history · read only\n");
+        for turn in snapshot.persisted_history.iter() {
+            push_bounded(
+                &mut out,
+                &format!(
+                    "\n— {} · {} —\nYou: {}\nAssistant: {}\n",
+                    turn.provider_turn_id, turn.status, turn.user_text, turn.agent_text
+                ),
+            );
+            if out.truncated {
+                break;
+            }
+        }
+    }
+    if snapshot.history_loading {
+        out.push_str("\nLoading provider history…\n");
+    }
     let index = stream_history_index(snapshot, ordinal);
     if snapshot.dropped_turns > 0 {
         out.push_str(&format!(
@@ -636,7 +655,7 @@ pub(crate) fn render_stream_history(
             snapshot.turn_history[index].ordinal
         ));
     } else if snapshot.dropped_turns == 0 {
-        return String::new();
+        return out.finish();
     }
     if let Some(turn) = index.and_then(|index| snapshot.turn_history.get(index)) {
         out.push_str(&format!("\n\n— turn {} —", turn.ordinal));

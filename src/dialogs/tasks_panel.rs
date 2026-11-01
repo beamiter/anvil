@@ -135,6 +135,8 @@ pub(crate) struct DiffSync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActionKind {
     StartNative,
+    RecentHistory,
+    EarlierHistory,
     StartTerminal,
     FocusTerminal,
     FocusValidation,
@@ -188,8 +190,10 @@ fn primary_task_action(detail: &TaskDetailSync) -> Option<(ActionKind, String)> 
     Some((kind, label.to_string()))
 }
 
-const ACTION_KINDS: [(ActionKind, &str); 12] = [
+const ACTION_KINDS: [(ActionKind, &str); 14] = [
     (ActionKind::StartNative, "Start provider"),
+    (ActionKind::RecentHistory, "Recent history"),
+    (ActionKind::EarlierHistory, "Load earlier"),
     (ActionKind::StartTerminal, "Start terminal"),
     (ActionKind::FocusTerminal, "Agent terminal"),
     (ActionKind::FocusValidation, "Validation output"),
@@ -1141,17 +1145,30 @@ impl Component for TasksPanelModel {
                                 set_spacing: 4,
                                 set_visible: false,
 
-                                #[name(follow_up_entry)]
-                                gtk::Entry {
+                                gtk::ScrolledWindow {
                                     set_hexpand: true,
-                                    set_placeholder_text: Some("Follow-up turn for the Agent…"),
+                                    set_min_content_height: 76,
+                                    set_max_content_height: 150,
+                                    set_hscrollbar_policy: gtk::PolicyType::Never,
+                                    set_vscrollbar_policy: gtk::PolicyType::Automatic,
+                                    #[name(follow_up_entry)]
+                                    gtk::TextView {
+                                        set_hexpand: true,
+                                        set_wrap_mode: gtk::WrapMode::WordChar,
+                                        set_top_margin: 8,
+                                        set_bottom_margin: 8,
+                                        set_left_margin: 8,
+                                        set_right_margin: 8,
+                                        add_css_class: "ai-panel-entry",
+                                        set_tooltip_text: Some("Follow-up turn · Enter for a new line · Ctrl+Enter to send"),
+                                    },
                                 },
 
                                 #[name(follow_up_send)]
                                 gtk::Button {
                                     set_icon_name: "go-next-symbolic",
                                     add_css_class: "flat",
-                                    set_tooltip_text: Some("Send follow-up turn"),
+                                    set_tooltip_text: Some("Send follow-up turn (Ctrl+Enter)"),
                                 },
                             },
                         },
@@ -1330,7 +1347,7 @@ impl Component for TasksPanelModel {
                 }
             }
         });
-        widgets.follow_up_entry.connect_changed({
+        widgets.follow_up_entry.buffer().connect_changed({
             let sender = sender.clone();
             let target = action_target.clone();
             let guard = follow_up_guard.clone();
@@ -1339,19 +1356,48 @@ impl Component for TasksPanelModel {
                     return;
                 }
                 if let Some(id) = target.get() {
-                    sender.input(TasksPanelMsg::FollowUpChanged(id, entry.text().to_string()));
+                    sender.input(TasksPanelMsg::FollowUpChanged(
+                        id,
+                        entry
+                            .text(&entry.start_iter(), &entry.end_iter(), true)
+                            .to_string(),
+                    ));
                 }
             }
         });
-        widgets.follow_up_entry.connect_activate({
+        let follow_up_keys = gtk::EventControllerKey::new();
+        follow_up_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        follow_up_keys.connect_key_pressed({
             let sender = sender.clone();
             let target = action_target.clone();
-            move |_| {
-                if let Some(id) = target.get() {
-                    sender.input(TasksPanelMsg::SendFollowUp(id));
+            let editor = widgets.follow_up_entry.clone();
+            move |controller, key, _, modifiers| {
+                if matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
+                    && modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+                    && !modifiers.intersects(
+                        gtk::gdk::ModifierType::SHIFT_MASK
+                            | gtk::gdk::ModifierType::ALT_MASK
+                            | gtk::gdk::ModifierType::SUPER_MASK
+                            | gtk::gdk::ModifierType::META_MASK,
+                    )
+                {
+                    if controller
+                        .current_event()
+                        .as_ref()
+                        .is_some_and(|event| editor.im_context_filter_keypress(event))
+                    {
+                        return gtk::glib::Propagation::Stop;
+                    }
+                    if let Some(id) = target.get() {
+                        sender.input(TasksPanelMsg::SendFollowUp(id));
+                    }
+                    gtk::glib::Propagation::Stop
+                } else {
+                    gtk::glib::Propagation::Proceed
                 }
             }
         });
+        widgets.follow_up_entry.add_controller(follow_up_keys);
         widgets.follow_up_send.connect_clicked({
             let sender = sender.clone();
             let target = action_target.clone();
@@ -1589,6 +1635,8 @@ impl Component for TasksPanelModel {
                 // The application/runtime rechecks this task and its live gates.
                 let action = match kind {
                     ActionKind::StartNative => TaskPanelAction::StartNative(id),
+                    ActionKind::RecentHistory => TaskPanelAction::LoadNativeHistory(id, true),
+                    ActionKind::EarlierHistory => TaskPanelAction::LoadNativeHistory(id, false),
                     ActionKind::StartTerminal => TaskPanelAction::StartTerminal(id),
                     ActionKind::FocusTerminal => TaskPanelAction::FocusTerminal(id),
                     ActionKind::FocusValidation => TaskPanelAction::FocusValidation(id),
@@ -1887,6 +1935,21 @@ impl TasksPanelModel {
             let sensitive = detail.is_some_and(|detail| {
                 match kind {
                     ActionKind::StartNative => detail.can_start_native,
+                    ActionKind::RecentHistory => {
+                        detail.provider == crate::agent_task::AgentProvider::Codex
+                            && detail.can_finish
+                            && detail
+                                .stream
+                                .as_ref()
+                                .is_some_and(|view| !view.history_loading)
+                    }
+                    ActionKind::EarlierHistory => {
+                        detail.provider == crate::agent_task::AgentProvider::Codex
+                            && detail.can_finish
+                            && detail.stream.as_ref().is_some_and(|view| {
+                                !view.history_loading && view.history_cursor.is_some()
+                            })
+                    }
                     ActionKind::StartTerminal => detail.can_start_terminal,
                     ActionKind::FocusTerminal => detail.can_focus_terminal,
                     ActionKind::FocusValidation => detail.can_focus_validation,
@@ -1910,6 +1973,11 @@ impl TasksPanelModel {
                 ));
             }
             let visible = detail.is_some_and(|detail| match kind {
+                ActionKind::RecentHistory | ActionKind::EarlierHistory => {
+                    detail.provider == crate::agent_task::AgentProvider::Codex
+                        && detail.stream.is_some()
+                        && !detail.archived
+                }
                 ActionKind::Complete => !detail.manual_review && !detail.archived,
                 ActionKind::AcceptReviewed => detail.manual_review && !detail.archived,
                 ActionKind::Archive => !detail.archived,
@@ -2006,12 +2074,10 @@ impl TasksPanelModel {
             }
 
             widgets.follow_up_row.set_visible(detail.can_follow_up);
-            let placeholder = format!("Follow-up turn for {}…", detail.provider.display_name());
-            if widgets.follow_up_entry.placeholder_text().as_deref() != Some(placeholder.as_str()) {
-                widgets
-                    .follow_up_entry
-                    .set_placeholder_text(Some(&placeholder));
-            }
+            widgets.follow_up_entry.set_tooltip_text(Some(&format!(
+                "Follow-up turn for {} · Enter for a new line · Ctrl+Enter to send",
+                detail.provider.display_name()
+            )));
             let error = self.follow_up_receipts.error(detail.id);
             let hint = error.unwrap_or(&detail.follow_up_hint);
             widgets.follow_up_hint.set_visible(!hint.is_empty());
@@ -2027,11 +2093,21 @@ impl TasksPanelModel {
                 .get(&detail.id)
                 .cloned()
                 .unwrap_or_default();
-            if widgets.follow_up_entry.text().as_str() != draft {
+            if widgets
+                .follow_up_entry
+                .buffer()
+                .text(
+                    &widgets.follow_up_entry.buffer().start_iter(),
+                    &widgets.follow_up_entry.buffer().end_iter(),
+                    true,
+                )
+                .as_str()
+                != draft
+            {
                 // Replacing nonempty Entry text emits delete/insert notifications.
                 // View synchronization must never enqueue another authored edit.
                 let guard = self.follow_up_guard.replace(true);
-                widgets.follow_up_entry.set_text(&draft);
+                widgets.follow_up_entry.buffer().set_text(&draft);
                 self.follow_up_guard.set(guard);
             }
             widgets.follow_up_send.set_sensitive(

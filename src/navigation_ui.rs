@@ -40,7 +40,8 @@ impl AppModel {
     /// flip its orientation; sidebar = vertical list, top bar = horizontal.
     pub(crate) fn apply_tab_placement(&self) {
         use config::TabPlacement;
-        let placement = self.tab_placement.get();
+        let placement = config::TabPlacement::Sidebar;
+        self.tab_placement.set(placement);
 
         self.tab_strip_scroll.set_child(None::<&gtk::Widget>);
         self.top_tab_scroll.set_child(None::<&gtk::Widget>);
@@ -101,7 +102,7 @@ impl AppModel {
                 if jterm_core::reference_conversation::fixture_enabled() {
                     "reference-recent"
                 } else {
-                    "tabs"
+                    "sessions"
                 },
             ),
             SidebarView::Files => {
@@ -175,7 +176,7 @@ impl AppModel {
             config::TabPlacement::TopBar => {
                 self.tab_strip_scroll.set_visible(false);
                 self.sidebar_tab_scroll.set_visible(true);
-                self.top_tab_scroll.set_visible(!self.tabs.is_empty());
+                self.top_tab_scroll.set_visible(false);
             }
         }
     }
@@ -249,7 +250,10 @@ impl AppModel {
             .iter()
             .enumerate()
             .filter(|(_, tab)| {
-                filter.is_empty() || tab.display_title().to_lowercase().contains(&filter)
+                !tab.panes
+                    .iter()
+                    .all(|pane| self.agent_session_tabs.values().any(|id| *id == pane.id))
+                    && (filter.is_empty() || tab.display_title().to_lowercase().contains(&filter))
             })
             .map(|(index, tab)| tab_strip::TabRowInit {
                 id: tab.id,
