@@ -656,14 +656,9 @@ impl AppModel {
                 );
             }
             Action::OpenAgentSessions => {
-                let sender = sender.clone();
-                crate::agent_sessions::show(
-                    &self.window,
-                    self.active_cwd(),
-                    self.agent_session_library.clone(),
-                    self.agent_session_tabs.keys().cloned().collect(),
-                    move |request| sender.input(AppMsg::ResumeAgentSession(Box::new(request))),
-                );
+                self.set_sidebar_visible(true, false);
+                self.apply_sidebar_view(config::SidebarView::Tabs, false);
+                self.session_sidebar.focus_search();
             }
             Action::OpenAgent => {
                 self.open_agent_panel(sender);

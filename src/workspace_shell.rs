@@ -49,7 +49,8 @@ pub(crate) struct Chrome {
     task_actions_available: std::cell::Cell<Option<(bool, bool)>>,
     sender: ComponentSender<AppModel>,
     files_control: std::cell::RefCell<Option<std::rc::Rc<FilesControl>>>,
-    block_shelf: gtk::Box,
+    pub block_shelf: gtk::Box,
+    main_workspace: gtk::Stack,
     presentation_navigation: gtk::Label,
     search: gtk::Button,
     inspector_control: std::rc::Rc<InspectorControl>,
@@ -875,8 +876,10 @@ impl Chrome {
             inspector_sender.input(AppMsg::ToggleInspector);
         });
         let inspector_control = std::rc::Rc::new(InspectorControl {
-            requested: std::cell::Cell::new(None),
-            shown: std::cell::Cell::new(true),
+            requested: std::cell::Cell::new(
+                (!jterm_core::reference_conversation::fixture_enabled()).then_some(false),
+            ),
+            shown: std::cell::Cell::new(jterm_core::reference_conversation::fixture_enabled()),
             available: std::cell::Cell::new(true),
             button: inspector_button,
             refresh: std::cell::RefCell::new(None),
@@ -1067,11 +1070,15 @@ impl Chrome {
                     .and_then(|row| row.last_child())
                     .and_downcast::<gtk::Label>();
             }
-            navigation_heading.append(&row);
+            if jterm_core::reference_conversation::fixture_enabled() {
+                navigation_heading.append(&row);
+            }
         }
         let recent_heading = label("RECENT", "shell-section");
         recent_heading.add_css_class("shell-recent-heading");
-        navigation_heading.append(&recent_heading);
+        if jterm_core::reference_conversation::fixture_enabled() {
+            navigation_heading.append(&recent_heading);
+        }
         navigation.prepend(&navigation_heading);
         let spaces = gtk::Box::new(gtk::Orientation::Vertical, 0);
         spaces.add_css_class("shell-spaces");
@@ -1127,7 +1134,9 @@ impl Chrome {
         status_line.append(&label("Local session", "shell-muted"));
         status.append(&status_line);
         status.append(&label("Local workspace", "shell-muted"));
-        navigation.append(&spaces);
+        if jterm_core::reference_conversation::fixture_enabled() {
+            navigation.append(&spaces);
+        }
 
         let center = gtk::Box::new(gtk::Orientation::Vertical, 0);
         center.add_css_class("workspace-center");
@@ -1462,6 +1471,7 @@ impl Chrome {
             sender: sender.clone(),
             files_control: std::cell::RefCell::new(None),
             block_shelf,
+            main_workspace: terminal_stack.clone(),
             presentation_navigation: presentation_navigation
                 .expect("presentation navigation label"),
             search,
@@ -1780,8 +1790,10 @@ impl Chrome {
         }
         // Block and Chat own their real per-pane input dock; the outer shelf
         // is only for the traditional native terminal presentation.
-        self.block_shelf
-            .set_visible(!matches!(mode, TerminalMode::Block | TerminalMode::Chat));
+        self.block_shelf.set_visible(
+            self.main_workspace.visible_child_name().as_deref() == Some("terminal")
+                && !matches!(mode, TerminalMode::Block | TerminalMode::Chat),
+        );
         self.canvas_header
             .set_height_request(tokens::CANVAS_HEADER_HEIGHT as i32);
         if mode != TerminalMode::Chat

@@ -48,6 +48,7 @@ mod host {
     pub const APP_NAME: &str = "anvil";
 }
 
+mod agent_workspace_ui;
 mod eva_companion;
 mod eva_companion_clip;
 mod eva_companion_paint;
@@ -83,7 +84,10 @@ mod vte_pty;
 mod workflow_ops;
 mod workflows;
 mod workspace;
+mod workspace_chats;
+mod workspace_cli;
 mod workspace_conversation;
+mod workspace_navigation;
 mod workspace_ops;
 mod workspace_shell;
 
@@ -329,7 +333,7 @@ struct AppModel {
     kbmap: Rc<RefCell<KeybindingMap>>,
     shell_argv: Rc<Vec<String>>,
     tabs: Vec<Tab>,
-    agent_session_tabs: std::collections::HashMap<agent_sessions::SessionIdentity, u64>,
+    agent_session_tabs: std::collections::HashMap<agent_sessions::RuntimeIdentity, u64>,
     agent_session_library: Rc<RefCell<jterm_core::agent_sessions::SessionLibraryStore>>,
     agent_session_pending: std::collections::HashMap<u64, agent_sessions::ResumeRequest>,
     active: usize,
@@ -350,6 +354,9 @@ struct AppModel {
     font_persist_generation: Rc<std::cell::Cell<u64>>,
     window_opacity: f64,
     stack: gtk::Stack,
+    workspace_stack: gtk::Stack,
+    session_sidebar: agent_sessions::Sidebar,
+    workspace_navigation: workspace_navigation::Navigation,
     tab_strip: gtk::Box,
     tab_rows: FactoryVecDeque<tab_strip::TabRow>,
     /// Second, always-vertical tab list living in the sidebar's "tabs" page.
@@ -951,7 +958,8 @@ impl SimpleComponent for AppModel {
         let sidebar_width = config.borrow().sidebar_width as i32;
         let tab_placement = config.borrow().tab_placement;
         let sidebar_view = config.borrow().sidebar_view;
-        let sidebar_visible = config.borrow().sidebar_visible;
+        let sidebar_visible = true;
+        config.borrow_mut().sidebar_visible = true;
         let sidebar_toggle = sidebar_toggle::SidebarToggleModel::builder()
             .launch((sidebar_view, true))
             .forward(sender.input_sender(), |output| match output {
@@ -1003,8 +1011,36 @@ impl SimpleComponent for AppModel {
         files_page.append(file_tree_status.widget());
         files_page.append(&file_tree_scroll);
 
+        let agent_session_library = Rc::new(RefCell::new(
+            jterm_core::agent_sessions::SessionLibraryStore::new(),
+        ));
+        let session_sender = sender.clone();
+        let session_sidebar = agent_sessions::sidebar(
+            &root,
+            None,
+            agent_session_library.clone(),
+            Default::default(),
+            move |request| session_sender.input(AppMsg::ResumeAgentSession(Box::new(request))),
+        );
+        let action_sender = sender.clone();
+        let workspace_navigation = workspace_navigation::Navigation::new(move |action| {
+            action_sender.input(AppMsg::WorkspaceAction(action));
+        });
+        session_sidebar.bind_navigation(&workspace_navigation);
+        session_sidebar
+            .supplemental
+            .append(&workspace_navigation.root);
+        let sessions_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        session_sidebar.root.set_vexpand(true);
+        sessions_page.append(&session_sidebar.root);
+        let terminals = gtk::Expander::new(Some("Terminals"));
+        terminals.set_child(Some(&tabs_page));
+        terminals.set_expanded(true);
+        tabs_page.set_size_request(-1, 120);
+        tabs_page.set_vexpand(false);
+        sessions_page.append(&terminals);
         let sidebar_stack = gtk::Stack::new();
-        sidebar_stack.add_named(&tabs_page, Some("tabs"));
+        sidebar_stack.add_named(&sessions_page, Some("sessions"));
         sidebar_stack.add_named(&files_page, Some("files"));
         if jterm_core::reference_conversation::fixture_enabled() {
             sidebar_stack.add_named(&workspace_shell::recent_fixture(), Some("reference-recent"));
@@ -1279,10 +1315,23 @@ impl SimpleComponent for AppModel {
         side_stack.add_css_class("anvil-ui-font");
         side_stack.add_css_class("shell-inspector-live-pages");
         side_stack.set_hhomogeneous(false);
-        side_stack.add_named(ai_panel.widget(), Some("chats"));
-        side_stack.add_named(tasks_panel.widget(), Some("tasks"));
-        side_stack.set_visible_child_name("chats");
-        side_stack.set_visible(initial_ai_panel_visible);
+        // Real API and native agent surfaces share the central workspace.
+        // The inspector retains contextual controls, never a second composer.
+        ai_paned.set_start_child(None::<&gtk::Widget>);
+        let workspace_stack = gtk::Stack::new();
+        workspace_stack.set_transition_type(gtk::StackTransitionType::None);
+        workspace_stack.set_hhomogeneous(false);
+        workspace_stack.set_vhomogeneous(false);
+        workspace_stack.add_named(&stack, Some("terminal"));
+        workspace_stack.add_named(ai_panel.widget(), Some("chats"));
+        workspace_navigation::compact_task_surface(tasks_panel.widget());
+        workspace_stack.add_named(tasks_panel.widget(), Some("tasks"));
+        workspace_stack.set_visible_child_name(if initial_ai_panel_visible {
+            "chats"
+        } else {
+            "terminal"
+        });
+        side_stack.set_visible(false);
         ai_paned.set_end_child(Some(&side_stack));
         let notebook = notebook::NotebookModel::builder()
             .launch(notebook::NotebookInit {
@@ -1357,12 +1406,23 @@ impl SimpleComponent for AppModel {
         ai_paned.set_end_child(None::<&gtk::Widget>);
         let shell = workspace_shell::Chrome::new(
             &sender,
-            &stack,
+            &workspace_stack,
             &sidebar_box,
             &side_stack,
             &config.borrow(),
         );
         shell.connect_files_browser(&files_page);
+        {
+            let header = shell.canvas_header.clone();
+            let composer = shell.block_shelf.clone();
+            workspace_stack.connect_visible_child_name_notify(move |workspace| {
+                let terminal = workspace.visible_child_name().as_deref() == Some("terminal");
+                header.set_visible(terminal);
+                if !terminal {
+                    composer.set_visible(false);
+                }
+            });
+        }
         content_paned.set_start_child(None::<&gtk::Widget>);
         let navigation_scroll = gtk::ScrolledWindow::new();
         navigation_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
@@ -1406,9 +1466,7 @@ impl SimpleComponent for AppModel {
             shell_argv,
             tabs: Vec::new(),
             agent_session_tabs: std::collections::HashMap::new(),
-            agent_session_library: Rc::new(RefCell::new(
-                jterm_core::agent_sessions::SessionLibraryStore::new(),
-            )),
+            agent_session_library,
             agent_session_pending: std::collections::HashMap::new(),
             active: 0,
             tab_drag_origin: None,
@@ -1423,6 +1481,9 @@ impl SimpleComponent for AppModel {
             font_persist_generation: Rc::new(std::cell::Cell::new(0)),
             window_opacity,
             stack: stack.clone(),
+            workspace_stack,
+            session_sidebar,
+            workspace_navigation,
             tab_strip: tab_strip.clone(),
             tab_rows,
             sidebar_tab_strip: sidebar_tab_strip.clone(),
@@ -1937,6 +1998,18 @@ impl SimpleComponent for AppModel {
             }
         }
 
+        model.sync_workspace_navigation();
+        {
+            let sender = sender.clone();
+            let window = root.downgrade();
+            glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+                if window.upgrade().is_none() {
+                    return glib::ControlFlow::Break;
+                }
+                sender.input(AppMsg::WorkspaceTick);
+                glib::ControlFlow::Continue
+            });
+        }
         crate::vim9_ide::install_shell_host(&root);
         model.init_file_tree();
         {
@@ -1985,7 +2058,14 @@ impl SimpleComponent for AppModel {
 
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
         match msg {
+            AppMsg::WorkspaceTick => {
+                self.ai_panel
+                    .emit(dialogs::ai_panel::AiPanelMsg::WorkspacePoll);
+                self.sync_workspace_navigation();
+            }
+            AppMsg::WorkspaceAction(action) => self.workspace_action(action, &sender),
             AppMsg::FocusShell => {
+                self.show_terminal_workspace();
                 if let Some(terminal) = self.active_terminal() {
                     terminal.emit(VteInput::GrabFocus);
                 }
@@ -2115,10 +2195,6 @@ impl SimpleComponent for AppModel {
             AppMsg::ReloadConfig => self.reload_config(&sender),
             AppMsg::PaneLaunched(pane_id) => {
                 if let Some(request) = self.agent_session_pending.remove(&pane_id) {
-                    let _ = self
-                        .agent_session_library
-                        .borrow_mut()
-                        .record_resumed(request.provider, &request.id);
                     let _ = request.completion.send(Ok(()));
                 }
                 if let Some((source_tab_id, _)) = self.pending_split_spawns.remove(&pane_id) {
@@ -2967,6 +3043,9 @@ impl jterm_core::organism_memory::MemoryScheduler for OrganismLane {
 }
 
 fn main() {
+    if let Some(code) = jterm_core::agent_workspace::run_embedded_if_requested() {
+        std::process::exit(code);
+    }
     // Freeze the inherited environment before anything can mutate it: CLI
     // parsing writes ANVIL_CONFIG below, input-method setup writes
     // GTK_PATH/GTK_IM_MODULE/XMODIFIERS, and GTK itself starts threads. Every

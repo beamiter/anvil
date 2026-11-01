@@ -61,7 +61,10 @@ against the repository's current `Cargo.lock`. Verify each registry package's
 archive and checksum entries, each Git dependency's locked revision and vendored
 manifest, and the final Cargo source config.
 
-The shared `jterm_core` source is bundled in the verified
-`packaging/jterm-core-src.tar.gz` snapshot. The build materializes it below
-`.shared/jterm_core` and adjusts the local path dependency inside the isolated
-build directory. It is not fetched as an obsolete Git-vendored dependency.
+The shared `jterm_core` source is an exact Git dependency in `Cargo.lock`.
+The generated manifest fetches that revision and vendors it with the registry
+dependencies, so the Flatpak build uses the locked sources offline.
+`packaging/jterm-core-src.tar.gz` also retains a deterministic source snapshot
+of the same revision. Its `.sha256`, `jterm-core-revision`, and
+`jterm-core-origin.json` files record the checksum and published Git provenance.
+Refresh all of them from the exact published commit when updating the core pin.

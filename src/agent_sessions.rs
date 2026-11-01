@@ -25,9 +25,11 @@ thread_local! {
 }
 
 pub(crate) type SessionIdentity = (SessionProvider, String);
+pub(crate) type RuntimeIdentity = jterm_core::agent_workspace::ConversationId;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResumeRequest {
+    pub runtime_key: RuntimeIdentity,
     pub provider: SessionProvider,
     pub id: String,
     pub title: String,
@@ -36,8 +38,247 @@ pub(crate) struct ResumeRequest {
     pub completion: Sender<Result<(), String>>,
 }
 
+/// Persistent, native workspace navigation. The same model owns scanning,
+/// selection, preflight and launch receipts in both presentations.
+#[derive(Clone)]
+pub(crate) struct Sidebar {
+    pub root: gtk::Box,
+    pub supplemental: gtk::Box,
+    manager: Rc<Manager>,
+}
+
+impl Sidebar {
+    pub fn bind_navigation(&self, navigation: &super::workspace_navigation::Navigation) {
+        *self.manager.navigation.borrow_mut() = Some(navigation.clone());
+    }
+
+    pub fn cli_rows(&self) -> Vec<super::workspace_navigation::Row> {
+        use super::workspace_navigation::{Action, Row};
+        let catalog = self.manager.catalog.borrow();
+        let library = self.manager.library.borrow();
+        let mut shared = self.manager.shared.borrow_mut();
+        if library.is_loaded() {
+            shared.poll(&catalog, library.snapshot());
+        }
+        if let Some(error) = shared.error.as_ref() {
+            self.manager.notice.set_text(error);
+        }
+        catalog
+            .sessions
+            .iter()
+            .filter_map(|session| {
+                let id = shared.id(session)?.clone();
+                let row = shared.rows.get(&id);
+                let busy = row.is_some_and(|r| r.runtime.is_live())
+                    || !catalog.live_pids(session).is_empty();
+                Some(Row {
+                    active: self.manager.selected.borrow().as_deref() == Some(id.0.as_str()),
+                    action: Action::Cli(id),
+                    title: row.map_or_else(|| session.title.clone(), |r| r.title.clone()),
+                    detail: format!(
+                        "{} · {}",
+                        session.provider.label(),
+                        row.filter(|r| r.runtime.is_live())
+                            .map_or(if busy { "CLI running" } else { "CLI session" }, |r| r
+                                .runtime
+                                .label())
+                    ),
+                    searchable: format!(
+                        "{} {}",
+                        session.preview,
+                        row.map(|r| r.tags.join(" ")).unwrap_or_default()
+                    ),
+                    busy,
+                    attention: busy && session.status == SessionStatus::Waiting,
+                    archived: row.map_or(session.archived, |r| r.archived),
+                    pinned: row.is_some_and(|r| r.pinned),
+                    project: session.cwd.to_string_lossy().into_owned(),
+                    provider: session.provider.label().into(),
+                    updated: row.map_or(session.updated_at_ms, |r| {
+                        r.updated_at_ms.max(session.updated_at_ms)
+                    }),
+                })
+            })
+            .collect()
+    }
+
+    pub fn activate(&self, id: &RuntimeIdentity) {
+        let position = {
+            let catalog = self.manager.catalog.borrow();
+            let shared = self.manager.shared.borrow();
+            self.manager
+                .matched
+                .borrow()
+                .iter()
+                .position(|index| shared.id(&catalog.sessions[*index]) == Some(id))
+        };
+        if let Some(position) = position {
+            let current = {
+                let catalog = self.manager.catalog.borrow();
+                let matched = self.manager.matched.borrow();
+                runtime_identity(&catalog.sessions[matched[position]])
+            };
+            if current != *id {
+                self.manager
+                    .notice
+                    .set_text("This session source changed. Refresh before opening it.");
+                self.manager.refresh();
+                return;
+            }
+            self.manager.page.set(position / PAGE_SIZE);
+            self.manager.render();
+            self.manager.list.select_row(
+                self.manager
+                    .list
+                    .row_at_index((position % PAGE_SIZE) as i32)
+                    .as_ref(),
+            );
+            self.manager.resume_selected();
+        } else {
+            self.manager
+                .notice
+                .set_text("This conversation changed during refresh. Search for it again.");
+        }
+    }
+
+    pub fn organize(&self, id: &RuntimeIdentity, pinned: Option<bool>, archived: Option<bool>) {
+        let mut change = jterm_core::agent_workspace::WorkspaceOrganization::new(id.clone());
+        change.pinned = pinned;
+        change.archived = archived;
+        if let Err(error) = self.manager.shared.borrow_mut().organize(vec![change]) {
+            self.manager.notice.set_text(&error);
+        }
+    }
+
+    pub fn shared_row(
+        &self,
+        id: &RuntimeIdentity,
+    ) -> Option<jterm_core::agent_workspace::WorkspaceRow> {
+        self.manager.shared.borrow().rows.get(id).cloned()
+    }
+
+    pub fn task_id(&self, namespace: &str, native_id: &str) -> Option<RuntimeIdentity> {
+        self.manager
+            .shared
+            .borrow_mut()
+            .task_id(namespace, native_id)
+    }
+
+    pub fn index_tasks(&self, rows: Vec<jterm_core::agent_workspace::WorkspaceRow>) {
+        self.manager.shared.borrow_mut().index_tasks(rows);
+    }
+
+    pub fn external_tasks(
+        &self,
+        owned: &HashSet<RuntimeIdentity>,
+    ) -> Vec<super::workspace_navigation::Row> {
+        use super::workspace_navigation::{Action, Row};
+        self.manager
+            .shared
+            .borrow()
+            .rows
+            .values()
+            .filter(|row| {
+                row.kind == jterm_core::agent_workspace::ConversationKind::Task
+                    && !owned.contains(&row.id)
+            })
+            .map(|row| Row {
+                action: Action::ExternalTask(row.id.clone()),
+                title: row.title.clone(),
+                detail: format!("{} · Task context", row.provider),
+                searchable: format!("{} {}", row.preview, row.tags.join(" ")),
+                active: false,
+                busy: false,
+                attention: false,
+                archived: row.archived,
+                pinned: row.pinned,
+                project: row.cwd.clone(),
+                provider: row.provider.clone(),
+                updated: row.updated_at_ms,
+            })
+            .collect()
+    }
+
+    pub fn set_terminal_active(&self, active: bool) {
+        self.manager.terminal_active.set(active);
+        let selected = self.manager.list.selected_row().is_some();
+        self.manager.readiness.set_visible(active && selected);
+        self.manager.resume.set_visible(active && selected);
+    }
+
+    pub fn focus_search(&self) {
+        self.manager.search.grab_focus();
+        self.manager.search.select_region(0, -1);
+    }
+
+    pub fn set_existing(&self, existing: HashSet<RuntimeIdentity>) {
+        if *self.manager.existing.borrow() != existing {
+            *self.manager.existing.borrow_mut() = existing;
+            self.manager.show_selection(
+                self.manager
+                    .list
+                    .selected_row()
+                    .map(|row| row.index() as usize),
+            );
+        }
+    }
+
+    pub fn set_projects(&self, mut projects: Vec<PathBuf>) {
+        projects.sort();
+        projects.dedup();
+        if *self.manager.supplemental_projects.borrow() != projects {
+            *self.manager.supplemental_projects.borrow_mut() = projects;
+            self.manager.render_view(true);
+        }
+    }
+
+    pub fn filter(&self) -> super::workspace_navigation::Filter {
+        super::workspace_navigation::Filter {
+            query: self.manager.search.text().to_string(),
+            provider: match self.manager.provider.selected() {
+                1 => Some("Codex".into()),
+                2 => Some("Claude".into()),
+                _ => None,
+            },
+            needs_attention: self.manager.status.selected() == 2,
+            running: self.manager.live_only.is_active() || self.manager.status.selected() == 1,
+            pinned: self.manager.saved_view.selected() == 1,
+            archive: self.manager.archive_view.selected(),
+            project: if self.manager.project_only.is_active() {
+                self.manager.current_directory.clone()
+            } else {
+                self.manager.selected_project.borrow().clone()
+            },
+        }
+    }
+
+    pub fn connect_query_changed(&self, callback: impl Fn(String) + 'static) {
+        self.manager
+            .search
+            .connect_changed(move |search| callback(search.text().to_string()));
+    }
+}
+
+pub(crate) fn sidebar(
+    parent: &impl IsA<gtk::Window>,
+    current_directory: Option<PathBuf>,
+    library: Rc<RefCell<SessionLibraryStore>>,
+    existing: HashSet<RuntimeIdentity>,
+    launch: impl Fn(ResumeRequest) + 'static,
+) -> Sidebar {
+    build(
+        parent,
+        current_directory,
+        library,
+        existing,
+        launch,
+        true,
+        true,
+    )
+}
+
 struct Activation {
-    key: SessionIdentity,
+    key: RuntimeIdentity,
     existing: bool,
     result: Receiver<Result<(), String>>,
 }
@@ -87,12 +328,16 @@ impl SessionQuickView {
 }
 
 struct Manager {
+    embedded: bool,
+    terminal_active: Cell<bool>,
+    shared: RefCell<super::workspace_cli::SharedCli>,
+    navigation: RefCell<Option<super::workspace_navigation::Navigation>>,
     bulk: session_bulk::SessionBulk,
     window: gtk::glib::WeakRef<gtk::Window>,
     library: Rc<RefCell<SessionLibraryStore>>,
-    existing: RefCell<HashSet<SessionIdentity>>,
+    existing: RefCell<HashSet<RuntimeIdentity>>,
     preflight: RefCell<SessionPreflight>,
-    confirmation: RefCell<Option<SessionIdentity>>,
+    confirmation: RefCell<Option<RuntimeIdentity>>,
     activation: RefCell<Option<Activation>>,
     enter_down: Rc<Cell<bool>>,
     completed_activation: Rc<Cell<bool>>,
@@ -101,6 +346,7 @@ struct Manager {
     quick_views: Vec<(SessionQuickView, gtk::Button)>,
     project: gtk::DropDown,
     project_paths: RefCell<Vec<PathBuf>>,
+    supplemental_projects: RefCell<Vec<PathBuf>>,
     project_labels: RefCell<Vec<String>>,
     selected_project: RefCell<Option<PathBuf>>,
     alias: gtk::Entry,
@@ -167,7 +413,7 @@ struct Manager {
 /// A shown "already running elsewhere" warning.
 #[derive(Clone, Debug)]
 struct ConflictAck {
-    key: SessionIdentity,
+    key: RuntimeIdentity,
     /// The Enter press that showed the warning is still held, so key repeat
     /// cannot confirm it.
     held: bool,
@@ -195,8 +441,19 @@ struct LibraryUiState {
 /// Background rescans start this long after the previous scan finished.
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
+fn runtime_identity(session: &AgentSession) -> RuntimeIdentity {
+    jterm_core::agent_workspace::session_id(session).unwrap_or_else(|_| {
+        jterm_core::agent_workspace::ConversationId(format!(
+            "{}:{}:{}",
+            session.provider.label(),
+            session.source.display(),
+            session.id
+        ))
+    })
+}
+
 fn identity(session: &AgentSession) -> String {
-    format!("{}:{}", session.provider.label(), session.id)
+    runtime_identity(session).0
 }
 
 fn age(updated: u64) -> String {
@@ -447,6 +704,11 @@ impl Manager {
             .iter()
             .map(|project| project.root.clone())
             .collect::<Vec<_>>();
+        for path in self.supplemental_projects.borrow().iter() {
+            if !paths.contains(path) {
+                paths.push(path.clone());
+            }
+        }
         if let Some(selected) = self.selected_project.borrow().as_ref() {
             if !paths.contains(selected) {
                 paths.push(selected.clone());
@@ -458,6 +720,9 @@ impl Manager {
             .map(|project| (&project.root, (project.total, project.archived)))
             .collect::<HashMap<_, _>>();
         labels.extend(paths.iter().enumerate().map(|(index, path)| {
+            if self.embedded {
+                return jterm_core::review_input::safe_inline_display(&path.to_string_lossy(), 160);
+            }
             let counts = project_counts.get(path).copied().unwrap_or_default();
             format!(
                 "{} · {}  ·  {} active · {} archived",
@@ -531,7 +796,7 @@ impl Manager {
                 _ => SessionSort::Relevance,
             },
         };
-        let matches = self.search_index.borrow().query_with_library(
+        let mut matches = self.search_index.borrow().query_with_library(
             &query,
             self.library.borrow().snapshot(),
             SessionLibraryFilter {
@@ -545,6 +810,9 @@ impl Manager {
                 },
             },
         );
+        if self.embedded {
+            matches = (0..self.catalog.borrow().sessions.len()).collect();
+        }
         let summary_matches = self.search_index.borrow().query_with_library(
             &SessionQuery {
                 status: None,
@@ -587,7 +855,16 @@ impl Manager {
                     SessionQuickView::Pinned => 3,
                     SessionQuickView::Archived => 4,
                 }];
-                button.set_label(&format!("{}  {count}", view.label()));
+                if self.embedded {
+                    button.set_label(match view {
+                        SessionQuickView::All => "Recent",
+                        SessionQuickView::NeedsInput => "Needs you",
+                        SessionQuickView::Live => "Running",
+                        _ => view.label(),
+                    });
+                } else {
+                    button.set_label(&format!("{}  {count}", view.label()));
+                }
                 let active = match view {
                     SessionQuickView::All => {
                         self.status.selected() == 0
@@ -697,7 +974,9 @@ impl Manager {
                 || selected_project.is_some()
                 || !self.pinned_first.is_active(),
         );
-        self.notice.set_text(if catalog.sessions.is_empty() {
+        self.notice.set_text(if self.embedded {
+            catalog.warnings.first().map(String::as_str).unwrap_or("")
+        } else if catalog.sessions.is_empty() {
             "No saved sessions found. Start Codex or Claude, then refresh. Custom CODEX_HOME and CLAUDE_CONFIG_DIR are supported."
         } else if matches.is_empty() {
             "No matching sessions. Clear filters or try a project, title, session ID, branch or conversation text."
@@ -723,7 +1002,19 @@ impl Manager {
             while let Some(child) = self.list.first_child() {
                 self.list.remove(&child);
             }
-            let rows: Vec<_> = self.visible.borrow().iter().map(SessionRow::new).collect();
+            let rows: Vec<_> = self
+                .visible
+                .borrow()
+                .iter()
+                .map(|session| {
+                    let row = SessionRow::new(session);
+                    if self.embedded {
+                        row.checked.set_visible(false);
+                        row.cwd.set_visible(false);
+                    }
+                    row
+                })
+                .collect();
             for (row, session) in rows.iter().zip(self.visible.borrow().iter()) {
                 self.wire_batch_check(row, (session.provider, session.id.clone()));
                 self.list.append(&row.row);
@@ -752,7 +1043,7 @@ impl Manager {
             }
             (None, _, _) => {
                 self.hidden_selection.borrow_mut().take();
-                Some(0)
+                (!self.embedded).then_some(0)
             }
         };
         match selected_index.and_then(|index| self.list.row_at_index(index as i32)) {
@@ -843,10 +1134,7 @@ impl Manager {
                 archived: library
                     .snapshot()
                     .is_archived(session.provider, &session.id),
-                open_here: self
-                    .existing
-                    .borrow()
-                    .contains(&(session.provider, session.id.clone())),
+                open_here: self.existing.borrow().contains(&runtime_identity(session)),
             }
         });
         if *self.action_identity.borrow() == next {
@@ -880,6 +1168,12 @@ impl Manager {
         let visible = self.visible.borrow();
         let session = index.and_then(|index| visible.get(index));
         self.sync_action_identity(session);
+        if self.embedded {
+            self.readiness
+                .set_visible(self.terminal_active.get() && session.is_some());
+            self.resume
+                .set_visible(self.terminal_active.get() && session.is_some());
+        }
         let Some(session) = session else {
             self.selected.borrow_mut().take();
             self.preflight.borrow_mut().select(None);
@@ -931,7 +1225,7 @@ impl Manager {
         };
         *self.selected.borrow_mut() = Some(identity(session));
         self.hidden_selection.borrow_mut().take();
-        let key = (session.provider, session.id.clone());
+        let key = runtime_identity(session);
         if self
             .conflict_ack
             .borrow()
@@ -941,10 +1235,7 @@ impl Manager {
             self.conflict_ack.borrow_mut().take();
         }
         self.sync_organization(session);
-        let existing = self
-            .existing
-            .borrow()
-            .contains(&(session.provider, session.id.clone()));
+        let existing = self.existing.borrow().contains(&runtime_identity(session));
         let changed =
             self.preflight
                 .borrow_mut()
@@ -992,7 +1283,15 @@ impl Manager {
             }
         };
         set_label(&self.readiness, &readiness);
-        self.resume.set_label(if existing {
+        self.resume.set_label(if self.embedded {
+            if existing {
+                "Switch to terminal"
+            } else if acknowledged {
+                "Resume anyway"
+            } else {
+                "Open terminal"
+            }
+        } else if existing {
             "Switch to Session"
         } else if acknowledged {
             "Resume anyway"
@@ -1017,7 +1316,15 @@ impl Manager {
         };
         let library = self.library.borrow();
         let facts = library.snapshot().facts(session.provider, &session.id);
-        let pinned = facts.pinned;
+        let pinned = if self.embedded {
+            self.shared
+                .borrow()
+                .rows
+                .get(&runtime_identity(session))
+                .is_some_and(|r| r.pinned)
+        } else {
+            facts.pinned
+        };
         self.updating.set(true);
         self.pin.set_active(pinned);
         self.updating.set(false);
@@ -1100,6 +1407,12 @@ impl Manager {
                         .join(", "),
                 );
                 self.organization_error.borrow_mut().take();
+            }
+            if self.embedded && draft.is_none() {
+                if let Some(row) = self.shared.borrow().rows.get(&runtime_identity(session)) {
+                    self.alias.set_text(&row.title);
+                    self.tags.set_text(&row.tags.join(", "));
+                }
             }
             self.updating.set(false);
             *self.organization_key.borrow_mut() = Some(key);
@@ -1192,6 +1505,43 @@ impl Manager {
     }
 
     fn save_organization(&self) {
+        if self.embedded {
+            let Some(session) = self.selected_session() else {
+                return;
+            };
+            if !self.save_details.is_sensitive() {
+                return;
+            }
+            if let Err(error) = validate_session_details(&self.alias.text(), &self.tags.text()) {
+                self.organization_notice.set_text(&error);
+                return;
+            }
+            let id = runtime_identity(&session);
+            let mut change = jterm_core::agent_workspace::WorkspaceOrganization::new(id.clone());
+            change.title = Some(if self.alias.text().trim().is_empty() {
+                session.title
+            } else {
+                self.alias.text().trim().to_string()
+            });
+            change.tags = Some(
+                self.tags
+                    .text()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            );
+            match self.shared.borrow_mut().organize(vec![change]) {
+                Ok(()) => {
+                    *self.organization_saving.borrow_mut() = Some(id.0);
+                }
+                Err(error) => {
+                    self.organization_notice.set_text(&error);
+                }
+            }
+            return;
+        }
         self.finish_organization_save();
         let Some(session) = self.selected_session() else {
             return;
@@ -1222,6 +1572,29 @@ impl Manager {
     }
 
     fn finish_organization_save(&self) {
+        if self.embedded {
+            let Some(key) = self.organization_saving.borrow().clone() else {
+                return;
+            };
+            let result = self
+                .shared
+                .borrow_mut()
+                .take_result(&jterm_core::agent_workspace::ConversationId(key.clone()));
+            if let Some(result) = result {
+                self.organization_saving.borrow_mut().take();
+                match result {
+                    Ok(()) => {
+                        self.organization_drafts.borrow_mut().remove(&key);
+                        self.organization_dirty.set(false);
+                        self.organization_error.borrow_mut().take();
+                    }
+                    Err(error) => {
+                        *self.organization_error.borrow_mut() = Some(error);
+                    }
+                }
+            }
+            return;
+        }
         // A failed write stays in `error()` even if a reload finished first.
         if self.library.borrow().is_saving() {
             return;
@@ -1261,6 +1634,27 @@ impl Manager {
     }
 
     fn archive_selected(&self) {
+        if self.embedded {
+            let Some(session) = self.selected_session() else {
+                return;
+            };
+            if !self.archive.is_sensitive() {
+                return;
+            }
+            let id = runtime_identity(&session);
+            let archived = self
+                .shared
+                .borrow()
+                .rows
+                .get(&id)
+                .is_some_and(|r| r.archived);
+            let mut change = jterm_core::agent_workspace::WorkspaceOrganization::new(id);
+            change.archived = Some(!archived);
+            if let Err(error) = self.shared.borrow_mut().organize(vec![change]) {
+                self.organization_notice.set_text(&error);
+            }
+            return;
+        }
         if !self.archive.is_sensitive() {
             return;
         }
@@ -1360,6 +1754,15 @@ impl Manager {
             return;
         };
         let pinned = self.pin.is_active();
+        if self.embedded {
+            let mut change =
+                jterm_core::agent_workspace::WorkspaceOrganization::new(runtime_identity(&session));
+            change.pinned = Some(pinned);
+            if let Err(error) = self.shared.borrow_mut().organize(vec![change]) {
+                self.notice.set_text(&error);
+            }
+            return;
+        }
         let result = self
             .library
             .borrow_mut()
@@ -1453,7 +1856,19 @@ impl Manager {
     }
 
     fn dispatch_activation(&self, session: AgentSession, launch: Option<SessionLaunch>) {
-        let key = (session.provider, session.id.clone());
+        let launch = if launch.is_some() {
+            match jterm_core::agent_workspace::managed_launch(&session) {
+                Ok(launch) => Some(launch),
+                Err(error) => {
+                    self.notice.set_text(&error);
+                    self.abandon_confirmation();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let key = runtime_identity(&session);
         let title = jterm_core::review_input::safe_inline_display(
             &format!(
                 "{} · {}",
@@ -1478,6 +1893,7 @@ impl Manager {
         self.resume.set_sensitive(false);
         set_label(&self.readiness, "Opening session…");
         (self.launch)(ResumeRequest {
+            runtime_key: runtime_identity(&session),
             provider: session.provider,
             id: session.id,
             title,
@@ -1505,6 +1921,7 @@ impl Manager {
             self.activation.borrow_mut().take();
             match result {
                 Ok(()) => {
+                    self.existing.borrow_mut().insert(key);
                     self.completed_activation.set(true);
                     set_label(&self.readiness, "Session opened — release Enter to switch");
                     self.close_when_released();
@@ -1523,13 +1940,18 @@ impl Manager {
 
     fn close_when_released(&self) {
         let window = self.window.clone();
+        let embedded = self.embedded;
+        let resume = self.resume.clone();
         let down = self.enter_down.clone();
         let completed = self.completed_activation.clone();
         // The shared ownership controller queues physical-release settlement
         // before this idle, so focus transfer cannot invalidate that release.
         gtk::glib::idle_add_local_once(move || {
             if completed.get() && !down.get() {
-                if let Some(window) = window.upgrade() {
+                if embedded {
+                    completed.set(false);
+                    resume.set_sensitive(true);
+                } else if let Some(window) = window.upgrade() {
                     window.close();
                 }
             }
@@ -1554,7 +1976,7 @@ impl Manager {
             self.abandon_confirmation();
             return;
         };
-        if key != (session.provider, session.id.clone()) {
+        if key != runtime_identity(&session) {
             self.abandon_confirmation();
             return;
         }
@@ -1577,9 +1999,9 @@ impl Manager {
         let Some(session) = self.selected_session() else {
             return;
         };
-        let key = (session.provider, session.id.clone());
+        let key = runtime_identity(&session);
         let existing = self.existing.borrow().contains(&key);
-        if !existing {
+        if !existing && !jterm_core::agent_workspace::managed_session_running(&session) {
             if let Some(warning) = self.catalog.borrow().resume_conflict(&session) {
                 let state = self.conflict_ack.borrow().clone();
                 match state {
@@ -1625,7 +2047,7 @@ pub(crate) fn show(
     parent: &impl IsA<gtk::Window>,
     current_directory: Option<PathBuf>,
     library: Rc<RefCell<SessionLibraryStore>>,
-    existing: HashSet<SessionIdentity>,
+    existing: HashSet<RuntimeIdentity>,
     launch: impl Fn(ResumeRequest) + 'static,
 ) {
     show_inner(parent, current_directory, library, existing, launch, true);
@@ -1635,7 +2057,7 @@ fn show_inner(
     parent: &impl IsA<gtk::Window>,
     current_directory: Option<PathBuf>,
     library: Rc<RefCell<SessionLibraryStore>>,
-    existing: HashSet<SessionIdentity>,
+    existing: HashSet<RuntimeIdentity>,
     launch: impl Fn(ResumeRequest) + 'static,
     auto_scan: bool,
 ) {
@@ -1645,15 +2067,41 @@ fn show_inner(
             return;
         }
     }
-    let window = gtk::Window::builder()
-        .title("Agent Manager")
-        .default_width(1180)
-        .default_height(780)
-        .transient_for(parent)
-        .modal(true)
-        .destroy_with_parent(true)
-        .build();
-    MANAGER_WINDOW.with(|slot| slot.borrow_mut().set(Some(&window)));
+    let _ = build(
+        parent,
+        current_directory,
+        library,
+        existing,
+        launch,
+        auto_scan,
+        false,
+    );
+}
+
+fn build(
+    parent: &impl IsA<gtk::Window>,
+    current_directory: Option<PathBuf>,
+    library: Rc<RefCell<SessionLibraryStore>>,
+    existing: HashSet<RuntimeIdentity>,
+    launch: impl Fn(ResumeRequest) + 'static,
+    auto_scan: bool,
+    embedded: bool,
+) -> Sidebar {
+    let window = if embedded {
+        parent.as_ref().clone()
+    } else {
+        gtk::Window::builder()
+            .title("Agent Manager")
+            .default_width(1180)
+            .default_height(780)
+            .transient_for(parent)
+            .modal(true)
+            .destroy_with_parent(true)
+            .build()
+    };
+    if !embedded {
+        MANAGER_WINDOW.with(|slot| slot.borrow_mut().set(Some(&window)));
+    }
     let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
     root.set_margin_top(18);
     root.set_margin_bottom(18);
@@ -1793,7 +2241,7 @@ fn show_inner(
     list.set_selection_mode(gtk::SelectionMode::Single);
     // A click only selects and inspects. Resuming needs Enter, a double
     // click or the Resume button, never a single click on a row.
-    list.set_activate_on_single_click(false);
+    list.set_activate_on_single_click(embedded);
     list.add_css_class("navigation-sidebar");
     let list_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -1927,8 +2375,113 @@ fn show_inner(
     actions.append(&copy_command);
     actions.append(&resume);
     root.append(&actions);
-    window.set_child(Some(&root));
+    let supplemental = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    if embedded {
+        // Keep one permanent navigation column. Advanced organization lives in
+        // a native popover, while activation stays in the main workspace.
+        while let Some(child) = root.first_child() {
+            root.remove(&child);
+        }
+        root.add_css_class("agent-workspace-navigation");
+        root.set_spacing(6);
+        root.set_margin_top(8);
+        root.set_margin_bottom(8);
+        root.set_margin_start(2);
+        root.set_margin_end(2);
+        heading.set_text("Conversations");
+        heading.remove_css_class("title-1");
+        heading.add_css_class("heading");
+        header.remove(&close);
+        header.set_spacing(2);
+        refresh.set_icon_name("view-refresh-symbolic");
+        refresh.add_css_class("flat");
+        refresh.update_property(&[gtk::accessible::Property::Label("Refresh conversations")]);
+        let options = gtk::MenuButton::new();
+        options.set_icon_name("view-more-symbolic");
+        options.set_tooltip_text(Some("Filters and session details"));
+        let options_popover = gtk::Popover::new();
+        let options_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        options_box.set_margin_top(12);
+        options_box.set_margin_bottom(12);
+        options_box.set_margin_start(12);
+        options_box.set_margin_end(12);
+        options_box.set_width_request(430);
+        filters.set_orientation(gtk::Orientation::Vertical);
+        saved_filters.set_orientation(gtk::Orientation::Vertical);
+        saved_view.set_model(Some(&gtk::StringList::new(&[
+            "All conversations",
+            "Pinned only",
+        ])));
+        sort.set_visible(false);
+        pinned_first.set_visible(false);
+        options_box.append(&filters);
+        options_box.append(&saved_filters);
+        project_row.remove(&archive_view);
+        options_box.append(&archive_view);
+        bulk.root.set_visible(false);
+        options_box.append(&bulk.root);
+        paned.set_end_child(None::<&gtk::Widget>);
+        details_scroll.set_min_content_height(280);
+        details_scroll.set_max_content_height(500);
+        options_box.append(&details_scroll);
+        actions.remove(&pin);
+        actions.remove(&copy_command);
+        options_box.append(&pin);
+        options_box.append(&copy_command);
+        options_popover.set_child(Some(&options_box));
+        options.set_popover(Some(&options_popover));
+        header.append(&options);
+        root.append(&header);
+        search.set_placeholder_text(Some("Search…"));
+        root.append(&search);
+        project_row.remove(&project_label);
+        root.append(&project_row);
+        quick_row.set_spacing(2);
+        // Full filters remain in the menu. These three primary views fit the
+        // 237 px sidebar without widening the terminal canvas.
+        for (view, button) in &quick_views {
+            button.add_css_class("flat");
+            button.set_visible(matches!(
+                view,
+                SessionQuickView::All | SessionQuickView::NeedsInput | SessionQuickView::Live
+            ));
+            button.set_label(match view {
+                SessionQuickView::All => "Recent",
+                SessionQuickView::NeedsInput => "Needs you",
+                SessionQuickView::Live => "Running",
+                _ => view.label(),
+            });
+        }
+        root.append(&quick_row);
+        root.append(&supplemental);
+        paned.set_start_child(None::<&gtk::Widget>);
+        list_scroll.set_min_content_width(190);
+        list_scroll.set_min_content_height(160);
+        list_column.set_visible(false);
+        root.append(&list_column);
+        supplemental.set_vexpand(true);
+        overview.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        overview.add_css_class("dim-label");
+        overview.set_visible(false);
+        root.append(&overview);
+        notice.set_lines(2);
+        notice.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        root.append(&notice);
+        readiness.set_lines(2);
+        readiness.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        actions.remove(&readiness);
+        root.append(&readiness);
+        actions.remove(&resume);
+        resume.set_label("Open selected conversation");
+        root.append(&resume);
+    } else {
+        window.set_child(Some(&root));
+    }
     let manager = Rc::new(Manager {
+        embedded,
+        terminal_active: Cell::new(true),
+        shared: RefCell::new(super::workspace_cli::SharedCli::new()),
+        navigation: RefCell::new(None),
         bulk,
         window: window.downgrade(),
         library,
@@ -1943,6 +2496,7 @@ fn show_inner(
         quick_views,
         project,
         project_paths: RefCell::new(Vec::new()),
+        supplemental_projects: RefCell::new(Vec::new()),
         project_labels: RefCell::new(Vec::new()),
         selected_project: RefCell::new(None),
         alias,
@@ -2158,7 +2712,12 @@ fn show_inner(
     let weak = Rc::downgrade(&manager);
     manager.search.connect_activate(move |_| {
         if let Some(manager) = weak.upgrade() {
-            manager.resume_selected();
+            let navigation = manager.navigation.borrow().clone();
+            if let Some(navigation) = navigation {
+                navigation.activate_selected();
+            } else {
+                manager.resume_selected();
+            }
         }
     });
     let search_keys = gtk::EventControllerKey::new();
@@ -2173,7 +2732,13 @@ fn show_inner(
         {
             return gtk::glib::Propagation::Proceed;
         }
-        if weak.upgrade().is_some_and(|manager| manager.navigate(key)) {
+        if weak.upgrade().is_some_and(|manager| {
+            let navigation = manager.navigation.borrow().clone();
+            navigation.map_or_else(
+                || manager.navigate(key),
+                |navigation| navigation.navigate(key),
+            )
+        }) {
             gtk::glib::Propagation::Stop
         } else {
             gtk::glib::Propagation::Proceed
@@ -2292,7 +2857,9 @@ fn show_inner(
         }
     });
 
-    crate::enter_ownership::watch_window(&window);
+    if !embedded {
+        crate::enter_ownership::watch_window(&window);
+    }
     let window_weak = window.downgrade();
     let weak = Rc::downgrade(&manager);
     keys.connect_key_pressed(move |_, key, _, modifiers| {
@@ -2318,8 +2885,10 @@ fn show_inner(
             {
                 return gtk::glib::Propagation::Stop;
             }
-            if let Some(window) = window_weak.upgrade() {
-                window.close();
+            if !embedded {
+                if let Some(window) = window_weak.upgrade() {
+                    window.close();
+                }
             }
             gtk::glib::Propagation::Stop
         } else {
@@ -2329,20 +2898,31 @@ fn show_inner(
             gtk::glib::Propagation::Proceed
         }
     });
-    window.add_controller(keys);
+    if embedded {
+        root.add_controller(keys);
+    } else {
+        window.add_controller(keys);
+    }
     #[cfg(test)]
     TEST_MANAGER.with(|slot| *slot.borrow_mut() = Rc::downgrade(&manager));
     manager.render();
     if auto_scan {
         manager.refresh();
     }
-    window.present();
-    manager.search.grab_focus();
+    if !embedded {
+        window.present();
+        manager.search.grab_focus();
+    }
+    let sidebar = Sidebar {
+        root,
+        supplemental,
+        manager: manager.clone(),
+    };
     gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
         let Some(window) = manager.window.upgrade() else {
             return gtk::glib::ControlFlow::Break;
         };
-        if !window.is_visible() {
+        if !manager.embedded && !window.is_visible() {
             return gtk::glib::ControlFlow::Break;
         }
         let library_changed = manager.library.borrow_mut().poll();
@@ -2365,12 +2945,126 @@ fn show_inner(
         }
         gtk::glib::ControlFlow::Continue
     });
+    sidebar
 }
 
 #[cfg(test)]
 mod native_tests {
     use super::*;
     use jterm_core::agent_sessions::{LiveSessionProcess, SessionProvider};
+
+    #[test]
+    #[ignore = "requires an isolated native GTK display"]
+    fn embedded_workspace_navigation_focuses_exact_session_without_closing_window() {
+        gtk::init().expect("GTK display");
+        let directory = std::env::temp_dir().join(format!(
+            "workspace-sidebar-{}",
+            gtk::glib::uuid_string_random()
+        ));
+        std::fs::create_dir_all(directory.join(".codex/sessions/2026/11/01")).unwrap();
+        let library = Rc::new(RefCell::new(SessionLibraryStore::with_path(
+            directory.join("library.json"),
+        )));
+        let session = AgentSession {
+            provider: SessionProvider::Codex,
+            id: "01912345-1234-7123-8123-123456789abc".into(),
+            title: "Actual session identity".into(),
+            cwd: directory.clone(),
+            updated_at_ms: 1,
+            status: SessionStatus::Idle,
+            preview: "A native sidebar integration test".into(),
+            branch: None,
+            source: directory.join(".codex/sessions/2026/11/01/rollout.jsonl"),
+            archived: false,
+        };
+        let key = runtime_identity(&session);
+        let activated = Rc::new(RefCell::new(Vec::new()));
+        let captured = activated.clone();
+        let parent = gtk::Window::new();
+        parent.set_default_size(600, 600);
+        let sidebar = Rc::new(build(
+            &parent,
+            Some(directory.clone()),
+            library,
+            [key.clone()].into_iter().collect(),
+            move |request| {
+                assert!(
+                    request.launch.is_none(),
+                    "an existing runtime is only focused"
+                );
+                captured.borrow_mut().push(request.runtime_key);
+                request.completion.send(Ok(())).unwrap();
+            },
+            false,
+            true,
+        ));
+        let weak = Rc::downgrade(&sidebar);
+        let navigation = super::super::workspace_navigation::Navigation::new(move |action| {
+            if let super::super::workspace_navigation::Action::Cli(id) = action {
+                if let Some(sidebar) = weak.upgrade() {
+                    sidebar.activate(&id);
+                }
+            }
+        });
+        sidebar.bind_navigation(&navigation);
+        sidebar.supplemental.append(&navigation.root);
+        let mut catalog = SessionCatalog::default();
+        catalog.sessions.push(session);
+        sidebar.manager.accept_catalog(catalog);
+        sidebar
+            .manager
+            .shared
+            .borrow_mut()
+            .isolated_state(&directory.join("test-host"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            sidebar.manager.library.borrow_mut().poll();
+            let rows = sidebar.cli_rows();
+            if !rows.is_empty() {
+                navigation.sync(rows, &sidebar.filter());
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background source projection timed out"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        parent.set_child(Some(&sidebar.root));
+        parent.present();
+        let context = gtk::glib::MainContext::default();
+        for _ in 0..30 {
+            while context.pending() {
+                context.iteration(false);
+            }
+        }
+        assert!(navigation.navigate(gtk::gdk::Key::Down));
+        assert!(
+            activated.borrow().is_empty(),
+            "keyboard browsing cannot launch or focus a session"
+        );
+        navigation.activate_selected();
+        sidebar.manager.poll_activation();
+        while context.pending() {
+            context.iteration(false);
+        }
+        assert_eq!(*activated.borrow(), vec![key]);
+        assert!(
+            parent.is_visible(),
+            "activation must not close the main workspace"
+        );
+        assert_eq!(
+            sidebar.root.root(),
+            Some(parent.clone().upcast::<gtk::Root>())
+        );
+        assert!(
+            !sidebar.manager.completed_activation.get(),
+            "the persistent sidebar accepts the next activation"
+        );
+        parent.destroy();
+        sidebar.manager.navigation.borrow_mut().take();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     /// Run in an isolated Xvfb session; verifies real GTK signals and exact
     /// launch argv without starting a provider or reading personal history.
@@ -2490,10 +3184,10 @@ mod native_tests {
         };
         let first = manager.visible.borrow()[0].clone();
         let second = manager.visible.borrow()[1].clone();
-        manager.existing.borrow_mut().extend([
-            (first.provider, first.id.clone()),
-            (second.provider, second.id.clone()),
-        ]);
+        manager
+            .existing
+            .borrow_mut()
+            .extend([runtime_identity(&first), runtime_identity(&second)]);
         manager.show_selection(Some(0));
         // GtkButton's keyboard action waits 250 ms before clicked. Begin all
         // eligible actions for A, then move to B before that timeout expires.
@@ -2990,7 +3684,7 @@ mod native_tests {
         manager
             .existing
             .borrow_mut()
-            .insert((target.provider, target.id.clone()));
+            .insert(runtime_identity(&target));
         manager.search.emit_activate();
         manager.poll_activation();
         assert!(
@@ -3164,7 +3858,11 @@ mod native_tests {
         manager.resume_selected();
         assert_eq!(
             manager.confirmation.borrow().as_ref(),
-            Some(&(SessionProvider::Codex, live.to_string())),
+            manager
+                .selected_session()
+                .as_ref()
+                .map(runtime_identity)
+                .as_ref(),
             "the explicit second Resume proceeds to the launch check"
         );
         // Escape also cancels a confirmed launch that is still being checked.

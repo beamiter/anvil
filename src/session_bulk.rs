@@ -565,7 +565,14 @@ mod native_tests {
                 archived: false,
             })
             .collect();
-        manager.existing.borrow_mut().extend([a.clone(), b.clone()]);
+        manager.existing.borrow_mut().extend(
+            manager
+                .catalog
+                .borrow()
+                .sessions
+                .iter()
+                .map(super::super::runtime_identity),
+        );
         *manager.search_index.borrow_mut() = SessionSearchIndex::new(&manager.catalog.borrow());
         manager.render();
         settle(&manager);

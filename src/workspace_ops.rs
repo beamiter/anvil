@@ -793,7 +793,8 @@ impl AppModel {
         request: crate::agent_sessions::ResumeRequest,
         sender: &ComponentSender<AppModel>,
     ) {
-        let key = (request.provider, request.id.clone());
+        self.show_terminal_workspace();
+        let key = request.runtime_key.clone();
         if let Some(pane_id) = self.agent_session_tabs.get(&key).copied() {
             if let Some((ti, pi)) = self.tabs.iter().enumerate().find_map(|(ti, tab)| {
                 tab.panes
@@ -810,10 +811,6 @@ impl AppModel {
                 if delta != 0 {
                     self.cycle_pane_focus(delta);
                 }
-                let _ = self
-                    .agent_session_library
-                    .borrow_mut()
-                    .record_resumed(request.provider, &request.id);
                 let _ = request.completion.send(Ok(()));
                 return;
             }
@@ -838,6 +835,7 @@ impl AppModel {
         ) {
             self.agent_session_tabs.insert(key, pane_id);
             self.agent_session_pending.insert(pane_id, request);
+            self.rebuild_tab_strip(sender);
         } else {
             let _ = request.completion.send(Err(
                 "The terminal tab limit prevented this session from opening.".into(),
@@ -1954,6 +1952,7 @@ impl AppModel {
     }
 
     pub(crate) fn select_tab(&mut self, id: u64, sender: &ComponentSender<AppModel>) {
+        self.show_terminal_workspace();
         self.select_tab_from_pane(id, sender, self.active_pane_id());
     }
 

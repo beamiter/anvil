@@ -68,8 +68,10 @@ fn classify_composer_key(key: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> C
             | ModifierType::META_MASK,
     ) {
         ComposerKeyAction::Proceed
-    } else {
+    } else if state.contains(ModifierType::CONTROL_MASK) {
         ComposerKeyAction::Send
+    } else {
+        ComposerKeyAction::Newline
     }
 }
 
@@ -104,6 +106,11 @@ pub(crate) enum AiPanelMsg {
         initial_context: Option<(ai::BlockContext, ai::BlockAiIntent)>,
     },
     Restore(String),
+    WorkspacePoll,
+    SharedReload,
+    SharedHistory,
+    SharedMutation(jterm_core::agent_workspace::WorkspaceCommand),
+    OpenShared(jterm_core::agent_workspace::ConversationId),
     SetStream(bool),
     SetRedactSecrets(bool),
     Ask,
@@ -151,6 +158,12 @@ pub(crate) struct AiPanelModel {
     /// opened by a build that forgot to pass the flag — cannot leak anything.
     share_command_context: bool,
     store: ChatStore,
+    shared: crate::workspace_chats::SharedChats,
+    pending_shared: HashMap<u64, (RequestPayload, bool)>,
+    pending_new_context: HashMap<u64, RequestPayload>,
+    earlier_history: HashMap<u64, String>,
+    scroll_owner: Rc<Cell<u64>>,
+    scroll_positions: HashMap<u64, f64>,
     requests: HashMap<RequestToken, ai::AiHandle>,
     retry_payloads: HashMap<u64, RequestPayload>,
     conversation_systems: HashMap<u64, String>,
@@ -179,7 +192,7 @@ impl Component for AiPanelModel {
         root = gtk::Box {
             set_orientation: gtk::Orientation::Vertical,
             set_width_request: 280,
-            set_hexpand: false,
+            set_hexpand: true,
             set_vexpand: true,
             add_css_class: "ai-panel",
 
@@ -190,6 +203,7 @@ impl Component for AiPanelModel {
 
                 gtk::Button {
                     set_label: "Chats",
+                        set_visible: false,
                     add_css_class: "flat",
                     set_tooltip_text: Some("Browse saved and archived chats"),
                     connect_clicked => AiPanelMsg::ShowLibrary,
@@ -206,6 +220,18 @@ impl Component for AiPanelModel {
                     },
                 },
 
+                gtk::Button {
+                    set_label: "Earlier",
+                    add_css_class: "flat",
+                    set_tooltip_text: Some("Load earlier saved messages without expanding provider context"),
+                    connect_clicked => AiPanelMsg::SharedHistory,
+                },
+                gtk::Button {
+                    set_icon_name: "view-refresh-symbolic",
+                    add_css_class: "flat",
+                    set_tooltip_text: Some("Reload shared history and keep the local draft"),
+                    connect_clicked => AiPanelMsg::SharedReload,
+                },
                 gtk::Button {
                     set_icon_name: "list-add-symbolic",
                     add_css_class: "flat",
@@ -340,7 +366,7 @@ impl Component for AiPanelModel {
                         gtk::Button {
                             set_label: "Send",
                             set_tooltip_text: Some(
-                                "Send (Enter / Ctrl+Enter) · New line (Shift+Enter)"
+                                "Send (Ctrl+Enter) · New line (Enter)"
                             ),
                             add_css_class: "suggested-action",
                             connect_clicked => AiPanelMsg::Ask,
@@ -423,6 +449,17 @@ impl Component for AiPanelModel {
             redact_secrets: init.redact_secrets,
             share_command_context: false,
             store: new_chat_store(),
+            shared: crate::workspace_chats::SharedChats::new(format!(
+                "anvil:{}",
+                crate::session::state_file_path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|_| format!("window-{}", std::process::id()))
+            )),
+            pending_shared: HashMap::new(),
+            pending_new_context: HashMap::new(),
+            earlier_history: HashMap::new(),
+            scroll_owner: Rc::new(Cell::new(0)),
+            scroll_positions: HashMap::new(),
             requests: HashMap::new(),
             retry_payloads: HashMap::new(),
             conversation_systems: HashMap::new(),
@@ -515,24 +552,21 @@ impl Component for AiPanelModel {
                 self.share_command_context = share_command_context;
                 widgets.page_stack.set_visible_child_name(CHAT_PAGE);
                 if let Some((context, intent)) = initial_context {
+                    let prompt = ai::seeded_block_question(intent, context.exit_code);
+                    let payload = RequestPayload {
+                        user_text: prompt.into(),
+                        context: Some(context),
+                        restore_pending_as_draft: false,
+                    };
                     if self.store.active_archived() {
-                        let _ = self.new_chat();
-                    }
-                    if !self.store.is_active_busy() {
-                        // The question is a fixed constant per intent; the
-                        // untrusted command/output travel only inside the
-                        // framed context envelope.
-                        let prompt = ai::seeded_block_question(intent, context.exit_code);
-                        self.start_request(
-                            widgets,
-                            &sender,
-                            RequestPayload {
-                                user_text: prompt.into(),
-                                context: Some(context),
-                                restore_pending_as_draft: false,
-                            },
-                            false,
-                        );
+                        match self.shared.create() {
+                            Ok(request) => {
+                                self.pending_new_context.insert(request, payload);
+                            }
+                            Err(error) => widgets.status.set_label(&error),
+                        }
+                    } else if !self.store.is_active_busy() {
+                        self.start_request(widgets, &sender, payload, false);
                     }
                 }
                 self.render_all(widgets, &sender);
@@ -557,6 +591,134 @@ impl Component for AiPanelModel {
                         .set_label(&format!("Saved AI chats were not restored: {error}"));
                 }
             },
+            AiPanelMsg::SharedMutation(command) => {
+                if let Err(error) = self.shared.mutation(command) {
+                    widgets.status.set_label(&error);
+                }
+            }
+            AiPanelMsg::SharedReload => {
+                if let Err(error) = self.shared.reload(self.store.active_id()) {
+                    widgets.status.set_label(&error);
+                }
+            }
+            AiPanelMsg::SharedHistory => {
+                if let Err(error) = self.shared.history(self.store.active_id()) {
+                    widgets.status.set_label(&error);
+                }
+            }
+            AiPanelMsg::OpenShared(id) => match self.shared.open(id) {
+                Ok(Some(id)) => sender.input(AiPanelMsg::SelectChat(id)),
+                Ok(None) => widgets.status.set_label("Opening conversation…"),
+                Err(error) => widgets.status.set_label(&error),
+            },
+            AiPanelMsg::WorkspacePoll => {
+                for event in self.shared.poll(&mut self.store, self.redact_secrets) {
+                    match event {
+                        crate::workspace_chats::Event::Created {
+                            request,
+                            chat_id: _,
+                        } => {
+                            self.invalidate_delete_confirmation();
+                            if let Some(payload) = self.pending_new_context.remove(&request) {
+                                self.start_request(widgets, &sender, payload, false);
+                            }
+                            self.render_all(widgets, &sender);
+                            self.publish_snapshot(widgets, &sender);
+                        }
+                        crate::workspace_chats::Event::Opened(_) => {
+                            self.invalidate_delete_confirmation();
+                            self.render_all(widgets, &sender);
+                            self.publish_snapshot(widgets, &sender);
+                        }
+                        crate::workspace_chats::Event::Authorized {
+                            request,
+                            chat_id,
+                            receipt,
+                        } => {
+                            let Some((payload, clear)) = self.pending_shared.remove(&request)
+                            else {
+                                self.shared.reject_receipt(chat_id, receipt);
+                                continue;
+                            };
+                            let active = self.store.active_id();
+                            if self.store.active_id() != chat_id && !self.store.select_chat(chat_id)
+                            {
+                                self.shared.reject_receipt(chat_id, receipt);
+                                continue;
+                            }
+                            let draft = if self.redact_secrets {
+                                jterm_core::redact::redact_secrets(self.store.active_draft())
+                            } else {
+                                self.store.active_draft().to_string()
+                            };
+                            let clear = clear && draft.trim() == payload.user_text.trim();
+                            if !self.start_request_authorized(
+                                widgets,
+                                &sender,
+                                payload,
+                                clear,
+                                receipt.clone(),
+                            ) {
+                                self.shared.reject_receipt(chat_id, receipt);
+                            }
+                            self.store.select_chat(active);
+                            self.render_all(widgets, &sender);
+                        }
+                        crate::workspace_chats::Event::Rejected { request, message } => {
+                            self.pending_shared.remove(&request);
+                            widgets.status.set_label(&message);
+                        }
+                        crate::workspace_chats::Event::Deleted(id) => {
+                            let active = self.store.active_id();
+                            if active == id || self.store.select_chat(id) {
+                                let _ = self.store.delete_active();
+                            }
+                            if active != id {
+                                self.store.select_chat(active);
+                            }
+                            self.earlier_history.remove(&id);
+                            self.retry_payloads.remove(&id);
+                            self.conversation_systems.remove(&id);
+                            self.invalidate_delete_confirmation();
+                            self.render_all(widgets, &sender);
+                            self.publish_snapshot(widgets, &sender);
+                        }
+                        crate::workspace_chats::Event::Earlier { chat_id, text } => {
+                            if self.earlier_history.len() >= 8
+                                && !self.earlier_history.contains_key(&chat_id)
+                            {
+                                if let Some(id) = self.earlier_history.keys().next().copied() {
+                                    self.earlier_history.remove(&id);
+                                }
+                            }
+                            let earlier = self.earlier_history.entry(chat_id).or_default();
+                            *earlier = format!("{text}{earlier}");
+                            if earlier.len() > 1024 * 1024 {
+                                let mut end = 1024 * 1024;
+                                while !earlier.is_char_boundary(end) {
+                                    end -= 1;
+                                }
+                                earlier.truncate(end);
+                            }
+                            if self.store.active_id() == chat_id {
+                                self.render_transcript(widgets);
+                                let view = widgets.transcript.clone();
+                                gtk::glib::idle_add_local_once(move || {
+                                    let mut start = view.buffer().start_iter();
+                                    view.scroll_to_iter(&mut start, 0.0, false, 0.0, 0.0);
+                                });
+                            }
+                        }
+                        crate::workspace_chats::Event::Error(error) => {
+                            if !self.store.is_active_busy() {
+                                widgets
+                                    .status
+                                    .set_label(&format!("Shared workspace: {error}"));
+                            }
+                        }
+                    }
+                }
+            }
             AiPanelMsg::Ask => {
                 if self.store.is_active_busy() {
                     return;
@@ -582,6 +744,7 @@ impl Component for AiPanelModel {
                     return;
                 };
                 handle.cancel();
+                let _ = self.shared.finish(token, Err(()));
                 let _ = self.store.cancel_request(token, STOPPED_STATUS.to_string());
                 self.render_all(widgets, &sender);
                 self.publish_snapshot(widgets, &sender);
@@ -619,10 +782,16 @@ impl Component for AiPanelModel {
                             .complete_success(token, answer.trim().to_string())
                             .is_some()
                         {
+                            let _ = self
+                                .shared
+                                .complete(token, &self.store, self.redact_secrets);
                             self.retry_payloads.remove(&token.chat_id);
+                        } else {
+                            let _ = self.shared.finish(token, Err(()));
                         }
                     }
                     Err(error) => {
+                        let _ = self.shared.finish(token, Err(()));
                         let error = crate::review_input::safe_inline_display(&error, 2 * 1024);
                         let _ = self
                             .store
@@ -666,19 +835,11 @@ impl Component for AiPanelModel {
                     self.refresh_library(&widgets.chat_list, &sender);
                 }
             }
-            AiPanelMsg::NewChat => match self.new_chat() {
-                Ok(_) => {
-                    widgets.page_stack.set_visible_child_name(CHAT_PAGE);
-                    self.render_all(widgets, &sender);
-                    self.publish_snapshot(widgets, &sender);
-                    widgets.composer.grab_focus();
+            AiPanelMsg::NewChat => {
+                if let Err(error) = self.shared.create() {
+                    widgets.status.set_label(&error);
                 }
-                Err(ChatStoreError::LimitReached) => widgets.status.set_label(&format!(
-                    "{} chats are already saved. Delete one before creating another.",
-                    ai::MAX_PERSISTED_CHATS
-                )),
-                Err(_) => {}
-            },
+            }
             AiPanelMsg::SelectChat(id) => {
                 if self.select_chat(id) {
                     self.render_all(widgets, &sender);
@@ -746,6 +907,24 @@ impl Component for AiPanelModel {
                 dialog.present(Some(root));
             }
             AiPanelMsg::DeleteConfirmed(confirmation) => {
+                if confirmation.chat_id == self.store.active_id()
+                    && Rc::ptr_eq(&confirmation.epoch, &self.delete_epoch)
+                {
+                    match self.shared.delete(confirmation.chat_id) {
+                        Ok(true) => {
+                            self.invalidate_delete_confirmation();
+                            widgets
+                                .status
+                                .set_label("Deleting the shared conversation…");
+                            return;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            widgets.status.set_label(&error);
+                            return;
+                        }
+                    }
+                }
                 match self.delete_confirmed(confirmation) {
                     Ok(Some(_)) => {
                         self.render_all(widgets, &sender);
@@ -894,6 +1073,7 @@ impl AiPanelModel {
     fn restore_chats(&mut self, snapshot: ai::ConversationSnapshot) {
         self.invalidate_delete_confirmation();
         self.store = restore_chat_store(snapshot);
+        self.shared.restore_legacy_sources(&self.store);
     }
 
     fn toggle_archive(&mut self) -> Result<(), ChatStoreError> {
@@ -922,9 +1102,46 @@ impl AiPanelModel {
     fn start_request(
         &mut self,
         widgets: &mut AiPanelModelWidgets,
+        _sender: &ComponentSender<Self>,
+        mut payload: RequestPayload,
+        clear_composer: bool,
+    ) -> bool {
+        if payload.user_text.trim().is_empty()
+            || self.store.is_active_busy()
+            || self.client.is_none()
+        {
+            return false;
+        }
+        if self.redact_secrets {
+            payload.user_text = jterm_core::redact::redact_secrets(&payload.user_text);
+        }
+        match self.shared.prepare(
+            self.store.active_id(),
+            payload.user_text.clone(),
+            clear_composer,
+        ) {
+            Ok(request) => {
+                self.pending_shared
+                    .insert(request, (payload, clear_composer));
+                widgets
+                    .status
+                    .set_label("Saving the draft and preparing this conversation…");
+                true
+            }
+            Err(error) => {
+                widgets.status.set_label(&error);
+                false
+            }
+        }
+    }
+
+    fn start_request_authorized(
+        &mut self,
+        widgets: &mut AiPanelModelWidgets,
         sender: &ComponentSender<Self>,
         mut payload: RequestPayload,
         clear_composer: bool,
+        receipt: jterm_core::agent_workspace::SubmissionReceipt,
     ) -> bool {
         if payload.user_text.trim().is_empty() {
             widgets.status.set_label("Message is empty.");
@@ -1003,6 +1220,7 @@ impl AiPanelModel {
             .or_insert(new_system)
             .clone();
         let token = start.token;
+        self.shared.attach(token, receipt);
         self.retry_payloads.insert(token.chat_id, payload);
         let handle = if self.stream {
             let delta_sender = sender.clone();
@@ -1030,6 +1248,7 @@ impl AiPanelModel {
         let requests = std::mem::take(&mut self.requests);
         for (token, handle) in requests {
             handle.cancel();
+            let _ = self.shared.finish(token, Err(()));
             let _ = self
                 .store
                 .cancel_request(token, "Request cancelled during restore.".into());
@@ -1043,6 +1262,63 @@ impl AiPanelModel {
     /// must still find it. The clone is also why the detaching variant is the
     /// right one — those chats are still marked busy, and their requests die
     /// with the process.
+    pub(crate) fn workspace_rows(&self, visible: bool) -> Vec<crate::workspace_navigation::Row> {
+        use crate::workspace_navigation::{Action, Row};
+        let summaries = self.store.summaries();
+        let mut rows = self
+            .shared
+            .rows
+            .iter()
+            .map(|row| {
+                let state = self
+                    .shared
+                    .local_id(&row.id)
+                    .and_then(|id| summaries.iter().find(|chat| chat.id == id));
+                Row {
+                    action: Action::SharedApi(row.id.clone()),
+                    title: format!("{}{}", if row.pinned { "★ " } else { "" }, row.title),
+                    detail: "API conversation".into(),
+                    searchable: row.preview.clone(),
+                    active: visible && state.is_some_and(|s| s.active),
+                    busy: row.runtime.is_live() || state.is_some_and(|s| s.busy),
+                    attention: state.is_some_and(|s| s.unread || s.error),
+                    archived: row.archived,
+                    pinned: row.pinned,
+                    project: row.cwd.clone(),
+                    provider: row.provider.clone(),
+                    updated: row.updated_at_ms,
+                }
+            })
+            .collect::<Vec<_>>();
+        rows.extend(
+            summaries
+                .into_iter()
+                .filter(|chat| {
+                    !self.shared.is_shared(chat.id)
+                        && (chat.active || chat.busy || chat.preview != "Empty conversation")
+                })
+                .map(|chat| Row {
+                    action: Action::Api(chat.id),
+                    title: chat.title,
+                    detail: if chat.preview == "Empty conversation" {
+                        "API draft".into()
+                    } else {
+                        "API conversation · syncing".into()
+                    },
+                    searchable: chat.preview,
+                    active: visible && chat.active,
+                    busy: chat.busy,
+                    attention: chat.unread || chat.error,
+                    archived: chat.archived,
+                    pinned: false,
+                    project: String::new(),
+                    provider: "API".into(),
+                    updated: 0,
+                }),
+        );
+        rows
+    }
+
     fn publish_snapshot(&mut self, widgets: &AiPanelModelWidgets, sender: &ComponentSender<Self>) {
         let mut durable = self.store.clone();
         for (chat_id, payload) in &self.retry_payloads {
@@ -1129,8 +1405,51 @@ impl AiPanelModel {
     /// on a chat switch, ruinous when it ran per streamed fragment — see
     /// [`Self::append_stream_text`].
     fn render_transcript(&mut self, widgets: &AiPanelModelWidgets) {
+        let active = self.store.active_id();
+        let previous = self.scroll_owner.replace(active);
+        let follows = transcript_follows_stream(&widgets.transcript);
+        let position = widgets.transcript.vadjustment().map(|adjustment| {
+            let bottom = (adjustment.upper() - adjustment.page_size()).max(1.0);
+            (
+                adjustment.value(),
+                (adjustment.value() / bottom).clamp(0.0, 1.0),
+            )
+        });
+        if previous != 0 {
+            if follows {
+                self.scroll_positions.remove(&previous);
+            } else if let Some((value, _)) = position {
+                self.scroll_positions.insert(previous, value);
+            }
+            if previous != active {
+                if let Some((_, ratio)) = position {
+                    self.shared.save_position(previous, ratio);
+                }
+            }
+        }
+        let restore = if previous == active {
+            (!follows)
+                .then(|| position.map(|(value, _)| (false, value)))
+                .flatten()
+        } else {
+            self.scroll_positions
+                .get(&active)
+                .copied()
+                .map(|value| (false, value))
+                .or_else(|| {
+                    self.shared
+                        .read_position(active)
+                        .filter(|ratio| *ratio < 0.99)
+                        .map(|ratio| (true, ratio))
+                })
+        };
         let buffer = widgets.transcript.buffer();
-        buffer.set_text("");
+        buffer.set_text(
+            self.earlier_history
+                .get(&self.store.active_id())
+                .map(String::as_str)
+                .unwrap_or(""),
+        );
         for turn in self.store.active_history() {
             append_transcript(
                 &widgets.transcript,
@@ -1150,7 +1469,25 @@ impl AiPanelModel {
             );
         }
         self.rendered_partial_bytes = self.store.active_partial().len();
-        queue_scroll_to_end(&widgets.transcript, &self.scroll_queued);
+        if let Some((ratio, position)) = restore {
+            let view = widgets.transcript.clone();
+            let owner = self.scroll_owner.clone();
+            gtk::glib::idle_add_local_once(move || {
+                if owner.get() != active {
+                    return;
+                }
+                if let Some(adjustment) = view.vadjustment() {
+                    let bottom = (adjustment.upper() - adjustment.page_size()).max(0.0);
+                    adjustment.set_value(if ratio {
+                        position * bottom
+                    } else {
+                        position.min(bottom)
+                    });
+                }
+            });
+        } else {
+            queue_scroll_to_end(&widgets.transcript, &self.scroll_queued);
+        }
     }
 
     /// Insert only the bytes that this fragment added.
@@ -1203,8 +1540,15 @@ impl AiPanelModel {
 
     fn render_status(&self, widgets: &AiPanelModelWidgets) {
         let busy = self.store.is_active_busy();
+        let idle = format!(
+            "{} · Enter for new line · Ctrl+Enter to send",
+            self.client.as_ref().map_or_else(
+                || "API conversation".into(),
+                |client| crate::review_input::safe_inline_display(&client.display_name(), 256)
+            )
+        );
         let status = match self.store.active_status() {
-            ChatStatus::Idle => "",
+            ChatStatus::Idle => &idle,
             ChatStatus::Thinking(text) | ChatStatus::Info(text) | ChatStatus::Error(text) => text,
         };
         widgets.status.set_label(status);
@@ -1393,6 +1737,17 @@ mod tests {
             redact_secrets: false,
             share_command_context,
             store: new_chat_store(),
+            shared: crate::workspace_chats::SharedChats::new(format!(
+                "anvil:{}",
+                crate::session::state_file_path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|_| format!("window-{}", std::process::id()))
+            )),
+            pending_shared: HashMap::new(),
+            pending_new_context: HashMap::new(),
+            earlier_history: HashMap::new(),
+            scroll_owner: Rc::new(Cell::new(0)),
+            scroll_positions: HashMap::new(),
             requests: HashMap::new(),
             retry_payloads: HashMap::new(),
             conversation_systems: HashMap::new(),
@@ -1677,7 +2032,11 @@ mod tests {
         use gtk::gdk::{Key, ModifierType};
 
         let cases = [
-            (Key::Return, ModifierType::empty(), ComposerKeyAction::Send),
+            (
+                Key::Return,
+                ModifierType::empty(),
+                ComposerKeyAction::Newline,
+            ),
             (
                 Key::Return,
                 ModifierType::CONTROL_MASK,
