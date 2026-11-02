@@ -23,6 +23,20 @@ use crate::dialogs::tasks_panel::{DiffSync, TaskDetailSync, TasksPanelMsg, Tasks
 use crate::workspace::Pane;
 use crate::AppModel;
 
+const HOSTED_VALIDATION_VIEW: &str = "anvil-hosted-validation-view";
+
+fn is_hosted_validation_view(pane: &Pane) -> bool {
+    use relm4::gtk::prelude::*;
+    // This marker belongs to the view widget, so it survives pane moves and
+    // disappears with the widget. It never represents execution authority.
+    unsafe {
+        pane.terminal
+            .widget()
+            .data::<bool>(HOSTED_VALIDATION_VIEW)
+            .is_some_and(|value| *value.as_ref())
+    }
+}
+
 /// Poll cadence while any task machinery is active; the runtime's own frame
 /// budgets make each tick a bounded, nonblocking drain.
 const TASKS_POLL_FAST: Duration = Duration::from_millis(120);
@@ -247,7 +261,29 @@ impl AppModel {
         // cancels pending provider preparation before it can launch.
         {
             let policy = self.task_prompt_policy();
+            let selected = self
+                .tasks_panel_visible
+                .get()
+                .then_some(self.selected_task)
+                .flatten();
+            self.agent_runtime.select_hosted_view(selected);
             let report = self.agent_runtime.poll(&mut self.task_manager, policy);
+            for outcome in self.agent_runtime.take_prompt_outcomes() {
+                if let Some(request) = self.hosted_followups.remove(&outcome.receipt) {
+                    self.tasks_panel
+                        .emit(TasksPanelMsg::FollowUpResolved(request, outcome.result));
+                }
+            }
+            for (task_id, terminal) in self.agent_runtime.take_owned_terminal_launches() {
+                if self.selected_task == Some(task_id) && self.tasks_panel_visible.get() {
+                    self.open_hosted_validation_terminal(task_id, terminal, sender);
+                }
+            }
+            for (task_id, session) in self.agent_runtime.take_terminal_handoffs() {
+                if self.selected_task == Some(task_id) && self.tasks_panel_visible.get() {
+                    self.open_hosted_native_terminal(session, sender);
+                }
+            }
             self.task_announcements.applied_turns(&report.applied_turns);
             // Report issues are consumed once, even when preparation failure
             // leaves the task status unchanged. Merge with terminal transitions
@@ -301,6 +337,7 @@ impl AppModel {
             || has_tasks
             || self.tasks_panel_visible.get()
             || self.agent_runtime.has_any_activity()
+            || self.agent_runtime.needs_host_poll()
         {
             self.ensure_agent_tasks_timer_with(
                 if keep_fast {
@@ -369,6 +406,22 @@ impl AppModel {
         ) {
             return;
         }
+        if role == TaskTerminalRole::Validation {
+            if let Some(terminal) = self
+                .agent_runtime
+                .hosted_validation_terminal(task_id)
+                .cloned()
+            {
+                let binding = self
+                    .task_manager
+                    .get(task_id)
+                    .and_then(|task| task.validation.terminal_session_id.as_deref());
+                if self.existing_task_terminal(binding, role).is_none() {
+                    self.open_hosted_validation_terminal(task_id, terminal, sender);
+                    return;
+                }
+            }
+        }
         let binding = self
             .task_manager
             .get(task_id)
@@ -416,15 +469,47 @@ impl AppModel {
             return;
         }
         self.announce_task_transitions();
+        let mutation = match &action {
+            TaskPanelAction::Complete(id) => Some((
+                *id,
+                jterm_core::agent_workspace::NativeTaskMutation::Complete,
+            )),
+            TaskPanelAction::AcceptReviewed(id) => Some((
+                *id,
+                jterm_core::agent_workspace::NativeTaskMutation::AcceptReviewed,
+            )),
+            TaskPanelAction::Archive(id) => Some((
+                *id,
+                jterm_core::agent_workspace::NativeTaskMutation::Archive,
+            )),
+            TaskPanelAction::Restore(id) => Some((
+                *id,
+                jterm_core::agent_workspace::NativeTaskMutation::Restore,
+            )),
+            _ => None,
+        };
+        if let Some((task_id, mutation)) = mutation {
+            if self.agent_runtime.conversation_id(task_id).is_some() {
+                if let Err(error) = self.agent_runtime.mutate_hosted_task(task_id, mutation) {
+                    self.show_toast(error.to_string());
+                }
+                // The host's accepted snapshot supplies the transition. Queueing
+                // a request cannot make this local replica complete or archive it.
+                self.ensure_agent_tasks_timer(sender);
+                return;
+            }
+        }
         match action {
             TaskPanelAction::CreateFromBlock => self.create_task_from_block(sender),
             TaskPanelAction::ComposeProject => self.compose_project_task(sender),
             TaskPanelAction::CreateProject(draft) => self.create_project_task(draft, sender),
             TaskPanelAction::Select(task_id) => {
+                self.agent_runtime.select_hosted_view(Some(task_id));
                 self.selected_task = Some(task_id);
                 self.sync_tasks_panel();
             }
             TaskPanelAction::Close => {
+                self.agent_runtime.select_hosted_view(None);
                 self.tasks_panel_visible.set(false);
                 self.sync_side_panel();
             }
@@ -497,7 +582,13 @@ impl AppModel {
                 let policy = self.task_prompt_policy();
                 let result = self
                     .agent_runtime
-                    .prompt_native(&self.task_manager, request.task_id, &request.text, policy)
+                    .prompt_native_tracked(
+                        &self.task_manager,
+                        request.task_id,
+                        &request.text,
+                        policy,
+                        request.request_id.to_string(),
+                    )
                     .map_err(|error| error.to_string());
                 match &result {
                     Ok(()) => self.show_toast(format!(
@@ -506,8 +597,13 @@ impl AppModel {
                     )),
                     Err(error) => self.show_toast(error.clone()),
                 }
-                self.tasks_panel
-                    .emit(TasksPanelMsg::FollowUpResolved(request, result));
+                if result.is_ok() && self.agent_runtime.needs_host_poll() {
+                    self.hosted_followups
+                        .insert(request.request_id.to_string(), request);
+                } else {
+                    self.tasks_panel
+                        .emit(TasksPanelMsg::FollowUpResolved(request, result));
+                }
             }
             TaskPanelAction::FinishCodex(task_id) => {
                 match self.agent_runtime.finish_codex(&self.task_manager, task_id) {
@@ -795,6 +891,15 @@ impl AppModel {
     /// This is the compatibility path: no native events, no approval cards;
     /// containment is the worktree plus the exact audited launcher argv.
     fn start_task_agent_terminal(&mut self, task_id: TaskId, sender: &ComponentSender<AppModel>) {
+        if self.agent_runtime.conversation_id(task_id).is_some()
+            && self.agent_runtime.can_continue_in_terminal(task_id)
+        {
+            if let Err(error) = self.agent_runtime.handoff_to_terminal(task_id) {
+                self.show_toast(error.to_string());
+            }
+            self.ensure_agent_tasks_timer(sender);
+            return;
+        }
         if self.agent_runtime.has_preparing(task_id) {
             self.show_toast(format!(
                 "Cancel native {} preparation before starting a terminal",
@@ -945,11 +1050,75 @@ impl AppModel {
         });
     }
 
-    /// Rerun the task's exact validation command in a fresh PTY inside the
-    /// pinned worktree cwd. The prepared pin is retained until the pane
-    /// reports its spawn, so the child enters the directory through the
-    /// validated descriptor rather than a re-resolved path.
+    /// Open only the already admitted host PTY. Closing or exiting this
+    /// helper is a view event; the host alone reduces validation outcomes.
+    fn open_hosted_validation_terminal(
+        &mut self,
+        task_id: TaskId,
+        terminal: jterm_core::agent_workspace::OwnedTerminalDescriptor,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        let Some(session_id) = self
+            .task_manager
+            .get(task_id)
+            .and_then(|task| task.validation.terminal_session_id.clone())
+        else {
+            self.show_toast("Validation is no longer bound to this task");
+            return;
+        };
+        if terminal.id.0 != format!("jterm:validation:{task_id}:{session_id}") {
+            self.show_toast("A newer validation replaced this transcript; open its current output");
+            return;
+        }
+        if self
+            .existing_task_terminal(Some(&session_id), TaskTerminalRole::Validation)
+            .is_some()
+        {
+            self.focus_task_terminal(task_id, TaskTerminalRole::Validation, sender);
+            return;
+        }
+        let launch = match jterm_core::agent_workspace::owned_terminal_launch(&terminal) {
+            Ok(launch) => launch,
+            Err(error) => {
+                self.show_toast(error);
+                return;
+            }
+        };
+        let argv = std::iter::once(launch.program).chain(launch.args).collect();
+        let Some((_, pane_id)) = self.add_task_terminal_tab(
+            &terminal.label,
+            argv,
+            Some(launch.cwd.to_string_lossy().into_owned()),
+            Vec::new(),
+            crate::workspace_ops::TaskTerminalIdentity {
+                role: TaskTerminalRole::Validation,
+                session_id,
+            },
+            sender,
+        ) else {
+            return;
+        };
+        if let Some(pane) = self.pane(pane_id) {
+            use relm4::gtk::prelude::*;
+            unsafe {
+                pane.terminal
+                    .widget()
+                    .set_data(HOSTED_VALIDATION_VIEW, true);
+            }
+        }
+    }
+
+    /// Request a host-owned attempt, or prepare a local task's exact command
+    /// in a fresh PTY with its validated cwd descriptor retained until spawn.
     fn start_task_validation(&mut self, task_id: TaskId, sender: &ComponentSender<AppModel>) {
+        if self.agent_runtime.conversation_id(task_id).is_some() {
+            if let Err(error) = self.agent_runtime.start_hosted_validation(task_id) {
+                self.show_toast(error.to_string());
+            }
+            self.ensure_agent_tasks_timer(sender);
+            return;
+        }
+
         let next_attempt = match self.task_manager.next_validation_attempt(task_id) {
             Ok(attempt) => attempt,
             Err(error) => {
@@ -1040,6 +1209,9 @@ impl AppModel {
     /// authoritative exit to the task model before the pane closes; returns
     /// true when the pane was task-owned.
     pub(crate) fn note_task_terminal_exited(&mut self, pane_id: u64, exit_code: i32) -> bool {
+        if self.pane(pane_id).is_some_and(is_hosted_validation_view) {
+            return true;
+        }
         self.announce_task_transitions();
         self.pending_validation_pins.remove(&pane_id);
         let Some((session_id, _role)) = self
@@ -1063,6 +1235,9 @@ impl AppModel {
     /// Retire its task session now, so validation can be retried and its cwd
     /// descriptor is not held until the user closes the diagnostic pane.
     pub(crate) fn note_task_terminal_launch_failed(&mut self, pane_id: u64) {
+        if self.pane(pane_id).is_some_and(is_hosted_validation_view) {
+            return;
+        }
         self.announce_task_transitions();
         self.pending_validation_pins.remove(&pane_id);
         let Some((session_id, role)) = self
@@ -1090,6 +1265,9 @@ impl AppModel {
     /// cwd pin is released. Safe to call after `note_task_terminal_exited`:
     /// the reducer ignores closes for terminals already in a terminal state.
     pub(crate) fn note_task_terminal_closed(&mut self, pane_id: u64) {
+        if self.pane(pane_id).is_some_and(is_hosted_validation_view) {
+            return;
+        }
         self.announce_task_transitions();
         self.pending_validation_pins.remove(&pane_id);
         let Some(session_id) = self
@@ -1156,11 +1334,15 @@ impl AppModel {
                     .terminal_session_id
                     .as_ref()
                     .is_some_and(|id| agent_terminals.contains(id)),
-                has_validation_terminal: task
-                    .validation
-                    .terminal_session_id
-                    .as_ref()
-                    .is_some_and(|id| validation_terminals.contains(id)),
+                has_validation_terminal: self
+                    .agent_runtime
+                    .hosted_validation_terminal(task.id)
+                    .is_some()
+                    || task
+                        .validation
+                        .terminal_session_id
+                        .as_ref()
+                        .is_some_and(|id| validation_terminals.contains(id)),
                 has_active_agent_stream: self.task_manager.has_active_agent_event_stream(task.id),
                 native_preparing: self.agent_runtime.has_preparing(task.id),
                 validation_status: task.validation.status,
@@ -1184,11 +1366,12 @@ impl AppModel {
                 .terminal_session_id
                 .as_ref()
                 .is_some_and(|id| agent_terminals.contains(id));
-            let validation = task
-                .validation
-                .terminal_session_id
-                .as_ref()
-                .is_some_and(|id| validation_terminals.contains(id));
+            let validation = self.agent_runtime.hosted_validation_terminal(id).is_some()
+                || task
+                    .validation
+                    .terminal_session_id
+                    .as_ref()
+                    .is_some_and(|id| validation_terminals.contains(id));
             self.task_detail_sync(id, native_ai_enabled, agent, validation)
         });
 
@@ -1265,14 +1448,18 @@ impl AppModel {
                     self.existing_task_terminal(Some(id), TaskTerminalRole::Agent)
                         .is_some()
                 });
-                let validation = task
-                    .validation
-                    .terminal_session_id
-                    .as_deref()
-                    .is_some_and(|id| {
-                        self.existing_task_terminal(Some(id), TaskTerminalRole::Validation)
-                            .is_some()
-                    });
+                let validation = self
+                    .agent_runtime
+                    .hosted_validation_terminal(task.id)
+                    .is_some()
+                    || task
+                        .validation
+                        .terminal_session_id
+                        .as_deref()
+                        .is_some_and(|id| {
+                            self.existing_task_terminal(Some(id), TaskTerminalRole::Validation)
+                                .is_some()
+                        });
                 self.task_detail_sync(
                     task.id,
                     self.task_prompt_policy().share_command_context,
@@ -1446,8 +1633,11 @@ impl AppModel {
             can_focus_validation,
             can_stop: (native_preparing || has_stream) && !native_idle,
             can_finish: native_idle,
-            can_run_validation: task.validation_command().is_some()
-                && task.status == TaskStatus::ReadyForReview
+            can_run_validation: (if self.agent_runtime.conversation_id(task_id).is_some() {
+                self.agent_runtime.can_start_hosted_validation(task_id)
+            } else {
+                task.validation_command().is_some()
+            }) && task.status == TaskStatus::ReadyForReview
                 && task.validation.status != TaskValidationStatus::Running
                 && !has_stream,
             can_complete: task.status == TaskStatus::ReadyForReview
