@@ -1,11 +1,11 @@
 {
-  "published_core_commit": "589a26658f548ec96ff60a53ea65804901ed5c7b",
-  "published_core_tree": "b5d1532292d78acc6fc7718c6beeebed35cbdf56",
-  "archive_sha256": "464599be87763d27aa3d34996b11dc86879fa33d1bb84ffe016fcde861c716e4",
-  "archive_members": 229,
-  "archive_files": 209,
+  "published_core_commit": "13b3dcfa3ab630497a6348a0540b4757a19c15be",
+  "published_core_tree": "3fee29a9089bedad59574bbbc930301825fc320a",
+  "archive_sha256": "b594e895443bf240aad0dd681d0e4cfb9749ab571c20a8f7df2194f300355daa",
+  "archive_members": 233,
+  "archive_files": 212,
   "omitted_paths": 45,
   "scope": "Cargo files, README.md, src/, runtime/, scripts/, tests/ and assets/ exported from the exact published commit. Repository docs and CI files are excluded.",
-  "verification": "Every archived blob and executable bit matches the published Git tree; timestamps and owner IDs are normalized. SHA-256 verification, isolated extraction and Rust 1.86 locked offline dependency resolution passed.",
+  "verification": "Every exported blob and executable bit was checked against the published Git tree. Archive timestamps, owner IDs and file modes are normalized; archive SHA-256 and contents were verified locally.",
   "publication_boundary": "Deterministic source bundle and dependency manifests; GUI behavior is verified separately."
 }

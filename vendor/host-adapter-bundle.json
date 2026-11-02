@@ -27,7 +27,7 @@
     "vendor/companion-protocol/upstream-Cargo.toml": "89c06787e200d75685facc835f0bb000186549b1b35eb62768d876e10eea6428"
   },
   "public_companion_base": "9aa569540091524d637a7115b64c587b9177a55b",
-  "public_core_base": "589a26658f548ec96ff60a53ea65804901ed5c7b",
+  "public_core_base": "13b3dcfa3ab630497a6348a0540b4757a19c15be",
   "schema": 1,
   "scope": "Exact versioned host/protocol/client source overlay with GTK frame identity and negotiated withdrawal resumption, validated against public_core_base. Bundled source origins and hashes and the public companion/atlas base are unchanged. This overlay is not a separately published companion release.",
   "version": "0.1.0"
