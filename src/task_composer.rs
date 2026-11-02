@@ -18,6 +18,14 @@ pub(crate) struct TaskProjectDraft {
     pub brief: TaskBrief,
 }
 
+/// A reviewed handoff seeds a new task form; it carries no execution or
+/// continuation authority from the source conversation.
+pub(crate) struct TaskSeed {
+    pub title: String,
+    pub goal: String,
+    pub provider: AgentProvider,
+}
+
 impl TaskProjectDraft {
     pub fn validate(&self) -> Result<(), String> {
         let title = self.title.trim();
@@ -222,6 +230,16 @@ pub(crate) fn show(
     shell: Option<String>,
     submit: impl Fn(TaskProjectRequest) + 'static,
 ) {
+    show_prefilled(parent, initial_directory, shell, None, submit);
+}
+
+pub(crate) fn show_prefilled(
+    parent: &impl IsA<gtk::Window>,
+    initial_directory: Option<PathBuf>,
+    shell: Option<String>,
+    initial: Option<TaskSeed>,
+    submit: impl Fn(TaskProjectRequest) + 'static,
+) {
     let window = gtk::Window::builder()
         .title("New project task")
         .default_width(650)
@@ -230,6 +248,7 @@ pub(crate) fn show(
         .modal(true)
         .destroy_with_parent(true)
         .build();
+    window.add_css_class("workspace-surface");
     let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
     for (edge, margin) in [(0, 20), (1, 20), (2, 20), (3, 20)] {
         match edge {
@@ -248,6 +267,7 @@ pub(crate) fn show(
     ));
     introduction.set_xalign(0.0);
     introduction.set_wrap(true);
+    introduction.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     root.append(&introduction);
 
     let field = |caption: &str, child: &gtk::Widget| {
@@ -273,6 +293,15 @@ pub(crate) fn show(
     let provider =
         gtk::DropDown::from_strings(&AgentProvider::ALL.map(|provider| provider.display_name()));
     provider.update_property(&[gtk::accessible::Property::Label("Task provider")]);
+    if let Some(initial) = &initial {
+        title.set_text(&initial.title);
+        if let Some(index) = AgentProvider::ALL
+            .iter()
+            .position(|provider| *provider == initial.provider)
+        {
+            provider.set_selected(index as u32);
+        }
+    }
     field("Provider", provider.upcast_ref());
     let goal_view = gtk::TextView::new();
     goal_view.set_wrap_mode(gtk::WrapMode::WordChar);
@@ -282,12 +311,16 @@ pub(crate) fn show(
     goal_view.set_right_margin(8);
     goal_view.update_property(&[gtk::accessible::Property::Label("Task goal")]);
     let goal = goal_view.buffer();
+    if let Some(initial) = &initial {
+        goal.set_text(&initial.goal);
+    }
     let goal_scroll = gtk::ScrolledWindow::builder()
         .min_content_height(150)
         .vexpand(true)
         .child(&goal_view)
         .build();
     goal_scroll.add_css_class("card");
+    crate::composer_geometry::install(&goal_view, &goal_scroll, 150, 480);
     field("Goal", goal_scroll.upcast_ref());
     let validation = gtk::Entry::new();
     validation.set_max_length(4096);
@@ -303,13 +336,21 @@ pub(crate) fn show(
     )));
     validation_hint.set_xalign(0.0);
     validation_hint.set_wrap(true);
+    validation_hint.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     validation_hint.add_css_class("caption");
     validation_hint.add_css_class("dim-label");
     root.append(&validation_hint);
     let error = gtk::Label::new(None);
     error.set_xalign(0.0);
     error.set_wrap(true);
+    error.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     error.add_css_class("error");
+    if initial
+        .as_ref()
+        .is_some_and(|initial| initial.goal.len() > 16 * 1024)
+    {
+        error.set_text("This handoff exceeds the 16 KiB task goal limit. Edit the complete draft before creating the task; nothing has been truncated or sent.");
+    }
     root.append(&error);
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     actions.set_halign(gtk::Align::End);
@@ -318,8 +359,21 @@ pub(crate) fn show(
     create.add_css_class("suggested-action");
     actions.append(&cancel);
     actions.append(&create);
-    root.append(&actions);
-    window.set_child(Some(&root));
+    // Keep the explicit submission controls visible on a 9:16 screen. The
+    // form scrolls independently, including its complete editable goal.
+    actions.set_margin_start(20);
+    actions.set_margin_end(20);
+    actions.set_margin_top(12);
+    actions.set_margin_bottom(16);
+    let form_scroll = gtk::ScrolledWindow::new();
+    form_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    form_scroll.set_min_content_height(1);
+    form_scroll.set_vexpand(true);
+    form_scroll.set_child(Some(&root));
+    let layout = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    layout.append(&form_scroll);
+    layout.append(&actions);
+    window.set_child(Some(&layout));
 
     let composer = Rc::new(Composer {
         window: window.clone(),
@@ -625,6 +679,59 @@ mod tests {
         assert!(cancelled_request
             .worktree_cancel_flag()
             .load(Ordering::Acquire));
+        parent.close();
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn workspace_v2_handoff_prefills_an_editable_unsent_task() {
+        gtk::init().expect("GTK display");
+        let parent = gtk::Window::new();
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let sink = requests.clone();
+        show_prefilled(
+            &parent,
+            Some(PathBuf::from("/tmp/handoff-project")),
+            Some("/bin/bash".into()),
+            Some(TaskSeed {
+                title: "Review migration".into(),
+                goal: "Read the captured evidence.\nKeep source approvals separate.".into(),
+                provider: AgentProvider::Claude,
+            }),
+            move |request| sink.borrow_mut().push(request),
+        );
+        let form = TEST_COMPOSER.with(|slot| slot.borrow().upgrade()).unwrap();
+        let draft = form.draft().unwrap();
+        assert_eq!(draft.provider, AgentProvider::Claude);
+        assert_eq!(draft.title, "Review migration");
+        assert!(draft.brief.goal.contains("source approvals"));
+        assert!(form.goal_view.is_editable());
+        form.window.set_decorated(false);
+        form.window.set_default_size(360, 640);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        while std::time::Instant::now() < deadline {
+            while gtk::glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            form.window.width() <= 360 && form.window.height() <= 640,
+            "the task form imposed {}x{} on a 360x640 screen",
+            form.window.width(),
+            form.window.height()
+        );
+        let controls = form
+            .create_button
+            .compute_bounds(&form.window)
+            .expect("visible task footer");
+        assert!(
+            controls.y() >= 0.0 && controls.y() + controls.height() <= form.window.height() as f32,
+            "Create task was below the viewport"
+        );
+        assert!(
+            requests.borrow().is_empty(),
+            "prefilling a handoff submitted a task"
+        );
+        form.window.close();
         parent.close();
     }
 }

@@ -30,8 +30,7 @@ const BACK_TO_CONVERSATION_LABEL: &str = "Back to conversation";
 // nothing — ember words the same withheld case inline, and forge/frost gate
 // the identical control on the identical config flag.
 const INCLUDE_RECENT_LABEL: &str = "Include recent shell context";
-const INCLUDE_RECENT_WITHHELD_LABEL: &str =
-    "Recent shell context withheld (needs ai_share_command_context)";
+const INCLUDE_RECENT_WITHHELD_LABEL: &str = "Recent shell context is off";
 const INCLUDE_RECENT_TOOLTIP: &str =
     "Attach the last five commands and exit codes to the next question";
 const INCLUDE_RECENT_WITHHELD_TOOLTIP: &str = concat!(
@@ -85,6 +84,40 @@ struct RequestPayload {
     restore_pending_as_draft: bool,
 }
 
+#[derive(Clone)]
+struct PendingHandoffDraft {
+    body: String,
+    source_chat: u64,
+    source_draft: String,
+    source_input_epoch: u64,
+}
+impl PendingHandoffDraft {
+    fn may_activate(
+        &self,
+        chat: u64,
+        draft: &str,
+        input_epoch: u64,
+        navigation_current: bool,
+        view_owns_focus: bool,
+    ) -> bool {
+        navigation_current
+            && view_owns_focus
+            && self.source_chat == chat
+            && self.source_draft == draft
+            && self.source_input_epoch == input_epoch
+    }
+}
+fn handoff_view_owns_focus(root: &impl IsA<gtk::Widget>) -> bool {
+    let root = root.as_ref();
+    let Some(window) = root.root().and_downcast::<gtk::Window>() else {
+        return false;
+    };
+    root.is_mapped()
+        && window.is_active()
+        && gtk::prelude::RootExt::focus(&window)
+            .is_none_or(|focus| focus == *root || focus.is_ancestor(root))
+}
+
 /// A confirmation belongs to one selection lifetime, even across same-ID restores.
 #[derive(Clone, Debug)]
 pub(crate) struct DeleteConfirmation {
@@ -126,6 +159,7 @@ pub(crate) enum AiPanelMsg {
     DraftChanged(String),
     PublishDraft(u64),
     NewChat,
+    NewDraft(String),
     SelectChat(u64),
     SearchChanged(String),
     ShowLibrary,
@@ -167,6 +201,9 @@ pub(crate) struct AiPanelModel {
     shared: crate::workspace_chats::SharedChats,
     pending_shared: HashMap<u64, (RequestPayload, bool)>,
     pending_new_context: HashMap<u64, RequestPayload>,
+    pending_new_drafts: HashMap<u64, PendingHandoffDraft>,
+    handoff_input_epoch: Rc<Cell<u64>>,
+    handoff_rendering: Rc<Cell<bool>>,
     navigation_focus: Option<NavigationFocus>,
     earlier_history: HashMap<u64, String>,
     scroll_owner: Rc<Cell<u64>>,
@@ -322,15 +359,16 @@ impl Component for AiPanelModel {
                         set_sensitive: false,
                     },
 
+                    #[name(composer_scroll)]
                     gtk::ScrolledWindow {
                         set_hexpand: true,
-                        set_min_content_height: 72,
-                        set_max_content_height: 160,
+                        set_min_content_height: 104,
+                        set_max_content_height: 220,
 
                         #[name(composer)]
                         gtk::TextView {
                             set_wrap_mode: gtk::WrapMode::WordChar,
-                            set_height_request: 72,
+                            set_height_request: 104,
                             add_css_class: "ai-panel-entry",
                         },
                     },
@@ -464,6 +502,9 @@ impl Component for AiPanelModel {
             )),
             pending_shared: HashMap::new(),
             pending_new_context: HashMap::new(),
+            pending_new_drafts: HashMap::new(),
+            handoff_input_epoch: Rc::new(Cell::new(0)),
+            handoff_rendering: Rc::new(Cell::new(false)),
             navigation_focus: None,
             earlier_history: HashMap::new(),
             scroll_owner: Rc::new(Cell::new(0)),
@@ -480,6 +521,8 @@ impl Component for AiPanelModel {
             scroll_queued: Rc::new(Cell::new(false)),
         };
         let widgets = view_output!();
+        crate::composer_geometry::install(&widgets.composer, &widgets.composer_scroll, 104, 220);
+        widgets.status.set_wrap_mode(gtk::pango::WrapMode::WordChar);
         // Consent is truthful and readable without setting the entire panel's
         // minimum width to the length of this status sentence.
         if let Some(label) = widgets.include_recent.child().and_downcast::<gtk::Label>() {
@@ -490,7 +533,12 @@ impl Component for AiPanelModel {
 
         {
             let sender = sender.clone();
+            let input_epoch = model.handoff_input_epoch.clone();
+            let programmatic = model.handoff_rendering.clone();
             widgets.composer.buffer().connect_changed(move |buffer| {
+                if !programmatic.get() {
+                    input_epoch.set(input_epoch.get().wrapping_add(1));
+                }
                 let (start, end) = buffer.bounds();
                 sender.input(AiPanelMsg::DraftChanged(
                     buffer.text(&start, &end, true).to_string(),
@@ -502,7 +550,10 @@ impl Component for AiPanelModel {
             key.set_propagation_phase(gtk::PropagationPhase::Capture);
             let sender = sender.clone();
             let composer = widgets.composer.clone();
+            let input_epoch = model.handoff_input_epoch.clone();
             key.connect_key_pressed(move |controller, key, _, state| {
+                // Synchronous ownership precedes IME filtering and async host replies.
+                input_epoch.set(input_epoch.get().wrapping_add(1));
                 let action = classify_composer_key(key, state);
                 if action != ComposerKeyAction::Proceed {
                     if let Some(event) = controller.current_event() {
@@ -532,6 +583,12 @@ impl Component for AiPanelModel {
             });
         }
 
+        let pointer = gtk::GestureClick::new();
+        pointer.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let input_epoch = model.handoff_input_epoch.clone();
+        pointer
+            .connect_pressed(move |_, _, _, _| input_epoch.set(input_epoch.get().wrapping_add(1)));
+        widgets.composer.add_controller(pointer);
         let mut parts = ComponentParts { model, widgets };
         parts.model.render_all(&mut parts.widgets, &sender);
         parts
@@ -637,12 +694,48 @@ impl Component for AiPanelModel {
                                 self.navigation_focus = None;
                             }
                             self.invalidate_delete_confirmation();
+                            let handoff = self.pending_new_drafts.remove(&request);
+                            let activate_handoff = handoff.as_ref().is_some_and(|draft| {
+                                draft.may_activate(
+                                    self.store.active_id(),
+                                    self.store.active_draft(),
+                                    self.handoff_input_epoch.get(),
+                                    focus,
+                                    handoff_view_owns_focus(root),
+                                )
+                            });
+                            let background_handoff = handoff.is_some() && !activate_handoff;
+                            let mut draft_conflict = false;
+                            if let Some(draft) = handoff {
+                                if self.store.chat_draft(chat_id).is_some_and(str::is_empty) {
+                                    self.store.set_chat_draft(chat_id, draft.body);
+                                } else {
+                                    draft_conflict = true;
+                                }
+                                if activate_handoff {
+                                    self.store.select_chat(chat_id);
+                                }
+                            }
                             if let Some(payload) = self.pending_new_context.remove(&request) {
                                 self.start_request(widgets, &sender, payload, false);
                             }
-                            self.render_all(widgets, &sender);
+                            if !background_handoff {
+                                self.render_all(widgets, &sender);
+                            } else {
+                                self.refresh_library(&widgets.chat_list, &sender);
+                            }
                             self.publish_snapshot(widgets, &sender);
-                            if focus && self.store.active_id() == chat_id && root.is_mapped() {
+                            if background_handoff && !draft_conflict {
+                                widgets.status.set_label("Handoff draft created in the conversation list. Your current input and selection are retained.");
+                            }
+                            if draft_conflict {
+                                widgets.status.set_label("The new conversation already has a draft. The handoff remains available in its source context; no text was overwritten.");
+                            }
+                            if !background_handoff
+                                && focus
+                                && self.store.active_id() == chat_id
+                                && root.is_mapped()
+                            {
                                 widgets.page_stack.set_visible_child_name(CHAT_PAGE);
                                 widgets.composer.grab_focus();
                             }
@@ -711,6 +804,11 @@ impl Component for AiPanelModel {
                         }
                         crate::workspace_chats::Event::Rejected { request, message } => {
                             self.pending_shared.remove(&request);
+                            self.pending_new_drafts.remove(&request);
+                            if matches!(self.navigation_focus, Some(NavigationFocus::New(pending)) if pending == request)
+                            {
+                                self.navigation_focus = None;
+                            }
                             widgets.status.set_label(&message);
                         }
                         crate::workspace_chats::Event::Deleted(id) => {
@@ -849,11 +947,13 @@ impl Component for AiPanelModel {
                     // draft; switching chats or retrying rematerializes from
                     // that authoritative state and removes this transient row.
                     self.rendering = true;
+                    self.handoff_rendering.set(true);
                     widgets
                         .composer
                         .buffer()
                         .set_text(self.store.active_draft());
                     self.rendering = false;
+                    self.handoff_rendering.set(false);
                     self.render_context(widgets);
                     self.render_status(widgets);
                     self.refresh_library(&widgets.chat_list, &sender);
@@ -878,6 +978,28 @@ impl Component for AiPanelModel {
                 if generation == self.draft_generation {
                     self.publish_snapshot(widgets, &sender);
                     self.refresh_library(&widgets.chat_list, &sender);
+                }
+            }
+            AiPanelMsg::NewDraft(draft) => {
+                if draft.len() > MAX_LIVE_MESSAGE_BYTES {
+                    widgets.status.set_label("This handoff is larger than the API draft limit. Edit it in the source context before creating a draft.");
+                } else {
+                    self.navigation_focus = None;
+                    match self.shared.create_inactive() {
+                        Ok(request) => {
+                            self.pending_new_drafts.insert(
+                                request,
+                                PendingHandoffDraft {
+                                    body: draft,
+                                    source_chat: self.store.active_id(),
+                                    source_draft: self.store.active_draft().into(),
+                                    source_input_epoch: self.handoff_input_epoch.get(),
+                                },
+                            );
+                            self.navigation_focus = Some(NavigationFocus::New(request));
+                        }
+                        Err(error) => widgets.status.set_label(&error),
+                    }
                 }
             }
             AiPanelMsg::NewChat => {
@@ -1242,8 +1364,10 @@ impl AiPanelModel {
         };
         if clear_composer {
             self.rendering = true;
+            self.handoff_rendering.set(true);
             widgets.composer.buffer().set_text("");
             self.rendering = false;
+            self.handoff_rendering.set(false);
             self.store.set_active_draft(String::new());
         }
 
@@ -1348,17 +1472,18 @@ impl AiPanelModel {
                     .and_then(|id| summaries.iter().find(|chat| chat.id == id));
                 Row {
                     action: Action::SharedApi(row.id.clone()),
-                    title: format!("{}{}", if row.pinned { "★ " } else { "" }, row.title),
-                    detail: "API conversation".into(),
+                    title: row.title.clone(),
+                    detail: format!("{} · {}", row.provider, row.presentation().status_label),
                     searchable: row.preview.clone(),
                     active: visible && state.is_some_and(|s| s.active),
                     busy: row.runtime.is_live() || state.is_some_and(|s| s.busy),
-                    attention: state.is_some_and(|s| s.unread || s.error),
+                    attention: row.attention().is_some() || state.is_some_and(|s| s.error),
                     archived: row.archived,
                     pinned: row.pinned,
                     project: row.cwd.clone(),
                     provider: row.provider.clone(),
                     updated: row.updated_at_ms,
+                    source: Some(row.clone()),
                 }
             })
             .collect::<Vec<_>>();
@@ -1380,12 +1505,13 @@ impl AiPanelModel {
                     searchable: chat.preview,
                     active: visible && chat.active,
                     busy: chat.busy,
-                    attention: chat.unread || chat.error,
+                    attention: chat.error,
                     archived: chat.archived,
                     pinned: false,
                     project: String::new(),
                     provider: "API".into(),
                     updated: 0,
+                    source: None,
                 }),
         );
         rows
@@ -1427,6 +1553,7 @@ impl AiPanelModel {
 
     fn render_all(&mut self, widgets: &mut AiPanelModelWidgets, sender: &ComponentSender<Self>) {
         self.rendering = true;
+        self.handoff_rendering.set(true);
         widgets.title_entry.set_text(self.store.active_title());
         widgets
             .archive_button
@@ -1455,6 +1582,13 @@ impl AiPanelModel {
             } else {
                 INCLUDE_RECENT_WITHHELD_LABEL
             }));
+        // set_label may replace GTK's internal label; restore its portrait
+        // wrapping after every consent render, not just component creation.
+        if let Some(label) = widgets.include_recent.child().and_downcast::<gtk::Label>() {
+            label.set_wrap(true);
+            label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+            label.set_xalign(0.0);
+        }
         widgets
             .include_recent
             .set_tooltip_text(Some(if self.share_command_context {
@@ -1467,6 +1601,7 @@ impl AiPanelModel {
             .buffer()
             .set_text(self.store.active_draft());
         self.rendering = false;
+        self.handoff_rendering.set(false);
         self.render_transcript(widgets);
         self.render_context(widgets);
         self.render_status(widgets);
@@ -1817,6 +1952,9 @@ mod tests {
             )),
             pending_shared: HashMap::new(),
             pending_new_context: HashMap::new(),
+            pending_new_drafts: HashMap::new(),
+            handoff_input_epoch: Rc::new(Cell::new(0)),
+            handoff_rendering: Rc::new(Cell::new(false)),
             navigation_focus: None,
             earlier_history: HashMap::new(),
             scroll_owner: Rc::new(Cell::new(0)),
@@ -2019,7 +2157,7 @@ mod tests {
     #[test]
     fn the_withheld_state_names_the_config_key_that_unlocks_it() {
         assert_ne!(INCLUDE_RECENT_LABEL, INCLUDE_RECENT_WITHHELD_LABEL);
-        assert!(INCLUDE_RECENT_WITHHELD_LABEL.contains("ai_share_command_context"));
+        assert!(INCLUDE_RECENT_WITHHELD_LABEL.contains("off"));
         assert!(INCLUDE_RECENT_WITHHELD_TOOLTIP.contains("ai_share_command_context"));
     }
 
@@ -2141,5 +2279,75 @@ mod tests {
         for (key, state, expected) in cases {
             assert_eq!(classify_composer_key(key, state), expected);
         }
+    }
+    #[test]
+    #[ignore = "requires an isolated workspace state and native GTK display"]
+    fn workspace_v2_api_composer_keeps_portrait_width_after_render() {
+        gtk::init().expect("GTK display");
+        crate::workspace_shell::install_css();
+        let panel = AiPanelModel::builder()
+            .launch(AiPanelInit {
+                redact_secrets: false,
+            })
+            .detach();
+        let find = crate::search::SearchModel::builder().launch(()).detach();
+        let window = gtk::Window::new();
+        window.set_decorated(false);
+        window.set_default_size(360, 640);
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.append(find.widget());
+        let workspace = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        workspace.add_css_class("workspace-center");
+        workspace.set_vexpand(true);
+        let rail = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        rail.set_width_request(55);
+        workspace.append(&rail);
+        workspace.append(panel.widget());
+        root.append(&workspace);
+        window.set_child(Some(&root));
+        window.present();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        while std::time::Instant::now() < deadline {
+            while gtk::glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            !find.widget().is_visible(),
+            "closed Find constrained the workspace"
+        );
+        let minimum = panel.widget().measure(gtk::Orientation::Horizontal, -1).0;
+        assert!(
+            minimum <= 305,
+            "the rendered API panel needs {minimum}px beside a 55px rail"
+        );
+        assert_eq!(
+            window.width(),
+            360,
+            "API controls clamped a portrait window"
+        );
+        assert!(
+            panel.widget().width() <= 305,
+            "API controls overflowed the portrait canvas"
+        );
+        window.close();
+    }
+    #[test]
+    fn workspace_handoff_receipt_preserves_later_navigation_and_typing() {
+        let draft = PendingHandoffDraft {
+            body: "reviewed handoff".into(),
+            source_chat: 7,
+            source_draft: "local draft".into(),
+            source_input_epoch: 3,
+        };
+        assert!(draft.may_activate(7, "local draft", 3, true, true));
+        assert!(!draft.may_activate(8, "local draft", 3, true, true));
+        assert!(!draft.may_activate(7, "new typing", 3, true, true));
+        assert!(!draft.may_activate(7, "local draft", 3, false, true));
+        assert!(!draft.may_activate(7, "local draft", 3, true, false));
+        assert!(
+            !draft.may_activate(7, "local draft", 4, true, true),
+            "IME/caret activity must retire pending input ownership"
+        );
+        assert_eq!(draft.body, "reviewed handoff");
     }
 }

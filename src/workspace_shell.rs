@@ -874,7 +874,9 @@ impl Chrome {
         top.add_css_class("workspace-titlebar");
         top.set_height_request(tokens::TITLEBAR_HEIGHT as i32);
         let identity = gtk::Box::new(gtk::Orientation::Horizontal, 5);
-        identity.set_width_request((tokens::RAIL_WIDTH + tokens::NAVIGATION_WIDTH - 12.0) as i32);
+        // Brand spacing follows the available width; it must not impose the
+        // desktop navigation width on a portrait window.
+        identity.set_width_request(-1);
         for (icon, title, msg) in [
             ("window-close-symbolic", "Close window", AppMsg::Quit),
             (
@@ -900,7 +902,8 @@ impl Chrome {
         );
         app_icon.add_css_class("shell-brand-icon");
         identity.append(&app_icon);
-        identity.append(&label("anvil", "shell-brand"));
+        let brand = label("anvil", "shell-brand");
+        identity.append(&brand);
 
         top.append(&identity);
         let path = label("Terminal workspace", "shell-top-path");
@@ -989,7 +992,14 @@ impl Chrome {
         search.set_margin_start((tokens::SEARCH_CENTER_OFFSET * 2.0) as i32);
         search.set_margin_top(tokens::SEARCH_TOP as i32);
         let title_overlay = gtk::Overlay::new();
-        title_overlay.set_child(Some(&top));
+        // The compact titlebar is measured independently of desktop-only
+        // labels. Otherwise GTK clamps the window before resize can hide them.
+        let title_scroll = gtk::ScrolledWindow::new();
+        title_scroll.set_policy(gtk::PolicyType::External, gtk::PolicyType::Never);
+        title_scroll.set_min_content_width(1);
+        title_scroll.set_propagate_natural_width(false);
+        title_scroll.set_child(Some(&top));
+        title_overlay.set_child(Some(&title_scroll));
         title_overlay.add_overlay(&search);
         title_overlay.set_measure_overlay(&search, false);
         let title_observer = gtk::DrawingArea::new();
@@ -998,6 +1008,9 @@ impl Chrome {
         title_overlay.set_measure_overlay(&title_observer, false);
         let search_width_gate = search.downgrade();
         let path_width_gate = path.downgrade();
+        let identity_width_gate = identity.downgrade();
+        let brand_width_gate = brand.upcast_ref::<gtk::Widget>().downgrade();
+        let modes_width_gate = modes.upcast_ref::<gtk::Widget>().downgrade();
         let title_allocation = title_overlay.downgrade();
         let title_visibility_epoch = std::rc::Rc::new(std::cell::Cell::new(0_u64));
         title_observer.connect_resize(move |observer, _, _| {
@@ -1007,6 +1020,9 @@ impl Chrome {
             let observer = observer.downgrade();
             let search = search_width_gate.clone();
             let path = path_width_gate.clone();
+            let identity = identity_width_gate.clone();
+            let brand = brand_width_gate.clone();
+            let modes = modes_width_gate.clone();
             let title = title_allocation.clone();
             // The observer is itself a non-measuring overlay. Changing a
             // sibling's visibility during this allocation can leave that
@@ -1024,6 +1040,22 @@ impl Chrome {
                     return;
                 }
                 let mut reallocate = false;
+                if let Some(identity) = identity.upgrade() {
+                    let requested = if width >= 1120 {
+                        (tokens::RAIL_WIDTH + tokens::NAVIGATION_WIDTH - 12.0) as i32
+                    } else {
+                        -1
+                    };
+                    reallocate |= identity.width_request() != requested;
+                    identity.set_width_request(requested);
+                }
+                for (widget, threshold) in [(brand, 520), (modes, 520)] {
+                    if let Some(widget) = widget.upgrade() {
+                        let visible = width >= threshold;
+                        reallocate |= widget.is_visible() != visible;
+                        widget.set_visible(visible);
+                    }
+                }
                 if let Some(search) = search.upgrade() {
                     let visible = width >= 1024;
                     reallocate |= search.is_visible() != visible
@@ -3397,7 +3429,9 @@ fn collect_native_geometry(
                 "page_size":adjustment.page_size(),
             })
         });
-    serde_json::json!({"window":[window.width(),window.height()],"dpr":window.scale_factor(),"regions":regions,"footer_buttons":buttons,"badge_style":badge_style,"window_opacity":window.opacity(),"right_sidebar":right_sidebar,"canvas_scroll":canvas_scroll})
+    let mut window_minimum_widths = Vec::new();
+    minimum_width_chain(window.upcast_ref(), "window", &mut window_minimum_widths);
+    serde_json::json!({"window_minimum_width_chain":window_minimum_widths,"window":[window.width(),window.height()],"dpr":window.scale_factor(),"regions":regions,"footer_buttons":buttons,"badge_style":badge_style,"window_opacity":window.opacity(),"right_sidebar":right_sidebar,"canvas_scroll":canvas_scroll})
 }
 
 #[cfg(test)]

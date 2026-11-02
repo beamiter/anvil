@@ -66,5 +66,9 @@ The generated manifest fetches that revision and vendors it with the registry
 dependencies, so the Flatpak build uses the locked sources offline.
 `packaging/jterm-core-src.tar.gz` also retains a deterministic source snapshot
 of the same revision. Its `.sha256`, `jterm-core-revision`, and
-`jterm-core-origin.json` files record the checksum and published Git provenance.
-Refresh all of them from the exact published commit when updating the core pin.
+`jterm-core-origin.json` files record the checksum and exact Git provenance.
+Refresh all of them from the exact commit when updating the core pin. A staged
+release can be checked against a local commit before publication; the origin
+record states that boundary explicitly. Push that exact core commit before
+remote builds acquire the new dependency. The source archive SHA-256 and the
+full source tree NAR hash used by Nix are separate values.

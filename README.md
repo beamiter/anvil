@@ -13,7 +13,7 @@ restoration as the only copy of work in progress.
 
 ## Agent Workspace
 
-默认左侧会话导航统一列出本地 Codex / Claude CLI、共享 API 对话和 Agent 任务；单击在中央打开真实会话。支持项目/搜索筛选、置顶、共享草稿、托管 CLI 的 Ctrl+] 断开与跨端重连，API / 原生 Agent 使用 Enter 换行、Ctrl+Enter 发送。原生任务仍由其所属窗口管理。详见 [Agent Workspace 使用与架构](docs/AGENT_WORKSPACE.md)。
+默认左侧会话导航统一列出本地 Codex / Claude CLI、共享 API 对话和 Agent 任务；单击在中央打开真实会话。支持项目/搜索筛选、置顶、共享草稿、托管 CLI 的 Ctrl+] 断开与跨端重连，API / 原生 Agent 使用 Enter 换行、Ctrl+Enter 发送。API / 原生任务由共享 host 托管，关闭视图不重发请求；会话详情提供精确历史搜索、版本化 Context、审阅后新建 handoff、Changes / Run 证据和显式依赖队列。详见 [Agent Workspace 使用与架构](docs/AGENT_WORKSPACE.md)。
 
 ## Highlights
 

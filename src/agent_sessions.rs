@@ -78,10 +78,12 @@ impl Sidebar {
                     detail: format!(
                         "{} · {}",
                         session.provider.label(),
-                        row.filter(|r| r.runtime.is_live())
-                            .map_or(if busy { "CLI running" } else { "CLI session" }, |r| r
-                                .runtime
-                                .label())
+                        row.map(|r| r.presentation().status_label)
+                            .unwrap_or_else(|| if busy {
+                                "Observed CLI process".into()
+                            } else {
+                                "CLI history".into()
+                            })
                     ),
                     searchable: format!(
                         "{} {}",
@@ -89,7 +91,7 @@ impl Sidebar {
                         row.map(|r| r.tags.join(" ")).unwrap_or_default()
                     ),
                     busy,
-                    attention: busy && session.status == SessionStatus::Waiting,
+                    attention: row.is_some_and(|r| r.attention().is_some()),
                     archived: row.map_or(session.archived, |r| r.archived),
                     pinned: row.is_some_and(|r| r.pinned),
                     project: session.cwd.to_string_lossy().into_owned(),
@@ -97,6 +99,7 @@ impl Sidebar {
                     updated: row.map_or(session.updated_at_ms, |r| {
                         r.updated_at_ms.max(session.updated_at_ms)
                     }),
+                    source: row.cloned(),
                 })
             })
             .collect()
@@ -139,6 +142,15 @@ impl Sidebar {
                 .notice
                 .set_text("This conversation changed during refresh. Search for it again.");
         }
+    }
+
+    pub fn contains(&self, id: &RuntimeIdentity) -> bool {
+        let catalog = self.manager.catalog.borrow();
+        let shared = self.manager.shared.borrow();
+        catalog
+            .sessions
+            .iter()
+            .any(|session| shared.id(session) == Some(id))
     }
 
     pub fn organize(&self, id: &RuntimeIdentity, pinned: Option<bool>, archived: Option<bool>) {
@@ -185,16 +197,17 @@ impl Sidebar {
             .map(|row| Row {
                 action: Action::ExternalTask(row.id.clone()),
                 title: row.title.clone(),
-                detail: format!("{} · Task context", row.provider),
+                detail: format!("{} · {}", row.provider, row.presentation().status_label),
                 searchable: format!("{} {}", row.preview, row.tags.join(" ")),
                 active: false,
-                busy: false,
-                attention: false,
+                busy: row.runtime.is_live(),
+                attention: row.attention().is_some(),
                 archived: row.archived,
                 pinned: row.pinned,
                 project: row.cwd.clone(),
                 provider: row.provider.clone(),
                 updated: row.updated_at_ms,
+                source: Some(row.clone()),
             })
             .collect()
     }

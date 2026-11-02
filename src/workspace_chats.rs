@@ -45,7 +45,9 @@ enum Pending {
     Bind(u64),
     Fresh(u64),
     Open,
-    Create,
+    Create {
+        activate: bool,
+    },
     Save {
         local: u64,
         snapshot: String,
@@ -332,10 +334,18 @@ impl SharedChats {
     }
 
     pub fn create(&mut self) -> Result<u64, String> {
+        self.create_with_activation(true)
+    }
+    /// A handoff receipt may populate its exact new chat without taking over
+    /// navigation that the user changed while creation was pending.
+    pub fn create_inactive(&mut self) -> Result<u64, String> {
+        self.create_with_activation(false)
+    }
+    fn create_with_activation(&mut self, activate: bool) -> Result<u64, String> {
         let request = self.client.send(Command::CreateChat {
             title: "New chat".into(),
         })?;
-        self.pending.insert(request, Pending::Create);
+        self.pending.insert(request, Pending::Create { activate });
         Ok(request)
     }
 
@@ -597,6 +607,12 @@ impl SharedChats {
                                 }
                             }
                         }
+                        Pending::Create { activate: false } => {
+                            events.push(Event::Rejected {
+                                request: request_id,
+                                message: message.clone(),
+                            });
+                        }
                         Pending::Begin { local, request } => {
                             if let Some(known) = self.known.get_mut(&local) {
                                 known.writing = false;
@@ -640,15 +656,27 @@ impl SharedChats {
                         Err(error) => events.push(Event::Error(error)),
                     }
                 }
-                (Pending::Create, Reply::Chat { chat }) => {
+                (Pending::Create { activate }, Reply::Chat { chat }) => {
                     self.refreshed = None;
-                    match self.accept_chat(store, chat, None, true, redact) {
-                        Ok(Some(chat_id)) => events.push(Event::Created {
-                            request: request_id,
-                            chat_id,
-                        }),
-                        Ok(None) => {}
-                        Err(error) => events.push(Event::Error(error)),
+                    let conversation = chat.row.id.clone();
+                    match self.accept_chat(store, chat, None, activate, redact) {
+                        Ok(opened) => {
+                            if let Some(chat_id) = opened.or_else(|| self.local_id(&conversation)) {
+                                events.push(Event::Created {
+                                    request: request_id,
+                                    chat_id,
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            if !activate {
+                                events.push(Event::Rejected {
+                                    request: request_id,
+                                    message: error.clone(),
+                                });
+                            }
+                            events.push(Event::Error(error));
+                        }
                     }
                 }
                 (Pending::Open, Reply::Chat { chat }) => {
@@ -1399,5 +1427,43 @@ mod tests {
             assert_eq!(saved.turns().len(), 2);
             assert_eq!(saved.turns()[1].text, "answer");
         }
+    }
+    #[test]
+    #[ignore = "requires JTERM_TEST_HOST and isolated local Unix sockets; no provider"]
+    fn workspace_handoff_creation_receipt_is_inactive() {
+        let host = host();
+        let mut shared = bridge(&host, "handoff-navigation");
+        let mut store = ChatStore::default();
+        let first = shared.create().unwrap();
+        let source = until(&mut shared, &mut store, |_, _, events| {
+            events.into_iter().find_map(|event| match event {
+                Event::Created { request, chat_id } if request == first => Some(chat_id),
+                Event::Error(error) => panic!("{error}"),
+                _ => None,
+            })
+        });
+        store.set_active_draft("Keep this typing and selection".into());
+        let request = shared.create_inactive().unwrap();
+        let target = until(&mut shared, &mut store, |_, _, events| {
+            events.into_iter().find_map(|event| match event {
+                Event::Created {
+                    request: received,
+                    chat_id,
+                } if received == request => Some(chat_id),
+                Event::Error(error) => panic!("{error}"),
+                _ => None,
+            })
+        });
+        assert_ne!(source, target);
+        assert_eq!(store.active_id(), source);
+        assert_eq!(store.active_draft(), "Keep this typing and selection");
+        assert_eq!(store.chat_draft(target), Some(""));
+        store.set_chat_draft(target, "Reviewed handoff, still unsent".into());
+        assert_eq!(store.active_id(), source);
+        assert_eq!(store.active_draft(), "Keep this typing and selection");
+        assert_eq!(
+            store.chat_draft(target),
+            Some("Reviewed handoff, still unsent")
+        );
     }
 }

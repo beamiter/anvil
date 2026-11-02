@@ -298,7 +298,21 @@ impl Component for SearchModel {
         let model = Self {
             case_sensitive: false,
         };
+        let search_root = root.clone();
         let widgets = view_output!();
+        // A concealed GtkSearchBar still measures its revealer's child. It
+        // must not impose Find's desktop width on every workspace page.
+        if let Some(content) = search_root.child() {
+            search_root.set_child(None::<&gtk::Widget>);
+            let scroll = gtk::ScrolledWindow::new();
+            scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
+            scroll.set_min_content_width(1);
+            scroll.set_propagate_natural_width(false);
+            scroll.set_child(Some(&content));
+            search_root.set_child(Some(&scroll));
+        }
+        search_root.set_visible(search_root.is_search_mode());
+        search_root.connect_search_mode_enabled_notify(|bar| bar.set_visible(bar.is_search_mode()));
         ComponentParts { model, widgets }
     }
 

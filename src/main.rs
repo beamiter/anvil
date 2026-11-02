@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+mod composer_geometry;
+
 mod agent_cli;
 mod gtk_presentation;
 mod gtk_process;
@@ -87,10 +89,18 @@ mod workflows;
 mod workspace;
 mod workspace_chats;
 mod workspace_cli;
+mod workspace_context;
+mod workspace_context_ui;
 mod workspace_conversation;
 mod workspace_navigation;
 mod workspace_ops;
+mod workspace_remote;
+mod workspace_remote_ui;
+mod workspace_review;
+mod workspace_review_ui;
+mod workspace_search_ui;
 mod workspace_shell;
+mod workspace_tools;
 mod workspace_visibility;
 
 use adw::prelude::*;

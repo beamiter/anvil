@@ -1145,10 +1145,11 @@ impl Component for TasksPanelModel {
                                 set_spacing: 4,
                                 set_visible: false,
 
+                                #[name(follow_up_scroll)]
                                 gtk::ScrolledWindow {
                                     set_hexpand: true,
-                                    set_min_content_height: 76,
-                                    set_max_content_height: 150,
+                                    set_min_content_height: 104,
+                                    set_max_content_height: 220,
                                     set_hscrollbar_policy: gtk::PolicyType::Never,
                                     set_vscrollbar_policy: gtk::PolicyType::Automatic,
                                     #[name(follow_up_entry)]
@@ -1222,6 +1223,12 @@ impl Component for TasksPanelModel {
             page_guard: page_guard.clone(),
         };
         let widgets: TasksPanelModelWidgets = view_output!();
+        crate::composer_geometry::install(
+            &widgets.follow_up_entry,
+            &widgets.follow_up_scroll,
+            104,
+            220,
+        );
         let factory = gtk::SignalListItemFactory::new();
         factory.connect_setup(|_, item| {
             let item = item.downcast_ref::<gtk::ListItem>().unwrap();
