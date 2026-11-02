@@ -648,6 +648,9 @@ impl Component for VteTerminal {
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         let terminal = create_terminal(&init.config.borrow());
+        if crate::agent_cli::is_inline_launch(&init.shell_argv) {
+            crate::block_view::install_inline_cli_reading(&terminal);
+        }
 
         mount_terminal_grid(&root, &terminal);
         let companion = crate::organism_ui::vte_surface::VteCompanion::new(

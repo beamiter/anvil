@@ -1689,6 +1689,11 @@ Node installations managed by NVM when a desktop launcher supplies a minimal
 本地终端默认让 Claude 使用 classic renderer，并让 Codex 使用
 `--no-alt-screen`，将会话输出保留在主屏历史中。可拖动右侧滑轨向上阅读、
 向下回到最新输出；滚动范围受终端的 scrollback 容量限制。
+运行中的 Codex / Claude 会话也支持直接按 `PageUp` / `PageDown` 翻阅，
+相邻页保留两行上下文；滚轮和翻页沿同一条逐帧轨迹移动，触控板与拖动滑轨
+直接跟随手势。向上阅读时，后续输出不会抢回阅读位置。
+这些快捷键只接管主屏中的交互会话；全屏编辑器、CLI 的全屏 transcript
+和带修饰键的操作继续交给应用。
 新会话、任务终端和恢复的会话采用相同设置，不改写 CLI 配置文件。
 
 Codex 的兼容入口仅加入子进程 PATH；用户自己的 alias/function 仍有优先权。

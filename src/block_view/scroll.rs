@@ -206,6 +206,10 @@ impl ScrollDebouncer {
         self.start_clock(scroll);
     }
 
+    pub(crate) fn scroll_pixels(&self, scroll: &ScrolledWindow, delta: f64) {
+        self.scroll_wheel(scroll, delta / WHEEL_DISTANCE_PX, false);
+    }
+
     pub(crate) fn scroll_wheel(&self, scroll: &ScrolledWindow, delta: f64, surface: bool) {
         if !delta.is_finite() || delta == 0.0 {
             return;

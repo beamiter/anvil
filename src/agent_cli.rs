@@ -90,6 +90,19 @@ fn prepare(mut block: Vec<CString>, directory: Option<&Path>) -> Vec<CString> {
     block
 }
 
+/// Main-screen agent sessions expose local transcript navigation. An explicit
+/// integration opt-out preserves the CLI's own keyboard/scroll ownership.
+pub(crate) fn is_inline_session(command: &str) -> bool {
+    std::env::var_os("JTERM_AGENT_SCROLLBACK").as_deref() != Some(OsStr::new("0"))
+        && crate::immersive_command::reading_agent_command(command)
+}
+
+pub(crate) fn is_inline_launch(argv: &[String]) -> bool {
+    jterm_core::process::shell_quote_argv(argv)
+        .as_deref()
+        .is_some_and(is_inline_session)
+}
+
 /// Absolute launchers (task tabs and session resume) bypass PATH shims.
 pub(crate) fn inline_argv(argv: &[String]) -> Vec<String> {
     let mut argv = argv.to_vec();
@@ -127,6 +140,32 @@ pub(crate) fn vte_environment(block: Vec<String>) -> Vec<String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn exact_direct_argv_selects_only_interactive_agent_launches() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|arg| (*arg).to_owned())
+                .collect::<Vec<_>>()
+        };
+        for values in [
+            vec!["/opt/my tools/codex", "resume", "session-id"],
+            vec!["env", "CODEX_HOME=/tmp/my home", "codex", "resume", "last"],
+            vec!["claude", "--resume", "session-id"],
+        ] {
+            assert!(is_inline_launch(&args(&values)), "{values:?}");
+        }
+        for values in [
+            vec!["bash", "-c", "codex"],
+            vec!["vim"],
+            vec!["echo", "codex"],
+            vec!["codex", "exec", "prompt"],
+            vec!["claude", "--print", "prompt"],
+        ] {
+            assert!(!is_inline_launch(&args(&values)), "{values:?}");
+        }
+    }
 
     #[test]
     fn defaults_preserve_explicit_choices_and_other_environment() {

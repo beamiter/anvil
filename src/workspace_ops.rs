@@ -833,6 +833,16 @@ impl AppModel {
             Vec::new(),
             sender,
         ) {
+            if let Some(pane) = self
+                .tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .find(|pane| pane.id == pane_id)
+            {
+                if let TermCtl::Vte(controller) = &pane.terminal {
+                    crate::block_view::install_inline_cli_reading(controller.model().terminal());
+                }
+            }
             self.agent_session_tabs.insert(key, pane_id);
             self.agent_session_pending.insert(pane_id, request);
             self.rebuild_tab_strip(sender);
@@ -889,6 +899,11 @@ impl AppModel {
         let tab = self.tabs.iter_mut().find(|tab| tab.id == tab_id)?;
         let pane = tab.panes.iter_mut().find(|pane| pane.id == pane_id)?;
         pane.task_role = Some(identity.role);
+        if identity.role == crate::agent_task::TaskTerminalRole::Agent {
+            if let TermCtl::Vte(controller) = &pane.terminal {
+                crate::block_view::install_inline_cli_reading(controller.model().terminal());
+            }
+        }
         pane.task_session_id = Some(identity.session_id);
         Some((tab_id, pane_id))
     }
