@@ -18,7 +18,6 @@ use super::ai_chat_store::{
 };
 use crate::{ai, palette};
 
-const STOPPED_STATUS: &str = "Response stopped. You can retry when ready.";
 const CHAT_PAGE: &str = "chat";
 const LIBRARY_PAGE: &str = "library";
 const NEW_CHAT_LABEL: &str = "New chat";
@@ -625,7 +624,20 @@ impl Component for AiPanelModel {
                             self.render_all(widgets, &sender);
                             self.publish_snapshot(widgets, &sender);
                         }
-                        crate::workspace_chats::Event::Opened(_) => {
+                        crate::workspace_chats::Event::Opened(id) => {
+                            if let Some(job) = self.shared.hosted_job(id) {
+                                if let Ok(token) = self.store.observe_turn(id, job.user_text) {
+                                    self.observe_hosted(
+                                        token,
+                                        jterm_core::agent_workspace::ApiRequest::Observe {
+                                            id: job.id,
+                                            epoch: job.epoch,
+                                            view: uuid::Uuid::new_v4().to_string(),
+                                        },
+                                        &sender,
+                                    );
+                                }
+                            }
                             self.invalidate_delete_confirmation();
                             self.render_all(widgets, &sender);
                             self.publish_snapshot(widgets, &sender);
@@ -740,12 +752,13 @@ impl Component for AiPanelModel {
                 let Some(token) = self.store.active_request_token() else {
                     return;
                 };
-                let Some(handle) = self.requests.remove(&token) else {
+                let Some(handle) = self.requests.get(&token) else {
                     return;
                 };
                 handle.cancel();
-                let _ = self.shared.finish(token, Err(()));
-                let _ = self.store.cancel_request(token, STOPPED_STATUS.to_string());
+                widgets
+                    .status
+                    .set_label("Stopping the background response…");
                 self.render_all(widgets, &sender);
                 self.publish_snapshot(widgets, &sender);
             }
@@ -764,8 +777,13 @@ impl Component for AiPanelModel {
                 }
             }
             AiPanelMsg::Delta { token, text } => {
-                if self.store.push_delta(token, &text) == Some(true) {
-                    self.append_stream_text(widgets);
+                let append_only = text.starts_with(self.store.active_partial());
+                if self.store.replace_partial(token, &text) == Some(true) {
+                    if append_only {
+                        self.append_stream_text(widgets);
+                    } else {
+                        self.render_transcript(widgets);
+                    }
                 }
             }
             AiPanelMsg::Result { token, result } => {
@@ -777,21 +795,15 @@ impl Component for AiPanelModel {
                     && !self.store.active_partial().is_empty();
                 match result {
                     Ok(answer) => {
-                        if self
-                            .store
-                            .complete_success(token, answer.trim().to_string())
-                            .is_some()
-                        {
-                            let _ = self
-                                .shared
-                                .complete(token, &self.store, self.redact_secrets);
+                        if self.store.complete_success(token, answer).is_some() {
+                            let _ = self.shared.hosted_finished(token);
                             self.retry_payloads.remove(&token.chat_id);
                         } else {
-                            let _ = self.shared.finish(token, Err(()));
+                            let _ = self.shared.hosted_finished(token);
                         }
                     }
                     Err(error) => {
-                        let _ = self.shared.finish(token, Err(()));
+                        let _ = self.shared.hosted_finished(token);
                         let error = crate::review_input::safe_inline_display(&error, 2 * 1024);
                         let _ = self
                             .store
@@ -1220,35 +1232,52 @@ impl AiPanelModel {
             .or_insert(new_system)
             .clone();
         let token = start.token;
-        self.shared.attach(token, receipt);
         self.retry_payloads.insert(token.chat_id, payload);
-        let handle = if self.stream {
-            let delta_sender = sender.clone();
-            let done_sender = sender.clone();
-            ai::ask_turns_streaming(
-                client,
-                system,
-                request_history,
-                move |text| delta_sender.input(AiPanelMsg::Delta { token, text }),
-                move |result| done_sender.input(AiPanelMsg::Result { token, result }),
-            )
-        } else {
-            let done_sender = sender.clone();
-            ai::ask_turns(client, system, request_history, move |result| {
-                done_sender.input(AiPanelMsg::Result { token, result });
-            })
+        let launch = match jterm_core::agent_workspace::ApiLaunch::new(
+            receipt.clone(),
+            &client,
+            Some(system),
+            &request_history,
+            self.stream,
+        ) {
+            Ok(launch) => launch,
+            Err(error) => {
+                let _ = self.store.complete_error(token, error);
+                return false;
+            }
         };
-        self.requests.insert(token, handle);
+        self.shared.attach(token, receipt);
+        self.observe_hosted(
+            token,
+            jterm_core::agent_workspace::ApiRequest::Start(launch),
+            sender,
+        );
         self.render_all(widgets, sender);
         self.publish_snapshot(widgets, sender);
         true
+    }
+
+    fn observe_hosted(
+        &mut self,
+        token: RequestToken,
+        request: jterm_core::agent_workspace::ApiRequest,
+        sender: &ComponentSender<Self>,
+    ) {
+        let delta_sender = sender.clone();
+        let done_sender = sender.clone();
+        let handle = ai::ask_hosted(
+            request,
+            move |text| delta_sender.input(AiPanelMsg::Delta { token, text }),
+            move |result| done_sender.input(AiPanelMsg::Result { token, result }),
+        );
+        self.requests.insert(token, handle);
     }
 
     fn cancel_all(&mut self) {
         let requests = std::mem::take(&mut self.requests);
         for (token, handle) in requests {
             handle.cancel();
-            let _ = self.shared.finish(token, Err(()));
+            let _ = self.shared.hosted_finished(token);
             let _ = self
                 .store
                 .cancel_request(token, "Request cancelled during restore.".into());

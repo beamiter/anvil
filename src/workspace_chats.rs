@@ -165,6 +165,33 @@ impl SharedChats {
         self.receipts.insert(token, receipt);
     }
 
+    pub fn hosted_job(&self, local: u64) -> Option<jterm_core::agent_workspace::ApiSnapshot> {
+        self.known
+            .get(&local)?
+            .chat
+            .api_job
+            .as_deref()
+            .filter(|job| job.state.is_live())
+            .cloned()
+    }
+    pub fn hosted_finished(&mut self, token: RequestToken) -> Result<(), String> {
+        self.receipts.remove(&token);
+        self.settlements.remove(&token);
+        let Some(id) = self
+            .known
+            .get(&token.chat_id)
+            .map(|known| known.chat.row.id.clone())
+        else {
+            return Ok(());
+        };
+        self.send(
+            Command::LoadChat { id },
+            Pending::Settle {
+                local: token.chat_id,
+            },
+        )
+    }
+
     pub fn complete(
         &mut self,
         token: RequestToken,
@@ -655,7 +682,28 @@ impl SharedChats {
                         .map(|known| snapshot_draft(&known.chat.snapshot_json))
                         .unwrap_or_default();
                     let writing = self.is_pending_write(local);
-                    let resolution = reconcile_draft(&local_draft, &remote_draft, &baseline);
+                    let previous_revision = self
+                        .known
+                        .get(&local)
+                        .map(|known| known.chat.draft_revision);
+                    let own_clear = chat.api_job.as_ref().is_some_and(|job| {
+                        job.state == jterm_core::agent_workspace::ApiState::Completed
+                            && remote_draft.is_empty()
+                            && chat.draft_revision == job.submitted_draft_revision.saturating_add(1)
+                            && previous_revision
+                                .is_some_and(|rev| rev <= job.submitted_draft_revision)
+                    });
+                    let mut resolution = reconcile_draft(&local_draft, &remote_draft, &baseline);
+                    if local_draft != remote_draft
+                        && resolution == DraftResolution::Local
+                        && previous_revision != Some(chat.draft_revision)
+                        && !own_clear
+                    {
+                        resolution = DraftResolution::Conflict;
+                    }
+                    if own_clear && !local_draft.is_empty() {
+                        resolution = DraftResolution::Local;
+                    }
                     if resolution == DraftResolution::Remote {
                         store.set_chat_draft(local, remote_draft);
                     }
@@ -958,6 +1006,12 @@ impl SharedChats {
                     let request = submission.request;
                     self.submissions.remove(&row.id);
                     events.push(Event::Rejected { request, message: "The draft changed before it was accepted. Your current draft is preserved; send it when ready.".into() });
+                    continue;
+                }
+                if !known.chat.background_api_supported {
+                    let request = submission.request;
+                    self.submissions.remove(&row.id);
+                    events.push(Event::Rejected { request, message: "This session host needs an update before API chats can run in the background. Finish its running tasks and restart it, then reopen the conversation. Your draft is kept.".into() });
                     continue;
                 }
                 let request = submission.request;

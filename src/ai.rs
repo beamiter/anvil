@@ -17,10 +17,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-const AI_DELTA_QUEUE_CAPACITY: usize = 256;
-const MAX_AI_DELTA_BYTES: usize = 64 * 1024;
-const MAX_AI_DELTAS_PER_TICK: usize = 64;
-
 use gtk::glib;
 
 pub(crate) use jterm_core::ai::{
@@ -128,6 +124,7 @@ pub(crate) fn client_from_config(config: &crate::config::Config) -> Result<AiCli
 /// transport via the shared cancellation token.
 pub(crate) struct AiHandle {
     token: AiCancellationToken,
+    hosted: Option<jterm_core::agent_workspace::ApiObservation>,
     suppressed: Arc<AtomicBool>,
 }
 
@@ -137,8 +134,12 @@ type AiCompletion = Box<dyn FnOnce(AiResult)>;
 
 impl AiHandle {
     pub(crate) fn cancel(&self) {
-        self.suppressed.store(true, Ordering::SeqCst);
-        self.token.cancel();
+        if let Some(observation) = &self.hosted {
+            observation.cancel();
+        } else {
+            self.suppressed.store(true, Ordering::SeqCst);
+            self.token.cancel();
+        }
     }
 }
 
@@ -148,7 +149,10 @@ impl Drop for AiHandle {
         // message (for example during application shutdown). Keep the handle's
         // ownership contract fail-safe: releasing it always suppresses the
         // late GTK callback and asks the shared transport to terminate.
-        self.cancel();
+        self.suppressed.store(true, Ordering::SeqCst);
+        if self.hosted.take().is_none() {
+            self.token.cancel();
+        }
     }
 }
 
@@ -229,7 +233,65 @@ pub(crate) fn generate_command(
         glib::ControlFlow::Continue
     });
 
-    AiHandle { token, suppressed }
+    AiHandle {
+        token,
+        suppressed,
+        hosted: None,
+    }
+}
+
+/// Observe a host-owned chat; dropping the GTK handle only detaches.
+pub(crate) fn ask_hosted(
+    request: jterm_core::agent_workspace::ApiRequest,
+    mut on_preview: impl FnMut(String) + 'static,
+    on_done: impl FnOnce(AiResult) + 'static,
+) -> AiHandle {
+    let hosted = jterm_core::agent_workspace::ApiObservation::default();
+    let observer = hosted.token();
+    let suppressed = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::sync_channel(32);
+    let result: AiResultSlot = Arc::new(std::sync::Mutex::new(None));
+    let worker_result = result.clone();
+    let spawn = std::thread::Builder::new()
+        .name("anvil-hosted-chat".into())
+        .spawn(move || {
+            let answer = jterm_core::agent_workspace::HostedApiClient::new().execute(
+                request,
+                &observer,
+                &mut |preview| {
+                    let _ = tx.try_send(preview.to_owned());
+                },
+            );
+            *worker_result.lock().expect("hosted result mutex") = Some(answer);
+        });
+    if let Err(error) = spawn {
+        *result.lock().expect("hosted result mutex") =
+            Some(Err(format!("Could not observe session host: {error}")));
+    }
+    let mut done = Some(on_done);
+    let hidden = suppressed.clone();
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        if hidden.load(Ordering::SeqCst) {
+            return glib::ControlFlow::Break;
+        }
+        if let Some(latest) = rx.try_iter().take(32).last() {
+            on_preview(latest);
+        }
+        let answer = result.lock().expect("hosted result mutex").take();
+        if let Some(answer) = answer {
+            if let Some(done) = done.take() {
+                done(answer);
+            }
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
+    AiHandle {
+        token: AiCancellationToken::new(),
+        hosted: Some(hosted),
+        suppressed,
+    }
 }
 
 /// Fire a provider-neutral multi-turn transcript. Roles are retained all the
@@ -288,91 +350,11 @@ pub(crate) fn ask_turns(
         glib::ControlFlow::Continue
     });
 
-    AiHandle { token, suppressed }
-}
-
-/// Fire a multi-turn transcript with incremental delivery. `on_delta` runs on
-/// the GLib main thread with each assistant text fragment as it arrives, and
-/// `on_done` then fires exactly once with the same result `ask_turns` would
-/// deliver. The completed text is the single source of truth: it can end with
-/// a token-limit advisory that never arrived as a fragment, so callers replace
-/// the accumulated fragments with it, which also heals any dropped delta.
-pub(crate) fn ask_turns_streaming(
-    client: AiClient,
-    system: String,
-    history: Vec<Turn>,
-    mut on_delta: impl FnMut(String) + 'static,
-    on_done: impl FnOnce(AiResult) + 'static,
-) -> AiHandle {
-    let token = AiCancellationToken::new();
-    let suppressed = Arc::new(AtomicBool::new(false));
-
-    let slot: AiResultSlot = Arc::new(std::sync::Mutex::new(None));
-    let slot_thread = slot.clone();
-    let slot_main = slot.clone();
-    let mut on_done_cell: Option<AiCompletion> = Some(Box::new(on_done));
-
-    // Incremental fragments are best-effort UI hints; the completed response
-    // below is authoritative. Keep this queue bounded and drop overload rather
-    // than letting a very fast local model grow memory or block cancellation.
-    let (delta_tx, delta_rx) = std::sync::mpsc::sync_channel::<String>(AI_DELTA_QUEUE_CAPACITY);
-
-    let worker_token = token.clone();
-    let spawn_result = std::thread::Builder::new()
-        .name("anvil-ai-stream".to_string())
-        .spawn(move || {
-            let result = client
-                .send_turns_streaming_cancellable(
-                    Some(&system),
-                    &history,
-                    &worker_token,
-                    &mut |fragment| {
-                        if fragment.len() <= MAX_AI_DELTA_BYTES {
-                            let _ = delta_tx.try_send(fragment.to_string());
-                        }
-                    },
-                )
-                .map_err(|error| error.to_string());
-            if worker_token.is_cancelled() {
-                return;
-            }
-            *slot_thread.lock().expect("ai slot mutex poisoned") = Some(result);
-        });
-    if let Err(error) = spawn_result {
-        *slot.lock().expect("ai slot mutex poisoned") =
-            Some(Err(format!("could not start AI streaming worker: {error}")));
+    AiHandle {
+        token,
+        suppressed,
+        hosted: None,
     }
-
-    // 50ms instead of the blocking poll's 100ms: the tick paces how alive the
-    // streamed text feels, not just completion latency.
-    let suppressed_main = suppressed.clone();
-    glib::timeout_add_local(Duration::from_millis(50), move || {
-        if suppressed_main.load(Ordering::SeqCst) {
-            return glib::ControlFlow::Break;
-        }
-        for _ in 0..MAX_AI_DELTAS_PER_TICK {
-            match delta_rx.try_recv() {
-                Ok(fragment) => on_delta(fragment),
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-            }
-        }
-        let taken = slot_main.lock().expect("ai slot mutex poisoned").take();
-        if let Some(result) = taken {
-            // Do not bypass the per-tick callback budget at completion. Up to
-            // 16 MiB of bounded fragments can still be queued here; invoking
-            // every callback in one GTK turn would freeze the UI. The completed
-            // result is authoritative and callers replace their fragment view
-            // with it, so dropping the remaining hints is lossless on success.
-            if let Some(cb) = on_done_cell.take() {
-                cb(result);
-            }
-            return glib::ControlFlow::Break;
-        }
-        glib::ControlFlow::Continue
-    });
-
-    AiHandle { token, suppressed }
 }
 
 /// Which AI action a finished block's context menu asked for. `Ask` keeps the
