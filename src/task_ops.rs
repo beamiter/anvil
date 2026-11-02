@@ -37,6 +37,45 @@ fn is_hosted_validation_view(pane: &Pane) -> bool {
     }
 }
 
+/// Read-only history remains available when the attach capability has expired.
+/// It is never supplied to the task reducer as execution evidence.
+fn validation_history_preview(
+    detail: Option<&str>,
+    history: Option<&jterm_core::agent_workspace::HostedValidationSnapshot>,
+    max_bytes: usize,
+    multiline: bool,
+) -> Option<String> {
+    let mut text = detail.unwrap_or_default().to_string();
+    if let Some(history) = history {
+        if history.preparing {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str("Preparing validation in the session host…");
+        }
+        if !history.output.is_empty() {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(if history.output_truncated {
+                "Saved validation output (earlier output was not retained):\n"
+            } else {
+                "Saved validation output:\n"
+            });
+            text.push_str(&history.output);
+        }
+    }
+    if text.is_empty() {
+        return None;
+    }
+    let redacted = jterm_core::redact::redact_secrets(&text);
+    Some(if multiline {
+        jterm_core::review_input::safe_multiline_display(&redacted, max_bytes)
+    } else {
+        jterm_core::review_input::safe_inline_display(&redacted, max_bytes)
+    })
+}
+
 /// Poll cadence while any task machinery is active; the runtime's own frame
 /// budgets make each tick a bounded, nonblocking drain.
 const TASKS_POLL_FAST: Duration = Duration::from_millis(120);
@@ -1349,11 +1388,12 @@ impl AppModel {
                 validation_attempt: task.validation.attempt,
                 needs_attention: task.needs_attention(),
                 status_detail: task.status_detail.clone(),
-                validation_detail: task
-                    .validation
-                    .status_detail
-                    .as_deref()
-                    .map(|detail| jterm_core::review_input::safe_inline_display(detail, 1024)),
+                validation_detail: validation_history_preview(
+                    task.validation.status_detail.as_deref(),
+                    self.agent_runtime.hosted_validation_snapshot(task.id),
+                    1024,
+                    false,
+                ),
             })
             .collect();
 
@@ -1513,11 +1553,12 @@ impl AppModel {
             validation_attempt: task.validation.attempt,
             needs_attention: task.needs_attention(),
             status_detail: task.status_detail.clone(),
-            validation_detail: task
-                .validation
-                .status_detail
-                .as_deref()
-                .map(|detail| jterm_core::review_input::safe_inline_display(detail, 1024)),
+            validation_detail: validation_history_preview(
+                task.validation.status_detail.as_deref(),
+                self.agent_runtime.hosted_validation_snapshot(task.id),
+                1024,
+                false,
+            ),
         });
         if let Some(detail) = &task.status_detail {
             status_line = format!("{status_line} · {detail}");
@@ -1581,6 +1622,23 @@ impl AppModel {
                 text: self.agent_diff.state().text.clone(),
             });
 
+        let mut inspector = agent_task_ui::task_inspector_text(task);
+        if let Some(history) = validation_history_preview(
+            None,
+            self.agent_runtime.hosted_validation_snapshot(task_id),
+            8192,
+            true,
+        ) {
+            inspector.push_str("\n\n");
+            inspector.push_str(&history);
+        }
+
+        // Redaction may remove a recipe from this display replica. The host
+        // retains the original task's review mode without exposing its command.
+        let manual_review = self
+            .agent_runtime
+            .hosted_manual_review(task_id)
+            .unwrap_or_else(|| task.requires_manual_review());
         let archived = task.status == TaskStatus::Archived;
         let archive_check = self.task_manager.can_archive(task_id);
         Some(TaskDetailSync {
@@ -1594,7 +1652,7 @@ impl AppModel {
             title: task.title.clone(),
             status_line,
             branch: task.branch.clone(),
-            inspector: agent_task_ui::task_inspector_text(task),
+            inspector,
             validation_status: task.validation.status,
             guidance: crate::agent_task::TaskGuidance::from_task(
                 task,
@@ -1610,8 +1668,8 @@ impl AppModel {
             } else {
                 format!("Start {}", task.provider.display_name())
             },
-            manual_review: task.requires_manual_review(),
-            can_accept_review: task.requires_manual_review()
+            manual_review,
+            can_accept_review: manual_review
                 && task.status == TaskStatus::ReadyForReview
                 && task.validation.status == TaskValidationStatus::NotRun
                 && !has_stream,
@@ -1633,14 +1691,17 @@ impl AppModel {
             can_focus_validation,
             can_stop: (native_preparing || has_stream) && !native_idle,
             can_finish: native_idle,
-            can_run_validation: (if self.agent_runtime.conversation_id(task_id).is_some() {
-                self.agent_runtime.can_start_hosted_validation(task_id)
-            } else {
-                task.validation_command().is_some()
-            }) && task.status == TaskStatus::ReadyForReview
+            can_run_validation: !manual_review
+                && (if self.agent_runtime.conversation_id(task_id).is_some() {
+                    self.agent_runtime.can_start_hosted_validation(task_id)
+                } else {
+                    task.validation_command().is_some()
+                })
+                && task.status == TaskStatus::ReadyForReview
                 && task.validation.status != TaskValidationStatus::Running
                 && !has_stream,
-            can_complete: task.status == TaskStatus::ReadyForReview
+            can_complete: !manual_review
+                && task.status == TaskStatus::ReadyForReview
                 && task.validation.status == TaskValidationStatus::Passed
                 && !has_stream,
             can_follow_up: native_idle
@@ -1945,5 +2006,36 @@ mod disabled_task_lifecycle_tests {
             dispatch.contains(".cancel(task_id)"),
             "Stop keeps the requested stable identity"
         );
+    }
+}
+
+#[cfg(test)]
+mod hosted_validation_history_tests {
+    use super::validation_history_preview;
+    use jterm_core::agent_workspace::HostedValidationSnapshot;
+
+    #[test]
+    fn saved_output_is_readable_without_a_terminal_and_safe_for_both_views() {
+        let secret = format!("sk-{}", "x".repeat(32));
+        let history = HostedValidationSnapshot {
+            run_id: "synthetic-validation".into(),
+            preparing: false,
+            terminal: None,
+            output: format!("first line\n{secret}\n\u{1b}[31m\u{202e}failure"),
+            output_truncated: true,
+        };
+        let detail = validation_history_preview(None, Some(&history), 8192, true).unwrap();
+        assert!(detail.contains("first line\n"));
+        assert!(detail.contains("earlier output was not retained"));
+        assert!(detail.contains("REDACTED"));
+        assert!(!detail.contains(&secret));
+        assert!(!detail.contains('\u{1b}'));
+        assert!(!detail.contains('\u{202e}'));
+        let row =
+            validation_history_preview(Some("Host restarted"), Some(&history), 96, false).unwrap();
+        assert!(row.starts_with("Host restarted"));
+        assert!(row.len() <= 96);
+        assert!(!row.contains('\n'));
+        assert!(!row.contains(&secret));
     }
 }

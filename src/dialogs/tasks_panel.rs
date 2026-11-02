@@ -1981,7 +1981,9 @@ impl TasksPanelModel {
                         && detail.stream.is_some()
                         && !detail.archived
                 }
-                ActionKind::Complete => !detail.manual_review && !detail.archived,
+                ActionKind::Complete => {
+                    detail.can_complete && !detail.manual_review && !detail.archived
+                }
                 ActionKind::AcceptReviewed => detail.manual_review && !detail.archived,
                 ActionKind::Archive => !detail.archived,
                 ActionKind::Restore => detail.archived,
