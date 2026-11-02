@@ -1694,3 +1694,5 @@ Node installations managed by NVM when a desktop launcher supplies a minimal
 Codex 的兼容入口仅加入子进程 PATH；用户自己的 alias/function 仍有优先权。
 `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=0 claude` 可显式使用 Claude 全屏模式；
 用 `JTERM_AGENT_SCROLLBACK=0` 启动终端可关闭上述兼容默认值。
+
+Click the **Agent Workspace** heading in the sidebar to show or hide its conversations, filters, and tasks. The setting is saved as `agent_workspace_enabled` (default `true`); terminal navigation, active sessions, drafts, and background work stay in place.

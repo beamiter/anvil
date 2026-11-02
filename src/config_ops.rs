@@ -114,6 +114,8 @@ impl AppModel {
             .set_sidebar_widths(new_config.sidebar_width, new_config.ai_panel_width);
         self.apply_tab_placement();
         self.set_sidebar_visible(sidebar_visible, false);
+        self.agent_workspace_expander
+            .set_expanded(new_config.agent_workspace_enabled);
         self.set_bottom_bar_visible(new_config.bottom_bar);
         let font_desc = self.config.borrow().font_desc.clone();
         let scrollback = new_config.terminal_scrollback_lines as i64;

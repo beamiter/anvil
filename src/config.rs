@@ -767,6 +767,8 @@ pub struct Config {
     /// Whether the left sidebar is visible. Older configs derive this from
     /// tab placement so sidebar tabs remain discoverable after an upgrade.
     pub(crate) sidebar_visible: bool,
+    /// Collapse only Agent Workspace conversations; terminal and Files navigation stay available.
+    pub(crate) agent_workspace_enabled: bool,
     /// Sidebar width in pixels.
     pub(crate) sidebar_width: u32,
     /// Width of each tab in the top tab bar, in pixels.
@@ -902,6 +904,7 @@ impl Config {
             // Recovery mode must not initiate network or shared-cache work.
             jsh_update_check: JshUpdateCheck::Never,
             sidebar_visible: true,
+            agent_workspace_enabled: true,
             sidebar_width: 280,
             tab_width: 180,
             max_visible_blocks: 200,
@@ -1153,6 +1156,17 @@ mod config_path_tests {
     use super::*;
 
     #[test]
+    fn agent_workspace_enabled_defaults_on_and_restores_explicit_false() {
+        assert!(Config::safe_defaults().agent_workspace_enabled);
+        let table = "agent_workspace_enabled = false\nsidebar_width = 312\n"
+            .parse::<toml::Table>()
+            .unwrap();
+        let (config, _, _) = resolve_file_config(file_config_from_table(&table));
+        assert!(!config.agent_workspace_enabled);
+        assert_eq!(config.sidebar_width, 312);
+    }
+
+    #[test]
     fn explicit_config_path_wins_over_xdg_default() {
         assert_eq!(
             resolve_config_file_path(
@@ -1368,6 +1382,7 @@ struct FileConfig {
     sidebar_view: Option<String>,
     jsh_update_check: Option<String>,
     sidebar_visible: Option<bool>,
+    agent_workspace_enabled: Option<bool>,
     sidebar_width: Option<u32>,
     tab_width: Option<u32>,
     // Block view optimizations
@@ -1522,6 +1537,9 @@ fn file_config_from_table(table: &toml::Table) -> FileConfig {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         sidebar_visible: table.get("sidebar_visible").and_then(|v| v.as_bool()),
+        agent_workspace_enabled: table
+            .get("agent_workspace_enabled")
+            .and_then(|v| v.as_bool()),
         sidebar_width: table
             .get("sidebar_width")
             .and_then(|v| v.as_integer())
@@ -2246,6 +2264,7 @@ fn resolve_file_config(fc: FileConfig) -> (Config, Vec<Theme>, KeybindingMap) {
         sidebar_view,
         jsh_update_check,
         sidebar_visible,
+        agent_workspace_enabled: fc.agent_workspace_enabled.unwrap_or(true),
         sidebar_width,
         tab_width,
         max_visible_blocks,

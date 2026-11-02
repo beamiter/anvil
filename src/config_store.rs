@@ -823,6 +823,10 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         toml::Value::Boolean(config.sidebar_visible),
     );
     table.insert(
+        "agent_workspace_enabled".into(),
+        toml::Value::Boolean(config.agent_workspace_enabled),
+    );
+    table.insert(
         "jsh_update_check".into(),
         toml::Value::String(config.jsh_update_check.as_str().to_string()),
     );
@@ -1632,6 +1636,7 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "sidebar_view",
         "jsh_update_check",
         "sidebar_visible",
+        "agent_workspace_enabled",
         "sidebar_width",
         "tab_width",
         "max_visible_blocks",
@@ -1739,6 +1744,7 @@ fn validate_table(path: &Path, table: &toml::Table) -> ConfigValidationReport {
         "block_compact",
         "allow_remote_clipboard_write",
         "sidebar_visible",
+        "agent_workspace_enabled",
         "ai_enabled",
         "ai_panel_visible",
         "eva_companion_enabled",
@@ -3247,5 +3253,28 @@ mod tests {
             let report = validate_table(Path::new("config.toml"), &wrong);
             assert!(report.errors() > 0, "{key} accepts a string as a boolean");
         }
+    }
+}
+
+#[cfg(test)]
+mod agent_workspace_visibility_tests {
+    use super::*;
+    #[test]
+    fn hidden_workspace_preference_is_written_without_overwriting_sidebar_width() {
+        let mut config = Config::safe_defaults();
+        config.agent_workspace_enabled = false;
+        config.sidebar_width = 312;
+        let mut table = toml::Table::new();
+        apply_config_to_table(&config, &mut table);
+        assert_eq!(
+            table
+                .get("agent_workspace_enabled")
+                .and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            table.get("sidebar_width").and_then(toml::Value::as_integer),
+            Some(312)
+        );
     }
 }

@@ -40,6 +40,8 @@ terminal_mode = "block"     # applies to new/restored local panes
 tab_placement = "sidebar"   # "sidebar" or "top"
 sidebar_view = "tabs"       # "tabs" or "files"
 sidebar_visible = true
+# Show conversations; false keeps terminal tabs and other sidebar views.
+agent_workspace_enabled = true
 sidebar_width = 237
 tab_width = 180
 ai_panel_visible = false

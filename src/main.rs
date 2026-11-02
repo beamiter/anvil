@@ -90,6 +90,7 @@ mod workspace_conversation;
 mod workspace_navigation;
 mod workspace_ops;
 mod workspace_shell;
+mod workspace_visibility;
 
 use adw::prelude::*;
 use gtk::gio::{self, Cancellable};
@@ -357,6 +358,7 @@ struct AppModel {
     workspace_stack: gtk::Stack,
     session_sidebar: agent_sessions::Sidebar,
     workspace_navigation: workspace_navigation::Navigation,
+    agent_workspace_expander: gtk::Expander,
     tab_strip: gtk::Box,
     tab_rows: FactoryVecDeque<tab_strip::TabRow>,
     /// Second, always-vertical tab list living in the sidebar's "tabs" page.
@@ -1032,13 +1034,20 @@ impl SimpleComponent for AppModel {
             .supplemental
             .append(&workspace_navigation.root);
         let sessions_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        session_sidebar.root.set_vexpand(true);
-        sessions_page.append(&session_sidebar.root);
         let terminals = gtk::Expander::new(Some("Terminals"));
         terminals.set_child(Some(&tabs_page));
         terminals.set_expanded(true);
         tabs_page.set_size_request(-1, 120);
         tabs_page.set_vexpand(false);
+        let workspace_sender = sender.clone();
+        let agent_workspace_expander = workspace_visibility::group(
+            session_sidebar.root.upcast_ref(),
+            terminals.upcast_ref(),
+            tabs_page.upcast_ref(),
+            config.borrow().agent_workspace_enabled,
+            move |visible| workspace_sender.input(AppMsg::AgentWorkspaceVisible(visible)),
+        );
+        sessions_page.append(&agent_workspace_expander);
         sessions_page.append(&terminals);
         let sidebar_stack = gtk::Stack::new();
         sidebar_stack.add_named(&sessions_page, Some("sessions"));
@@ -1485,6 +1494,7 @@ impl SimpleComponent for AppModel {
             workspace_stack,
             session_sidebar,
             workspace_navigation,
+            agent_workspace_expander,
             tab_strip: tab_strip.clone(),
             tab_rows,
             sidebar_tab_strip: sidebar_tab_strip.clone(),
@@ -2089,6 +2099,13 @@ impl SimpleComponent for AppModel {
             AppMsg::SelectTab(id) => self.select_tab(id, &sender),
             AppMsg::NextTab => self.switch_tab(1, &sender),
             AppMsg::PrevTab => self.switch_tab(-1, &sender),
+            AppMsg::AgentWorkspaceVisible(visible) => {
+                let changed = self.config.borrow().agent_workspace_enabled != visible;
+                if changed {
+                    self.config.borrow_mut().agent_workspace_enabled = visible;
+                    self.persist_config();
+                }
+            }
             AppMsg::ToggleSidebar => {
                 self.set_sidebar_visible(!self.sidebar_visible, true);
             }

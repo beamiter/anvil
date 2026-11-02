@@ -19,6 +19,7 @@ pub(crate) enum AppMsg {
     NextTab,
     PrevTab,
     ToggleSidebar,
+    AgentWorkspaceVisible(bool),
     ToggleInspector,
     FocusShell,
     MinimizeWindow,
