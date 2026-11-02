@@ -209,6 +209,15 @@ impl DrawerControl {
         self.active.set(Some(SidebarEdge::Inspector));
         self.inspector_dismissed.set(false);
     }
+    fn dismiss_for_canvas(&self) {
+        if self.shown.get().is_none() {
+            return;
+        }
+        self.navigation_requested.set(false);
+        self.inspector_dismissed.set(true);
+        self.active.set(None);
+        self.refresh();
+    }
     fn dismiss(&self) {
         match self.shown.get() {
             Some(SidebarEdge::Navigation) => self.navigation_requested.set(false),
@@ -2810,7 +2819,7 @@ fn install_responsive_sidebars(
             };
             if let (Some(panel), Some(focus)) = (panel, gtk::prelude::RootExt::focus(window)) {
                 if !crate::widget_is_within(focus, &panel) {
-                    drawers.dismiss();
+                    drawers.dismiss_for_canvas();
                 }
             }
         });
@@ -4166,6 +4175,17 @@ mod tests {
             control.requested.get(),
             Some(true),
             "temporary suppression retains right preference"
+        );
+        terminal.grab_focus();
+        assert_eq!(
+            drawers.shown.get(),
+            None,
+            "canvas activation dismisses both transient drawers"
+        );
+        assert_eq!(
+            control.requested.get(),
+            Some(true),
+            "canvas activation retains the docked inspector preference"
         );
         window.set_default_size(1356, 650);
         settle();

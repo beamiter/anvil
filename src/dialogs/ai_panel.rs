@@ -147,6 +147,13 @@ pub(crate) enum AiPanelOutput {
     CloseRequested,
 }
 
+/// A navigation request may complete after another conversation or surface is
+/// selected. Only its exact reply may move focus into the visible composer.
+enum NavigationFocus {
+    Shared(jterm_core::agent_workspace::ConversationId),
+    New(u64),
+}
+
 pub(crate) struct AiPanelModel {
     history_path: Option<String>,
     client: Option<ai::AiClient>,
@@ -160,6 +167,7 @@ pub(crate) struct AiPanelModel {
     shared: crate::workspace_chats::SharedChats,
     pending_shared: HashMap<u64, (RequestPayload, bool)>,
     pending_new_context: HashMap<u64, RequestPayload>,
+    navigation_focus: Option<NavigationFocus>,
     earlier_history: HashMap<u64, String>,
     scroll_owner: Rc<Cell<u64>>,
     scroll_positions: HashMap<u64, f64>,
@@ -456,6 +464,7 @@ impl Component for AiPanelModel {
             )),
             pending_shared: HashMap::new(),
             pending_new_context: HashMap::new(),
+            navigation_focus: None,
             earlier_history: HashMap::new(),
             scroll_owner: Rc::new(Cell::new(0)),
             scroll_positions: HashMap::new(),
@@ -544,6 +553,7 @@ impl Component for AiPanelModel {
                 share_command_context,
                 initial_context,
             } => {
+                self.navigation_focus = None;
                 self.history_path = history_path;
                 self.client = Some(client);
                 self.set_stream(stream);
@@ -578,6 +588,7 @@ impl Component for AiPanelModel {
             }
             AiPanelMsg::Restore(encoded) => match ai::ConversationSnapshot::from_json(&encoded) {
                 Ok(snapshot) => {
+                    self.navigation_focus = None;
                     self.cancel_all();
                     self.restore_chats(snapshot);
                     self.retry_payloads.clear();
@@ -605,26 +616,44 @@ impl Component for AiPanelModel {
                     widgets.status.set_label(&error);
                 }
             }
-            AiPanelMsg::OpenShared(id) => match self.shared.open(id) {
-                Ok(Some(id)) => sender.input(AiPanelMsg::SelectChat(id)),
-                Ok(None) => widgets.status.set_label("Opening conversation…"),
-                Err(error) => widgets.status.set_label(&error),
-            },
+            AiPanelMsg::OpenShared(id) => {
+                self.navigation_focus = Some(NavigationFocus::Shared(id.clone()));
+                match self.shared.open(id) {
+                    Ok(Some(id)) => sender.input(AiPanelMsg::SelectChat(id)),
+                    Ok(None) => widgets.status.set_label("Opening conversation…"),
+                    Err(error) => {
+                        self.navigation_focus = None;
+                        widgets.status.set_label(&error);
+                    }
+                }
+            }
             AiPanelMsg::WorkspacePoll => {
                 for event in self.shared.poll(&mut self.store, self.redact_secrets) {
                     match event {
-                        crate::workspace_chats::Event::Created {
-                            request,
-                            chat_id: _,
-                        } => {
+                        crate::workspace_chats::Event::Created { request, chat_id } => {
+                            let focus = matches!(self.navigation_focus,
+                                Some(NavigationFocus::New(pending)) if pending == request);
+                            if focus {
+                                self.navigation_focus = None;
+                            }
                             self.invalidate_delete_confirmation();
                             if let Some(payload) = self.pending_new_context.remove(&request) {
                                 self.start_request(widgets, &sender, payload, false);
                             }
                             self.render_all(widgets, &sender);
                             self.publish_snapshot(widgets, &sender);
+                            if focus && self.store.active_id() == chat_id && root.is_mapped() {
+                                widgets.page_stack.set_visible_child_name(CHAT_PAGE);
+                                widgets.composer.grab_focus();
+                            }
                         }
                         crate::workspace_chats::Event::Opened(id) => {
+                            let focus = matches!(self.navigation_focus.as_ref(),
+                                Some(NavigationFocus::Shared(pending))
+                                    if self.shared.local_id(pending) == Some(id));
+                            if focus {
+                                self.navigation_focus = None;
+                            }
                             if let Some(job) = self.shared.hosted_job(id) {
                                 if let Ok(token) = self.store.observe_turn(id, job.user_text) {
                                     self.observe_hosted(
@@ -641,6 +670,10 @@ impl Component for AiPanelModel {
                             self.invalidate_delete_confirmation();
                             self.render_all(widgets, &sender);
                             self.publish_snapshot(widgets, &sender);
+                            if focus && self.store.active_id() == id && root.is_mapped() {
+                                widgets.page_stack.set_visible_child_name(CHAT_PAGE);
+                                widgets.composer.grab_focus();
+                            }
                         }
                         crate::workspace_chats::Event::Authorized {
                             request,
@@ -848,22 +881,31 @@ impl Component for AiPanelModel {
                 }
             }
             AiPanelMsg::NewChat => {
-                if let Err(error) = self.shared.create() {
-                    widgets.status.set_label(&error);
+                self.navigation_focus = None;
+                match self.shared.create() {
+                    Ok(request) => self.navigation_focus = Some(NavigationFocus::New(request)),
+                    Err(error) => widgets.status.set_label(&error),
                 }
             }
             AiPanelMsg::SelectChat(id) => {
+                self.navigation_focus = None;
                 if self.select_chat(id) {
                     self.render_all(widgets, &sender);
                     self.publish_snapshot(widgets, &sender);
                 }
                 widgets.page_stack.set_visible_child_name(CHAT_PAGE);
+                // Re-selecting the current chat is also a successful navigation.
+                // Reading its history/draft does not require a provider client.
+                if self.store.active_id() == id && root.is_mapped() {
+                    widgets.composer.grab_focus();
+                }
             }
             AiPanelMsg::SearchChanged(query) => {
                 self.search = query.chars().take(1_024).collect();
                 self.refresh_library(&widgets.chat_list, &sender);
             }
             AiPanelMsg::ShowLibrary => {
+                self.navigation_focus = None;
                 self.refresh_library(&widgets.chat_list, &sender);
                 widgets.page_stack.set_visible_child_name(LIBRARY_PAGE);
                 widgets.search.grab_focus();
@@ -983,6 +1025,7 @@ impl Component for AiPanelModel {
                 paste_focused_text(widgets, self.store.active_archived());
             }
             AiPanelMsg::Close => {
+                self.navigation_focus = None;
                 self.publish_snapshot(widgets, &sender);
                 let _ = sender.output(AiPanelOutput::CloseRequested);
             }
@@ -1774,6 +1817,7 @@ mod tests {
             )),
             pending_shared: HashMap::new(),
             pending_new_context: HashMap::new(),
+            navigation_focus: None,
             earlier_history: HashMap::new(),
             scroll_owner: Rc::new(Cell::new(0)),
             scroll_positions: HashMap::new(),
