@@ -146,6 +146,7 @@ tests=(
     workspace_shell::tests::workspace_popups_follow_launcher_palette_without_composer_style_leaks
     workspace_shell::tests::workspace_dialog_themes_its_sheet_without_painting_over_the_workspace
     workspace_shell::tests::native_sidebar_drags_keep_preferences_and_terminal_draft_through_responsive_clamps
+    workspace_shell::tests::navigation_drawer_keeps_widgets_state_and_consumes_only_unhandled_escape
     dialogs::settings::organism_preview::tests::preview_lifecycle_keeps_motion_local_and_stops_hidden_sources
     organism_ui::tests::deferred_agent_loss_retires_closed_panes_but_keeps_hidden_outcomes
     organism_ui::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers

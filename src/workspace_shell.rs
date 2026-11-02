@@ -56,6 +56,7 @@ pub(crate) struct Chrome {
     inspector_control: std::rc::Rc<InspectorControl>,
     inspector_pages: gtk::Stack,
     sidebar_widths: std::rc::Rc<SidebarWidths>,
+    drawers: std::rc::Rc<DrawerControl>,
 }
 
 /// One authoritative browser moves between presentation hosts. Its model,
@@ -165,6 +166,58 @@ struct InspectorControl {
 enum SidebarEdge {
     Navigation,
     Inspector,
+}
+
+/// Transient window presentation only. No preference or runtime authority lives here.
+#[derive(Default)]
+struct DrawerControl {
+    navigation_requested: std::cell::Cell<bool>,
+    navigation_docked: std::cell::Cell<bool>,
+    navigation_available: std::cell::Cell<bool>,
+    navigation_content: gtk::glib::WeakRef<gtk::Widget>,
+    active: std::cell::Cell<Option<SidebarEdge>>,
+    shown: std::cell::Cell<Option<SidebarEdge>>,
+    inspector_dismissed: std::cell::Cell<bool>,
+    reconciling: std::cell::Cell<bool>,
+    prior_focus: std::cell::RefCell<Option<gtk::glib::WeakRef<gtk::Widget>>>,
+    navigation_focus: std::cell::RefCell<Option<gtk::glib::WeakRef<gtk::Widget>>>,
+    inspector_focus: std::cell::RefCell<Option<gtk::glib::WeakRef<gtk::Widget>>>,
+    refresh: std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>>,
+}
+impl DrawerControl {
+    fn refresh(&self) {
+        let refresh = self.refresh.borrow().clone();
+        if let Some(refresh) = refresh {
+            refresh();
+        }
+    }
+    fn toggle_navigation(&self) {
+        if self.navigation_docked.get() || !self.navigation_available.get() {
+            return;
+        }
+        let open = self.shown.get() != Some(SidebarEdge::Navigation);
+        self.navigation_requested.set(open);
+        if open {
+            if let Some(content) = self.navigation_content.upgrade() {
+                content.set_visible(true);
+            }
+        }
+        self.active.set(open.then_some(SidebarEdge::Navigation));
+        self.refresh();
+    }
+    fn request_inspector(&self) {
+        self.active.set(Some(SidebarEdge::Inspector));
+        self.inspector_dismissed.set(false);
+    }
+    fn dismiss(&self) {
+        match self.shown.get() {
+            Some(SidebarEdge::Navigation) => self.navigation_requested.set(false),
+            Some(SidebarEdge::Inspector) => self.inspector_dismissed.set(true),
+            None => return,
+        }
+        self.active.set(None);
+        self.refresh();
+    }
 }
 
 /// User preferences survive responsive clamps, hiding and drawer transitions.
@@ -385,7 +438,7 @@ fn icon_for_name(name: &str) -> jterm_core::reference_icons::Icon {
     }
 }
 
-fn button(icon: &str, title: &str, sender: &ComponentSender<AppModel>, msg: AppMsg) -> gtk::Button {
+fn chrome_button(icon: &str, title: &str) -> gtk::Button {
     let button = gtk::Button::new();
     if icon.contains("window-") {
         button.set_icon_name(icon);
@@ -396,6 +449,28 @@ fn button(icon: &str, title: &str, sender: &ComponentSender<AppModel>, msg: AppM
     button.set_focus_on_click(false);
     button.set_tooltip_text(Some(title));
     button.update_property(&[gtk::accessible::Property::Label(title)]);
+    button
+}
+
+fn workspace_rail_button(
+    title: &str,
+    drawers: &std::rc::Rc<DrawerControl>,
+    docked_action: impl Fn() + 'static,
+) -> gtk::Button {
+    let button = chrome_button("workspace", title);
+    let drawers = drawers.clone();
+    button.connect_clicked(move |_| {
+        if drawers.navigation_docked.get() {
+            docked_action();
+        } else {
+            drawers.toggle_navigation();
+        }
+    });
+    button
+}
+
+fn button(icon: &str, title: &str, sender: &ComponentSender<AppModel>, msg: AppMsg) -> gtk::Button {
+    let button = chrome_button(icon, title);
     let sender = sender.clone();
     button.connect_clicked(move |_| sender.input(msg.clone()));
     button
@@ -782,6 +857,10 @@ impl Chrome {
         side_stack: &gtk::Stack,
         config: &Config,
     ) -> Self {
+        let drawers = std::rc::Rc::new(DrawerControl::default());
+        drawers
+            .navigation_content
+            .set(Some(navigation.upcast_ref()));
         let top = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         top.add_css_class("workspace-titlebar");
         top.set_height_request(tokens::TITLEBAR_HEIGHT as i32);
@@ -967,7 +1046,12 @@ impl Chrome {
                 "agent" => AppMsg::Action(Action::ToggleTasksPanel),
                 _ => AppMsg::Action(Action::ToggleSearch),
             };
-            let control = button(key, title, sender, action);
+            let control = if key == "workspace" {
+                let sender = sender.clone();
+                workspace_rail_button(title, &drawers, move || sender.input(action.clone()))
+            } else {
+                button(key, title, sender, action)
+            };
             control.set_size_request(
                 tokens::SELECTED_RAIL_SIZE as i32,
                 tokens::SELECTED_RAIL_SIZE as i32,
@@ -1476,6 +1560,7 @@ impl Chrome {
                 .expect("presentation navigation label"),
             search,
             inspector_control,
+            drawers,
             inspector_pages: panel,
             sidebar_widths: std::rc::Rc::new(SidebarWidths::new(
                 config.sidebar_width,
@@ -1708,6 +1793,9 @@ impl Chrome {
         if !self.inspector_control.available.get() {
             return;
         }
+        if !self.inspector_control.shown.get() {
+            self.drawers.request_inspector();
+        }
         self.inspector_control
             .requested
             .set(Some(!self.inspector_control.shown.get()));
@@ -1723,6 +1811,7 @@ impl Chrome {
     }
 
     pub(crate) fn show_inspector_live(&self) {
+        self.drawers.request_inspector();
         self.inspector_control.requested.set(Some(true));
         self.inspector_pages.set_visible_child_name("live");
         self.refresh_inspector_layout();
@@ -2558,13 +2647,6 @@ pub(crate) fn observe_layout(
     inspector_split: &gtk::Paned,
     sender: &ComponentSender<AppModel>,
 ) {
-    let observer = gtk::DrawingArea::new();
-    observer.set_can_target(false);
-    observer.set_focusable(false);
-    observer.set_halign(gtk::Align::Fill);
-    observer.set_valign(gtk::Align::Fill);
-    host.add_overlay(&observer);
-    host.set_measure_overlay(&observer, false);
     // Opt-in acceptance diagnostics sample actual native allocation after the
     // resize settles. They do not feed geometry back into layout or input.
     let geometry = std::env::var_os("ANVIL_BLOCK_REFERENCE_METRICS").map(|_| {
@@ -2586,169 +2668,21 @@ pub(crate) fn observe_layout(
         .map(|(name, widget)| (name, widget.downgrade()))
         .collect::<Vec<_>>()
     });
-    // A single, non-measuring drawer retains the same inspector on narrow
-    // windows. Its viewport is also retained when the panel docks again.
-    let drawer = gtk::ScrolledWindow::new();
-    drawer.add_css_class("workspace-inspector-drawer");
-    drawer.set_policy(gtk::PolicyType::External, gtk::PolicyType::Never);
-    drawer.set_min_content_width(tokens::INSPECTOR_WIDTH as i32);
-    drawer.set_max_content_width(tokens::INSPECTOR_WIDTH as i32);
-    drawer.set_propagate_natural_width(true);
-    drawer.set_halign(gtk::Align::End);
-    drawer.set_valign(gtk::Align::Fill);
-    let drawer_frame = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    drawer_frame.add_css_class("workspace-inspector-drawer-frame");
-    drawer_frame.set_halign(gtk::Align::End);
-    drawer_frame.set_valign(gtk::Align::Fill);
-    drawer_frame.set_visible(false);
-    let drawer_grip = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    drawer_frame.append(&drawer_grip);
-    drawer_frame.append(&drawer);
-    let drawer_viewport = gtk::Viewport::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
-    drawer_viewport.set_scroll_to_focus(false);
-    drawer.set_child(Some(&drawer_viewport));
-    host.add_overlay(&drawer_frame);
-    host.set_measure_overlay(&drawer_frame, false);
+    let (apply, native_drawer, drawer_grip) = install_responsive_sidebars(
+        host,
+        navigation,
+        inspector,
+        navigation_split,
+        inspector_split,
+        SidebarLayoutControls {
+            inspector: &chrome.inspector_control,
+            drawers: &chrome.drawers,
+            widths: &chrome.sidebar_widths,
+        },
+        geometry,
+    );
     let native_navigation_split = navigation_split.clone();
     let native_inspector_split = inspector_split.clone();
-    let native_drawer = drawer.clone();
-    let navigation = navigation.downgrade();
-    let inspector = inspector.downgrade();
-    let navigation_split = navigation_split.downgrade();
-    let inspector_split = inspector_split.downgrade();
-    let drawer = drawer.downgrade();
-    let drawer_frame = drawer_frame.downgrade();
-    let drawer_viewport = drawer_viewport.downgrade();
-    let observer_weak = observer.downgrade();
-    let control = std::rc::Rc::downgrade(&chrome.inspector_control);
-    let widths = chrome.sidebar_widths.clone();
-    let diagnostic_epoch = std::rc::Rc::new(std::cell::Cell::new(0_u64));
-    let apply: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
-        let (
-            Some(observer),
-            Some(control),
-            Some(inspector),
-            Some(split),
-            Some(drawer),
-            Some(drawer_frame),
-            Some(drawer_viewport),
-        ) = (
-            observer_weak.upgrade(),
-            control.upgrade(),
-            inspector.upgrade(),
-            inspector_split.upgrade(),
-            drawer.upgrade(),
-            drawer_frame.upgrade(),
-            drawer_viewport.upgrade(),
-        )
-        else {
-            return;
-        };
-        let width = observer.width();
-        let height = observer.height();
-        if width <= 0 || height <= 0 {
-            return;
-        }
-        let base = tokens::Layout::for_size_with_sidebars(
-            width as f32,
-            height as f32 + tokens::TITLEBAR_HEIGHT,
-            if widths.navigation_visible.get() {
-                widths.navigation.get() as f32
-            } else {
-                0.0
-            },
-            if control.requested.get() == Some(false) {
-                0.0
-            } else {
-                widths.inspector.get() as f32
-            },
-        );
-        let panel_focus = observer
-            .root()
-            .and_downcast::<gtk::Window>()
-            .and_then(|window| gtk::prelude::RootExt::focus(&window))
-            .filter(|focus| crate::widget_is_within(focus.clone(), inspector.upcast_ref()));
-        if panel_focus.is_some() && base.inspector.is_none() && control.requested.get().is_none() {
-            // Keep a focused panel in a drawer rather than hiding its owner
-            // merely because the default presentation auto-collapses.
-            control.requested.set(Some(true));
-        }
-        let drawer_width = (width as f32
-            - tokens::RAIL_WIDTH
-            - tokens::SIDEBAR_DIVIDER_WIDTH
-            - 2.0 * tokens::CONTROL_HEIGHT)
-            .max(0.0)
-            .min(
-                widths
-                    .drawer_preview
-                    .get()
-                    .unwrap_or_else(|| widths.inspector.get()) as f32,
-            );
-        let drawer_available = drawer_width >= tokens::MIN_INSPECTOR_WIDTH
-            && height as f32 >= tokens::INSPECTOR_TABS_HEIGHT + tokens::CONTROL_HEIGHT;
-        let placement = if control.requested.get() == Some(false) {
-            InspectorPlacement::Hidden
-        } else if base.inspector.is_some() {
-            InspectorPlacement::Docked
-        } else if control.requested.get() == Some(true) && drawer_available {
-            InspectorPlacement::Drawer
-        } else {
-            InspectorPlacement::Hidden
-        };
-        let available = base.inspector.is_some() || drawer_available;
-        drawer.set_max_content_width(-1);
-        drawer.set_min_content_width(drawer_width as i32);
-        drawer.set_max_content_width(drawer_width as i32);
-        drawer.set_width_request(drawer_width as i32);
-        drawer_frame.set_width_request(drawer_width as i32 + tokens::SIDEBAR_DIVIDER_WIDTH as i32);
-        let layout = if placement == InspectorPlacement::Docked {
-            base
-        } else {
-            base.without_inspector()
-        };
-        let in_drawer =
-            drawer_viewport.child().as_ref() == Some(inspector.upcast_ref::<gtk::Widget>());
-        let moving = (placement == InspectorPlacement::Drawer && !in_drawer)
-            || (placement == InspectorPlacement::Docked && in_drawer);
-        match placement {
-            InspectorPlacement::Drawer if !in_drawer => {
-                split.set_end_child(None::<&gtk::Widget>);
-                drawer_viewport.set_child(Some(&inspector));
-            }
-            InspectorPlacement::Docked if in_drawer => {
-                drawer_viewport.set_child(None::<&gtk::Widget>);
-                split.set_end_child(Some(&inspector));
-            }
-            _ => {}
-        }
-        inspector.set_visible(placement != InspectorPlacement::Hidden);
-        drawer_frame.set_visible(placement == InspectorPlacement::Drawer);
-        if moving {
-            if let Some(focus) = panel_focus.filter(|focus| {
-                focus.is_mapped() && focus.root().as_ref() == observer.root().as_ref()
-            }) {
-                // GTK repairs focus synchronously to a container while the
-                // original input is temporarily unparented. Finish this
-                // synchronous remap before arming the existing idle guard;
-                // actual later user choices still supersede that guard.
-                focus.grab_focus();
-                crate::block_view::restore_live_focus_deferred(&focus);
-            }
-        }
-        if let Some(navigation) = navigation.upgrade() {
-            navigation.set_visible(layout.navigation.is_some());
-        }
-        if let Some(navigation) = navigation_split.upgrade() {
-            apply_sidebar_positions(&navigation, &split, &layout, &widths);
-        }
-        control.sync_button(placement, available);
-        if let Some(nodes) = &geometry {
-            let epoch = diagnostic_epoch.get().wrapping_add(1);
-            diagnostic_epoch.set(epoch);
-            schedule_geometry_sample(&observer, nodes.clone(), epoch, diagnostic_epoch.clone());
-        }
-    });
-    *chrome.inspector_control.refresh.borrow_mut() = Some(apply.clone());
     let width_sender = sender.clone();
     let changed: std::rc::Rc<dyn Fn(SidebarEdge, u32)> = std::rc::Rc::new(move |edge, width| {
         width_sender.input(match edge {
@@ -2781,7 +2715,407 @@ pub(crate) fn observe_layout(
         &[&native_navigation_split, &native_inspector_split],
         apply.clone(),
     );
-    observer.connect_resize(move |_, _, _| apply());
+}
+
+struct SidebarLayoutControls<'a> {
+    inspector: &'a std::rc::Rc<InspectorControl>,
+    drawers: &'a std::rc::Rc<DrawerControl>,
+    widths: &'a std::rc::Rc<SidebarWidths>,
+}
+
+type NativeGeometryNodes = Vec<(&'static str, gtk::glib::WeakRef<gtk::Widget>)>;
+
+/// Production widget mounting, also exercised without a Relm4 application or provider.
+fn install_responsive_sidebars(
+    host: &gtk::Overlay,
+    navigation: &gtk::Widget,
+    inspector: &gtk::Box,
+    navigation_split: &gtk::Paned,
+    inspector_split: &gtk::Paned,
+    controls: SidebarLayoutControls<'_>,
+    geometry: Option<NativeGeometryNodes>,
+) -> (std::rc::Rc<dyn Fn()>, gtk::ScrolledWindow, gtk::Box) {
+    let observer = gtk::DrawingArea::new();
+    observer.set_can_target(false);
+    observer.set_focusable(false);
+    observer.set_halign(gtk::Align::Fill);
+    observer.set_valign(gtk::Align::Fill);
+    host.add_overlay(&observer);
+    host.set_measure_overlay(&observer, false);
+    let scrim = gtk::Button::new();
+    scrim.add_css_class("workspace-sidebar-scrim");
+    scrim.set_focusable(false);
+    scrim.set_focus_on_click(false);
+    scrim.set_margin_start(tokens::RAIL_WIDTH as i32);
+    scrim.set_halign(gtk::Align::Fill);
+    scrim.set_valign(gtk::Align::Fill);
+    scrim.set_visible(false);
+    scrim.set_tooltip_text(Some("Close sidebar drawer"));
+    scrim.update_property(&[gtk::accessible::Property::Label("Close sidebar drawer")]);
+    host.add_overlay(&scrim);
+    host.set_measure_overlay(&scrim, false);
+    let dismiss = controls.drawers.clone();
+    scrim.connect_clicked(move |_| dismiss.dismiss());
+    let navigation_drawer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    navigation_drawer.add_css_class("workspace-navigation-drawer");
+    navigation_drawer.set_halign(gtk::Align::Start);
+    navigation_drawer.set_valign(gtk::Align::Fill);
+    navigation_drawer.set_margin_start(tokens::RAIL_WIDTH as i32);
+    navigation_drawer.set_visible(false);
+    host.add_overlay(&navigation_drawer);
+    host.set_measure_overlay(&navigation_drawer, false);
+    navigation.set_focusable(true);
+    inspector.set_focusable(true);
+    // Bubble leaves Entry/Text IM candidate cancellation with its real owner.
+    // Only an unhandled Escape closes a drawer, after focus has entered it.
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Bubble);
+    let dismiss = controls.drawers.clone();
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape && dismiss.shown.get().is_some() {
+            dismiss.dismiss();
+            gtk::glib::Propagation::Stop
+        } else {
+            gtk::glib::Propagation::Proceed
+        }
+    });
+    host.add_controller(keys);
+    // Explicit canvas/session focus ends its overlay presentation. Synchronous
+    // reparent repairs are guarded below, so resize cannot dismiss a drawer.
+    let watched_focus = std::cell::Cell::new(false);
+    let focus_drawers = std::rc::Rc::downgrade(controls.drawers);
+    let focus_navigation = navigation.downgrade();
+    let focus_inspector = inspector.downgrade();
+    host.connect_map(move |host| {
+        if watched_focus.replace(true) {
+            return;
+        }
+        let Some(window) = host.root().and_downcast::<gtk::Window>() else {
+            return;
+        };
+        let drawers = focus_drawers.clone();
+        let navigation = focus_navigation.clone();
+        let inspector = focus_inspector.clone();
+        window.connect_notify_local(Some("focus-widget"), move |window, _| {
+            let Some(drawers) = drawers.upgrade() else {
+                return;
+            };
+            if drawers.reconciling.get() {
+                return;
+            }
+            let panel = match drawers.shown.get() {
+                Some(SidebarEdge::Navigation) => navigation.upgrade(),
+                Some(SidebarEdge::Inspector) => inspector.upgrade().map(|widget| widget.upcast()),
+                None => return,
+            };
+            if let (Some(panel), Some(focus)) = (panel, gtk::prelude::RootExt::focus(window)) {
+                if !crate::widget_is_within(focus, &panel) {
+                    drawers.dismiss();
+                }
+            }
+        });
+    });
+    // A single, non-measuring drawer retains the same inspector on narrow
+    // windows. Its viewport is also retained when the panel docks again.
+    let drawer = gtk::ScrolledWindow::new();
+    drawer.add_css_class("workspace-inspector-drawer");
+    drawer.set_policy(gtk::PolicyType::External, gtk::PolicyType::Never);
+    drawer.set_min_content_width(tokens::INSPECTOR_WIDTH as i32);
+    drawer.set_max_content_width(tokens::INSPECTOR_WIDTH as i32);
+    drawer.set_propagate_natural_width(true);
+    drawer.set_halign(gtk::Align::End);
+    drawer.set_valign(gtk::Align::Fill);
+    let drawer_frame = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    drawer_frame.add_css_class("workspace-inspector-drawer-frame");
+    drawer_frame.set_halign(gtk::Align::End);
+    drawer_frame.set_valign(gtk::Align::Fill);
+    drawer_frame.set_visible(false);
+    let drawer_grip = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    drawer_frame.append(&drawer_grip);
+    drawer_frame.append(&drawer);
+    let drawer_viewport = gtk::Viewport::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
+    drawer_viewport.set_scroll_to_focus(false);
+    drawer.set_child(Some(&drawer_viewport));
+    host.add_overlay(&drawer_frame);
+    host.set_measure_overlay(&drawer_frame, false);
+    let native_drawer = drawer.clone();
+    let native_grip = drawer_grip.clone();
+    let navigation = navigation.downgrade();
+    let navigation_drawer = navigation_drawer.downgrade();
+    let scrim = scrim.downgrade();
+    let drawers = std::rc::Rc::downgrade(controls.drawers);
+    let inspector = inspector.downgrade();
+    let navigation_split = navigation_split.downgrade();
+    let inspector_split = inspector_split.downgrade();
+    let drawer = drawer.downgrade();
+    let drawer_frame = drawer_frame.downgrade();
+    let drawer_viewport = drawer_viewport.downgrade();
+    let observer_weak = observer.downgrade();
+    let control = std::rc::Rc::downgrade(controls.inspector);
+    let widths = controls.widths.clone();
+    let diagnostic_epoch = std::rc::Rc::new(std::cell::Cell::new(0_u64));
+    let apply: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
+        let (
+            Some(observer),
+            Some(control),
+            Some(drawers),
+            Some(navigation),
+            Some(navigation_drawer),
+            Some(navigation_split),
+            Some(scrim),
+            Some(inspector),
+            Some(split),
+            Some(drawer),
+            Some(drawer_frame),
+            Some(drawer_viewport),
+        ) = (
+            observer_weak.upgrade(),
+            control.upgrade(),
+            drawers.upgrade(),
+            navigation.upgrade(),
+            navigation_drawer.upgrade(),
+            navigation_split.upgrade(),
+            scrim.upgrade(),
+            inspector.upgrade(),
+            inspector_split.upgrade(),
+            drawer.upgrade(),
+            drawer_frame.upgrade(),
+            drawer_viewport.upgrade(),
+        )
+        else {
+            return;
+        };
+        let width = observer.width();
+        let height = observer.height();
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        drawers.reconciling.set(true);
+        let base = tokens::Layout::for_size_with_sidebars(
+            width as f32,
+            height as f32 + tokens::TITLEBAR_HEIGHT,
+            if widths.navigation_visible.get() {
+                widths.navigation.get() as f32
+            } else {
+                0.0
+            },
+            if control.requested.get() == Some(false) {
+                0.0
+            } else {
+                widths.inspector.get() as f32
+            },
+        );
+        let focus = observer
+            .root()
+            .and_downcast::<gtk::Window>()
+            .and_then(|window| gtk::prelude::RootExt::focus(&window));
+        let navigation_focus = focus
+            .as_ref()
+            .filter(|focus| crate::widget_is_within((*focus).clone(), &navigation))
+            .cloned();
+        let panel_focus = focus
+            .as_ref()
+            .filter(|focus| crate::widget_is_within((*focus).clone(), inspector.upcast_ref()))
+            .cloned();
+        if let Some(focus) = &navigation_focus {
+            *drawers.navigation_focus.borrow_mut() = Some(focus.downgrade());
+        }
+        if let Some(focus) = &panel_focus {
+            *drawers.inspector_focus.borrow_mut() = Some(focus.downgrade());
+        }
+        let navigation_can_dock = tokens::Layout::for_size_with_sidebars(
+            width as f32,
+            height as f32 + tokens::TITLEBAR_HEIGHT,
+            widths.navigation.get() as f32,
+            if control.requested.get() == Some(false) {
+                0.0
+            } else {
+                widths.inspector.get() as f32
+            },
+        )
+        .navigation
+        .is_some();
+        drawers.navigation_docked.set(navigation_can_dock);
+        let left_width = (width as f32 - tokens::RAIL_WIDTH - 2.0 * tokens::CONTROL_HEIGHT)
+            .max(0.0)
+            .min(widths.navigation.get() as f32);
+        let left_available =
+            left_width >= tokens::MIN_NAVIGATION_WIDTH && height as f32 >= tokens::CONTROL_HEIGHT;
+        drawers.navigation_available.set(left_available);
+        if navigation_can_dock {
+            drawers.navigation_requested.set(false);
+            if drawers.active.get() == Some(SidebarEdge::Navigation) {
+                drawers.active.set(None);
+            }
+        }
+        let left_requested =
+            drawers.navigation_requested.get() && base.navigation.is_none() && left_available;
+        if panel_focus.is_some() && base.inspector.is_none() && control.requested.get().is_none() {
+            // Keep a focused panel in a drawer rather than hiding its owner
+            // merely because the default presentation auto-collapses.
+            control.requested.set(Some(true));
+        }
+        let drawer_width = (width as f32
+            - tokens::RAIL_WIDTH
+            - tokens::SIDEBAR_DIVIDER_WIDTH
+            - 2.0 * tokens::CONTROL_HEIGHT)
+            .max(0.0)
+            .min(
+                widths
+                    .drawer_preview
+                    .get()
+                    .unwrap_or_else(|| widths.inspector.get()) as f32,
+            );
+        let drawer_available = drawer_width >= tokens::MIN_INSPECTOR_WIDTH
+            && height as f32 >= tokens::INSPECTOR_TABS_HEIGHT + tokens::CONTROL_HEIGHT;
+        let mut placement = if control.requested.get() == Some(false) {
+            InspectorPlacement::Hidden
+        } else if base.inspector.is_some() {
+            InspectorPlacement::Docked
+        } else if control.requested.get() == Some(true) && drawer_available {
+            InspectorPlacement::Drawer
+        } else {
+            InspectorPlacement::Hidden
+        };
+        if placement == InspectorPlacement::Drawer
+            && (drawers.inspector_dismissed.get()
+                || (left_requested && drawers.active.get() != Some(SidebarEdge::Inspector)))
+        {
+            placement = InspectorPlacement::Hidden;
+        }
+        let left_shown = left_requested && placement != InspectorPlacement::Drawer;
+        let previous_drawer = drawers.shown.replace(if left_shown {
+            Some(SidebarEdge::Navigation)
+        } else if placement == InspectorPlacement::Drawer {
+            Some(SidebarEdge::Inspector)
+        } else {
+            None
+        });
+        let current_drawer = drawers.shown.get();
+        if previous_drawer.is_none() && current_drawer.is_some() {
+            *drawers.prior_focus.borrow_mut() =
+                focus.as_ref().map(gtk::prelude::ObjectExt::downgrade);
+        }
+        let available = base.inspector.is_some() || drawer_available;
+        drawer.set_max_content_width(-1);
+        drawer.set_min_content_width(drawer_width as i32);
+        drawer.set_max_content_width(drawer_width as i32);
+        drawer.set_width_request(drawer_width as i32);
+        drawer_frame.set_width_request(drawer_width as i32 + tokens::SIDEBAR_DIVIDER_WIDTH as i32);
+        let layout = if placement == InspectorPlacement::Docked {
+            base
+        } else {
+            base.without_inspector()
+        };
+        let in_drawer =
+            drawer_viewport.child().as_ref() == Some(inspector.upcast_ref::<gtk::Widget>());
+        let moving = (placement == InspectorPlacement::Drawer && !in_drawer)
+            || (placement == InspectorPlacement::Docked && in_drawer);
+        match placement {
+            InspectorPlacement::Drawer if !in_drawer => {
+                split.set_end_child(None::<&gtk::Widget>);
+                drawer_viewport.set_child(Some(&inspector));
+            }
+            InspectorPlacement::Docked if in_drawer => {
+                drawer_viewport.set_child(None::<&gtk::Widget>);
+                split.set_end_child(Some(&inspector));
+            }
+            _ => {}
+        }
+        inspector.set_visible(placement != InspectorPlacement::Hidden);
+        drawer_frame.set_visible(placement == InspectorPlacement::Drawer);
+        if moving {
+            if let Some(focus) = panel_focus.as_ref().filter(|focus| {
+                focus.is_mapped() && focus.root().as_ref() == observer.root().as_ref()
+            }) {
+                // GTK repairs focus synchronously to a container while the
+                // original input is temporarily unparented. Finish this
+                // synchronous remap before arming the existing idle guard;
+                // actual later user choices still supersede that guard.
+                focus.grab_focus();
+                crate::block_view::restore_live_focus_deferred(focus);
+            }
+        }
+        let navigation_in_drawer =
+            navigation.parent().as_ref() == Some(navigation_drawer.upcast_ref());
+        let navigation_moving = (left_shown && !navigation_in_drawer)
+            || (layout.navigation.is_some() && navigation_in_drawer);
+        if left_shown && !navigation_in_drawer {
+            navigation_split.set_start_child(None::<&gtk::Widget>);
+            navigation_drawer.append(&navigation);
+        } else if layout.navigation.is_some() && navigation_in_drawer {
+            navigation_drawer.remove(&navigation);
+            navigation_split.set_start_child(Some(&navigation));
+        }
+        navigation_drawer.set_width_request(left_width as i32);
+        navigation.set_visible(left_shown || layout.navigation.is_some());
+        navigation_drawer.set_visible(left_shown);
+        scrim.set_visible(current_drawer.is_some());
+        apply_sidebar_positions(&navigation_split, &split, &layout, &widths);
+        if navigation_moving {
+            if let Some(focus) = navigation_focus.as_ref().filter(|focus| focus.is_mapped()) {
+                focus.grab_focus();
+                crate::block_view::restore_live_focus_deferred(focus);
+            }
+        }
+        if previous_drawer != current_drawer {
+            if let Some(edge) = current_drawer {
+                let (panel, saved) = if edge == SidebarEdge::Navigation {
+                    (&navigation, &drawers.navigation_focus)
+                } else {
+                    (inspector.upcast_ref(), &drawers.inspector_focus)
+                };
+                let remembered = saved
+                    .borrow()
+                    .as_ref()
+                    .and_then(gtk::glib::WeakRef::upgrade)
+                    .filter(|focus| {
+                        focus.is_mapped() && crate::widget_is_within(focus.clone(), panel)
+                    });
+                if let Some(focus) = remembered {
+                    focus.grab_focus();
+                } else if !panel.grab_focus() {
+                    panel.child_focus(gtk::DirectionType::TabForward);
+                }
+            } else {
+                let retained_focus = navigation_focus
+                    .as_ref()
+                    .filter(|_| layout.navigation.is_some())
+                    .or_else(|| {
+                        panel_focus
+                            .as_ref()
+                            .filter(|_| placement == InspectorPlacement::Docked)
+                    });
+                if retained_focus.is_none() && (navigation_focus.is_some() || panel_focus.is_some())
+                {
+                    if let Some(previous) = drawers
+                        .prior_focus
+                        .borrow_mut()
+                        .take()
+                        .and_then(|focus| focus.upgrade())
+                        .filter(|focus| focus.is_mapped())
+                    {
+                        previous.grab_focus();
+                        crate::block_view::restore_live_focus_deferred(&previous);
+                    }
+                } else {
+                    drawers.prior_focus.borrow_mut().take();
+                }
+            }
+        }
+        control.sync_button(placement, available);
+        drawers.reconciling.set(false);
+        if let Some(nodes) = &geometry {
+            let epoch = diagnostic_epoch.get().wrapping_add(1);
+            diagnostic_epoch.set(epoch);
+            schedule_geometry_sample(&observer, nodes.clone(), epoch, diagnostic_epoch.clone());
+        }
+    });
+    *controls.inspector.refresh.borrow_mut() = Some(apply.clone());
+    *controls.drawers.refresh.borrow_mut() = Some(apply.clone());
+    let resize = apply.clone();
+    observer.connect_resize(move |_, _, _| resize());
+    (apply, native_drawer, native_grip)
 }
 
 // This opt-in observer never drives layout or input. Idle after a resize can
@@ -3562,6 +3896,304 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires isolated X11 DISPLAY and xdotool; retained native drawer and input ownership"]
+    fn navigation_drawer_keeps_widgets_state_and_consumes_only_unhandled_escape() {
+        gtk::init().expect("GTK display");
+        install_css();
+        let window = gtk::Window::new();
+        let title = format!("anvil-navigation-drawer-{}", std::process::id());
+        window.set_title(Some(&title));
+        window.set_default_size(1356, 650);
+        let navigation = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        navigation.set_width_request(tokens::MIN_NAVIGATION_WIDTH as i32);
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        scroll.set_vexpand(true);
+        let items = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let search = gtk::Entry::new();
+        search.set_text("中文 independent navigation draft");
+        search.set_position(2);
+        items.append(&search);
+        let list = gtk::ListBox::new();
+        for index in 0..40 {
+            let label = gtk::Label::new(Some(&format!("Existing conversation {index}")));
+            label.set_height_request(30);
+            list.append(&label);
+        }
+        list.select_row(list.row_at_index(7).as_ref());
+        items.append(&list);
+        scroll.set_child(Some(&items));
+        navigation.append(&scroll);
+        let selected = list.selected_row().unwrap();
+        let terminal = gtk::Entry::new();
+        terminal.set_text("same terminal draft");
+        terminal.set_width_request(1);
+        terminal.set_hexpand(true);
+        let terminal_keys = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = terminal_keys.clone();
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed(move |_, _, _, _| {
+            observed.set(observed.get() + 1);
+            gtk::glib::Propagation::Proceed
+        });
+        terminal.add_controller(keys);
+        let terminal_clicks = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = terminal_clicks.clone();
+        let pointer = gtk::GestureClick::new();
+        pointer.connect_pressed(move |_, _, _, _| observed.set(observed.get() + 1));
+        terminal.add_controller(pointer);
+        let inspector = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        inspector.set_width_request(tokens::MIN_INSPECTOR_WIDTH as i32);
+        let inspector_entry = gtk::Entry::new();
+        inspector_entry.set_text("same inspector draft");
+        inspector.append(&inspector_entry);
+        let right = gtk::Paned::new(gtk::Orientation::Horizontal);
+        right.set_start_child(Some(&terminal));
+        right.set_end_child(Some(&inspector));
+        right.set_resize_start_child(true);
+        right.set_resize_end_child(false);
+        right.set_shrink_start_child(true);
+        right.set_shrink_end_child(false);
+        let left = gtk::Paned::new(gtk::Orientation::Horizontal);
+        left.set_start_child(Some(&navigation));
+        left.set_end_child(Some(&right));
+        left.set_hexpand(true);
+        left.set_resize_start_child(false);
+        left.set_resize_end_child(true);
+        left.set_shrink_start_child(false);
+        left.set_shrink_end_child(true);
+        let drawers = std::rc::Rc::new(DrawerControl::default());
+        let navigation_actions = std::rc::Rc::new(std::cell::Cell::new(0));
+        let recorded = navigation_actions.clone();
+        let workspace = workspace_rail_button("Workspace", &drawers, move || {
+            recorded.set(recorded.get() + 1)
+        });
+        let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let rail = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        rail.set_width_request(tokens::RAIL_WIDTH as i32);
+        rail.append(&workspace);
+        body.append(&rail);
+        body.append(&left);
+        let host = gtk::Overlay::new();
+        host.set_child(Some(&body));
+        let control = std::rc::Rc::new(InspectorControl {
+            requested: std::cell::Cell::new(None),
+            shown: std::cell::Cell::new(false),
+            available: std::cell::Cell::new(true),
+            button: gtk::ToggleButton::new(),
+            refresh: std::cell::RefCell::new(None),
+        });
+        let widths = std::rc::Rc::new(SidebarWidths::new(280, 306, true));
+        let (refresh, _, _) = install_responsive_sidebars(
+            &host,
+            navigation.upcast_ref(),
+            &inspector,
+            &left,
+            &right,
+            SidebarLayoutControls {
+                inspector: &control,
+                drawers: &drawers,
+                widths: &widths,
+            },
+            None,
+        );
+        observe_sidebar_allocations(&[&left, &right], refresh.clone());
+        window.set_child(Some(&host));
+        window.present();
+        let settle = || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(180);
+            while std::time::Instant::now() < deadline {
+                while gtk::glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            refresh();
+        };
+        settle();
+        workspace.emit_clicked();
+        assert_eq!(
+            navigation_actions.get(),
+            1,
+            "docked rail keeps its existing navigation action"
+        );
+        widths.navigation_visible.set(false);
+        refresh();
+        workspace.emit_clicked();
+        assert_eq!(
+            navigation_actions.get(),
+            2,
+            "wide hidden preference is not mistaken for a narrow window"
+        );
+        assert_eq!(drawers.shown.get(), None);
+        assert!(!widths.navigation_visible.get());
+        widths.navigation_visible.set(true);
+        refresh();
+        navigation_actions.set(0);
+        scroll.vadjustment().set_value(42.0);
+        terminal.grab_focus();
+        window.set_default_size(1000, 650);
+        settle();
+        assert!(
+            navigation.is_mapped(),
+            "navigation remains docked while the inspector collapses first"
+        );
+        assert!(!inspector.is_mapped());
+        window.set_default_size(700, 650);
+        settle();
+        assert!(
+            !navigation.is_visible(),
+            "navigation collapses after the inspector"
+        );
+        assert!(left.start_child().as_ref() == Some(navigation.upcast_ref()));
+        workspace.emit_clicked();
+        settle();
+        assert_eq!(drawers.shown.get(), Some(SidebarEdge::Navigation));
+        assert!(navigation.is_mapped());
+        assert!(left.start_child().is_none());
+        assert!(navigation
+            .parent()
+            .unwrap()
+            .has_css_class("workspace-navigation-drawer"));
+        assert!(gtk::prelude::RootExt::focus(&window)
+            .is_some_and(|focus| crate::widget_is_within(focus, navigation.upcast_ref())));
+        assert_eq!(scroll.vadjustment().value(), 42.0);
+        assert_eq!(list.selected_row().as_ref(), Some(&selected));
+        assert_eq!(search.text().as_str(), "中文 independent navigation draft");
+        assert_eq!(search.position(), 2);
+        terminal.grab_focus();
+        assert_eq!(
+            drawers.shown.get(),
+            None,
+            "explicit session/canvas focus closes the drawer before terminal keys"
+        );
+        workspace.emit_clicked();
+        settle();
+        let child_consumes_escape = std::rc::Rc::new(std::cell::Cell::new(true));
+        let consumes = child_consumes_escape.clone();
+        let child_keys = gtk::EventControllerKey::new();
+        child_keys.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk::gdk::Key::Escape && consumes.get() {
+                gtk::glib::Propagation::Stop
+            } else {
+                gtk::glib::Propagation::Proceed
+            }
+        });
+        search.add_controller(child_keys);
+        search.grab_focus();
+        let output = std::process::Command::new("xdotool")
+            .args(["search", "--name", &title])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let id = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_owned();
+        let key = || {
+            assert!(std::process::Command::new("xdotool")
+                .args(["windowfocus", "--sync", &id, "key", "Escape"])
+                .status()
+                .unwrap()
+                .success());
+        };
+        key();
+        settle();
+        assert_eq!(
+            drawers.shown.get(),
+            Some(SidebarEdge::Navigation),
+            "child/IME Escape owns cancellation first"
+        );
+        child_consumes_escape.set(false);
+        key();
+        settle();
+        assert_eq!(drawers.shown.get(), None);
+        assert_eq!(
+            terminal_keys.get(),
+            0,
+            "drawer Escape never reaches the terminal input owner"
+        );
+        workspace.emit_clicked();
+        settle();
+        let mut child = host.first_child();
+        let scrim = loop {
+            let widget = child.expect("shared drawer backdrop");
+            if widget.has_css_class("workspace-sidebar-scrim") {
+                break widget;
+            }
+            child = widget.next_sibling();
+        };
+        let bounds = scrim.compute_bounds(&window).unwrap();
+        let (surface_x, surface_y) = window.surface_transform();
+        let x = (f64::from(bounds.x() + bounds.width() - 12.0) + surface_x)
+            .round()
+            .to_string();
+        let y = (f64::from(bounds.y() + bounds.height() / 2.0) + surface_y)
+            .round()
+            .to_string();
+        assert!(std::process::Command::new("xdotool")
+            .args(["mousemove", "--window", &id, &x, &y, "click", "1"])
+            .status()
+            .unwrap()
+            .success());
+        settle();
+        assert_eq!(
+            drawers.shown.get(),
+            None,
+            "backdrop click closes the drawer"
+        );
+        assert_eq!(
+            terminal_clicks.get(),
+            0,
+            "backdrop click never reaches the terminal"
+        );
+        workspace.emit_clicked();
+        settle();
+        control.requested.set(Some(true));
+        drawers.request_inspector();
+        drawers.refresh();
+        settle();
+        assert_eq!(drawers.shown.get(), Some(SidebarEdge::Inspector));
+        assert!(
+            !navigation.is_mapped(),
+            "left and right drawers never overlap"
+        );
+        workspace.emit_clicked();
+        settle();
+        assert_eq!(drawers.shown.get(), Some(SidebarEdge::Navigation));
+        assert!(!inspector.is_mapped());
+        assert_eq!(
+            control.requested.get(),
+            Some(true),
+            "temporary suppression retains right preference"
+        );
+        window.set_default_size(1356, 650);
+        settle();
+        assert_eq!(drawers.shown.get(), None);
+        assert_eq!(left.start_child().as_ref(), Some(navigation.upcast_ref()));
+        assert!(navigation.is_mapped());
+        assert!(inspector.is_mapped(),
+            "wide inspector: window={} host={} split={} requested={:?} shown={} dismissed={} visible={} parent={:?}",
+            window.width(), host.width(), right.width(), control.requested.get(), control.shown.get(),
+            drawers.inspector_dismissed.get(), inspector.is_visible(), inspector.parent().map(|parent|parent.css_name()));
+        assert!(!drawers.navigation_requested.get());
+        assert_eq!(
+            navigation_actions.get(),
+            0,
+            "narrow rail never dispatches view/config operations"
+        );
+        assert_eq!(widths.navigation.get(), 280);
+        assert_eq!(widths.inspector.get(), 306);
+        assert!(widths.navigation_visible.get());
+        assert_eq!(list.selected_row().as_ref(), Some(&selected));
+        assert_eq!(search.text().as_str(), "中文 independent navigation draft");
+        assert_eq!(inspector_entry.text().as_str(), "same inspector draft");
+        assert_eq!(terminal.text().as_str(), "same terminal draft");
+        window.close();
+        settle();
+    }
+
+    #[test]
     fn inspector_toggle_uses_narrow_drawer_and_keeps_the_explicit_choice() {
         for (width, height, choice, placement, available) in [
             (1356.0, 704.0, None, InspectorPlacement::Docked, true),
@@ -3582,9 +4214,9 @@ mod tests {
         }
         let closed = tokens::Layout::for_size(1356.0, 704.0).without_inspector();
         assert!(closed.inspector.is_none());
-        assert_eq!(closed.center.width, 1064.0);
-        assert_eq!(closed.header.width, 1064.0);
-        assert_eq!(closed.composer.width, 1008.0);
+        assert_eq!(closed.center.width, 1021.0);
+        assert_eq!(closed.header.width, 1021.0);
+        assert_eq!(closed.composer.width, 965.0);
         assert_eq!(closed.composer.y, 613.0);
     }
 
