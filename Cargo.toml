@@ -29,7 +29,7 @@ sha2 = "0.11.0"
 crossbeam-channel = "0.5"
 dirs = "6"
 libc = "0.2"
-parking_lot = "0.12"
+parking_lot = "0.13"
 uuid = { version = "1", features = ["v4", "serde"] }
 rkyv = { version = "0.8", features = ["bytecheck"] }
 bytecheck = { version = "0.8", default-features = false }
