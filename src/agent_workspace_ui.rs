@@ -42,6 +42,12 @@ impl AppModel {
                 }
             }
             WorkspaceAction::Task(id, _) => {
+                let terminal = self.agent_runtime.hosted_terminal(id).cloned();
+                if let Some(session) = terminal {
+                    self.open_hosted_native_terminal(session, sender);
+                    return;
+                }
+
                 if let Some(task) = self.task_manager.get(id) {
                     self.tasks_panel
                         .emit(dialogs::tasks_panel::TasksPanelMsg::ClearDashboardFilters);
@@ -94,6 +100,32 @@ impl AppModel {
         self.sync_workspace_navigation();
     }
 
+    pub(crate) fn open_hosted_native_terminal(
+        &mut self,
+        session: jterm_core::agent_sessions::AgentSession,
+        sender: &relm4::ComponentSender<crate::AppModel>,
+    ) {
+        match jterm_core::agent_workspace::managed_launch(&session)
+            .and_then(|launch| Ok((jterm_core::agent_workspace::session_id(&session)?, launch)))
+        {
+            Ok((runtime_key, launch)) => {
+                let (completion, _) = std::sync::mpsc::channel();
+                self.add_agent_session_tab(
+                    crate::agent_sessions::ResumeRequest {
+                        runtime_key,
+                        provider: session.provider,
+                        id: session.id,
+                        title: session.title,
+                        launch: Some(launch),
+                        completion,
+                    },
+                    sender,
+                );
+            }
+            Err(error) => self.show_toast(error),
+        }
+    }
+
     pub(crate) fn sync_workspace_navigation(&self) {
         self.session_sidebar
             .set_existing(self.agent_session_tabs.keys().cloned().collect());
@@ -113,8 +145,13 @@ impl AppModel {
         let mut owned = std::collections::HashSet::new();
         for task in self.task_manager.tasks() {
             let Some(metadata) = self
-                .session_sidebar
-                .task_id(&namespace, &task.id.to_string())
+                .agent_runtime
+                .conversation_id(task.id)
+                .cloned()
+                .or_else(|| {
+                    self.session_sidebar
+                        .task_id(&namespace, &task.id.to_string())
+                })
             else {
                 continue;
             };

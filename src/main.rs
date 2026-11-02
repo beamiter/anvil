@@ -483,6 +483,7 @@ struct AppModel {
     task_manager: crate::agent_task::TaskManager,
     task_announcements: crate::task_announcements::TaskAnnouncements,
     agent_runtime: crate::agent_task::AgentRuntimeManager,
+    hosted_followups: std::collections::HashMap<String, crate::agent_task_ui::TaskFollowUpRequest>,
     agent_diff: crate::agent_task::AgentDiffPanel,
     selected_task: Option<crate::agent_task::TaskId>,
     pending_task_creation: Option<crate::agent_task_ui::PendingTaskCreation>,
@@ -1562,7 +1563,11 @@ impl SimpleComponent for AppModel {
             tasks_panel_visible: std::cell::Cell::new(false),
             task_manager: crate::agent_task::TaskManager::new(),
             task_announcements: crate::task_announcements::TaskAnnouncements::default(),
-            agent_runtime: crate::agent_task::AgentRuntimeManager::new(),
+            agent_runtime: crate::agent_task::AgentRuntimeManager::hosted(format!(
+                "anvil:{}",
+                crate::config::config_file_path().display()
+            )),
+            hosted_followups: Default::default(),
             agent_diff: crate::agent_task::AgentDiffPanel::new(),
             selected_task: None,
             pending_task_creation: None,
@@ -1999,6 +2004,7 @@ impl SimpleComponent for AppModel {
         }
 
         model.sync_workspace_navigation();
+        model.ensure_agent_tasks_timer(&sender);
         {
             let sender = sender.clone();
             let window = root.downgrade();
@@ -2894,7 +2900,7 @@ impl SimpleComponent for AppModel {
                 self.set_ai_panel_visible(false, true);
             }
             AppMsg::NavigationWidthChanged(width) => {
-                let width = width.clamp(120, 800);
+                let width = width.clamp(240, 360);
                 if self.config.borrow().sidebar_width != width {
                     self.config.borrow_mut().sidebar_width = width;
                     self.persist_sidebar_widths_debounced(&sender);

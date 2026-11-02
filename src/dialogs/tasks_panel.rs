@@ -1602,6 +1602,9 @@ impl Component for TasksPanelModel {
                 }
             }
             TasksPanelMsg::FollowUpChanged(id, text) => {
+                if self.follow_up_drafts.get(&id) != Some(&text) {
+                    self.follow_up_receipts.edited(id);
+                }
                 self.follow_up_drafts.insert(id, text);
             }
             TasksPanelMsg::FollowUpResolved(request, result) => {

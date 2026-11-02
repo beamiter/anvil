@@ -902,7 +902,7 @@ impl Config {
             // Recovery mode must not initiate network or shared-cache work.
             jsh_update_check: JshUpdateCheck::Never,
             sidebar_visible: true,
-            sidebar_width: 237,
+            sidebar_width: 280,
             tab_width: 180,
             max_visible_blocks: 200,
             lazy_load_threshold: 1_000,
@@ -2170,7 +2170,7 @@ fn resolve_file_config(fc: FileConfig) -> (Config, Vec<Theme>, KeybindingMap) {
         &resolve_setting_text(None, fc.jsh_update_check, 64).unwrap_or_else(|| "daily".to_string()),
     );
     let sidebar_visible = resolve_sidebar_visibility(fc.sidebar_visible, tab_placement);
-    let sidebar_width = fc.sidebar_width.unwrap_or(237).clamp(120, 800);
+    let sidebar_width = fc.sidebar_width.unwrap_or(280).clamp(240, 360);
     let tab_width = fc.tab_width.unwrap_or(180).clamp(80, 480);
     let eva_companion_enabled = fc.eva_companion_enabled.unwrap_or(true);
     let ascii_organism_enabled = env_bool("ANVIL_ASCII_ORGANISM_ENABLED")

@@ -21,11 +21,16 @@ impl TaskFollowUpRequest {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FollowUpReceipts {
-    pending: HashMap<TaskId, uuid::Uuid>,
+    pending: HashMap<TaskId, (uuid::Uuid, u64)>,
+    revisions: HashMap<TaskId, u64>,
     errors: HashMap<TaskId, String>,
 }
 
 impl FollowUpReceipts {
+    pub fn edited(&mut self, task: TaskId) {
+        let revision = self.revisions.entry(task).or_default();
+        *revision = revision.wrapping_add(1);
+    }
     pub fn is_pending(&self, task: TaskId) -> bool {
         self.pending.contains_key(&task)
     }
@@ -39,7 +44,10 @@ impl FollowUpReceipts {
             return None;
         }
         let request = TaskFollowUpRequest::new(task, text);
-        self.pending.insert(task, request.request_id);
+        self.pending.insert(
+            task,
+            (request.request_id, *self.revisions.get(&task).unwrap_or(&0)),
+        );
         self.errors.remove(&task);
         Some(request)
     }
@@ -51,14 +59,19 @@ impl FollowUpReceipts {
         request: &TaskFollowUpRequest,
         result: Result<(), String>,
     ) -> bool {
-        if self.pending.get(&request.task_id) != Some(&request.request_id) {
+        let Some((id, revision)) = self.pending.get(&request.task_id).copied() else {
+            return false;
+        };
+        if id != request.request_id {
             return false;
         }
         self.pending.remove(&request.task_id);
         match result {
             Ok(()) => {
                 self.errors.remove(&request.task_id);
-                if drafts.get(&request.task_id) == Some(&request.text) {
+                if *self.revisions.get(&request.task_id).unwrap_or(&0) == revision
+                    && drafts.get(&request.task_id) == Some(&request.text)
+                {
                     drafts.remove(&request.task_id);
                 }
             }
@@ -107,5 +120,18 @@ mod tests {
         assert_eq!(drafts[&task], "new correction");
         assert_eq!(drafts[&other], "other project");
         assert!(!receipts.is_pending(task));
+    }
+    #[test]
+    fn acknowledgement_cannot_clear_text_edited_and_changed_back() {
+        let task = TaskId::new();
+        let mut drafts = HashMap::from([(task, "same text".into())]);
+        let mut receipts = FollowUpReceipts::default();
+        let request = receipts.begin(task, "same text".into()).unwrap();
+        receipts.edited(task);
+        drafts.insert(task, "different".into());
+        receipts.edited(task);
+        drafts.insert(task, "same text".into());
+        assert!(receipts.resolve(&mut drafts, &request, Ok(())));
+        assert_eq!(drafts[&task], "same text");
     }
 }
