@@ -16,6 +16,9 @@ pub(crate) struct TaskProjectDraft {
     pub directory: PathBuf,
     pub provider: AgentProvider,
     pub brief: TaskBrief,
+    /// Set when this draft came from an approved Eva handoff, so the created
+    /// task can be reported back. It grants nothing.
+    pub eva_operation: Option<String>,
 }
 
 /// A reviewed handoff seeds a new task form; it carries no execution or
@@ -24,6 +27,10 @@ pub(crate) struct TaskSeed {
     pub title: String,
     pub goal: String,
     pub provider: AgentProvider,
+    /// The Eva handoff this form was opened for, if any.
+    pub eva_operation: Option<String>,
+    /// Called once if the form closes without creating a task.
+    pub on_abandoned: Option<Rc<dyn Fn()>>,
 }
 
 impl TaskProjectDraft {
@@ -100,6 +107,10 @@ struct Composer {
     activation_revision: Cell<Option<u64>>,
     pending: RefCell<Option<PendingSubmission>>,
     submit: Box<dyn Fn(TaskProjectRequest)>,
+    eva_operation: Option<String>,
+    on_abandoned: Option<Rc<dyn Fn()>>,
+    created: Cell<bool>,
+    abandon_reported: Cell<bool>,
 }
 
 impl Composer {
@@ -136,6 +147,7 @@ impl Composer {
             directory: PathBuf::from(self.directory.text().as_str()),
             provider: AgentProvider::ALL[self.provider.selected() as usize],
             brief,
+            eva_operation: self.eva_operation.clone(),
         };
         draft.validate()?;
         Ok(draft)
@@ -207,12 +219,22 @@ impl Composer {
         self.set_pending(false);
         match result {
             Ok(()) => {
+                self.created.set(true);
                 crate::enter_ownership::claim_held();
                 self.window.close();
             }
             Err(error) => self
                 .error
                 .set_text(&crate::review_text::visible_bounded(&error, 2048)),
+        }
+    }
+
+    /// The form is going away without a created task: tell the handoff once.
+    fn report_abandoned(&self) {
+        if !self.created.get() && !self.abandon_reported.replace(true) {
+            if let Some(abandoned) = self.on_abandoned.as_ref() {
+                abandoned();
+            }
         }
     }
 
@@ -375,6 +397,10 @@ pub(crate) fn show_prefilled(
     layout.append(&actions);
     window.set_child(Some(&layout));
 
+    let (eva_operation, on_abandoned) = initial
+        .as_ref()
+        .map(|seed| (seed.eva_operation.clone(), seed.on_abandoned.clone()))
+        .unwrap_or((None, None));
     let composer = Rc::new(Composer {
         window: window.clone(),
         title,
@@ -390,6 +416,10 @@ pub(crate) fn show_prefilled(
         activation_revision: Cell::new(None),
         pending: RefCell::new(None),
         submit: Box::new(submit),
+        eva_operation,
+        on_abandoned,
+        created: Cell::new(false),
+        abandon_reported: Cell::new(false),
     });
     #[cfg(test)]
     TEST_COMPOSER.with(|slot| *slot.borrow_mut() = Rc::downgrade(&composer));
@@ -472,6 +502,7 @@ pub(crate) fn show_prefilled(
     window.connect_close_request(move |_| {
         if let Some(composer) = weak.upgrade() {
             composer.cancel();
+            composer.report_abandoned();
         }
         gtk::glib::Propagation::Proceed
     });
@@ -493,6 +524,7 @@ pub(crate) fn show_prefilled(
     window.connect_destroy(move |_| {
         if let Some(composer) = form_owner.borrow_mut().take() {
             composer.cancel();
+            composer.report_abandoned();
         }
     });
     window.present();
@@ -510,6 +542,7 @@ mod tests {
             directory: PathBuf::from("/tmp/project"),
             provider: AgentProvider::Codex,
             brief: TaskBrief::new("Show the real worktree and validation result", None).unwrap(),
+            eva_operation: None,
         };
         assert!(draft.validate().is_ok());
         let mut invalid = draft.clone();
@@ -697,6 +730,8 @@ mod tests {
                 title: "Review migration".into(),
                 goal: "Read the captured evidence.\nKeep source approvals separate.".into(),
                 provider: AgentProvider::Claude,
+                eva_operation: None,
+                on_abandoned: None,
             }),
             move |request| sink.borrow_mut().push(request),
         );
@@ -732,6 +767,50 @@ mod tests {
             "prefilling a handoff submitted a task"
         );
         form.window.close();
+        parent.close();
+    }
+
+    #[test]
+    #[ignore = "requires a native GTK display"]
+    fn eva_handoff_is_an_ordinary_unsent_draft_and_reports_abandonment_once() {
+        gtk::init().expect("GTK display");
+        let parent = gtk::Window::new();
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let sink = requests.clone();
+        let abandoned = Rc::new(Cell::new(0));
+        let count = abandoned.clone();
+        show_prefilled(
+            &parent,
+            Some(PathBuf::from("/tmp/eva-project")),
+            Some("/bin/bash".into()),
+            Some(TaskSeed {
+                title: "找出 build 失败原因".into(),
+                goal: "Eva 建议：检查失败原因。".into(),
+                provider: AgentProvider::ALL[0],
+                eva_operation: Some("op-1".into()),
+                on_abandoned: Some(Rc::new(move || count.set(count.get() + 1))),
+            }),
+            move |request| sink.borrow_mut().push(request),
+        );
+        let form = TEST_COMPOSER.with(|slot| slot.borrow().upgrade()).unwrap();
+        let draft = form.draft().unwrap();
+        assert_eq!(draft.eva_operation.as_deref(), Some("op-1"));
+        assert!(draft.brief.validation.is_none(), "validation stays the user's choice");
+        assert!(form.goal_view.is_editable());
+        assert!(requests.borrow().is_empty(), "opening the form submitted nothing");
+        drop(form);
+        let window = TEST_COMPOSER
+            .with(|slot| slot.borrow().upgrade())
+            .map(|form| form.window.clone())
+            .unwrap();
+        window.close();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while std::time::Instant::now() < deadline {
+            while gtk::glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(abandoned.get(), 1, "closing without a task reports it once");
+        assert!(requests.borrow().is_empty());
         parent.close();
     }
 }

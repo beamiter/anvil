@@ -396,6 +396,8 @@ pub(crate) enum AppMsg {
     /// One staged action from the agent Tasks panel, executed against the
     /// live task domain at message time.
     TaskPanelAction(crate::agent_task_ui::TaskPanelAction),
+    /// An approved Eva handoff: open the task composer prefilled.
+    EvaHandoff(crate::eva_companion::EvaHandoff),
     /// Self-re-arming drain of native runtime events, worktree creation, and
     /// the diff worker.
     AgentTasksTick,

@@ -25,6 +25,10 @@ pub struct ProposalBoard {
 fn status_text(status: &str) -> String {
     match status {
         "goal_active" => "Eva is watching that task and will tell you once when it finishes.",
+        "handoff_sent" => {
+            "Opening the task composer. Nothing starts until you create the task there."
+        }
+        "delegation_not_negotiated" => "This terminal cannot open an agent task composer.",
         "remembered" => "Saved to memory after your approval.",
         "declined" => "Declined. Nothing was saved or started.",
         "goal_cancelled" => "Stopped watching that task.",
@@ -183,6 +187,10 @@ pub fn card_text(p: &CognitionProposal) -> String {
         } => format!(
             "Eva suggests: watch {task_ref} and tell you once when it {}.\nIt only notices and tells; nothing is run.",
             statuses(notify_on)
+        ),
+        ProposalChange::AgentTask { title, goal } => format!(
+            "Eva suggests handing a task to an agent: {title}\n{}\nApproving opens the task composer prefilled; you choose the repository, agent and validation and create the task there. Eva then tells you when it is ready for review or fails.",
+            goal.trim()
         ),
         ProposalChange::Remember {
             scope,

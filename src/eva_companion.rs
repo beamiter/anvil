@@ -12,8 +12,26 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// An approved Eva handoff for this window's own task composer. It carries no
+/// execution authority: the user still creates (and later starts) the task.
+#[derive(Clone, Debug)]
+pub(crate) struct EvaHandoff {
+    pub operation_id: String,
+    pub title: String,
+    pub goal: String,
+}
+pub(crate) type HandoffSink = Rc<dyn Fn(EvaHandoff)>;
+/// What the task UI did with a handoff.
+pub(crate) enum HandoffReport {
+    Opened,
+    Closed,
+    Unavailable(&'static str),
+    Created(String),
+}
+
 struct State {
     client: host::SharedHost,
+    handoff_sink: Option<HandoffSink>,
     generation: u64,
     last_task: Option<(String, u64, host::TaskStatus)>,
     active_turn: Option<(String, host::ContextRef)>,
@@ -177,6 +195,16 @@ fn refresh_frame_clock(state: &Rc<RefCell<State>>, overlay: &gtk::Overlay, body:
 
 /// Called exactly once per GUI, never from pane construction or paint.
 pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
+    install_with_handoffs(window, overlay, app, None)
+}
+/// Like `install`, for a window whose app can open its own task composer for
+/// an approved Eva handoff.
+pub(crate) fn install_with_handoffs(
+    window: &gtk::Window,
+    overlay: &gtk::Overlay,
+    app: &str,
+    handoff_sink: Option<HandoffSink>,
+) {
     if !shared_mode_requested() {
         return;
     }
@@ -196,7 +224,17 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
     overlay.set_measure_overlay(&clip, false);
     overlay.set_clip_overlay(&clip, true);
     let state = Rc::new(RefCell::new(State {
-        client: host::SharedHost::from_env(app, host::RetirementCapability::NativePresented, || {}),
+        // Only a window that can open its task composer asks for handoffs.
+        client: if handoff_sink.is_some() {
+            host::SharedHost::from_env_delegating(
+                app,
+                host::RetirementCapability::NativePresented,
+                || {},
+            )
+        } else {
+            host::SharedHost::from_env(app, host::RetirementCapability::NativePresented, || {})
+        },
+        handoff_sink,
         generation: 0,
         last_task: None,
         active_turn: None,
@@ -919,6 +957,22 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
                     s.client.notice_displayed(&id);
                 }
             }
+            while let Some(handoff) = s.client.take_handoff() {
+                match s.handoff_sink.clone() {
+                    // Deferred: the task UI reports back into this state.
+                    Some(sink) => {
+                        let handoff = EvaHandoff {
+                            operation_id: handoff.operation_id,
+                            title: handoff.title,
+                            goal: handoff.goal,
+                        };
+                        gtk::glib::idle_add_local_once(move || sink(handoff));
+                    }
+                    None => s
+                        .client
+                        .handoff_unavailable(&handoff.operation_id, "no_task_composer"),
+                }
+            }
             watch_task.set_sensitive(
                 s.client.gate.proposals_supported()
                     && s.current_context
@@ -1391,6 +1445,69 @@ fn motion_key(m: atlas::Motion) -> &'static str {
 
 thread_local! {
     static HOSTS: RefCell<Vec<(gtk::glib::WeakRef<gtk::Window>, std::rc::Weak<RefCell<State>>)>> = const { RefCell::new(Vec::new()) };
+}
+fn with_state(window: &gtk::Window, f: impl FnOnce(&mut State)) {
+    HOSTS.with(|hosts| {
+        for (w, s) in hosts.borrow().iter() {
+            if w.upgrade().as_ref() == Some(window) {
+                if let Some(s) = s.upgrade() {
+                    f(&mut s.borrow_mut());
+                    return;
+                }
+            }
+        }
+    });
+}
+/// Report what the task UI did with an Eva handoff.
+pub(crate) fn report_handoff(window: &gtk::Window, operation_id: &str, report: HandoffReport) {
+    with_state(window, |s| match report {
+        HandoffReport::Opened => s.client.handoff_opened(operation_id),
+        HandoffReport::Closed => s.client.handoff_closed(operation_id),
+        HandoffReport::Unavailable(reason) => s.client.handoff_unavailable(operation_id, reason),
+        HandoffReport::Created(task_id) => s.client.handoff_created(operation_id, &task_id),
+    });
+}
+fn agent_state(status: jterm_core::agent_task::TaskStatus) -> host::AgentTaskState {
+    use jterm_core::agent_task::TaskStatus as T;
+    match status {
+        T::Created => host::AgentTaskState::Created,
+        T::Starting => host::AgentTaskState::Starting,
+        T::Working => host::AgentTaskState::Working,
+        T::WaitingForApproval => host::AgentTaskState::WaitingForApproval,
+        T::WaitingForHuman => host::AgentTaskState::WaitingForHuman,
+        T::ReadyForReview => host::AgentTaskState::ReadyForReview,
+        T::Completed => host::AgentTaskState::Completed,
+        T::Failed => host::AgentTaskState::Failed,
+        T::Cancelled => host::AgentTaskState::Cancelled,
+        T::Archived => host::AgentTaskState::Archived,
+    }
+}
+fn agent_validation(status: jterm_core::agent_task::TaskValidationStatus) -> host::AgentValidation {
+    use jterm_core::agent_task::TaskValidationStatus as V;
+    match status {
+        V::NotRun => host::AgentValidation::NotRun,
+        V::Running => host::AgentValidation::Running,
+        V::Passed => host::AgentValidation::Passed,
+        V::Failed => host::AgentValidation::Failed,
+        V::Inconclusive => host::AgentValidation::Inconclusive,
+        V::Cancelled => host::AgentValidation::Cancelled,
+    }
+}
+/// Report the lifecycle of tasks created from Eva handoffs, as the task
+/// runtime has them. Only linked tasks are sent, and only when they change.
+pub(crate) fn report_agent_tasks(window: &gtk::Window, tasks: &[jterm_core::agent_task::AgentTask]) {
+    with_state(window, |s| {
+        let linked: Vec<String> = s.client.handoffs.linked_tasks().map(str::to_owned).collect();
+        for id in linked {
+            if let Some(task) = tasks.iter().find(|t| t.id.to_string() == id) {
+                s.client.agent_task_status(
+                    &id,
+                    agent_state(task.status),
+                    agent_validation(task.validation.status),
+                );
+            }
+        }
+    });
 }
 /// Only identifiers, revision and actual task receipt state cross IPC.
 pub(crate) fn observe_task(window: &gtk::Window, task: Option<&jterm_core::agent_task::AgentTask>) {

@@ -1468,7 +1468,16 @@ impl SimpleComponent for AppModel {
         workspace_row.append(&content_paned);
         let workspace_body = gtk::Overlay::new();
         workspace_body.set_child(Some(&workspace_row));
-        eva_companion::install(root.upcast_ref(), &workspace_body, "anvil");
+        let handoff_sender = sender.clone();
+        let handoff_sink: eva_companion::HandoffSink = std::rc::Rc::new(move |handoff| {
+            handoff_sender.input(AppMsg::EvaHandoff(handoff));
+        });
+        eva_companion::install_with_handoffs(
+            root.upcast_ref(),
+            &workspace_body,
+            "anvil",
+            Some(handoff_sink),
+        );
         content_paned.set_hexpand(true);
         workspace_shell::observe_layout(
             &workspace_body,
@@ -2229,6 +2238,7 @@ impl SimpleComponent for AppModel {
             AppMsg::Action(action) => self.execute_action(action, &sender),
             AppMsg::ConnectPickedRemote(host) => self.connect_picked_remote(&host, &sender),
             AppMsg::TaskPanelAction(action) => self.execute_task_panel_action(action, &sender),
+            AppMsg::EvaHandoff(handoff) => self.compose_eva_handoff(handoff, &sender),
             AppMsg::AgentTasksTick => self.agent_tasks_tick(&sender),
             AppMsg::ReloadConfig => self.reload_config(&sender),
             AppMsg::PaneLaunched(pane_id) => {

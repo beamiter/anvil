@@ -235,6 +235,13 @@ impl AppModel {
     /// Keep the top-bar Tasks button in step with the domain. It is shown
     /// only where tasks can be used and counts attention by the shared rule.
     pub(crate) fn sync_task_badge(&self) {
+        {
+            use relm4::gtk::prelude::*;
+            crate::eva_companion::report_agent_tasks(
+                self.window.upcast_ref(),
+                self.task_manager.tasks(),
+            );
+        }
         self.refresh_workspace_task_overview();
         let visible = !self.safe_mode
             && (self.config.borrow().agent_tasks_enabled || !self.task_manager.tasks().is_empty());
@@ -767,6 +774,68 @@ impl AppModel {
         );
     }
 
+    /// An approved Eva handoff opens the ordinary task composer prefilled. The
+    /// user still chooses repository, provider and validation and creates the
+    /// task; starting the agent stays a separate action in the task panel.
+    pub(crate) fn compose_eva_handoff(
+        &self,
+        handoff: crate::eva_companion::EvaHandoff,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        use crate::eva_companion::{report_handoff, HandoffReport};
+        use relm4::gtk::prelude::*;
+        let window: &relm4::gtk::Window = self.window.upcast_ref();
+        if self.safe_mode || !self.config.borrow().agent_tasks_enabled {
+            report_handoff(
+                window,
+                &handoff.operation_id,
+                HandoffReport::Unavailable("agent_tasks_disabled"),
+            );
+            self.show_toast("Eva suggested an agent task, but agent tasks are off in Settings.");
+            return;
+        }
+        if self.pending_task_creation.is_some() {
+            report_handoff(
+                window,
+                &handoff.operation_id,
+                HandoffReport::Unavailable("task_creation_busy"),
+            );
+            self.show_toast("Another task worktree is still being created");
+            return;
+        }
+        let directory = self
+            .active_pane()
+            .and_then(|pane| pane.local_cwd())
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_dir().ok());
+        let weak = self.window.downgrade();
+        let operation = handoff.operation_id.clone();
+        let on_abandoned: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(move || {
+            if let Some(window) = weak.upgrade() {
+                report_handoff(window.upcast_ref(), &operation, HandoffReport::Closed);
+            }
+        });
+        let sender = sender.clone();
+        agent_task_ui::task_composer::show_prefilled(
+            &self.window,
+            directory,
+            self.shell_argv.first().cloned(),
+            Some(agent_task_ui::task_composer::TaskSeed {
+                title: handoff.title,
+                goal: handoff.goal,
+                provider: AgentProvider::ALL[0],
+                eva_operation: Some(handoff.operation_id.clone()),
+                on_abandoned: Some(on_abandoned),
+            }),
+            move |draft| {
+                sender.input(AppMsg::TaskPanelAction(TaskPanelAction::CreateProject(
+                    draft,
+                )))
+            },
+        );
+        report_handoff(window, &handoff.operation_id, HandoffReport::Opened);
+    }
+
     pub(crate) fn compose_handoff_task(
         &self,
         title: String,
@@ -796,6 +865,8 @@ impl AppModel {
                 title,
                 goal: body,
                 provider,
+                eva_operation: None,
+                on_abandoned: None,
             }),
             move |draft| {
                 sender.input(AppMsg::TaskPanelAction(TaskPanelAction::CreateProject(
@@ -952,6 +1023,17 @@ impl AppModel {
         match result {
             Ok(task_id) => {
                 self.selected_task = Some(task_id);
+                if let Some(operation) = project_request
+                    .as_ref()
+                    .and_then(|request| request.draft.eva_operation.as_deref())
+                {
+                    use relm4::gtk::prelude::*;
+                    crate::eva_companion::report_handoff(
+                        self.window.upcast_ref(),
+                        operation,
+                        crate::eva_companion::HandoffReport::Created(task_id.to_string()),
+                    );
+                }
                 self.show_toast("Task created in an isolated worktree; choose Start when ready");
             }
             Err(error) => {

@@ -1,6 +1,7 @@
 //! One GUI-owned Eva adapter. Transport work never runs on the rendering thread.
 //! A native presentation acknowledgement is not a compositor scanout guarantee.
 pub mod dialogue_save;
+pub mod handoff;
 pub mod history;
 pub mod notice;
 pub mod proposal;
@@ -133,6 +134,7 @@ pub struct HostGate {
     voice_text_supported: bool,
     notices_supported: bool,
     proposals_supported: bool,
+    delegation_supported: bool,
 }
 impl HostGate {
     pub fn new(host: Host) -> Self {
@@ -169,7 +171,12 @@ impl HostGate {
             voice_text_supported: false,
             notices_supported: false,
             proposals_supported: false,
+            delegation_supported: false,
         }
+    }
+    /// The current connection negotiated `CognitionDelegationV1`.
+    pub fn delegation_supported(&self) -> bool {
+        self.delegation_supported
     }
     /// The current connection negotiated `CognitionProposalV1`.
     pub fn proposals_supported(&self) -> bool {
@@ -379,6 +386,7 @@ impl HostGate {
         self.voice_text_supported = false;
         self.notices_supported = false;
         self.proposals_supported = false;
+        self.delegation_supported = false;
         self.connection_nonce = None;
         self.admitted = false;
         self.admission_epoch = 0;
@@ -414,6 +422,7 @@ impl HostGate {
                 self.voice_text_supported = features.contains(&HostFeature::VoiceTextV1);
                 self.notices_supported = features.contains(&HostFeature::CognitionNoticeV1);
                 self.proposals_supported = features.contains(&HostFeature::CognitionProposalV1);
+                self.delegation_supported = features.contains(&HostFeature::CognitionDelegationV1);
                 self.connection_generation = self.connection_generation.saturating_add(1);
                 self.admission_generation = self.admission_generation.saturating_add(1);
                 self.admitted = false;
@@ -696,13 +705,17 @@ pub struct SharedHost {
     pub notices: notice::NoticeBoard,
     /// Eva's reviewable proposals and active goals; see [`proposal::ProposalBoard`].
     pub proposals: proposal::ProposalBoard,
+    /// Agent handoffs into this window's task composer; see [`handoff::HandoffBoard`].
+    pub handoffs: handoff::HandoffBoard,
+    handoff_generation: u64,
 }
-const FEATURES: [HostFeature; 5] = [
+const FEATURES: [HostFeature; 6] = [
     HostFeature::WithdrawalResumeV1,
     HostFeature::DialogueHistoryV1,
     HostFeature::VoiceTextV1,
     HostFeature::CognitionNoticeV1,
     HostFeature::CognitionProposalV1,
+    HostFeature::CognitionDelegationV1,
 ];
 /// The first `level` features a modern host asks for. An older coordinator
 /// rejects a longer list as a schema error before admission; the worker then
@@ -718,10 +731,28 @@ fn predates_features(replies: &[Reply], accepted: bool) -> bool {
         })
 }
 impl SharedHost {
+    /// A host without an agent task composer: negotiates everything except
+    /// `CognitionDelegationV1`, so it never receives handoffs.
     pub fn from_env(
         app: &str,
         capability: RetirementCapability,
         wake: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        Self::from_env_with(app, capability, wake, FEATURES.len() - 1)
+    }
+    /// A host that can open its own task composer for an approved handoff.
+    pub fn from_env_delegating(
+        app: &str,
+        capability: RetirementCapability,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        Self::from_env_with(app, capability, wake, FEATURES.len())
+    }
+    fn from_env_with(
+        app: &str,
+        capability: RetirementCapability,
+        wake: impl Fn() + Send + Sync + 'static,
+        max_level: usize,
     ) -> Self {
         let host = Host {
             id: format!("{app}-{}", uuid::Uuid::new_v4()),
@@ -750,7 +781,7 @@ impl SharedHost {
                         .join("jcompanion/eva.sock")
                     });
                 let mut disconnected_notice = false;
-                let mut level = FEATURES.len();
+                let mut level = max_level.clamp(1, FEATURES.len());
                 while !stopping.load(std::sync::atomic::Ordering::Relaxed) {
                     let result = (|| -> std::io::Result<()> {
                         let mut client = companion_client::Client::connect_with_features(
@@ -837,7 +868,44 @@ impl SharedHost {
             voice_text: Default::default(),
             notices: Default::default(),
             proposals: Default::default(),
+            handoffs: Default::default(),
+            handoff_generation: 0,
         }
+    }
+    /// The next approved handoff to open in this window's task composer.
+    pub fn take_handoff(&mut self) -> Option<AgentHandoff> {
+        self.handoffs.take()
+    }
+    fn send_handoff(&mut self, request: Option<Request>) {
+        if let Some(request) = request.filter(|_| self.gate.delegation_supported) {
+            self.send(request);
+        }
+    }
+    pub fn handoff_opened(&mut self, operation_id: &str) {
+        let r = self.handoffs.opened(operation_id);
+        self.send_handoff(r);
+    }
+    pub fn handoff_closed(&mut self, operation_id: &str) {
+        let r = self.handoffs.closed(operation_id);
+        self.send_handoff(r);
+    }
+    pub fn handoff_unavailable(&mut self, operation_id: &str, reason: &str) {
+        let r = self.handoffs.unavailable(operation_id, reason);
+        self.send_handoff(r);
+    }
+    pub fn handoff_created(&mut self, operation_id: &str, agent_task_id: &str) {
+        let r = self.handoffs.created(operation_id, agent_task_id);
+        self.send_handoff(r);
+    }
+    /// Report a linked task's own lifecycle (no-op when unchanged or unlinked).
+    pub fn agent_task_status(
+        &mut self,
+        agent_task_id: &str,
+        state: AgentTaskState,
+        validation: AgentValidation,
+    ) {
+        let r = self.handoffs.status(agent_task_id, state, validation);
+        self.send_handoff(r);
     }
     /// The user approved the exact proposal shown.
     pub fn approve_proposal(&mut self, proposal_id: &str) {
@@ -968,6 +1036,12 @@ impl SharedHost {
                         }
                         continue;
                     }
+                    if matches!(&r, Reply::AgentHandoff { .. }) {
+                        if self.gate.delegation_supported {
+                            self.handoffs.observe(&r);
+                        }
+                        continue;
+                    }
                     if matches!(
                         &r,
                         Reply::CognitionProposal { .. }
@@ -1050,6 +1124,17 @@ impl SharedHost {
         }
         if !self.gate.proposals_supported || self.failed {
             self.proposals.disconnected();
+        }
+        if !self.gate.delegation_supported || self.failed {
+            self.handoffs.disconnected();
+        } else if self.gate.admitted && self.gate.admission_generation() != self.handoff_generation
+        {
+            // A fresh admission may follow a coordinator restart: resend what
+            // the task runtime last reported for every created task.
+            self.handoff_generation = self.gate.admission_generation();
+            for request in self.handoffs.reconnected() {
+                self.send(request);
+            }
         }
         self.flush_controls();
         changed
@@ -1389,6 +1474,8 @@ mod tests {
             voice_text: Default::default(),
             notices: Default::default(),
             proposals: Default::default(),
+            handoffs: Default::default(),
+            handoff_generation: 0,
         };
         for n in 0..1000 {
             h.send(Request::Focus {
@@ -1434,6 +1521,8 @@ mod tests {
             voice_text: Default::default(),
             notices: Default::default(),
             proposals: Default::default(),
+            handoffs: Default::default(),
+            handoff_generation: 0,
         };
         let discovery = Reply::MemoryScopes {
             scopes: vec![MemoryScope::Project("project-without-task".into())],

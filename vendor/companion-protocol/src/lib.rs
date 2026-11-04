@@ -44,6 +44,9 @@ pub enum HostFeature {
     CognitionNoticeV1,
     /// Reviewable proposals (watch a task, remember something) and goals. Requires notices.
     CognitionProposalV1,
+    /// Agent-task handoffs into the host's own task composer, and their receipts.
+    /// Requires proposals.
+    CognitionDelegationV1,
 }
 /// The only accepted feature sets; order is fixed so a list cannot smuggle duplicates.
 pub fn valid_host_features(features: &[HostFeature]) -> bool {
@@ -72,7 +75,75 @@ pub fn valid_host_features(features: &[HostFeature]) -> bool {
                 HostFeature::CognitionNoticeV1,
                 HostFeature::CognitionProposalV1
             ]
+            | [
+                HostFeature::WithdrawalResumeV1,
+                HostFeature::DialogueHistoryV1,
+                HostFeature::VoiceTextV1,
+                HostFeature::CognitionNoticeV1,
+                HostFeature::CognitionProposalV1,
+                HostFeature::CognitionDelegationV1
+            ]
     )
+}
+pub const MAX_HANDOFF_TITLE: usize = 256;
+pub const MAX_HANDOFF_GOAL: usize = 4096;
+/// One approved handoff. The host opens its own task composer prefilled with
+/// this; the user still chooses repository, provider and validation and
+/// creates the task there. Nothing here starts an agent.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentHandoff {
+    pub operation_id: String,
+    pub context: ContextRef,
+    pub title: String,
+    pub goal: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HandoffOutcome {
+    ComposerOpened,
+    /// The user closed the composer without creating a task.
+    ComposerClosed,
+    /// The host created this task from the handoff (its own stable task id).
+    TaskCreated {
+        agent_task_id: String,
+    },
+    /// Agent tasks are disabled or busy here; nothing was opened.
+    Unavailable {
+        reason: String,
+    },
+}
+/// Mirrors the host task runtime's own lifecycle; reported, never commanded.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTaskState {
+    Created,
+    Starting,
+    Working,
+    WaitingForApproval,
+    WaitingForHuman,
+    ReadyForReview,
+    Completed,
+    Failed,
+    Cancelled,
+    Archived,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentValidation {
+    NotRun,
+    Running,
+    Passed,
+    Failed,
+    Inconclusive,
+    Cancelled,
+}
+pub fn valid_handoff(h: &AgentHandoff) -> bool {
+    identifier(&h.operation_id)
+        && valid_context(&h.context)
+        && notice_text(&h.title, MAX_HANDOFF_TITLE)
+        && !h.title.contains('\n')
+        && notice_text(&h.goal, MAX_HANDOFF_GOAL)
 }
 pub const MAX_PROPOSAL_VALUE: usize = 1024;
 pub const MAX_GOALS_LISTED: usize = 32;
@@ -88,6 +159,10 @@ pub enum ProposalChange {
         notify_on: Vec<TaskStatus>,
         expires_at_ms: u64,
     },
+    /// Hand a task to this host's agent task composer (negotiated
+    /// `CognitionDelegationV1` only). Approval opens the composer prefilled; the
+    /// user still creates the task there. Approval also watches that task.
+    AgentTask { title: String, goal: String },
     /// Save one memory entry, or correct the existing entry `supersedes`.
     Remember {
         scope: MemoryScope,
@@ -148,6 +223,11 @@ pub fn valid_proposal(p: &CognitionProposal) -> bool {
                     && !notify_on.is_empty()
                     && notify_on.len() <= 3
                     && notify_on.iter().all(terminal_status)
+            }
+            ProposalChange::AgentTask { title, goal } => {
+                notice_text(title, MAX_HANDOFF_TITLE)
+                    && !title.contains('\n')
+                    && notice_text(goal, MAX_HANDOFF_GOAL)
             }
             ProposalChange::Remember {
                 scope,
@@ -557,6 +637,19 @@ pub enum Request {
     GoalList {
         context: ContextRef,
     },
+    /// What happened to a handoff this host received (negotiated `CognitionDelegationV1`).
+    AgentHandoffReceipt {
+        operation_id: String,
+        outcome: HandoffOutcome,
+    },
+    /// The latest state of the task created from a handoff, as the host's task
+    /// runtime reports it. Sent on change and again after reconnecting.
+    AgentTaskStatus {
+        operation_id: String,
+        agent_task_id: String,
+        state: AgentTaskState,
+        validation: AgentValidation,
+    },
     EvaHello,
     Audio {
         turn_id: String,
@@ -777,6 +870,10 @@ pub enum Reply {
         context: ContextRef,
         goals: Vec<GoalView>,
     },
+    /// Open the task composer prefilled (negotiated `CognitionDelegationV1`).
+    AgentHandoff {
+        handoff: AgentHandoff,
+    },
     Accepted {
         boot_id: String,
         companion_id: String,
@@ -974,6 +1071,25 @@ pub fn decode(bytes: &[u8]) -> Result<Envelope, String> {
         }
         Request::GoalCancel { goal_id } if !identifier(goal_id) => {
             return Err("invalid_goal_request".into())
+        }
+        Request::AgentHandoffReceipt {
+            operation_id,
+            outcome,
+        } if !identifier(operation_id)
+            || match outcome {
+                HandoffOutcome::TaskCreated { agent_task_id } => !identifier(agent_task_id),
+                HandoffOutcome::Unavailable { reason } => !identifier(reason),
+                _ => false,
+            } =>
+        {
+            return Err("invalid_handoff_receipt".into())
+        }
+        Request::AgentTaskStatus {
+            operation_id,
+            agent_task_id,
+            ..
+        } if !identifier(operation_id) || !identifier(agent_task_id) => {
+            return Err("invalid_handoff_receipt".into())
         }
         Request::MemoryScopes { after: Some(after) }
             if !(after == "global"
@@ -1341,6 +1457,59 @@ mod host_feature_tests {
             origin: "model".into(),
             ..goal
         }));
+    }
+    #[test]
+    fn handoffs_and_receipts_are_strict() {
+        let h = AgentHandoff {
+            operation_id: "op-1".into(),
+            context: notice().context,
+            title: "检查构建失败".into(),
+            goal: "找出 build 失败原因并给出最小修复。\n先只读。".into(),
+        };
+        assert!(valid_handoff(&h));
+        for bad in [
+            AgentHandoff {
+                title: "a\nb".into(),
+                ..h.clone()
+            },
+            AgentHandoff {
+                goal: "x".repeat(MAX_HANDOFF_GOAL + 1),
+                ..h.clone()
+            },
+            AgentHandoff {
+                goal: "ok\u{1b}[2J".into(),
+                ..h.clone()
+            },
+            AgentHandoff {
+                operation_id: "op 1".into(),
+                ..h.clone()
+            },
+        ] {
+            assert!(!valid_handoff(&bad));
+        }
+        let created = serde_json::json!({"type":"agent_handoff_receipt","operation_id":"op-1",
+            "outcome":{"outcome":"task_created","agent_task_id":"5f0c-ab"}});
+        assert!(decode(&wire(created)).is_ok());
+        let bad_id = serde_json::json!({"type":"agent_handoff_receipt","operation_id":"op-1",
+            "outcome":{"outcome":"task_created","agent_task_id":"a b"}});
+        assert!(decode(&wire(bad_id)).is_err());
+        let status = serde_json::json!({"type":"agent_task_status","operation_id":"op-1",
+            "agent_task_id":"t-1","state":"ready_for_review","validation":"passed"});
+        assert!(decode(&wire(status)).is_ok());
+        let mut extra = serde_json::json!({"type":"agent_task_status","operation_id":"op-1",
+            "agent_task_id":"t-1","state":"completed","validation":"passed"});
+        extra["merged"] = true.into();
+        assert!(decode(&wire(extra)).is_err());
+        let chain: Vec<HostFeature> = vec![
+            HostFeature::WithdrawalResumeV1,
+            HostFeature::DialogueHistoryV1,
+            HostFeature::VoiceTextV1,
+            HostFeature::CognitionNoticeV1,
+            HostFeature::CognitionProposalV1,
+            HostFeature::CognitionDelegationV1,
+        ];
+        assert!(valid_host_features(&chain));
+        assert!(!valid_host_features(&[chain[0], chain[5]]));
     }
     #[test]
     fn proposal_and_goal_requests_need_identifiers() {
