@@ -42,6 +42,8 @@ pub enum HostFeature {
     VoiceTextV1,
     /// Proactive notices from validated background cognition. Requires voice text.
     CognitionNoticeV1,
+    /// Reviewable proposals (watch a task, remember something) and goals. Requires notices.
+    CognitionProposalV1,
 }
 /// The only accepted feature sets; order is fixed so a list cannot smuggle duplicates.
 pub fn valid_host_features(features: &[HostFeature]) -> bool {
@@ -63,7 +65,118 @@ pub fn valid_host_features(features: &[HostFeature]) -> bool {
                 HostFeature::VoiceTextV1,
                 HostFeature::CognitionNoticeV1
             ]
+            | [
+                HostFeature::WithdrawalResumeV1,
+                HostFeature::DialogueHistoryV1,
+                HostFeature::VoiceTextV1,
+                HostFeature::CognitionNoticeV1,
+                HostFeature::CognitionProposalV1
+            ]
     )
+}
+pub const MAX_PROPOSAL_VALUE: usize = 1024;
+pub const MAX_GOALS_LISTED: usize = 32;
+/// What an approved proposal does. The approval is the user's exact review:
+/// the digest covers this change, the proposal id and the origin context.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProposalChange {
+    /// Tell the user once when this task's current or next run finishes.
+    /// Only lets Eva notice and tell; it runs nothing.
+    WatchTask {
+        task_ref: String,
+        notify_on: Vec<TaskStatus>,
+        expires_at_ms: u64,
+    },
+    /// Save one memory entry, or correct the existing entry `supersedes`.
+    Remember {
+        scope: MemoryScope,
+        key: String,
+        value: String,
+        /// `note`, `preference`, `project_knowledge` or `experience`.
+        memory_kind: String,
+        supersedes: Option<i64>,
+        source_refs: Vec<String>,
+    },
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CognitionProposal {
+    pub proposal_id: String,
+    pub digest: String,
+    /// The context it was proposed in; approval must name this exact context.
+    pub context: ContextRef,
+    pub change: ProposalChange,
+    pub explanation: String,
+}
+/// An active goal, shown so the user can see and stop it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GoalView {
+    pub goal_id: String,
+    pub task_ref: String,
+    pub notify_on: Vec<TaskStatus>,
+    pub expires_at_ms: u64,
+    /// `explicit` or `approved_suggestion`.
+    pub origin: String,
+}
+fn digest_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+fn terminal_status(s: &TaskStatus) -> bool {
+    matches!(
+        s,
+        TaskStatus::Failed | TaskStatus::NeedsReview | TaskStatus::Succeeded
+    )
+}
+fn task_ref_ok(r: &str) -> bool {
+    r.strip_prefix("task:").is_some_and(identifier)
+}
+/// Hosts check every received proposal; an invalid one is dropped, never shown.
+pub fn valid_proposal(p: &CognitionProposal) -> bool {
+    identifier(&p.proposal_id)
+        && digest_hex(&p.digest)
+        && valid_context(&p.context)
+        && notice_text(&p.explanation, MAX_NOTICE_EXPLANATION)
+        && match &p.change {
+            ProposalChange::WatchTask {
+                task_ref,
+                notify_on,
+                ..
+            } => {
+                task_ref_ok(task_ref)
+                    && !notify_on.is_empty()
+                    && notify_on.len() <= 3
+                    && notify_on.iter().all(terminal_status)
+            }
+            ProposalChange::Remember {
+                scope,
+                key,
+                value,
+                memory_kind,
+                supersedes,
+                source_refs,
+            } => {
+                valid_scope(scope)
+                    && identifier(key)
+                    && notice_text(value, MAX_PROPOSAL_VALUE)
+                    && matches!(
+                        memory_kind.as_str(),
+                        "note" | "preference" | "project_knowledge" | "experience"
+                    )
+                    && supersedes.is_none_or(|id| id > 0)
+                    && source_refs.len() <= MAX_NOTICE_EVIDENCE
+                    && source_refs.iter().all(|r| notice_ref(r))
+            }
+        }
+}
+pub fn valid_goal(g: &GoalView) -> bool {
+    identifier(&g.goal_id)
+        && task_ref_ok(&g.task_ref)
+        && !g.notify_on.is_empty()
+        && g.notify_on.len() <= 3
+        && g.notify_on.iter().all(terminal_status)
+        && matches!(g.origin.as_str(), "explicit" | "approved_suggestion")
 }
 pub const MAX_NOTICE_TEXT: usize = 2048;
 pub const MAX_NOTICE_EXPLANATION: usize = 512;
@@ -424,6 +537,26 @@ pub enum Request {
     CognitionNoticeDismissed {
         notice_id: String,
     },
+    /// The user approved the exact proposal shown (negotiated `CognitionProposalV1`).
+    CognitionProposalApprove {
+        proposal_id: String,
+        context: ContextRef,
+        digest: String,
+    },
+    CognitionProposalDecline {
+        proposal_id: String,
+    },
+    /// Explicit button: watch the task of this exact current context.
+    WatchTask {
+        context: ContextRef,
+    },
+    GoalCancel {
+        goal_id: String,
+    },
+    /// Goals visible to this exact current context.
+    GoalList {
+        context: ContextRef,
+    },
     EvaHello,
     Audio {
         turn_id: String,
@@ -629,6 +762,21 @@ pub enum Reply {
     CognitionNoticeWithdrawn {
         reason: String,
     },
+    /// A reviewable suggestion for this host's context (negotiated `CognitionProposalV1`).
+    CognitionProposal {
+        proposal: CognitionProposal,
+    },
+    /// Outcome of an approval, decline, watch or cancel. Never implies more than
+    /// its status: `goal_active`, `remembered`, `declined`, `goal_cancelled`, or a reason.
+    CognitionProposalResult {
+        proposal_id: Option<String>,
+        status: String,
+    },
+    /// Active goals visible to `context` (newest first, bounded).
+    Goals {
+        context: ContextRef,
+        goals: Vec<GoalView>,
+    },
     Accepted {
         boot_id: String,
         companion_id: String,
@@ -808,6 +956,24 @@ pub fn decode(bytes: &[u8]) -> Result<Envelope, String> {
             if !identifier(notice_id) =>
         {
             return Err("invalid_notice".into())
+        }
+        Request::CognitionProposalApprove {
+            proposal_id,
+            context,
+            digest,
+        } if !identifier(proposal_id) || !valid_context(context) || !digest_hex(digest) => {
+            return Err("invalid_proposal".into())
+        }
+        Request::CognitionProposalDecline { proposal_id } if !identifier(proposal_id) => {
+            return Err("invalid_proposal".into())
+        }
+        Request::WatchTask { context } | Request::GoalList { context }
+            if !valid_context(context) =>
+        {
+            return Err("invalid_goal_request".into())
+        }
+        Request::GoalCancel { goal_id } if !identifier(goal_id) => {
+            return Err("invalid_goal_request".into())
         }
         Request::MemoryScopes { after: Some(after) }
             if !(after == "global"
@@ -1089,6 +1255,129 @@ mod host_feature_tests {
         let mut extra = wire;
         extra["notice"]["authorized"] = true.into();
         assert!(serde_json::from_value::<Reply>(extra).is_err());
+    }
+    fn proposal(change: ProposalChange) -> CognitionProposal {
+        CognitionProposal {
+            proposal_id: "prop-1".into(),
+            digest: "a".repeat(64),
+            context: notice().context,
+            change,
+            explanation: "你让我盯着这个构建。".into(),
+        }
+    }
+    #[test]
+    fn proposals_and_goals_are_bounded_and_strict() {
+        let watch = ProposalChange::WatchTask {
+            task_ref: "task:build".into(),
+            notify_on: vec![TaskStatus::Failed, TaskStatus::Succeeded],
+            expires_at_ms: 10,
+        };
+        let remember = ProposalChange::Remember {
+            scope: MemoryScope::Global,
+            key: "eva-pref-1".into(),
+            value: "工作时少聊天，完成再说".into(),
+            memory_kind: "preference".into(),
+            supersedes: Some(4),
+            source_refs: vec!["mem:1".into()],
+        };
+        assert!(valid_proposal(&proposal(watch.clone())));
+        assert!(valid_proposal(&proposal(remember.clone())));
+        let mut p = proposal(watch.clone());
+        p.digest = "A".repeat(64);
+        assert!(!valid_proposal(&p));
+        let bad: Vec<ProposalChange> = vec![
+            ProposalChange::WatchTask {
+                task_ref: "build".into(),
+                notify_on: vec![TaskStatus::Failed],
+                expires_at_ms: 1,
+            },
+            ProposalChange::WatchTask {
+                task_ref: "task:build".into(),
+                notify_on: vec![TaskStatus::Running],
+                expires_at_ms: 1,
+            },
+            ProposalChange::Remember {
+                scope: MemoryScope::Global,
+                key: "k".into(),
+                value: "ok\u{1b}[2J".into(),
+                memory_kind: "note".into(),
+                supersedes: None,
+                source_refs: vec![],
+            },
+            ProposalChange::Remember {
+                scope: MemoryScope::Global,
+                key: "k".into(),
+                value: "x".repeat(MAX_PROPOSAL_VALUE + 1),
+                memory_kind: "note".into(),
+                supersedes: None,
+                source_refs: vec![],
+            },
+            ProposalChange::Remember {
+                scope: MemoryScope::Global,
+                key: "k".into(),
+                value: "v".into(),
+                memory_kind: "secret".into(),
+                supersedes: Some(0),
+                source_refs: vec![],
+            },
+        ];
+        for change in bad {
+            assert!(!valid_proposal(&proposal(change.clone())), "{change:?}");
+        }
+        let wire = serde_json::json!({"type":"cognition_proposal","proposal":proposal(remember)});
+        let mut extra = wire.clone();
+        extra["proposal"]["change"]["approved"] = true.into();
+        assert!(serde_json::from_value::<Reply>(extra).is_err());
+        assert!(serde_json::from_value::<Reply>(wire).is_ok());
+        let goal = GoalView {
+            goal_id: "goal-1".into(),
+            task_ref: "task:build".into(),
+            notify_on: vec![TaskStatus::Succeeded],
+            expires_at_ms: 1,
+            origin: "explicit".into(),
+        };
+        assert!(valid_goal(&goal));
+        assert!(!valid_goal(&GoalView {
+            origin: "model".into(),
+            ..goal
+        }));
+    }
+    #[test]
+    fn proposal_and_goal_requests_need_identifiers() {
+        let ctx = serde_json::to_value(notice().context).unwrap();
+        let hex = "b".repeat(64);
+        assert!(decode(&wire(serde_json::json!({"type":"cognition_proposal_approve","proposal_id":"p-1","context":ctx,"digest":hex}))).is_ok());
+        assert!(decode(&wire(serde_json::json!({"type":"cognition_proposal_approve","proposal_id":"p-1","context":ctx,"digest":"short"}))).is_err());
+        assert!(decode(&wire(
+            serde_json::json!({"type":"cognition_proposal_decline","proposal_id":"p 1"})
+        ))
+        .is_err());
+        assert!(decode(&wire(
+            serde_json::json!({"type":"watch_task","context":ctx})
+        ))
+        .is_ok());
+        assert!(decode(&wire(serde_json::json!({"type":"goal_list","context":ctx}))).is_ok());
+        assert!(decode(&wire(
+            serde_json::json!({"type":"goal_cancel","goal_id":"goal-1"})
+        ))
+        .is_ok());
+        assert!(decode(&wire(
+            serde_json::json!({"type":"goal_cancel","goal_id":"goal 1"})
+        ))
+        .is_err());
+        assert!(valid_host_features(&[
+            HostFeature::WithdrawalResumeV1,
+            HostFeature::DialogueHistoryV1,
+            HostFeature::VoiceTextV1,
+            HostFeature::CognitionNoticeV1,
+            HostFeature::CognitionProposalV1
+        ]));
+        assert!(!valid_host_features(&[
+            HostFeature::WithdrawalResumeV1,
+            HostFeature::DialogueHistoryV1,
+            HostFeature::VoiceTextV1,
+            HostFeature::CognitionProposalV1
+        ]));
     }
     #[test]
     fn notice_acknowledgements_need_identifiers() {

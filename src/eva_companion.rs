@@ -21,6 +21,7 @@ struct State {
     history_rendered: u64,
     voice_text_rendered: u64,
     notices_rendered: u64,
+    proposals_rendered: u64,
     pending_displayed: Option<String>,
     body: gtk::glib::WeakRef<gtk::Label>,
     close: close_rules::CloseIntent,
@@ -203,6 +204,7 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
         history_rendered: 0,
         voice_text_rendered: 0,
         notices_rendered: 0,
+        proposals_rendered: 0,
         pending_displayed: None,
         body: body.downgrade(),
         close: close_rules::CloseIntent::default(),
@@ -343,6 +345,59 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
     }
     notice_box.append(&notice_dismiss);
     controls.append(&notice_box);
+    // Eva's proposals (negotiated `cognition_proposal_v1`): the exact change is
+    // shown and nothing happens unless the user approves it here.
+    let proposal_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    proposal_box.add_css_class("eva-companion-proposal");
+    proposal_box.set_visible(false);
+    let proposal_label = gtk::Label::new(None);
+    proposal_label.set_wrap(true);
+    proposal_label.set_max_width_chars(42);
+    proposal_label.set_selectable(true);
+    proposal_label.set_xalign(0.);
+    proposal_box.append(&proposal_label);
+    let proposal_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    for (title, approve) in [("Approve", true), ("Decline", false)] {
+        let button = gtk::Button::with_label(title);
+        let state = state.clone();
+        button.connect_clicked(move |_| {
+            let mut s = state.borrow_mut();
+            if let Some(id) = s.client.proposals.latest().map(|p| p.proposal_id.clone()) {
+                if approve {
+                    s.client.approve_proposal(&id);
+                } else {
+                    s.client.decline_proposal(&id);
+                }
+            }
+        });
+        proposal_row.append(&button);
+    }
+    proposal_box.append(&proposal_row);
+    controls.append(&proposal_box);
+    let watch_task = gtk::Button::with_label("Tell me when this task finishes");
+    watch_task.set_sensitive(false);
+    let goals_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let proposal_status = gtk::Label::new(None);
+    proposal_status.set_wrap(true);
+    proposal_status.set_max_width_chars(42);
+    proposal_status.set_xalign(0.);
+    {
+        let state = state.clone();
+        let proposal_status = proposal_status.clone();
+        watch_task.connect_clicked(move |_| {
+            let mut s = state.borrow_mut();
+            let Some(context) = s.current_context.clone() else {
+                proposal_status.set_text("Eva has no current pane context yet.");
+                return;
+            };
+            if let Err(reason) = s.client.watch_task(&context) {
+                proposal_status.set_text(reason);
+            }
+        });
+    }
+    controls.append(&watch_task);
+    controls.append(&goals_box);
+    controls.append(&proposal_status);
     for (title, request) in [
         (
             "Follow me",
@@ -862,6 +917,37 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
             if notice_label.is_mapped() && window.is_mapped() {
                 if let Some(id) = s.client.notices.latest().map(|n| n.notice_id.clone()) {
                     s.client.notice_displayed(&id);
+                }
+            }
+            watch_task.set_sensitive(
+                s.client.gate.proposals_supported()
+                    && s.current_context
+                        .as_ref()
+                        .is_some_and(|c| c.task_id.is_some()),
+            );
+            let revision = s.client.proposals.revision();
+            if revision != s.proposals_rendered {
+                s.proposals_rendered = revision;
+                let latest = s.client.proposals.latest();
+                proposal_box.set_visible(latest.is_some());
+                proposal_label.set_text(&latest.map(host::proposal::card_text).unwrap_or_default());
+                proposal_status.set_text(s.client.proposals.status());
+                while let Some(child) = goals_box.first_child() {
+                    goals_box.remove(&child);
+                }
+                for goal in s.client.proposals.goals() {
+                    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                    let line = gtk::Label::new(Some(&host::proposal::goal_line(goal)));
+                    line.set_wrap(true);
+                    line.set_xalign(0.);
+                    line.set_hexpand(true);
+                    let stop = gtk::Button::with_label("Stop");
+                    let state = state.clone();
+                    let goal_id = goal.goal_id.clone();
+                    stop.connect_clicked(move |_| state.borrow_mut().client.cancel_goal(&goal_id));
+                    row.append(&line);
+                    row.append(&stop);
+                    goals_box.append(&row);
                 }
             }
         }

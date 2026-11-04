@@ -3,6 +3,7 @@
 pub mod dialogue_save;
 pub mod history;
 pub mod notice;
+pub mod proposal;
 pub mod pty_session;
 pub mod shell_identity;
 pub mod voice_text;
@@ -131,6 +132,7 @@ pub struct HostGate {
     history_supported: bool,
     voice_text_supported: bool,
     notices_supported: bool,
+    proposals_supported: bool,
 }
 impl HostGate {
     pub fn new(host: Host) -> Self {
@@ -166,7 +168,12 @@ impl HostGate {
             history_supported: false,
             voice_text_supported: false,
             notices_supported: false,
+            proposals_supported: false,
         }
+    }
+    /// The current connection negotiated `CognitionProposalV1`.
+    pub fn proposals_supported(&self) -> bool {
+        self.proposals_supported
     }
     /// The current connection negotiated `CognitionNoticeV1`.
     pub fn notices_supported(&self) -> bool {
@@ -371,6 +378,7 @@ impl HostGate {
         self.history_supported = false;
         self.voice_text_supported = false;
         self.notices_supported = false;
+        self.proposals_supported = false;
         self.connection_nonce = None;
         self.admitted = false;
         self.admission_epoch = 0;
@@ -405,6 +413,7 @@ impl HostGate {
                 self.history_supported = features.contains(&HostFeature::DialogueHistoryV1);
                 self.voice_text_supported = features.contains(&HostFeature::VoiceTextV1);
                 self.notices_supported = features.contains(&HostFeature::CognitionNoticeV1);
+                self.proposals_supported = features.contains(&HostFeature::CognitionProposalV1);
                 self.connection_generation = self.connection_generation.saturating_add(1);
                 self.admission_generation = self.admission_generation.saturating_add(1);
                 self.admitted = false;
@@ -685,12 +694,15 @@ pub struct SharedHost {
     pub voice_text: voice_text::VoiceTextStatus,
     /// Proactive notices for this window's context; see [`notice::NoticeBoard`].
     pub notices: notice::NoticeBoard,
+    /// Eva's reviewable proposals and active goals; see [`proposal::ProposalBoard`].
+    pub proposals: proposal::ProposalBoard,
 }
-const FEATURES: [HostFeature; 4] = [
+const FEATURES: [HostFeature; 5] = [
     HostFeature::WithdrawalResumeV1,
     HostFeature::DialogueHistoryV1,
     HostFeature::VoiceTextV1,
     HostFeature::CognitionNoticeV1,
+    HostFeature::CognitionProposalV1,
 ];
 /// The first `level` features a modern host asks for. An older coordinator
 /// rejects a longer list as a schema error before admission; the worker then
@@ -824,6 +836,43 @@ impl SharedHost {
             history: Default::default(),
             voice_text: Default::default(),
             notices: Default::default(),
+            proposals: Default::default(),
+        }
+    }
+    /// The user approved the exact proposal shown.
+    pub fn approve_proposal(&mut self, proposal_id: &str) {
+        if let Some(request) = self.proposals.approve(proposal_id) {
+            self.send(request);
+        }
+    }
+    pub fn decline_proposal(&mut self, proposal_id: &str) {
+        if let Some(request) = self.proposals.decline(proposal_id) {
+            self.send(request);
+        }
+    }
+    /// Explicit button: watch this context's task until it finishes.
+    pub fn watch_task(&mut self, context: &ContextRef) -> Result<(), &'static str> {
+        if self.failed || !self.gate.admitted {
+            return Err("Eva is not connected.");
+        }
+        if !self.gate.proposals_supported {
+            return Err("Update the Eva coordinator to watch tasks.");
+        }
+        if context.task_id.is_none() {
+            return Err("This pane has no task to watch.");
+        }
+        self.send(Request::WatchTask {
+            context: context.clone(),
+        });
+        Ok(())
+    }
+    pub fn cancel_goal(&mut self, goal_id: &str) {
+        if self.gate.proposals_supported
+            && self.proposals.goals().iter().any(|g| g.goal_id == goal_id)
+        {
+            self.send(Request::GoalCancel {
+                goal_id: goal_id.into(),
+            });
         }
     }
     /// Acknowledge a notice the window actually drew (once per notice).
@@ -919,6 +968,17 @@ impl SharedHost {
                         }
                         continue;
                     }
+                    if matches!(
+                        &r,
+                        Reply::CognitionProposal { .. }
+                            | Reply::CognitionProposalResult { .. }
+                            | Reply::Goals { .. }
+                    ) {
+                        if self.gate.proposals_supported {
+                            self.proposals.observe(&r);
+                        }
+                        continue;
+                    }
                     if matches!(&r, Reply::ContextAccessReview { .. }) {
                         if self.context_access.len() >= 8 {
                             self.gate.disconnect();
@@ -988,6 +1048,9 @@ impl SharedHost {
         if !self.gate.notices_supported || self.failed {
             self.notices.disconnected();
         }
+        if !self.gate.proposals_supported || self.failed {
+            self.proposals.disconnected();
+        }
         self.flush_controls();
         changed
     }
@@ -1030,6 +1093,7 @@ impl SharedHost {
             }),
             Request::ContextObserved { context } => {
                 self.notices.context_changed(&context);
+                self.proposals.context_changed(&context);
                 self.send_metadata(HostMetadata::ContextObserved { context })
             }
             request => self.send_control(request),
@@ -1324,6 +1388,7 @@ mod tests {
             history: Default::default(),
             voice_text: Default::default(),
             notices: Default::default(),
+            proposals: Default::default(),
         };
         for n in 0..1000 {
             h.send(Request::Focus {
@@ -1368,6 +1433,7 @@ mod tests {
             history: Default::default(),
             voice_text: Default::default(),
             notices: Default::default(),
+            proposals: Default::default(),
         };
         let discovery = Reply::MemoryScopes {
             scopes: vec![MemoryScope::Project("project-without-task".into())],
