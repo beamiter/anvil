@@ -2,6 +2,7 @@
 //! A native presentation acknowledgement is not a compositor scanout guarantee.
 pub mod dialogue_save;
 pub mod history;
+pub mod notice;
 pub mod pty_session;
 pub mod shell_identity;
 pub mod voice_text;
@@ -129,6 +130,7 @@ pub struct HostGate {
     operation_error: Option<String>,
     history_supported: bool,
     voice_text_supported: bool,
+    notices_supported: bool,
 }
 impl HostGate {
     pub fn new(host: Host) -> Self {
@@ -163,7 +165,12 @@ impl HostGate {
             operation_error: None,
             history_supported: false,
             voice_text_supported: false,
+            notices_supported: false,
         }
+    }
+    /// The current connection negotiated `CognitionNoticeV1`.
+    pub fn notices_supported(&self) -> bool {
+        self.notices_supported
     }
     /// The current connection negotiated `VoiceTextV1`.
     pub fn voice_text_supported(&self) -> bool {
@@ -363,6 +370,7 @@ impl HostGate {
     pub fn disconnect(&mut self) {
         self.history_supported = false;
         self.voice_text_supported = false;
+        self.notices_supported = false;
         self.connection_nonce = None;
         self.admitted = false;
         self.admission_epoch = 0;
@@ -396,6 +404,7 @@ impl HostGate {
                 }
                 self.history_supported = features.contains(&HostFeature::DialogueHistoryV1);
                 self.voice_text_supported = features.contains(&HostFeature::VoiceTextV1);
+                self.notices_supported = features.contains(&HostFeature::CognitionNoticeV1);
                 self.connection_generation = self.connection_generation.saturating_add(1);
                 self.admission_generation = self.admission_generation.saturating_add(1);
                 self.admitted = false;
@@ -674,11 +683,14 @@ pub struct SharedHost {
     pub history: history::HistoryView,
     /// Outcome of explicit voice-text requests; see [`voice_text::VoiceTextStatus`].
     pub voice_text: voice_text::VoiceTextStatus,
+    /// Proactive notices for this window's context; see [`notice::NoticeBoard`].
+    pub notices: notice::NoticeBoard,
 }
-const FEATURES: [HostFeature; 3] = [
+const FEATURES: [HostFeature; 4] = [
     HostFeature::WithdrawalResumeV1,
     HostFeature::DialogueHistoryV1,
     HostFeature::VoiceTextV1,
+    HostFeature::CognitionNoticeV1,
 ];
 /// The first `level` features a modern host asks for. An older coordinator
 /// rejects a longer list as a schema error before admission; the worker then
@@ -811,6 +823,19 @@ impl SharedHost {
             context_access: Default::default(),
             history: Default::default(),
             voice_text: Default::default(),
+            notices: Default::default(),
+        }
+    }
+    /// Acknowledge a notice the window actually drew (once per notice).
+    pub fn notice_displayed(&mut self, notice_id: &str) {
+        if let Some(request) = self.notices.displayed(notice_id) {
+            self.send(request);
+        }
+    }
+    /// The user closed a notice.
+    pub fn dismiss_notice(&mut self, notice_id: &str) {
+        if let Some(request) = self.notices.dismiss(notice_id) {
+            self.send(request);
         }
     }
     /// Asks Eva, through the coordinator, for its latest retained spoken reply.
@@ -885,6 +910,15 @@ impl SharedHost {
                     if self.history.observe(&r) || self.voice_text.observe(&r) {
                         continue;
                     }
+                    if matches!(
+                        &r,
+                        Reply::CognitionNotice { .. } | Reply::CognitionNoticeWithdrawn { .. }
+                    ) {
+                        if self.gate.notices_supported {
+                            self.notices.observe(&r);
+                        }
+                        continue;
+                    }
                     if matches!(&r, Reply::ContextAccessReview { .. }) {
                         if self.context_access.len() >= 8 {
                             self.gate.disconnect();
@@ -951,6 +985,9 @@ impl SharedHost {
         if !self.gate.voice_text_supported || self.failed {
             self.voice_text.disconnected();
         }
+        if !self.gate.notices_supported || self.failed {
+            self.notices.disconnected();
+        }
         self.flush_controls();
         changed
     }
@@ -992,6 +1029,7 @@ impl SharedHost {
                 exclusions,
             }),
             Request::ContextObserved { context } => {
+                self.notices.context_changed(&context);
                 self.send_metadata(HostMetadata::ContextObserved { context })
             }
             request => self.send_control(request),
@@ -1285,6 +1323,7 @@ mod tests {
             context_access: Default::default(),
             history: Default::default(),
             voice_text: Default::default(),
+            notices: Default::default(),
         };
         for n in 0..1000 {
             h.send(Request::Focus {
@@ -1328,6 +1367,7 @@ mod tests {
             context_access: Default::default(),
             history: Default::default(),
             voice_text: Default::default(),
+            notices: Default::default(),
         };
         let discovery = Reply::MemoryScopes {
             scopes: vec![MemoryScope::Project("project-without-task".into())],

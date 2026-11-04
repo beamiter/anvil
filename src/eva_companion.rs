@@ -20,6 +20,7 @@ struct State {
     dialogue_save: host::DialogueSave,
     history_rendered: u64,
     voice_text_rendered: u64,
+    notices_rendered: u64,
     pending_displayed: Option<String>,
     body: gtk::glib::WeakRef<gtk::Label>,
     close: close_rules::CloseIntent,
@@ -201,6 +202,7 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
         dialogue_save: Default::default(),
         history_rendered: 0,
         voice_text_rendered: 0,
+        notices_rendered: 0,
         pending_displayed: None,
         body: body.downgrade(),
         close: close_rules::CloseIntent::default(),
@@ -308,6 +310,7 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
         .build();
     menu.add_css_class("eva-companion-dock");
     menu.set_tooltip_text(Some("Open Eva companion"));
+    let notice_menu = menu.downgrade();
     let pop = gtk::Popover::new();
     pop.add_css_class("eva-companion-popover");
     pop.add_css_class("forge-popup");
@@ -317,6 +320,29 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
     status.set_wrap(true);
     status.set_max_width_chars(42);
     controls.append(&status);
+    // Proactive notice (negotiated `cognition_notice_v1` only). Its offer is a
+    // label: nothing here runs it.
+    let notice_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    notice_box.add_css_class("eva-companion-notice");
+    notice_box.set_visible(false);
+    let notice_label = gtk::Label::new(None);
+    notice_label.set_wrap(true);
+    notice_label.set_max_width_chars(42);
+    notice_label.set_selectable(true);
+    notice_label.set_xalign(0.);
+    notice_box.append(&notice_label);
+    let notice_dismiss = gtk::Button::with_label("Dismiss notice");
+    {
+        let state = state.clone();
+        notice_dismiss.connect_clicked(move |_| {
+            let mut s = state.borrow_mut();
+            if let Some(id) = s.client.notices.latest().map(|n| n.notice_id.clone()) {
+                s.client.dismiss_notice(&id);
+            }
+        });
+    }
+    notice_box.append(&notice_dismiss);
+    controls.append(&notice_box);
     for (title, request) in [
         (
             "Follow me",
@@ -817,6 +843,26 @@ pub(crate) fn install(window: &gtk::Window, overlay: &gtk::Overlay, app: &str) {
             if revision != s.voice_text_rendered {
                 s.voice_text_rendered = revision;
                 memory.voice_status.set_text(s.client.voice_text.status());
+            }
+            let revision = s.client.notices.revision();
+            if revision != s.notices_rendered {
+                s.notices_rendered = revision;
+                let latest = s.client.notices.latest();
+                notice_box.set_visible(latest.is_some());
+                notice_label.set_text(&latest.map(host::notice::card_text).unwrap_or_default());
+                if let Some(menu) = notice_menu.upgrade() {
+                    menu.set_label(if latest.is_some() { "Eva •" } else { "Eva" });
+                    let tip = latest
+                        .map(|n| format!("Eva: {}", host::notice::headline(n)))
+                        .unwrap_or_else(|| "Open Eva companion".into());
+                    menu.set_tooltip_text(Some(&tip));
+                }
+            }
+            // Acknowledge only what was actually on screen.
+            if notice_label.is_mapped() && window.is_mapped() {
+                if let Some(id) = s.client.notices.latest().map(|n| n.notice_id.clone()) {
+                    s.client.notice_displayed(&id);
+                }
             }
         }
 

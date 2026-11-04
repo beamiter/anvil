@@ -95,14 +95,25 @@ mod tests {
     }
 
     fn ready_shell(program: &Path, command: &str) -> TestChild {
-        let mut child = TestChild(
-            Command::new(program)
+        // A just-copied program can be briefly "text busy": another test thread
+        // may fork while the copy's write descriptor is still open, and the
+        // child holds it until exec. Retry that specific error only.
+        let mut attempts = 0;
+        let spawned = loop {
+            match Command::new(program)
                 .args(["-c", command])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .spawn()
-                .unwrap(),
-        );
+            {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && attempts < 100 => {
+                    attempts += 1;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => break other.unwrap(),
+            }
+        };
+        let mut child = TestChild(spawned);
         let mut ready = String::new();
         BufReader::new(child.0.stdout.take().unwrap())
             .read_line(&mut ready)

@@ -40,6 +40,8 @@ pub enum HostFeature {
     DialogueHistoryV1,
     /// Explicit review of Eva's retained spoken reply for memory. Requires history.
     VoiceTextV1,
+    /// Proactive notices from validated background cognition. Requires voice text.
+    CognitionNoticeV1,
 }
 /// The only accepted feature sets; order is fixed so a list cannot smuggle duplicates.
 pub fn valid_host_features(features: &[HostFeature]) -> bool {
@@ -55,7 +57,58 @@ pub fn valid_host_features(features: &[HostFeature]) -> bool {
                 HostFeature::DialogueHistoryV1,
                 HostFeature::VoiceTextV1
             ]
+            | [
+                HostFeature::WithdrawalResumeV1,
+                HostFeature::DialogueHistoryV1,
+                HostFeature::VoiceTextV1,
+                HostFeature::CognitionNoticeV1
+            ]
     )
+}
+pub const MAX_NOTICE_TEXT: usize = 2048;
+pub const MAX_NOTICE_EXPLANATION: usize = 512;
+pub const MAX_NOTICE_OFFER: usize = 768;
+pub const MAX_NOTICE_EVIDENCE: usize = 8;
+/// One proactive notice from a background cognitive turn that passed the local
+/// commit check. It is generated for the receiving host's current context; an
+/// offer is a label for something not executed. Nothing here grants authority.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Notice {
+    pub notice_id: String,
+    pub context: ContextRef,
+    /// `task:<id>` the notice is about.
+    pub task_ref: String,
+    /// Decision mode, e.g. `report_status` or `offer_help`.
+    pub mode: String,
+    pub text: String,
+    /// "Why am I seeing this": one or two sentences.
+    pub explanation: String,
+    pub evidence_refs: Vec<String>,
+    pub offer: Option<String>,
+}
+fn notice_text(s: &str, max: usize) -> bool {
+    !s.trim().is_empty() && s.len() <= max && !s.chars().any(|c| c.is_control() && c != '\n')
+}
+fn notice_ref(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 192
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-.:".contains(&b))
+}
+/// Hosts check every received notice; an invalid one is dropped, never shown.
+pub fn valid_notice(n: &Notice) -> bool {
+    identifier(&n.notice_id)
+        && valid_context(&n.context)
+        && n.task_ref.strip_prefix("task:").is_some_and(identifier)
+        && identifier(&n.mode)
+        && notice_text(&n.text, MAX_NOTICE_TEXT)
+        && notice_text(&n.explanation, MAX_NOTICE_EXPLANATION)
+        && n.evidence_refs.len() <= MAX_NOTICE_EVIDENCE
+        && n.evidence_refs.iter().all(|r| notice_ref(r))
+        && n.offer
+            .as_deref()
+            .is_none_or(|o| notice_text(o, MAX_NOTICE_OFFER))
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -363,6 +416,14 @@ pub enum Request {
         request_id: u64,
         context: ContextRef,
     },
+    /// The host actually showed this notice (negotiated `CognitionNoticeV1`).
+    CognitionNoticeDisplayed {
+        notice_id: String,
+    },
+    /// The user dismissed this notice; the coordinator quiets that cause longer.
+    CognitionNoticeDismissed {
+        notice_id: String,
+    },
     EvaHello,
     Audio {
         turn_id: String,
@@ -560,6 +621,14 @@ pub enum Reply {
     DialogueHistoryWithdrawn {
         reason: String,
     },
+    /// Sent only to hosts that negotiated `CognitionNoticeV1`.
+    CognitionNotice {
+        notice: Notice,
+    },
+    /// Clear every displayed notice (desktop locked or unknown).
+    CognitionNoticeWithdrawn {
+        reason: String,
+    },
     Accepted {
         boot_id: String,
         companion_id: String,
@@ -733,6 +802,12 @@ pub fn decode(bytes: &[u8]) -> Result<Envelope, String> {
             context,
         } if *request_id == 0 || !valid_context(context) => {
             return Err("invalid_voice_text_request".into())
+        }
+        Request::CognitionNoticeDisplayed { notice_id }
+        | Request::CognitionNoticeDismissed { notice_id }
+            if !identifier(notice_id) =>
+        {
+            return Err("invalid_notice".into())
         }
         Request::MemoryScopes { after: Some(after) }
             if !(after == "global"
@@ -943,6 +1018,89 @@ mod tests {
 #[cfg(test)]
 mod host_feature_tests {
     use super::*;
+    #[test]
+    fn notice_feature_extends_the_ordered_chain_only() {
+        use HostFeature::*;
+        assert!(valid_host_features(&[
+            WithdrawalResumeV1,
+            DialogueHistoryV1,
+            VoiceTextV1,
+            CognitionNoticeV1
+        ]));
+        for skipped in [
+            vec![WithdrawalResumeV1, CognitionNoticeV1],
+            vec![WithdrawalResumeV1, DialogueHistoryV1, CognitionNoticeV1],
+            vec![
+                WithdrawalResumeV1,
+                DialogueHistoryV1,
+                CognitionNoticeV1,
+                VoiceTextV1,
+            ],
+        ] {
+            assert!(!valid_host_features(&skipped), "{skipped:?}");
+        }
+        assert_eq!(
+            serde_json::to_value(CognitionNoticeV1).unwrap(),
+            "cognition_notice_v1"
+        );
+    }
+    fn notice() -> Notice {
+        Notice {
+            notice_id: "n-1".into(),
+            context: ContextRef {
+                host_id: "h".into(),
+                pane_id: "p".into(),
+                task_id: Some("build".into()),
+                project_id: Some("alpha".into()),
+                revision: 2,
+            },
+            task_ref: "task:build".into(),
+            mode: "report_status".into(),
+            text: "build 失败了。\n第二行".into(),
+            explanation: "收到失败回执。".into(),
+            evidence_refs: vec!["evt:task:build:3:failed".into()],
+            offer: Some("交给 Agent 检查".into()),
+        }
+    }
+    #[test]
+    fn notices_are_bounded_and_carry_no_control_bytes() {
+        assert!(valid_notice(&notice()));
+        let bad: Vec<fn(&mut Notice)> = vec![
+            |n| n.notice_id = "n 1".into(),
+            |n| n.task_ref = "build".into(),
+            |n| n.task_ref = "task:a b".into(),
+            |n| n.text = "  ".into(),
+            |n| n.text = "x".repeat(MAX_NOTICE_TEXT + 1),
+            |n| n.text = "ok\u{1b}[2J".into(),
+            |n| n.explanation = "ok\u{9b}m".into(),
+            |n| n.evidence_refs = vec!["evt bad".into()],
+            |n| n.evidence_refs = vec!["e".into(); MAX_NOTICE_EVIDENCE + 1],
+            |n| n.offer = Some("\t".into()),
+            |n| n.context.host_id = "h h".into(),
+        ];
+        for mutate in bad {
+            let mut n = notice();
+            mutate(&mut n);
+            assert!(!valid_notice(&n), "{n:?}");
+        }
+        let wire = serde_json::json!({"type":"cognition_notice","notice":notice()});
+        let back: Reply = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(back, Reply::CognitionNotice { notice: notice() });
+        let mut extra = wire;
+        extra["notice"]["authorized"] = true.into();
+        assert!(serde_json::from_value::<Reply>(extra).is_err());
+    }
+    #[test]
+    fn notice_acknowledgements_need_identifiers() {
+        for kind in ["cognition_notice_displayed", "cognition_notice_dismissed"] {
+            assert!(decode(&wire(serde_json::json!({"type":kind,"notice_id":"n-1"}))).is_ok());
+            assert!(decode(&wire(serde_json::json!({"type":kind,"notice_id":"n 1"}))).is_err());
+            assert!(decode(&wire(
+                serde_json::json!({"type":kind,"notice_id":"n-1","extra":1})
+            ))
+            .is_err());
+        }
+    }
     fn wire(body: serde_json::Value) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({"protocol_version":1,"event_id":"e","source_id":"h","source_seq":1,"boot_id":"boot","session_id":"session","body":body})).unwrap()
     }
