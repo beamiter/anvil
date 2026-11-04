@@ -48,6 +48,10 @@ pub(crate) struct Sidebar {
 }
 
 impl Sidebar {
+    pub(crate) fn desktop_session(&self,id:&RuntimeIdentity)->Option<AgentSession> {
+        self.manager.catalog.borrow().sessions.iter().find(|session|runtime_identity(session)==*id).cloned()
+    }
+
     pub fn bind_navigation(&self, navigation: &super::workspace_navigation::Navigation) {
         *self.manager.navigation.borrow_mut() = Some(navigation.clone());
     }

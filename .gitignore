@@ -9,3 +9,8 @@
 # Nix build output
 /result
 .cargo/config.toml
+
+# Review the candidate shared-core source override with the frontend.
+!.cargo/
+.cargo/*
+!.cargo/config.toml

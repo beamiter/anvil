@@ -29,6 +29,7 @@ mod config_store;
 mod context_menu;
 mod diagnostics;
 mod dialogs;
+mod desktop_sessions;
 mod enter_ownership;
 mod file_drop;
 mod file_tree;
@@ -346,6 +347,7 @@ struct AppModel {
     shell_argv: Rc<Vec<String>>,
     tabs: Vec<Tab>,
     agent_session_tabs: std::collections::HashMap<agent_sessions::RuntimeIdentity, u64>,
+    desktop_sessions: Option<jterm_core::desktop_sessions::Bridge>,
     agent_session_library: Rc<RefCell<jterm_core::agent_sessions::SessionLibraryStore>>,
     agent_session_pending: std::collections::HashMap<u64, agent_sessions::ResumeRequest>,
     active: usize,
@@ -1487,6 +1489,7 @@ impl SimpleComponent for AppModel {
             shell_argv,
             tabs: Vec::new(),
             agent_session_tabs: std::collections::HashMap::new(),
+            desktop_sessions: None,
             agent_session_library,
             agent_session_pending: std::collections::HashMap::new(),
             active: 0,
@@ -2086,6 +2089,7 @@ impl SimpleComponent for AppModel {
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
         match msg {
             AppMsg::WorkspaceTick => {
+                self.poll_desktop_sessions(&sender);
                 self.ai_panel
                     .emit(dialogs::ai_panel::AiPanelMsg::WorkspacePoll);
                 self.sync_workspace_navigation();
