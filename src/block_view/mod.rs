@@ -88,6 +88,124 @@ use selection_hold::SelectionFeedHold;
 pub(crate) use unified_chrome::format_block_duration;
 use watch_reader::WatchReader;
 
+// An allocation-only overlay has no visual or pointer region. Merely setting
+// can_target=false is insufficient: explanatory tooltip queries intentionally
+// include non-targetable widgets to respect genuine covering overlays.
+mod allocation_observer {
+    use gtk::{glib, subclass::prelude::*};
+    use relm4::gtk;
+
+    mod imp {
+        use super::*;
+
+        #[derive(Default)]
+        pub struct AllocationObserver;
+
+        #[glib::object_subclass]
+        impl ObjectSubclass for AllocationObserver {
+            const NAME: &'static str = "AnvilCanvasAllocationObserver";
+            type Type = super::AllocationObserver;
+            type ParentType = gtk::DrawingArea;
+        }
+
+        impl ObjectImpl for AllocationObserver {}
+        impl WidgetImpl for AllocationObserver {
+            fn contains(&self, _: f64, _: f64) -> bool {
+                false
+            }
+        }
+        impl DrawingAreaImpl for AllocationObserver {}
+    }
+
+    glib::wrapper! {
+        pub struct AllocationObserver(ObjectSubclass<imp::AllocationObserver>)
+            @extends gtk::Widget, gtk::DrawingArea,
+            @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+    }
+
+    pub(super) fn new() -> AllocationObserver {
+        glib::Object::new()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use gtk::prelude::*;
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::time::{Duration, Instant};
+
+        #[test]
+        #[ignore = "requires an isolated GTK display"]
+        fn canvas_observer_preserves_resize_without_occluding_picks() {
+            gtk::init().unwrap();
+            let label = gtk::Label::new(Some("Underlying explanatory label"));
+            let overlay = gtk::Overlay::new();
+            overlay.set_child(Some(&label));
+            let observer = super::new();
+            observer.set_can_target(false);
+            observer.set_focusable(false);
+            overlay.add_overlay(&observer);
+            overlay.set_measure_overlay(&observer, false);
+            let resizes = Rc::new(Cell::new(0));
+            let seen = resizes.clone();
+            observer.connect_resize(move |_, _, _| seen.set(seen.get() + 1));
+            let window = gtk::Window::builder()
+                .default_width(320)
+                .default_height(120)
+                .child(&overlay)
+                .build();
+            window.present();
+            let context = glib::MainContext::default();
+            let wait = |ready: &dyn Fn() -> bool| {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !ready() {
+                    while context.iteration(false) {}
+                    assert!(
+                        Instant::now() < deadline,
+                        "native allocation did not settle"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            };
+            wait(&|| observer.is_mapped() && observer.width() > 0 && resizes.get() > 0);
+            assert_eq!(observer.width(), overlay.width());
+            assert_eq!(observer.height(), overlay.height());
+            let pick = |flags| {
+                let bounds = label.compute_bounds(&window).unwrap();
+                window.pick(
+                    f64::from(bounds.x() + bounds.width() / 2.0),
+                    f64::from(bounds.y() + bounds.height() / 2.0),
+                    flags,
+                )
+            };
+            let expected = Some(label.clone().upcast::<gtk::Widget>());
+            assert_eq!(pick(gtk::PickFlags::DEFAULT), expected);
+            assert_eq!(pick(gtk::PickFlags::NON_TARGETABLE), expected);
+            let width = observer.width();
+            let count = resizes.get();
+            window.set_default_size(460, 180);
+            wait(&|| observer.width() > width && resizes.get() > count);
+            assert_eq!(pick(gtk::PickFlags::NON_TARGETABLE), expected);
+
+            // A real covering widget still occludes explanatory picking even
+            // when normal pointer routing passes through that widget.
+            let cover = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            cover.set_can_target(false);
+            overlay.add_overlay(&cover);
+            wait(&|| cover.is_mapped() && cover.width() == overlay.width());
+            assert_eq!(pick(gtk::PickFlags::DEFAULT), expected);
+            assert_eq!(
+                pick(gtk::PickFlags::NON_TARGETABLE),
+                Some(cover.clone().upcast())
+            );
+            overlay.remove_overlay(&cover);
+            assert_eq!(pick(gtk::PickFlags::NON_TARGETABLE), expected);
+            window.close();
+        }
+    }
+}
+
 // ── perf profiling (env JTERM_PROF=1) ───────────────────────────────────────
 pub(crate) fn prof_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -12558,7 +12676,7 @@ impl TermView {
             chat_frame.set_child(Some(&chat_canvas));
             chat_frame.set_hexpand(true);
             chat_frame.set_vexpand(true);
-            let observer = gtk::DrawingArea::new();
+            let observer = allocation_observer::new();
             observer.set_halign(gtk::Align::Fill);
             observer.set_valign(gtk::Align::Fill);
             observer.set_can_target(false);
