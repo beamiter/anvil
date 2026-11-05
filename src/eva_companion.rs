@@ -1441,7 +1441,10 @@ fn motion_key(m: atlas::Motion) -> &'static str {
     }
 }
 
-type HostRegistration = (gtk::glib::WeakRef<gtk::Window>, std::rc::Weak<RefCell<State>>);
+type HostRegistration = (
+    gtk::glib::WeakRef<gtk::Window>,
+    std::rc::Weak<RefCell<State>>,
+);
 
 thread_local! {
     static HOSTS: RefCell<Vec<HostRegistration>> = const { RefCell::new(Vec::new()) };
