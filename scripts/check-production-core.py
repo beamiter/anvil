@@ -56,6 +56,17 @@ def check(root):
         raise ValueError("Production source receipt disagrees with the manifest")
     if f'"jterm_core-0.2.0" = "{receipt.get("source_nar_sha256")}";' not in flake:
         raise ValueError("Nix hash disagrees with the production source receipt")
+    for name in ("host-adapter-bundle", "process-adapter-bundle"):
+        bundle = json.loads((root / f"vendor/{name}.json").read_text())
+        if bundle.get("public_core_base") != revision:
+            raise ValueError(f"{name} receipt names a different production core")
+    fixture = root / "scripts/link-recovery"
+    fixture_core = tomllib.loads((fixture / "Cargo.toml").read_text())["dependencies"]["jterm_core"]
+    if fixture_core.get("git") != dependency["git"] or fixture_core.get("rev") != revision or "path" in fixture_core:
+        raise ValueError("Link-recovery fixture manifest names a different core")
+    fixture_cores = [p for p in tomllib.loads((fixture / "Cargo.lock").read_text())["package"] if p["name"] == "jterm_core"]
+    if len(fixture_cores) != 1 or fixture_cores[0].get("source") != expected:
+        raise ValueError("Link-recovery fixture lock names a different core")
     return revision
 
 

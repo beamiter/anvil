@@ -313,7 +313,7 @@ impl WorkspaceReview {
                 self.report_loading = false;
                 match result {
                     Ok(WorkspaceReply::Result { report }) if report.conversation == id => {
-                        self.report = Some(report);
+                        self.report = Some(*report);
                         self.notice = None;
                     }
                     Err(error) => self.notice = Some(format!("Result evidence: {error}")),
@@ -523,5 +523,62 @@ mod tests {
         assert!(!state.receive(1, Err("Previous task is gone".into())));
         assert!(state.report.is_none());
         assert!(state.notice.is_none());
+    }
+
+    #[test]
+    fn boxed_result_preserves_current_selection_identity() {
+        for matches_selection in [true, false] {
+            let id = ConversationId("selected".into());
+            let mut state = WorkspaceReview {
+                selected: Some(id.clone()),
+                generation: 7,
+                report_loading: true,
+                ..Default::default()
+            };
+            state.pending.insert(
+                1,
+                Pending::Result {
+                    id: id.clone(),
+                    generation: 7,
+                },
+            );
+            let report = WorkspaceResultReport {
+                conversation: if matches_selection {
+                    id.clone()
+                } else {
+                    ConversationId("other".into())
+                },
+                task_id: jterm_core::agent_task::TaskId::new(),
+                run_id: "fixture-run".into(),
+                source_sequence: 9,
+                baseline: None,
+                current: None,
+                validation: None,
+                validation_current: false,
+                validation_status: "Not run".into(),
+                validation_output: String::new(),
+                validation_output_truncated: false,
+                error: None,
+            };
+            assert!(state.receive(
+                1,
+                Ok(WorkspaceReply::Result {
+                    report: Box::new(report)
+                })
+            ));
+            assert!(!state.report_loading);
+            assert_eq!(state.report.is_some(), matches_selection);
+            if let Some(report) = &state.report {
+                assert_eq!(report.conversation, id);
+                assert_eq!(report.run_id, "fixture-run");
+                assert_eq!(report.source_sequence, 9);
+            } else {
+                assert!(state
+                    .notice
+                    .as_deref()
+                    .unwrap()
+                    .contains("different result"));
+            }
+        }
     }
 }

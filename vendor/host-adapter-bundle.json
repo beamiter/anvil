@@ -1,7 +1,7 @@
 {
   "adapter_source_core_base": "10120c3aa690ff5e1a66ae15f2418b753e2053f1",
   "bundle": "withdrawal-resume-v1",
-  "core_pin_verification": "Current application dependency pin checked against the exact local core commit; remote publication is pending. Existing bundled source files and their checksums are unchanged. adapter_source_core_base retains the prior core base; this repin does not claim a rerun of all prior native adapter acceptance tests.",
+  "core_pin_verification": "Application and fixture source pins match the published c1aebbe7 core commit. Existing adapter source files and their checksums are unchanged. adapter_source_core_base retains the original adapter base; this source repin alone does not claim native adapter acceptance.",
   "files_sha256": {
     "src/gtk_clock_fixture.rs": "3e1c4827a77cac5d79ebe2d40c5dc9ecbfdf5a88c72c0d3b43785cb32858126d",
     "src/gtk_close.rs": "4bbee5053b58a0b93a784a24f48c5b8a74a4f0db2fb83e617353d8a0cb417cd8",
@@ -32,7 +32,7 @@
     "vendor/companion-protocol/upstream-Cargo.toml": "89c06787e200d75685facc835f0bb000186549b1b35eb62768d876e10eea6428"
   },
   "public_companion_base": "9aa569540091524d637a7115b64c587b9177a55b",
-  "public_core_base": "d7387fce27bf2b1e60ff2652ab04239a0b809dd3",
+  "public_core_base": "c1aebbe7b6ad4a8edb98582ea282d6e4d2ba6816",
   "schema": 1,
   "scope": "Exact versioned host/protocol/client source overlay with GTK frame identity and negotiated withdrawal resumption, validated against public_core_base. Bundled source origins and hashes and the public companion/atlas base are unchanged. This overlay is not a separately published companion release.",
   "version": "0.1.0"

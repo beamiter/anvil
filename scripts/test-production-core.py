@@ -19,7 +19,7 @@ class SourceContract(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory(prefix="anvil-core-contract-")
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
-        for name in ["Cargo.toml", "Cargo.lock", ".cargo/config.toml", "flake.nix", "packaging/flatpak/cargo-sources.json", "packaging/jterm-core-production.json"]:
+        for name in ["Cargo.toml", "Cargo.lock", ".cargo/config.toml", "flake.nix", "packaging/flatpak/cargo-sources.json", "packaging/jterm-core-production.json", "vendor/host-adapter-bundle.json", "vendor/process-adapter-bundle.json", "scripts/link-recovery/Cargo.toml", "scripts/link-recovery/Cargo.lock"]:
             target = self.root / name
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes((ROOT / name).read_bytes())
@@ -85,6 +85,31 @@ class SourceContract(unittest.TestCase):
         receipt["source_nar_sha256"] = "sha256-" + "A" * 43 + "="
         path.write_text(json.dumps(receipt))
         with self.assertRaisesRegex(ValueError, "Nix hash"):
+            checker.check(self.root)
+
+    def test_adapter_receipts_are_checked(self):
+        for name in ("host-adapter-bundle", "process-adapter-bundle"):
+            path = self.root / f"vendor/{name}.json"
+            original = path.read_text()
+            receipt = json.loads(original)
+            receipt["public_core_base"] = "0" * 40
+            path.write_text(json.dumps(receipt))
+            with self.assertRaisesRegex(ValueError, name):
+                checker.check(self.root)
+            path.write_text(original)
+
+    def test_nested_fixture_manifest_is_checked(self):
+        path = self.root / "scripts/link-recovery/Cargo.toml"
+        revision = checker.check(self.root)
+        path.write_text(path.read_text().replace(revision, "0" * 40))
+        with self.assertRaisesRegex(ValueError, "fixture manifest"):
+            checker.check(self.root)
+
+    def test_nested_fixture_lock_is_checked(self):
+        path = self.root / "scripts/link-recovery/Cargo.lock"
+        revision = checker.check(self.root)
+        path.write_text(path.read_text().replace(revision, "0" * 40))
+        with self.assertRaisesRegex(ValueError, "fixture lock"):
             checker.check(self.root)
 
 
