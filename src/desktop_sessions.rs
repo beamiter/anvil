@@ -11,10 +11,7 @@ impl AppModel {
             };
             let raw = if surface.type_().name().contains("X11") {
                 let function = unsafe {
-                    libc::dlsym(
-                        libc::RTLD_DEFAULT,
-                        b"gdk_x11_surface_get_xid\0".as_ptr().cast(),
-                    )
+                    libc::dlsym(libc::RTLD_DEFAULT, c"gdk_x11_surface_get_xid".as_ptr())
                 };
                 if function.is_null() {
                     None

@@ -795,9 +795,15 @@ mod tests {
         let form = TEST_COMPOSER.with(|slot| slot.borrow().upgrade()).unwrap();
         let draft = form.draft().unwrap();
         assert_eq!(draft.eva_operation.as_deref(), Some("op-1"));
-        assert!(draft.brief.validation.is_none(), "validation stays the user's choice");
+        assert!(
+            draft.brief.validation.is_none(),
+            "validation stays the user's choice"
+        );
         assert!(form.goal_view.is_editable());
-        assert!(requests.borrow().is_empty(), "opening the form submitted nothing");
+        assert!(
+            requests.borrow().is_empty(),
+            "opening the form submitted nothing"
+        );
         drop(form);
         let window = TEST_COMPOSER
             .with(|slot| slot.borrow().upgrade())

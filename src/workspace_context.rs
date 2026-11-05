@@ -420,8 +420,10 @@ mod tests {
     use super::*;
     fn editor() -> (ContextEditor, ConversationId) {
         let id = ConversationId("fixture-context".into());
-        let mut editor = ContextEditor::default();
-        editor.selected = Some(id.clone());
+        let mut editor = ContextEditor {
+            selected: Some(id.clone()),
+            ..Default::default()
+        };
         editor.entries.insert(
             id.clone(),
             Entry {

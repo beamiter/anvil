@@ -1100,18 +1100,16 @@ pub(crate) fn install_with_handoffs(
                 host::Reply::MemoryResult {
                     review_id,
                     status: result,
-                } => {
-                    if (review_id.is_none() && s.memory_review.is_none())
-                        || s.memory_review
-                            .as_ref()
-                            .is_some_and(|(_, r)| Some(r.id) == review_id)
-                    {
-                        memory
-                            .status
-                            .set_text(&format!("Memory result: {}", result));
-                        memory.approve.set_sensitive(false);
-                        s.memory_review = None;
-                    }
+                } if (review_id.is_none() && s.memory_review.is_none())
+                    || s.memory_review
+                        .as_ref()
+                        .is_some_and(|(_, r)| Some(r.id) == review_id) =>
+                {
+                    memory
+                        .status
+                        .set_text(&format!("Memory result: {}", result));
+                    memory.approve.set_sensitive(false);
+                    s.memory_review = None;
                 }
                 _ => {}
             }
@@ -1443,8 +1441,10 @@ fn motion_key(m: atlas::Motion) -> &'static str {
     }
 }
 
+type HostRegistration = (gtk::glib::WeakRef<gtk::Window>, std::rc::Weak<RefCell<State>>);
+
 thread_local! {
-    static HOSTS: RefCell<Vec<(gtk::glib::WeakRef<gtk::Window>, std::rc::Weak<RefCell<State>>)>> = const { RefCell::new(Vec::new()) };
+    static HOSTS: RefCell<Vec<HostRegistration>> = const { RefCell::new(Vec::new()) };
 }
 fn with_state(window: &gtk::Window, f: impl FnOnce(&mut State)) {
     HOSTS.with(|hosts| {
@@ -1495,9 +1495,17 @@ fn agent_validation(status: jterm_core::agent_task::TaskValidationStatus) -> hos
 }
 /// Report the lifecycle of tasks created from Eva handoffs, as the task
 /// runtime has them. Only linked tasks are sent, and only when they change.
-pub(crate) fn report_agent_tasks(window: &gtk::Window, tasks: &[jterm_core::agent_task::AgentTask]) {
+pub(crate) fn report_agent_tasks(
+    window: &gtk::Window,
+    tasks: &[jterm_core::agent_task::AgentTask],
+) {
     with_state(window, |s| {
-        let linked: Vec<String> = s.client.handoffs.linked_tasks().map(str::to_owned).collect();
+        let linked: Vec<String> = s
+            .client
+            .handoffs
+            .linked_tasks()
+            .map(str::to_owned)
+            .collect();
         for id in linked {
             if let Some(task) = tasks.iter().find(|t| t.id.to_string() == id) {
                 s.client.agent_task_status(
@@ -1699,105 +1707,6 @@ fn task_status(value: jterm_core::agent_task::TaskStatus) -> host::TaskStatus {
 }
 fn presentation_evidence(complete: bool, presentation_time: i64) -> bool {
     complete && presentation_time > 0
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn every_skin_pose_is_colored_and_escaped_without_emoji() {
-        for skin in atlas::Skin::ALL {
-            for pose in atlas::Pose::ALL {
-                let f = atlas::sample(atlas::Request::new(skin, pose)).unwrap();
-                let m = markup(&f, skin, false);
-                assert!(m.starts_with("<span font_family=\"monospace\""));
-                assert!(m.contains("foreground=\"#"));
-                assert!(!m.contains("<3"));
-                assert_eq!(f.cells.len(), f.width * f.height);
-                assert!(f.cells.iter().all(|c| c.glyph.is_ascii()));
-            }
-        }
-    }
-    #[test]
-    fn safe_edges_hide_when_fully_excluded_and_compact_when_narrow() {
-        assert!(safe_edge(
-            (800, 600),
-            &[Rect {
-                x: 0.,
-                y: 0.,
-                width: 800.,
-                height: 600.
-            }],
-            (280, 264),
-            (100, 72)
-        )
-        .is_none());
-        assert!(safe_edge((220, 240), &[], (280, 264), (100, 72)).unwrap().1);
-        assert!(!safe_edge((800, 600), &[], (280, 264), (100, 72)).unwrap().1);
-    }
-    #[test]
-    fn companion_uses_canvas_gap_without_covering_inspector_or_output() {
-        let exclusions = [
-            Rect {
-                x: 0.,
-                y: 0.,
-                width: 300.,
-                height: 1000.,
-            },
-            Rect {
-                x: 1360.,
-                y: 0.,
-                width: 312.,
-                height: 1000.,
-            },
-            Rect {
-                x: 300.,
-                y: 0.,
-                width: 1060.,
-                height: 220.,
-            },
-            Rect {
-                x: 300.,
-                y: 840.,
-                width: 1060.,
-                height: 160.,
-            },
-        ];
-        let (body, compact) = safe_edge((1672, 1000), &exclusions, (240, 242), (120, 121)).unwrap();
-        assert!(!compact);
-        assert!(body.x >= 300. && body.y >= 220.);
-        assert!(body.x + body.width <= 1360. && body.y + body.height <= 840.);
-        assert!(exclusions.iter().all(|r| !r.overlaps(body)));
-    }
-    #[test]
-    fn only_actual_receipts_map_to_success() {
-        use jterm_core::agent_task::TaskStatus as T;
-        assert_eq!(
-            task_status(T::ReadyForReview),
-            host::TaskStatus::NeedsReview
-        );
-        assert_eq!(task_status(T::Completed), host::TaskStatus::Succeeded);
-        assert_eq!(task_status(T::Cancelled), host::TaskStatus::Unknown);
-    }
-    #[test]
-    fn native_proof_rejects_submission_without_presentation() {
-        assert!(!presentation_evidence(false, 42));
-        assert!(!presentation_evidence(true, 0));
-        assert!(presentation_evidence(true, 42));
-    }
-    /// Requires a real GTK display; intentionally not silently mocked by CI.
-    #[test]
-    #[ignore = "requires native GTK display; run explicitly in native matrix"]
-    fn shared_body_is_non_layout_and_pointer_transparent() {
-        gtk::init().unwrap();
-        let overlay = gtk::Overlay::new();
-        let body = gtk::Label::new(Some("Eva"));
-        body.set_can_target(false);
-        overlay.add_overlay(&body);
-        overlay.set_measure_overlay(&body, false);
-        assert!(!overlay.is_measure_overlay(&body));
-        assert!(!body.can_target());
-    }
 }
 
 static SHARED_MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2771,4 +2680,103 @@ fn restore_close_focus(
             focus.grab_focus();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn every_skin_pose_is_colored_and_escaped_without_emoji() {
+        for skin in atlas::Skin::ALL {
+            for pose in atlas::Pose::ALL {
+                let f = atlas::sample(atlas::Request::new(skin, pose)).unwrap();
+                let m = markup(&f, skin, false);
+                assert!(m.starts_with("<span font_family=\"monospace\""));
+                assert!(m.contains("foreground=\"#"));
+                assert!(!m.contains("<3"));
+                assert_eq!(f.cells.len(), f.width * f.height);
+                assert!(f.cells.iter().all(|c| c.glyph.is_ascii()));
+            }
+        }
+    }
+    #[test]
+    fn safe_edges_hide_when_fully_excluded_and_compact_when_narrow() {
+        assert!(safe_edge(
+            (800, 600),
+            &[Rect {
+                x: 0.,
+                y: 0.,
+                width: 800.,
+                height: 600.
+            }],
+            (280, 264),
+            (100, 72)
+        )
+        .is_none());
+        assert!(safe_edge((220, 240), &[], (280, 264), (100, 72)).unwrap().1);
+        assert!(!safe_edge((800, 600), &[], (280, 264), (100, 72)).unwrap().1);
+    }
+    #[test]
+    fn companion_uses_canvas_gap_without_covering_inspector_or_output() {
+        let exclusions = [
+            Rect {
+                x: 0.,
+                y: 0.,
+                width: 300.,
+                height: 1000.,
+            },
+            Rect {
+                x: 1360.,
+                y: 0.,
+                width: 312.,
+                height: 1000.,
+            },
+            Rect {
+                x: 300.,
+                y: 0.,
+                width: 1060.,
+                height: 220.,
+            },
+            Rect {
+                x: 300.,
+                y: 840.,
+                width: 1060.,
+                height: 160.,
+            },
+        ];
+        let (body, compact) = safe_edge((1672, 1000), &exclusions, (240, 242), (120, 121)).unwrap();
+        assert!(!compact);
+        assert!(body.x >= 300. && body.y >= 220.);
+        assert!(body.x + body.width <= 1360. && body.y + body.height <= 840.);
+        assert!(exclusions.iter().all(|r| !r.overlaps(body)));
+    }
+    #[test]
+    fn only_actual_receipts_map_to_success() {
+        use jterm_core::agent_task::TaskStatus as T;
+        assert_eq!(
+            task_status(T::ReadyForReview),
+            host::TaskStatus::NeedsReview
+        );
+        assert_eq!(task_status(T::Completed), host::TaskStatus::Succeeded);
+        assert_eq!(task_status(T::Cancelled), host::TaskStatus::Unknown);
+    }
+    #[test]
+    fn native_proof_rejects_submission_without_presentation() {
+        assert!(!presentation_evidence(false, 42));
+        assert!(!presentation_evidence(true, 0));
+        assert!(presentation_evidence(true, 42));
+    }
+    /// Requires a real GTK display; intentionally not silently mocked by CI.
+    #[test]
+    #[ignore = "requires native GTK display; run explicitly in native matrix"]
+    fn shared_body_is_non_layout_and_pointer_transparent() {
+        gtk::init().unwrap();
+        let overlay = gtk::Overlay::new();
+        let body = gtk::Label::new(Some("Eva"));
+        body.set_can_target(false);
+        overlay.add_overlay(&body);
+        overlay.set_measure_overlay(&body, false);
+        assert!(!overlay.is_measure_overlay(&body));
+        assert!(!body.can_target());
+    }
 }

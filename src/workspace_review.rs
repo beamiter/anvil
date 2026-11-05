@@ -432,8 +432,10 @@ mod tests {
     }
     #[test]
     fn immediate_runtime_fact_wins_over_older_catalog_but_fallback_does_not() {
-        let mut state = WorkspaceReview::default();
-        state.rows = vec![row(Some(10), "Catalog")];
+        let state = WorkspaceReview {
+            rows: vec![row(Some(10), "Catalog")],
+            ..Default::default()
+        };
         assert_eq!(
             state.combined_rows(&[row(Some(11), "Live current")])[0].title,
             "Live current"
@@ -449,8 +451,10 @@ mod tests {
     }
     #[test]
     fn newer_unsequenced_metadata_survives_an_older_catalog_refresh() {
-        let mut state = WorkspaceReview::default();
-        state.rows = vec![row(None, "Old API title")];
+        let state = WorkspaceReview {
+            rows: vec![row(None, "Old API title")],
+            ..Default::default()
+        };
         let mut current = row(None, "Renamed API");
         current.updated_at_ms = 2;
         assert_eq!(state.combined_rows(&[current])[0].title, "Renamed API");
@@ -504,9 +508,11 @@ mod tests {
 
     #[test]
     fn late_result_cannot_replace_a_new_selection() {
-        let mut state = WorkspaceReview::default();
-        state.selected = Some(ConversationId("current".into()));
-        state.generation = 2;
+        let mut state = WorkspaceReview {
+            selected: Some(ConversationId("current".into())),
+            generation: 2,
+            ..Default::default()
+        };
         state.pending.insert(
             1,
             Pending::Result {

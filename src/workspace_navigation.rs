@@ -929,7 +929,7 @@ pub(crate) fn wrap_button_labels(root: &impl IsA<gtk::Widget>) {
 /// Preserve existing identities while the user is reading or interacting.
 /// Newly discovered rows remain reachable, after the retained rows, until an
 /// explicit refresh or an idle-at-top update applies the chronological order.
-fn stable_reading_order(rows: &mut Vec<Row>, previous: &[RowIdentity], freeze: bool) -> bool {
+fn stable_reading_order(rows: &mut [Row], previous: &[RowIdentity], freeze: bool) -> bool {
     if !freeze {
         return false;
     }
