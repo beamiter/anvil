@@ -141,7 +141,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check all targets
-        run: cargo check --all-targets --locked
+        run: bash scripts/check-clean-build.sh
 
       - name: Run tests
         id: tests

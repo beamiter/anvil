@@ -204,6 +204,14 @@ instructions are in
 
 For development:
 
+Clean checkouts fetch the exact published shared-core revision through Cargo. No
+`../jterm_core` sibling or source-materialization step is required. With the GTK,
+libadwaita and VTE development packages installed,
+`cargo check --all-targets --locked` and `cargo build --release --locked` work directly.
+`scripts/check-clean-build.sh` checks the committed tree in a fresh directory
+without a sibling checkout. The historical packaged core archive is not a
+production input.
+
 ```bash
 make run       # debug build and launch
 make test      # cargo test --all-targets

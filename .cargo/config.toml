@@ -1,6 +1,3 @@
-# Candidate source integration: preserve the upstream Git pin in Cargo.toml,
-# but build this reviewed sibling core atomically with the frontend.
-# scripts/materialize-shared-core.sh reconstructs this sibling from the
-# deterministic bundled snapshot for an isolated checkout.
-[patch."https://github.com/beamiter/jterm_core.git"]
-jterm_core = { path = "../jterm_core" }
+# Production builds resolve the exact Git revision in Cargo.toml and Cargo.lock.
+# Do not commit sibling path overrides here: they also affect nested fixtures.
+# Explicit local candidate overrides are development-only, never release evidence.

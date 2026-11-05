@@ -13,5 +13,6 @@
   "nar_baseline_commit": "10120c3aa690ff5e1a66ae15f2418b753e2053f1",
   "nar_baseline_sha256": "sha256-pWlvnbcgGitlQ+Hm30ONIB0z6NgGGWu7sJvlH4UuZB0=",
   "nar_baseline_reproduced": true,
-  "flatpak_sources_verification": "Existing pinned update-flatpak-cargo-sources.sh --update and --check both passed. All 199 registry package archives/checksums match Cargo.lock; the Git entry and offline source configuration name the exact core pin. A temporary command-scoped Git URL mapping read the same local core commit during generation; output retains the public repository URL. No remote publication or Flatpak runtime build is claimed."
+  "flatpak_sources_verification": "Existing pinned update-flatpak-cargo-sources.sh --update and --check both passed. All 199 registry package archives/checksums match Cargo.lock; the Git entry and offline source configuration name the exact core pin. A temporary command-scoped Git URL mapping read the same local core commit during generation; output retains the public repository URL. No remote publication or Flatpak runtime build is claimed.",
+  "usage": "Historical export only. Active production source is recorded in jterm-core-production.json; the archive is not used by Cargo, Nix or Flatpak."
 }

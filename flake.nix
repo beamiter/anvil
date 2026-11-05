@@ -22,15 +22,8 @@
           package = pkgs.rustPlatform.buildRustPackage {
             pname = manifest.package.name;
             version = manifest.package.version;
-            # Stage the exact bundled candidate core beside the app so the
-            # relative Cargo source override also works in the Nix sandbox.
-            src = pkgs.runCommand "anvil-desktop-session-source" { } ''
-              mkdir -p "$out/anvil" "$out/jterm_core"
-              cp -R ${self}/. "$out/anvil/"
-              tar -xzf ${self}/packaging/jterm-core-src.tar.gz -C "$out/jterm_core"
-            '';
-            postUnpack = ''sourceRoot="$sourceRoot/anvil"'';
-            # The bundled core is the explicit candidate path dependency.
+            # Historical source bundles are not production inputs.
+            src = self;
 
             cargoLock = {
               lockFile = ./Cargo.lock;
@@ -41,6 +34,8 @@
               # then run `nix flake check --no-write-lock-file` and copy `got:`.
               # Full revisions beside the hashes make a stale repin conspicuous.
               outputHashes = {
+                # git+https://github.com/beamiter/jterm_core.git?rev=c1aebbe7b6ad4a8edb98582ea282d6e4d2ba6816#c1aebbe7b6ad4a8edb98582ea282d6e4d2ba6816
+                "jterm_core-0.2.0" = "sha256-vKRvyUof0eHoPokl2bXa8H8KWlHeZFwyzGBrIWDk8Ww=";
                 # git+https://github.com/beamiter/jagent.git?rev=f269c3c6afafcf9b6d60b3cccd741649fdb74576#f269c3c6afafcf9b6d60b3cccd741649fdb74576
                 "jagent-0.7.0" = "sha256-2PO6UiTrhwa2JUBznPTXFV42KxJ3H8qctBTg7WNxZfA=";
                 # git+https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa569540091524d637a7115b64c587b9177a55b
