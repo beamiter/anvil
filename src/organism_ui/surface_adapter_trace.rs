@@ -326,6 +326,31 @@ fn idle_fit_oracle_checks_native_size_and_grid_margins() {
 }
 
 #[test]
+fn large_font_positive_control_requires_two_real_grid_margins() {
+    // The narrow 500px window leaves 176px after Chat's four 57px
+    // composer rows. A fixed64 body plus two grid margins needs 178px.
+    let measured = SurfaceBox {
+        width: 370,
+        height: 176,
+        right_gutter: 20,
+        cell_width: 26,
+        cell_height: 57,
+        body_width: 64,
+        body_height: 64,
+        cursor_row: -1,
+    };
+    assert!(!idle_space_available(measured));
+    assert!(!idle_space_available(SurfaceBox {
+        height: 177,
+        ..measured
+    }));
+    assert!(idle_space_available(SurfaceBox {
+        height: 178,
+        ..measured
+    }));
+}
+
+#[test]
 fn constrained_chat_preserves_single_surface_and_wake_oracles() {
     run_with_geometry(Host::Chat, |step| {
         (
@@ -392,12 +417,27 @@ pub(super) fn exercise_mounted_modes(
 ) {
     use crate::config::TerminalMode;
     let original = overlay.child().expect("original fixture content");
+    let original_size = window.default_size();
     let mut default_chat_cell_height = None;
     for (mode, host, font_desc, allow_constrained) in [
         (TerminalMode::Block, Host::Block, None, false),
         (TerminalMode::Chat, Host::Chat, None, true),
         (TerminalMode::Chat, Host::Chat, Some("monospace 32"), false),
     ] {
+        // This is the required-visible large-font control, not the cramped
+        // canvas case. Chat's composer reserves four actual font rows, so
+        // increasing the font alone can remove the body's safe idle area.
+        // Keep the narrow width, provide explicit vertical room, and retain
+        // the unchanged native fit assertion below. Constrained and 59px
+        // viewport tests continue to require refusal instead of overlap.
+        window.set_default_size(
+            original_size.0,
+            if font_desc.is_some() {
+                original_size.1.max(720)
+            } else {
+                original_size.1
+            },
+        );
         for remote in [false, true] {
             println!("ORGANISM_MOUNTED_CASE {host:?} remote={remote} font={font_desc:?} constrained={allow_constrained}");
             let view = crate::block_view::organism_settings_test_view_for_mode(mode, font_desc);
@@ -543,6 +583,7 @@ pub(super) fn exercise_mounted_modes(
     }
     gtk::prelude::RootExt::set_focus(window, None::<&gtk::Widget>);
     overlay.set_child(Some(&original));
+    window.set_default_size(original_size.0, original_size.1);
     settle(Duration::from_millis(120));
 }
 
