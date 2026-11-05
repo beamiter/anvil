@@ -50,7 +50,7 @@ fn native_chat_passthrough_initial_focus_accepts_composition() {
         "chat-passthrough-ime-test",
         &[],
         &[],
-        |_, _, _, _| crate::pty::OwnedPty::from_openpty(Some(true)),
+        |_, _, _, _| crate::pty::OwnedPty::from_live_openpty(Some(true)),
     )
     .expect("nonexecuting PTY recorder");
     view.block_onboarding.history_resolved(false);

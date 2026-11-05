@@ -26,7 +26,7 @@ fn collapsed_output_navigation(mode: crate::config::TerminalMode) {
         "fold-geometry-test",
         &[],
         &[],
-        |_, _, _, _| crate::pty::OwnedPty::from_openpty(Some(true)),
+        |_, _, _, _| crate::pty::OwnedPty::from_live_openpty(Some(true)),
     )
     .unwrap();
     // A long document keeps the last card parked even after bulk folding.
@@ -217,7 +217,7 @@ fn retained_scrollback_case(mode: crate::config::TerminalMode, new_lines: usize)
         "live-find-range-test",
         &[],
         &[],
-        |_, _, _, _| crate::pty::OwnedPty::from_openpty(Some(true)),
+        |_, _, _, _| crate::pty::OwnedPty::from_live_openpty(Some(true)),
     )
     .unwrap();
     let window = gtk::Window::builder()
@@ -396,7 +396,7 @@ fn live_find_change_case(mode: crate::config::TerminalMode, change: &str) {
         "live-find-mutation-test",
         &[],
         &[],
-        |_, _, _, _| crate::pty::OwnedPty::from_openpty(Some(true)),
+        |_, _, _, _| crate::pty::OwnedPty::from_live_openpty(Some(true)),
     )
     .unwrap();
     let window = gtk::Window::builder()

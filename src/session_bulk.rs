@@ -442,11 +442,11 @@ impl Manager {
             return;
         }
         if !matches!(request.action, SessionBatchAction::Pin(_))
-            && request.keys.iter().any(|(provider, id)| {
-                self.organization_drafts
-                    .borrow()
-                    .contains_key(&format!("{}:{id}", provider.label()))
-            })
+            && self
+                .organization_drafts
+                .borrow()
+                .values()
+                .any(|draft| request.keys.contains(&draft.target))
         {
             self.bulk.notice.set_text("Save or Revert the selected sessions' name/tag drafts before archiving or changing their tags.");
             return;

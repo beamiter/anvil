@@ -58,7 +58,7 @@ fn more_opens_complete_menu_preserves_selection_and_retires_stale_cards() {
             "more-menu-test",
             &[],
             &[],
-            |_, _, _, _| crate::pty::OwnedPty::from_openpty(Some(true)),
+            |_, _, _, _| crate::pty::OwnedPty::from_live_openpty(Some(true)),
         )
         .unwrap();
         let outside = gtk::Entry::new();

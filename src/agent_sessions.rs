@@ -308,6 +308,10 @@ struct Activation {
 
 #[derive(Clone)]
 struct OrganizationDraft {
+    // The batch store uses provider/native ID, while the editor uses the
+    // source-qualified workspace identity. Keep both instead of rebuilding
+    // one namespace with a string format when admitting a batch action.
+    target: SessionIdentity,
     alias: String,
     tags: String,
     error: Option<String>,
@@ -1452,10 +1456,14 @@ impl Manager {
     }
 
     fn remember_organization_draft(&self) {
-        if let Some(key) = self.organization_key.borrow().as_ref() {
+        if let (Some(key), Some(session)) = (
+            self.organization_key.borrow().as_ref(),
+            self.selected_session(),
+        ) {
             self.organization_drafts.borrow_mut().insert(
                 key.clone(),
                 OrganizationDraft {
+                    target: (session.provider, session.id.clone()),
                     alias: self.alias.text().to_string(),
                     tags: self.tags.text().to_string(),
                     error: self.organization_error.borrow().clone(),

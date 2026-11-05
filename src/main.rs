@@ -93,6 +93,8 @@ mod workspace_cli;
 mod workspace_context;
 mod workspace_context_ui;
 mod workspace_conversation;
+mod workspace_mission_model;
+mod workspace_mission_ui;
 mod workspace_navigation;
 mod workspace_ops;
 mod workspace_remote;

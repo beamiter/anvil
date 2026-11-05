@@ -17685,7 +17685,7 @@ pub(crate) fn organism_settings_test_view_for_mode(
         "organism-test",
         &[],
         &[],
-        |_argv, _cwd, _env, _token| crate::pty::OwnedPty::from_openpty(Some(true)),
+        |_argv, _cwd, _env, _token| crate::pty::OwnedPty::from_live_openpty(Some(true)),
     )
     .expect("nonexecuting organism test PTY")
     .into();
@@ -18193,7 +18193,9 @@ mod tests {
                     "ssh-viewport-test",
                     &[],
                     &[],
-                    |_argv, _cwd, _env, _token| crate::pty::OwnedPty::from_openpty(Some(false)),
+                    |_argv, _cwd, _env, _token| {
+                        crate::pty::OwnedPty::from_live_openpty(Some(false))
+                    },
                 )
                 .expect("nonexecuting SSH fixture PTY");
                 let window = gtk::Window::builder()

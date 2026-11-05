@@ -179,6 +179,7 @@ impl AppModel {
                 self.add_tab(startup, sender);
             }
             WorkspaceAction::RemoteWorkspace => crate::workspace_remote_ui::show(&self.window),
+            WorkspaceAction::Missions => self.workspace_navigation.show_missions(&self.window),
         }
         self.sync_workspace_navigation();
     }

@@ -53,6 +53,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    workspace_mission_ui::tests::mission_window_is_narrow_and_construction_does_not_start_work
     workspace_shell::panel_tests::files_inspector_roundtrip_preserves_browser_model_selection_and_draft
     workspace_shell::panel_tests::session_context_private_transition_clears_copy_source_and_restores_public_state
     workspace_shell::panel_tests::task_overview_renders_observed_evidence_and_attention_state

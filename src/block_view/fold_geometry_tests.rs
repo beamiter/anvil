@@ -71,7 +71,7 @@ fn fold_actions_update_visible_and_parked_geometry() {
             "fold-geometry-test",
             &[],
             &[],
-            |_, _, _, _| crate::pty::OwnedPty::from_openpty(Some(true)),
+            |_, _, _, _| crate::pty::OwnedPty::from_live_openpty(Some(true)),
         )
         .unwrap();
         // A long document keeps the last card parked even after bulk folding.

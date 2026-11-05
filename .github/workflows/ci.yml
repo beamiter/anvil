@@ -140,6 +140,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check Mission form adapter without GTK
+        run: python3 scripts/test-mission-adapter.py
+
       - name: Check all targets
         run: bash scripts/check-clean-build.sh
 
@@ -225,14 +228,16 @@ jobs:
         run: python3 scripts/test-gtk-display-contract.py
 
       - name: Run display-backed GTK/VTE regressions
-        run: GTK_PAINT_DIAGNOSTICS_DIR="$PWD/gtk-paint-diagnostics" ANVIL_XTEST_DRIVER="$PWD/scripts/qa-cross-selection-pointer.py" bash scripts/test-gtk-display.sh
+        run: GTK_PAINT_DIAGNOSTICS_DIR="$PWD/gtk-paint-diagnostics" ANVIL_XTEST_DRIVER="$PWD/scripts/qa-cross-selection-pointer.py" bash scripts/test-gtk-display.sh 2>&1 | tee gtk-display.log
 
       - name: Upload synthetic GTK paint diagnostics
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: gtk-paint-diagnostics
-          path: gtk-paint-diagnostics/
+          path: |
+            gtk-paint-diagnostics/
+            gtk-display.log
           if-no-files-found: ignore
           retention-days: 7
 
@@ -345,6 +350,7 @@ jobs:
           path: |
             test.log
             clippy.log
+            gtk-display.log
           if-no-files-found: ignore
           retention-days: 7
 

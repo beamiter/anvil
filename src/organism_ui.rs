@@ -6310,6 +6310,9 @@ mod tests {
 
         let before = paint.current();
         runtime.card.remove_css_class("organism-paint-fixture");
+        // Removing the display provider also invalidates style/allocation.
+        // Settle that cleanup before the caller captures tooltip coordinates.
+        drop(_style);
         probe.expose_full().unwrap();
         wait(&|| paint.current() > before);
         let snapshots = inline_card::snapshot_count(&runtime.card);
@@ -6563,7 +6566,14 @@ mod tests {
             while main.iteration(false) {}
         }
         assert!(root.has_tooltip());
-        assert!(query(state_point, false));
+        assert!(
+            query(state_point, false),
+            "mapped tooltip rejected: point={state_point:?}, bounds={:?}, pointer={:?}, card_mapped={}, state_mapped={}, state_tooltip={:?}, hit={:?}",
+            runtime.state.compute_bounds(&root),
+            pointer_buttons_on_surface(&root, gtk::gdk::ModifierType::BUTTON1_MASK | gtk::gdk::ModifierType::BUTTON2_MASK | gtk::gdk::ModifierType::BUTTON3_MASK | gtk::gdk::ModifierType::BUTTON4_MASK | gtk::gdk::ModifierType::BUTTON5_MASK),
+            runtime.card.is_mapped(), runtime.state.is_mapped(), runtime.state.tooltip_text(),
+            card_tooltip_at(&root, &runtime.card, &labels, state_point, false, false).map(|(text, _)| text),
+        );
         assert!(gtk::prelude::GtkWindowExt::focus(&window)
             .is_some_and(|focus| focus.is_ancestor(&entry) || focus == entry));
         #[cfg(target_os = "linux")]

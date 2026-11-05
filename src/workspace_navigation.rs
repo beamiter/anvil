@@ -22,6 +22,7 @@ pub(crate) enum Action {
     NewTask,
     NewTerminal,
     RemoteWorkspace,
+    Missions,
     Inspect(jterm_core::agent_workspace::ConversationId),
     InspectContext(jterm_core::agent_workspace::ConversationId),
     OpenTask(jterm_core::agent_workspace::ConversationId),
@@ -255,6 +256,8 @@ pub(crate) struct Navigation {
     next_surface: Rc<Cell<u64>>,
     context: super::workspace_context_ui::ContextSurface,
     review: super::workspace_review_ui::ReviewSurface,
+    missions: super::workspace_mission_ui::MissionSurface,
+    mission_button: gtk::Button,
     callback: Rc<dyn Fn(Action)>,
 }
 
@@ -264,6 +267,7 @@ impl Navigation {
         let context = super::workspace_context_ui::ContextSurface::new(callback.clone());
         let review =
             super::workspace_review_ui::ReviewSurface::new(callback.clone(), context.clone());
+        let missions = super::workspace_mission_ui::MissionSurface::new(callback.clone());
         let root = gtk::Box::new(gtk::Orientation::Vertical, 4);
         let new = gtk::MenuButton::new();
         new.set_label("＋ New");
@@ -299,7 +303,7 @@ impl Navigation {
         summary.add_css_class("dim-label");
         let next_attention = gtk::Button::with_label(SharedAction::NextAttention.label());
         next_attention.add_css_class("flat");
-        next_attention.set_tooltip_text(Some("Open the next visible conversation that needs your attention. No action is approved or sent."));
+        next_attention.set_tooltip_text(Some("Open the next visible conversation or loaded Mission that needs your attention. Open Missions to load saved delivery plans. No action is approved or sent."));
         summary_line.append(&summary);
         summary_line.append(&next_attention);
         root.append(&summary_line);
@@ -328,6 +332,11 @@ impl Navigation {
         scroll_body.append(&search.root);
         scroll.set_child(Some(&scroll_body));
         root.set_vexpand(true);
+        let mission_button = gtk::Button::with_label("Missions · delivery plans");
+        mission_button.add_css_class("flat");
+        let open_missions = callback.clone();
+        mission_button.connect_clicked(move |_| open_missions(Action::Missions));
+        root.append(&mission_button);
         root.append(&scroll);
         let rows = Rc::new(RefCell::new(Vec::<Row>::new()));
         let all_rows = Rc::new(RefCell::new(Vec::<Row>::new()));
@@ -359,6 +368,8 @@ impl Navigation {
             let callback = callback.clone();
             let limit = visible_limit.clone();
             let requested = requested_selection.clone();
+            let missions = missions.clone();
+            let last_was_mission = Cell::new(false);
             next_attention.connect_clicked(move |_| {
                 let current = list.selected_row().and_then(|row| {
                     visible_rows
@@ -373,6 +384,15 @@ impl Navigation {
                 let next = (start..rows.len())
                     .chain(0..start.min(rows.len()))
                     .find(|&index| rows[index].attention);
+                let after_mission = last_was_mission.replace(false);
+                let wrapped =
+                    next.is_none_or(|index| current.is_some_and(|current| index <= current));
+                if missions.needs_attention() > 0 && wrapped && (next.is_none() || !after_mission) {
+                    last_was_mission.set(true);
+                    drop(rows);
+                    callback(Action::Missions);
+                    return;
+                }
                 if let Some(index) = next {
                     let action = rows[index].action.clone();
                     *requested.borrow_mut() = Some(rows[index].identity());
@@ -482,8 +502,27 @@ impl Navigation {
             next_surface: Rc::new(Cell::new(1)),
             context,
             review,
+            missions,
+            mission_button,
             callback,
         }
+    }
+
+    pub fn show_missions(&self, parent: &impl IsA<gtk::Window>) {
+        let current = self.list.selected_row().and_then(|selected| {
+            self.rows
+                .borrow()
+                .get(selected.index() as usize)
+                .and_then(|row| {
+                    row.source
+                        .as_ref()
+                        .filter(|source| {
+                            source.kind == jterm_core::agent_workspace::ConversationKind::Task
+                        })
+                        .map(|source| source.id.clone())
+                })
+        });
+        self.missions.show(parent, current);
     }
 
     pub fn navigate(&self, key: gtk::gdk::Key) -> bool {
@@ -522,6 +561,13 @@ impl Navigation {
 
     pub fn sync(&self, mut rows: Vec<Row>, filter: &Filter) {
         self.context.poll();
+        self.missions.poll();
+        let attention = self.missions.needs_attention();
+        self.mission_button.set_label(&if attention == 0 {
+            "Missions · delivery plans".into()
+        } else {
+            format!("Missions · {attention} need review")
+        });
         self.review
             .sync(rows.iter().filter_map(|row| row.source.clone()).collect());
         let catalog = self.review.catalog_rows();
@@ -643,10 +689,11 @@ impl Navigation {
         } else {
             format!("{total} conversations")
         });
+        let attention_total = all_attention + self.missions.needs_attention();
         self.next_attention
-            .set_label(&format!("Needs you · {all_attention}"));
-        self.next_attention.set_visible(all_attention > 0);
-        self.next_attention.set_sensitive(all_attention > 0);
+            .set_label(&format!("Needs you · {attention_total}"));
+        self.next_attention.set_visible(attention_total > 0);
+        self.next_attention.set_sensitive(attention_total > 0);
         self.more.set_visible(total > visible.len());
         self.more.set_label(&format!(
             "Show more · {} remaining",

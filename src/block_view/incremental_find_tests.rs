@@ -169,7 +169,7 @@ impl Fixture {
             "incremental-find-test",
             &[],
             &[],
-            |_, _, _, _| crate::pty::OwnedPty::from_openpty(Some(true)),
+            |_, _, _, _| crate::pty::OwnedPty::from_live_openpty(Some(true)),
         )
         .expect("nonexecuting find PTY");
         for id in 1..=CARD_COUNT {
