@@ -1,12 +1,15 @@
 //! Native delivery-plan view over the host-owned Mission controller.
 //! Opening a plan never starts a task, validates code, pushes or merges.
 use super::workspace_mission_model::{
-    can_advance_draft_base, draft_matches_selected, parse_roots, update_draft,
-    validate_new_environment,
+    attention_is_current, can_advance_draft_base, draft_matches_selected, parse_roots,
+    receipt_command, receipt_is_current, update_draft, validate_new_environment,
 };
 use super::workspace_navigation::Action;
 use gtk::prelude::*;
-use jterm_core::agent_workspace::{ConversationId, MissionWorkbench, WorkspaceMission};
+use jterm_core::agent_workspace::{
+    ConversationId, MissionWorkbench, WorkspaceClient, WorkspaceEvent, WorkspaceMission,
+    WorkspaceMissionAttention, WorkspaceReply,
+};
 use relm4::gtk;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -32,6 +35,104 @@ fn buffer_text(buffer: &gtk::TextBuffer) -> String {
     buffer
         .text(&buffer.start_iter(), &buffer.end_iter(), true)
         .into()
+}
+
+/// Each receipt window owns one read request and one immutable queue entry.
+/// It never changes the selected task, runs validation or substitutes newer logs.
+fn show_receipt(
+    parent: &gtk::Window,
+    state: Rc<RefCell<MissionWorkbench>>,
+    entry: WorkspaceMissionAttention,
+) {
+    let command = {
+        let model = state.borrow();
+        receipt_command(&entry, &model.attention_items(), model.busy)
+    };
+    let Some(command) = command else {
+        state.borrow_mut().notice =
+            Some("This receipt changed. Refresh the saved Mission first.".into());
+        return;
+    };
+    let client = WorkspaceClient::new();
+    let pending = client.send(command);
+    let window = gtk::Window::builder()
+        .title("Exact Mission validation receipt")
+        .transient_for(parent)
+        .destroy_with_parent(true)
+        .default_width(720)
+        .default_height(500)
+        .build();
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    body.set_margin_top(16);
+    body.set_margin_bottom(16);
+    body.set_margin_start(16);
+    body.set_margin_end(16);
+    body.append(&label(&format!(
+        "{} · revision {}\n{}\nReceipt: {}\nThis is recorded validation output, not proof of the current worktree or delivery.",
+        entry.mission_title, entry.revision, entry.kind.label(),
+        entry.receipt_id.as_deref().unwrap_or("unavailable")
+    )));
+    let status = label("Requesting the exact linked run from the current host…");
+    body.append(&status);
+    let output = gtk::TextView::new();
+    output.set_editable(false);
+    output.set_cursor_visible(false);
+    output.set_monospace(true);
+    output.set_wrap_mode(gtk::WrapMode::WordChar);
+    let scroll = gtk::ScrolledWindow::new();
+    scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    scroll.set_vexpand(true);
+    scroll.set_child(Some(&output));
+    body.append(&scroll);
+    window.set_child(Some(&body));
+    window.present();
+    let request_id = match pending {
+        Ok(id) => id,
+        Err(error) => {
+            status.set_text(&format!("Exact receipt unavailable: {error}"));
+            return;
+        }
+    };
+    let weak = window.downgrade();
+    let mut completed = false;
+    gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+        if weak.upgrade().is_none() {
+            return gtk::glib::ControlFlow::Break;
+        }
+        let model = state.borrow();
+        let queue = model.attention_items();
+        if !attention_is_current(&entry, &queue, model.busy) {
+            output.buffer().set_text("");
+            status.set_text("This saved Mission or receipt changed. Close this view and inspect the Mission again; newer output was not substituted.");
+            return gtk::glib::ControlFlow::Break;
+        }
+        for WorkspaceEvent::Reply {
+            request_id: received,
+            result,
+        } in client.poll()
+        {
+            if received != request_id || completed {
+                continue;
+            }
+            completed = true;
+            match result {
+                Ok(WorkspaceReply::Result { report })
+                    if receipt_is_current(&entry, &queue, model.busy, &report) =>
+                {
+                    status.set_text(&format!(
+                        "Run {} · sequence {} · {}\n{}{}",
+                        report.run_id, report.source_sequence, report.validation_status,
+                        report.error.as_deref().unwrap_or(""),
+                        if report.validation_output_truncated { "\nOutput was truncated by the host." } else { "" }
+                    ));
+                    output.buffer().set_text(&report.validation_output);
+                }
+                Err(error) => status.set_text(&format!("Exact receipt unavailable: {error}")),
+                _ => status.set_text("The host no longer exposes this exact receipt. No newer run or log was substituted."),
+            }
+        }
+        gtk::glib::ControlFlow::Continue
+    });
 }
 
 impl MissionSurface {
@@ -85,6 +186,9 @@ impl MissionSurface {
         body.append(&refresh);
         let catalog = gtk::Box::new(gtk::Orientation::Vertical, 4);
         body.append(&catalog);
+        body.append(&label("Needs-you reasons for saved plans · read-only"));
+        let attention = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        body.append(&attention);
         let title = gtk::Entry::new();
         title.set_placeholder_text(Some("Delivery title"));
         let goal = gtk::Entry::new();
@@ -252,6 +356,7 @@ impl MissionSurface {
         let callback = self.callback.clone();
         let mut catalog_signature = String::new();
         let mut report_signature = String::new();
+        let mut attention_signature = String::new();
         let mut selected_id = String::new();
         let weak = window.downgrade();
         gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
@@ -260,6 +365,57 @@ impl MissionSurface {
             }
             state.borrow_mut().poll();
             let model = state.borrow();
+            let queue = model.attention_items();
+            let signature = format!("{:?}|{}", queue, model.busy);
+            if signature != attention_signature {
+                attention_signature = signature;
+                while let Some(child) = attention.first_child() {
+                    attention.remove(&child);
+                }
+                for entry in &queue {
+                    attention.append(&label(&format!(
+                        "{} · revision {} · {}\n{} · {} · environment {}\n{}\nCandidate: {}",
+                        entry.mission_title,
+                        entry.revision,
+                        entry.kind.label(),
+                        entry
+                            .repository
+                            .as_ref()
+                            .map(|r| r.full_name.as_str())
+                            .unwrap_or("Mission"),
+                        entry.check_name.as_deref().unwrap_or("plan"),
+                        entry.environment.as_deref().unwrap_or("not specified"),
+                        entry.detail,
+                        entry.candidate.as_deref().unwrap_or("not selected")
+                    )));
+                    let open = gtk::Button::with_label("Open saved plan");
+                    open.set_sensitive(!model.busy);
+                    let captured = entry.clone();
+                    let data = state.clone();
+                    open.connect_clicked(move |_| {
+                        let mut model = data.borrow_mut();
+                        if attention_is_current(&captured, &model.attention_items(), model.busy) {
+                            model.select(&captured.mission_id);
+                        }
+                    });
+                    attention.append(&open);
+                    if entry.receipt_id.is_some() {
+                        let open = gtk::Button::with_label("Show exact validation receipt");
+                        open.set_sensitive(receipt_command(entry, &queue, model.busy).is_some());
+                        open.set_tooltip_text(Some("Only the exact linked run and receipt sequence may be shown. Missing or ambiguous task bindings remain unavailable."));
+                        let captured = entry.clone();
+                        let data = state.clone();
+                        let parent = weak.clone();
+                        open.connect_clicked(move |_| {
+                            if let Some(parent) = parent.upgrade() {
+                                show_receipt(&parent, data.clone(), captured.clone());
+                            }
+                        });
+                        attention.append(&open);
+                    }
+                }
+                super::workspace_navigation::wrap_button_labels(&attention);
+            }
             let states: Vec<_> = model
                 .missions
                 .iter()
@@ -461,6 +617,50 @@ mod tests {
         );
         assert!(surface.state.borrow().missions.is_empty());
         assert_eq!(surface.window.borrow().upgrade().as_ref(), Some(&window));
+        let mut mission = WorkspaceMission::new("Native attention fixture", "Read-only review");
+        mission.revision = 1;
+        mission.repositories.push(
+            jterm_core::agent_workspace::WorkspaceMissionRepository::new(
+                "beamiter/anvil",
+                "/tmp/anvil-attention-fixture",
+            )
+            .unwrap(),
+        );
+        surface.state.borrow_mut().missions.push(mission);
+        for _ in 0..40 {
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        fn has_reason(widget: &gtk::Widget) -> bool {
+            if widget
+                .downcast_ref::<gtk::Label>()
+                .is_some_and(|label| label.text().contains("Inspect current delivery"))
+            {
+                return true;
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                if has_reason(&current) {
+                    return true;
+                }
+                child = current.next_sibling();
+            }
+            false
+        }
+        assert!(
+            has_reason(window.upcast_ref()),
+            "The shared attention reason was not rendered"
+        );
+        assert!(
+            !surface.state.borrow().busy,
+            "Rendering attention dispatched work"
+        );
+        assert!(
+            window.width() <= 400,
+            "Attention content broke the narrow layout"
+        );
         window.close();
         parent.close();
     }

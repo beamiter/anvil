@@ -1,10 +1,10 @@
 {
   "repository": "https://github.com/beamiter/jterm_core.git",
-  "revision": "c1aebbe7b6ad4a8edb98582ea282d6e4d2ba6816",
-  "tree": "cf00c85c7a0b14488c7d028793e47490b5b2d1c6",
-  "source_nar_sha256": "sha256-vKRvyUof0eHoPokl2bXa8H8KWlHeZFwyzGBrIWDk8Ww=",
-  "publication_verified_at": "2026-11-05T03:50:15Z",
-  "publication_url": "https://github.com/beamiter/jterm_core/commit/c1aebbe7b6ad4a8edb98582ea282d6e4d2ba6816",
-  "source_policy": "Cargo, Nix and Flatpak use this exact published Git source. The older jterm-core-origin.json and tar archive are historical exports, not production build inputs.",
-  "nar_verification": "Independent Git-tree and complete Git-export NAR serializations agree and reproduce the previously verified baseline. Native Nix build is verified separately by CI."
+  "revision": "4ffa774138ee89dc2916ce21786c45e411196ca4",
+  "tree": "708de59ad2ae3f67f6af58b23c0a4c1b61433f95",
+  "source_nar_sha256": "sha256-CZinWRNrlmclrkzh9GbiKs/SEGraa5xlIL1GyIIljuk=",
+  "publication_verified_at": "2026-11-05T16:20:00Z",
+  "publication_url": "https://github.com/beamiter/jterm_core/commit/4ffa774138ee89dc2916ce21786c45e411196ca4",
+  "source_policy": "Cargo, Nix and Flatpak use this exact published Git source. The matching deterministic audit archive is not a production build input.",
+  "nar_verification": "Complete Git-tree NAR serialization independently reproduced the previous verified c1aebbe hash and computed this revision. Native Nix build is verified separately by exact-head CI."
 }

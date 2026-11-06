@@ -37,6 +37,24 @@ restore expired current gates. Checks retain passed, failed, blocked, not-run an
 states. A saved plan, model message or historical log is not a current pass.
 Closing this view detaches the widgets; it does not cancel or restart work.
 
+## Reasoned Needs-you and exact receipts
+
+The saved-plan view uses the shared core's ordered attention projection. Entries
+name the Mission revision, repository, candidate, check, required environment and
+specific reason: inspection, incomplete plan, repository/candidate/pin issues,
+validation failed/blocked/stale/not run, or missing publication evidence.
+These are manual review requests, never instructions to run or publish work.
+
+**Show exact validation receipt** opens an isolated, read-only log window. An
+ambiguous or absent linked task keeps the button unavailable. On activation and
+on the asynchronous reply, Anvil checks the complete current attention entry,
+then binds conversation, task, run and exact receipt sequence. A reused task,
+newer sequence, changed revision or refresh cannot substitute a different log.
+Closing the window does not cancel or restart a task. Changing the saved plan
+invalidates the open log view. Historical output is explicitly not a current
+validation or delivery pass. Unsaved form edits remain separate from this saved
+plan queue and retain the existing Save/Inspect/Freeze gates.
+
 ## Production dependency identity
 
 Production builds use the exact Git revision in both `Cargo.toml` declarations
@@ -44,8 +62,10 @@ and `Cargo.lock`. `.cargo/config.toml` must not install a global sibling patch:
 Cargo would also apply it to nested fixtures, and a stale sibling could silently
 replace the declared production core. Nix uses the same Git source with an
 explicit fixed-output hash. Flatpak's offline source list is generated from the
-lockfile. Historical `packaging/jterm-core-src.tar.gz` files are not Nix or Cargo
-production inputs.
+lockfile. The matching `packaging/jterm-core-src.tar.gz` audit export is not a Nix or Cargo
+production input. Its revision, tree and checksum must agree with the source
+receipt. Packaging exports committed blobs from the exact pin rather than
+copying potentially modified worktree files.
 
 For deliberate local candidate work, pass a path patch with Cargo's `--config`
 option for that command only. Do not publish the resulting path-resolved lock or
@@ -60,7 +80,8 @@ claim it verifies the production pin.
   overrides. It does not claim a Nix or Flatpak application build.
 - `python3 scripts/test-mission-adapter.py` compiles the actual pure form adapter
   against the Cargo-resolved exact core. It tests explicit paths and candidate
-  binding preservation without GTK, a provider, an IME or a live host.
+  binding preservation and fail-closed exact receipt navigation without GTK, a
+  provider, an IME or a live host.
 - The ordinary CI still runs all-target checking, tests, Clippy, Nix, the native
   Vim suite and the isolated GTK display suite. The latter includes a narrow
   Mission-window construction test that must not dispatch work.

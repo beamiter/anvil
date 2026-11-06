@@ -1,5 +1,8 @@
 //! Pure form adaptation. Execution, evidence and persistence stay in the host.
-use jterm_core::agent_workspace::{WorkspaceMission, WorkspaceMissionRepository};
+use jterm_core::agent_workspace::{
+    WorkspaceCommand, WorkspaceMission, WorkspaceMissionAttention, WorkspaceMissionRepository,
+    WorkspaceResultReport,
+};
 use std::path::PathBuf;
 
 /// An explicit editable list, not repository discovery or a filesystem mutation.
@@ -120,6 +123,42 @@ pub(crate) fn validate_new_environment(environment: &str) -> Result<(), String> 
     } else {
         Err("New local plans require environment 'local'. Set it to local to create, then edit and save the selected plan to use a different acceptance environment.".into())
     }
+}
+
+/// A queue entry is an ephemeral projection, not authority. Stable identity
+/// alone is insufficient after a refresh, plan edit or receipt replacement.
+pub(crate) fn attention_is_current(
+    entry: &WorkspaceMissionAttention,
+    queue: &[WorkspaceMissionAttention],
+    busy: bool,
+) -> bool {
+    !busy && queue.iter().any(|current| current == entry)
+}
+
+/// Request only read-only evidence for an unambiguous linked task. The current
+/// host may expose a different run; that reply must be rejected independently.
+pub(crate) fn receipt_command(
+    entry: &WorkspaceMissionAttention,
+    queue: &[WorkspaceMissionAttention],
+    busy: bool,
+) -> Option<WorkspaceCommand> {
+    if !attention_is_current(entry, queue, busy) || entry.receipt_id.is_none() {
+        return None;
+    }
+    let task = entry.task.as_ref()?;
+    task.validate().ok()?;
+    Some(WorkspaceCommand::InspectResult {
+        id: task.conversation.clone(),
+    })
+}
+
+pub(crate) fn receipt_is_current(
+    entry: &WorkspaceMissionAttention,
+    queue: &[WorkspaceMissionAttention],
+    busy: bool,
+    report: &WorkspaceResultReport,
+) -> bool {
+    receipt_command(entry, queue, busy).is_some() && entry.matches_result(report)
 }
 
 #[cfg(test)]
@@ -315,5 +354,157 @@ mod tests {
         current.revision += 1;
         current.preset = jterm_core::agent_workspace::WorkspaceMissionPreset::FourTerminals;
         assert!(!confirmed_submission(&current, &attempted));
+    }
+    fn receipt_fixture() -> (WorkspaceMissionAttention, WorkspaceResultReport) {
+        use jterm_core::agent_workspace::{
+            ConversationId, WorkspaceMissionAttentionKind, WorkspaceMissionTaskRef,
+        };
+        let task_id = jterm_core::agent_task::TaskId::new();
+        let conversation = ConversationId(format!(
+            "jterm:task:v1:[\"host\",\"namespace\",\"{task_id}\"]"
+        ));
+        let entry = WorkspaceMissionAttention {
+            id: "stable-attention-id".into(),
+            mission_id: "mission".into(),
+            revision: 4,
+            mission_title: "Delivery".into(),
+            repository: Some(
+                WorkspaceMissionRepository::new("beamiter/anvil", "/tmp/anvil")
+                    .unwrap()
+                    .identity,
+            ),
+            candidate: Some("a".repeat(40)),
+            kind: WorkspaceMissionAttentionKind::ValidationFailed,
+            check_name: Some("gtk-display".into()),
+            environment: Some("linux-x11".into()),
+            receipt_id: Some("workspace:run-a:12".into()),
+            task: Some(WorkspaceMissionTaskRef {
+                conversation: conversation.clone(),
+                task_id,
+                run_id: "run-a".into(),
+                source_sequence: 10,
+            }),
+            detail: "A native validation failed".into(),
+        };
+        let report = WorkspaceResultReport {
+            conversation,
+            task_id,
+            run_id: "run-a".into(),
+            source_sequence: 12,
+            baseline: None,
+            current: None,
+            validation: None,
+            validation_current: false,
+            validation_status: "Failed".into(),
+            validation_output: "exact captured output".into(),
+            validation_output_truncated: false,
+            error: None,
+        };
+        (entry, report)
+    }
+
+    #[test]
+    fn receipt_navigation_only_requests_read_only_exact_task_evidence() {
+        let (entry, report) = receipt_fixture();
+        let queue = [entry.clone()];
+        assert!(matches!(receipt_command(&entry, &queue, false),
+            Some(WorkspaceCommand::InspectResult { id }) if id == report.conversation));
+        assert!(receipt_is_current(&entry, &queue, false, &report));
+        // Historical validation may be useful even though current worktree
+        // evidence is unavailable; this never promotes a Mission to passed.
+        assert!(!report.validation_current);
+    }
+
+    #[test]
+    fn stale_callback_is_not_authorized_by_a_stable_attention_id() {
+        let (entry, report) = receipt_fixture();
+        let mut variants = Vec::new();
+        let mut changed = entry.clone();
+        changed.revision += 1;
+        variants.push(changed);
+        let mut changed = entry.clone();
+        changed.candidate = Some("b".repeat(40));
+        variants.push(changed);
+        let mut changed = entry.clone();
+        changed.environment = Some("linux-wayland".into());
+        variants.push(changed);
+        let mut changed = entry.clone();
+        changed.receipt_id = Some("workspace:run-a:13".into());
+        variants.push(changed);
+        let mut changed = entry.clone();
+        changed.task.as_mut().unwrap().run_id = "run-b".into();
+        variants.push(changed);
+        for changed in variants {
+            assert_eq!(changed.id, entry.id);
+            assert!(receipt_command(&entry, std::slice::from_ref(&changed), false).is_none());
+            assert!(!receipt_is_current(&entry, &[changed], false, &report));
+        }
+    }
+
+    #[test]
+    fn refresh_removal_or_pending_writes_invalidate_receipt_callbacks() {
+        let (entry, report) = receipt_fixture();
+        assert!(receipt_command(&entry, &[], false).is_none());
+        assert!(!receipt_is_current(&entry, &[], false, &report));
+        assert!(receipt_command(&entry, std::slice::from_ref(&entry), true).is_none());
+        assert!(!receipt_is_current(
+            &entry,
+            std::slice::from_ref(&entry),
+            true,
+            &report
+        ));
+    }
+
+    #[test]
+    fn reused_task_or_newer_receipt_never_substitutes_output() {
+        let (entry, report) = receipt_fixture();
+        let mut variants = Vec::new();
+        let mut changed = report.clone();
+        changed.conversation.0.push_str("-other-host");
+        variants.push(changed);
+        let mut changed = report.clone();
+        changed.task_id = jterm_core::agent_task::TaskId::new();
+        variants.push(changed);
+        let mut changed = report.clone();
+        changed.run_id = "run-b".into();
+        variants.push(changed);
+        let mut changed = report.clone();
+        changed.source_sequence = 13;
+        variants.push(changed);
+        let mut changed = report.clone();
+        changed.source_sequence = 11;
+        variants.push(changed);
+        for changed in variants {
+            assert!(!receipt_is_current(
+                &entry,
+                std::slice::from_ref(&entry),
+                false,
+                &changed
+            ));
+        }
+    }
+
+    #[test]
+    fn absent_ambiguous_and_invalid_task_bindings_remain_unavailable() {
+        let (entry, report) = receipt_fixture();
+        let mut variants = Vec::new();
+        let mut changed = entry.clone();
+        changed.task = None;
+        variants.push(changed);
+        let mut changed = entry.clone();
+        changed.receipt_id = None;
+        variants.push(changed);
+        let mut changed = entry.clone();
+        changed.task.as_mut().unwrap().conversation.0 = "invalid".into();
+        variants.push(changed);
+        for changed in variants {
+            assert!(receipt_command(&changed, std::slice::from_ref(&changed), false).is_none());
+            assert!(!receipt_is_current(
+                &changed,
+                std::slice::from_ref(&changed),
+                false,
+                &report
+            ));
+        }
     }
 }

@@ -19,7 +19,7 @@ class SourceContract(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory(prefix="anvil-core-contract-")
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
-        for name in ["Cargo.toml", "Cargo.lock", ".cargo/config.toml", "flake.nix", "packaging/flatpak/cargo-sources.json", "packaging/jterm-core-production.json", "vendor/host-adapter-bundle.json", "vendor/process-adapter-bundle.json", "scripts/link-recovery/Cargo.toml", "scripts/link-recovery/Cargo.lock"]:
+        for name in ["Cargo.toml", "Cargo.lock", ".cargo/config.toml", "flake.nix", "packaging/flatpak/cargo-sources.json", "packaging/jterm-core-production.json", "packaging/jterm-core-origin.json", "packaging/jterm-core-revision", "packaging/jterm-core-src.tar.gz", "packaging/jterm-core-src.tar.gz.sha256", "vendor/host-adapter-bundle.json", "vendor/process-adapter-bundle.json", "scripts/link-recovery/Cargo.toml", "scripts/link-recovery/Cargo.lock"]:
             target = self.root / name
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes((ROOT / name).read_bytes())
@@ -110,6 +110,25 @@ class SourceContract(unittest.TestCase):
         revision = checker.check(self.root)
         path.write_text(path.read_text().replace(revision, "0" * 40))
         with self.assertRaisesRegex(ValueError, "fixture lock"):
+            checker.check(self.root)
+
+    def test_stale_audit_bundle_revision_is_rejected(self):
+        (self.root / "packaging/jterm-core-revision").write_text("0" * 40 + "\n")
+        with self.assertRaisesRegex(ValueError, "Audit bundle revision"):
+            checker.check(self.root)
+
+    def test_altered_audit_bundle_is_rejected(self):
+        with (self.root / "packaging/jterm-core-src.tar.gz").open("ab") as stream:
+            stream.write(b"changed")
+        with self.assertRaisesRegex(ValueError, "Audit bundle checksum"):
+            checker.check(self.root)
+
+    def test_audit_bundle_tree_identity_is_checked(self):
+        path = self.root / "packaging/jterm-core-origin.json"
+        data = json.loads(path.read_text())
+        data["published_core_tree"] = "0" * 40
+        path.write_text(json.dumps(data))
+        with self.assertRaisesRegex(ValueError, "Audit bundle source identity"):
             checker.check(self.root)
 
 

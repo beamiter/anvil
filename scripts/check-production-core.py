@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Reject a production source that silently differs from the declared core pin."""
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -56,6 +57,14 @@ def check(root):
         raise ValueError("Production source receipt disagrees with the manifest")
     if f'"jterm_core-0.2.0" = "{receipt.get("source_nar_sha256")}";' not in flake:
         raise ValueError("Nix hash disagrees with the production source receipt")
+    origin = json.loads((root / "packaging/jterm-core-origin.json").read_text())
+    if (root / "packaging/jterm-core-revision").read_text().strip() != revision or origin.get("published_core_commit") != revision:
+        raise ValueError("Audit bundle revision disagrees with the production core")
+    if origin.get("published_core_tree") != receipt.get("tree") or origin.get("source_nar_sha256") != receipt.get("source_nar_sha256"):
+        raise ValueError("Audit bundle source identity disagrees with production")
+    archive_hash = hashlib.sha256((root / "packaging/jterm-core-src.tar.gz").read_bytes()).hexdigest()
+    if origin.get("archive_sha256") != archive_hash or (root / "packaging/jterm-core-src.tar.gz.sha256").read_text().strip() != f"{archive_hash}  jterm-core-src.tar.gz":
+        raise ValueError("Audit bundle checksum disagrees with its receipt")
     for name in ("host-adapter-bundle", "process-adapter-bundle"):
         bundle = json.loads((root / f"vendor/{name}.json").read_text())
         if bundle.get("public_core_base") != revision:
