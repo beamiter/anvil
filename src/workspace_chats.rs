@@ -140,6 +140,16 @@ impl SharedChats {
         Ok(())
     }
 
+    fn bind_imported(&mut self, local: u64, id: ConversationId) -> Result<(), String> {
+        if let Err(error) = self.send(Command::LoadChat { id }, Pending::Bind(local)) {
+            // No request was queued. Retaining this marker would exclude the
+            // local chat from every subsequent import pass after backpressure.
+            self.importing.remove(&local);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn prepare(&mut self, local: u64, text: String, exact_draft: bool) -> Result<u64, String> {
         if self.submissions.contains_key(&local)
             || self.receipts.keys().any(|token| token.chat_id == local)
@@ -640,10 +650,7 @@ impl SharedChats {
                 }
                 (Pending::Import(_), Reply::Imported { mappings }) => {
                     for mapping in mappings {
-                        if let Err(error) = self.send(
-                            Command::LoadChat { id: mapping.id },
-                            Pending::Bind(mapping.legacy_id),
-                        ) {
+                        if let Err(error) = self.bind_imported(mapping.legacy_id, mapping.id) {
                             events.push(Event::Error(error));
                         }
                     }
@@ -1101,6 +1108,53 @@ fn reconcile_draft(local: &str, remote: &str, baseline: &str) -> DraftResolution
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn rejected_import_binding_releases_only_its_retry_marker() {
+        let mut bridge = SharedChats::new("import-retry-fixture".into());
+        // LoadChat is rejected synchronously by a read-only client, exercising
+        // send's error path without starting an SSH process or a host.
+        let config = jterm_core::agent_workspace::WorkspaceSshHost::new(
+            "fixture",
+            "/bin/jterm-sessiond",
+            "fixture",
+        )
+        .unwrap();
+        bridge.client = WorkspaceClient::with_ssh_host(config).unwrap();
+        bridge.importing.extend([1, 2]);
+        assert!(bridge
+            .bind_imported(1, ConversationId("imported-chat".into()))
+            .is_err());
+        assert!(
+            !bridge.importing.contains(&1),
+            "failed enqueue must be retryable"
+        );
+        assert!(
+            bridge.importing.contains(&2),
+            "other pending imports stay protected"
+        );
+        assert!(bridge.pending.is_empty());
+        // The retry's accepted enqueue must retain its marker until the reply.
+        // This endpoint cannot launch a host; no provider or SSH is involved.
+        let path = std::env::temp_dir().join(format!(
+            "jterm-bind-retry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        bridge.client = WorkspaceClient::for_state_dir(path);
+        bridge.importing.insert(1);
+        bridge
+            .bind_imported(1, ConversationId("imported-chat".into()))
+            .unwrap();
+        assert!(bridge.importing.contains(&1));
+        assert!(bridge
+            .pending
+            .values()
+            .any(|pending| matches!(pending, Pending::Bind(1))));
+    }
 
     #[test]
     fn settlement_draft_reconciliation_does_not_bless_a_peer_overwrite() {
