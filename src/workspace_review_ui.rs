@@ -466,11 +466,12 @@ impl ReviewSurface {
         if let (Some(id), Some(entry)) = (selected, queued) {
             if !state.queue_saving {
                 let query = self.dependency_search.text().to_lowercase();
+                let indexed_tasks = state.indexed_task_ids();
                 let mut candidates: Vec<_> = rows
                     .iter()
                     .filter(|row| {
                         row.kind == ConversationKind::Task
-                            && state.task_indexed(&row.id)
+                            && indexed_tasks.contains(&row.id)
                             && &row.id != id
                             && (entry.intent.dependencies.contains(&row.id)
                                 || query.is_empty()

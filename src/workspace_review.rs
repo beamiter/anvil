@@ -6,7 +6,7 @@ use jterm_core::agent_workspace::{
     WorkspaceQueueSnapshot, WorkspaceQueueUpdate, WorkspaceReply, WorkspaceResultReport,
     WorkspaceRow,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 enum Pending {
@@ -117,6 +117,21 @@ impl WorkspaceReview {
                 .rows
                 .iter()
                 .any(|row| row.kind == ConversationKind::Task && &row.id == id)
+    }
+    /// Snapshot discovery authority once for a whole dependency render. Repeated
+    /// `task_indexed` calls would scan the catalog for every candidate (O(n²)).
+    /// Borrow identities so this does not clone potentially long source IDs or
+    /// retain stale authority across a catalog refresh.
+    pub(crate) fn indexed_task_ids(&self) -> HashSet<&ConversationId> {
+        self.indexed_tasks
+            .keys()
+            .chain(
+                self.rows
+                    .iter()
+                    .filter(|row| row.kind == ConversationKind::Task)
+                    .map(|row| &row.id),
+            )
+            .collect()
     }
     fn send(&mut self, command: WorkspaceCommand, pending: Pending) -> bool {
         match self.client.send(command) {
@@ -430,6 +445,39 @@ mod tests {
         row.facts.source_sequence = sequence;
         row
     }
+    #[test]
+    fn indexed_task_snapshot_matches_single_lookup_and_refresh() {
+        let mut state = WorkspaceReview::default();
+        let mut acknowledged = row(None, "Acknowledged");
+        acknowledged.id = ConversationId("acknowledged".into());
+        state
+            .indexed_tasks
+            .insert(acknowledged.id.clone(), acknowledged.clone());
+        let mut hosted = row(Some(1), "Hosted");
+        hosted.id = ConversationId("hosted".into());
+        let mut chat = row(None, "Not a task");
+        chat.id = ConversationId("chat".into());
+        chat.kind = ConversationKind::Api;
+        state.rows = vec![hosted.clone(), acknowledged.clone(), chat.clone()];
+        let missing = ConversationId("pending-or-local-only".into());
+        {
+            let ids = state.indexed_task_ids();
+            assert_eq!(ids.len(), 2, "duplicate authority must be deduplicated");
+            for id in [&acknowledged.id, &hosted.id, &chat.id, &missing] {
+                assert_eq!(ids.contains(id), state.task_indexed(id));
+            }
+        }
+        state.rows.clear();
+        let ids = state.indexed_task_ids();
+        assert!(ids.contains(&acknowledged.id));
+        assert!(
+            !ids.contains(&hosted.id),
+            "refresh must not leave stale authority"
+        );
+        assert!(!ids.contains(&chat.id));
+        assert!(!ids.contains(&missing));
+    }
+
     #[test]
     fn immediate_runtime_fact_wins_over_older_catalog_but_fallback_does_not() {
         let state = WorkspaceReview {

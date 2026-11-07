@@ -5,6 +5,10 @@ versioning for tagged releases while it remains experimental.
 
 ## Unreleased
 
+- Dependency queue rendering now indexes known task identities once per update
+  instead of repeatedly scanning the catalog, reducing UI-thread work for large
+  workspaces without changing which tasks can be selected as dependencies.
+
 ### Added
 
 - The Block canvas now matches Forge's developer Block: cards show the same
