@@ -718,7 +718,7 @@ impl Component for AiPanelModel {
                                 }
                             }
                             if let Some(payload) = self.pending_new_context.remove(&request) {
-                                self.start_request(widgets, &sender, payload, false);
+                                self.start_request_for_chat(chat_id, widgets, payload, false);
                             }
                             if !background_handoff {
                                 self.render_all(widgets, &sender);
@@ -809,7 +809,11 @@ impl Component for AiPanelModel {
                         }
                         crate::workspace_chats::Event::Rejected { request, message } => {
                             self.pending_shared.remove(&request);
+                            widgets.status.set_label(&message);
+                        }
+                        crate::workspace_chats::Event::CreateRejected { request, message } => {
                             self.pending_new_drafts.remove(&request);
+                            self.pending_new_context.remove(&request);
                             if matches!(self.navigation_focus, Some(NavigationFocus::New(pending)) if pending == request)
                             {
                                 self.navigation_focus = None;
@@ -1293,20 +1297,28 @@ impl AiPanelModel {
         &mut self,
         widgets: &mut AiPanelModelWidgets,
         _sender: &ComponentSender<Self>,
+        payload: RequestPayload,
+        clear_composer: bool,
+    ) -> bool {
+        self.start_request_for_chat(self.store.active_id(), widgets, payload, clear_composer)
+    }
+
+    fn start_request_for_chat(
+        &mut self,
+        chat_id: u64,
+        widgets: &mut AiPanelModelWidgets,
         mut payload: RequestPayload,
         clear_composer: bool,
     ) -> bool {
-        if payload.user_text.trim().is_empty()
-            || self.store.is_active_busy()
-            || self.client.is_none()
-        {
+        if payload.user_text.trim().is_empty() || self.client.is_none() {
             return false;
         }
         if self.redact_secrets {
             payload.user_text = jterm_core::redact::redact_secrets(&payload.user_text);
         }
-        match self.shared.prepare(
-            self.store.active_id(),
+        match self.shared.prepare_for_chat(
+            &self.store,
+            chat_id,
             payload.user_text.clone(),
             clear_composer,
         ) {

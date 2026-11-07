@@ -5,6 +5,10 @@ versioning for tagged releases while it remains experimental.
 
 ## Unreleased
 
+- Late new-chat replies preserve newer navigation, and deferred block-context
+  messages target the exact created chat even when multiple creations finish
+  together. Creation failures no longer clear unrelated pending submissions.
+
 - Delayed chat open and reload replies now refresh cached data without
   overriding a newer conversation selection or reopening a retired view.
 

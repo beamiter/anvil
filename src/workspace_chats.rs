@@ -25,6 +25,11 @@ pub(crate) enum Event {
         request: u64,
         message: String,
     },
+    /// Client creation request IDs and submission IDs are separate namespaces.
+    CreateRejected {
+        request: u64,
+        message: String,
+    },
     Deleted(u64),
     Earlier {
         chat_id: u64,
@@ -152,6 +157,28 @@ impl SharedChats {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Bind deferred context submission to its creation receipt, never to the
+    /// selection that happens to be visible when the receipt is processed.
+    pub fn prepare_for_chat(
+        &mut self,
+        store: &ChatStore,
+        local: u64,
+        text: String,
+        exact_draft: bool,
+    ) -> Result<u64, String> {
+        let target = store
+            .summaries()
+            .into_iter()
+            .find(|row| row.id == local)
+            .ok_or("The target conversation is no longer available.")?;
+        if target.busy || target.archived {
+            return Err(
+                "The target conversation is busy or archived; the message was not sent.".into(),
+            );
+        }
+        self.prepare(local, text, exact_draft)
     }
 
     pub fn prepare(&mut self, local: u64, text: String, exact_draft: bool) -> Result<u64, String> {
@@ -327,7 +354,9 @@ impl SharedChats {
     pub fn retire_navigation(&mut self) {
         for pending in self.pending.values_mut() {
             match pending {
-                Pending::Open { activate } | Pending::Reload { open: activate, .. } => {
+                Pending::Open { activate }
+                | Pending::Create { activate }
+                | Pending::Reload { open: activate, .. } => {
                     *activate = false;
                 }
                 _ => {}
@@ -637,8 +666,8 @@ impl SharedChats {
                                 }
                             }
                         }
-                        Pending::Create { activate: false } => {
-                            events.push(Event::Rejected {
+                        Pending::Create { .. } => {
+                            events.push(Event::CreateRejected {
                                 request: request_id,
                                 message: message.clone(),
                             });
@@ -696,12 +725,10 @@ impl SharedChats {
                             }
                         }
                         Err(error) => {
-                            if !activate {
-                                events.push(Event::Rejected {
-                                    request: request_id,
-                                    message: error.clone(),
-                                });
-                            }
+                            events.push(Event::CreateRejected {
+                                request: request_id,
+                                message: error.clone(),
+                            });
                             events.push(Event::Error(error));
                         }
                     }
@@ -1235,6 +1262,96 @@ mod tests {
             .unwrap();
         assert_eq!(result, Some(incoming));
         assert_eq!(store.active_id(), incoming);
+    }
+
+    #[test]
+    fn retired_creation_keeps_new_selection_and_receipt_bound_context_target() {
+        let mut bridge = SharedChats::new("creation-fixture".into());
+        let mut store = ChatStore::default();
+        let visible = store.active_id();
+        store.set_active_draft("Keep visible draft".into());
+        bridge.pending.insert(1, Pending::Create { activate: true });
+        bridge.retire_navigation();
+        let Pending::Create { activate } = bridge.pending.remove(&1).unwrap() else {
+            panic!("create");
+        };
+        assert!(!activate);
+        let created = jterm_core::agent_workspace::SHARED_CHAT_ID_BASE + 1;
+        bridge
+            .accept_chat(
+                &mut store,
+                navigation_chat(created, "New background chat"),
+                None,
+                activate,
+                false,
+            )
+            .unwrap();
+        assert_eq!(store.active_id(), visible);
+        assert_eq!(store.active_draft(), "Keep visible draft");
+        // An unrelated busy foreground conversation must not block this target.
+        store
+            .begin_turn("Foreground response".into(), None, "Thinking".into(), true)
+            .unwrap();
+        let request = bridge
+            .prepare_for_chat(&store, created, "Exact context".into(), false)
+            .unwrap();
+        assert_eq!(bridge.submissions[&created].request, request);
+        assert_eq!(bridge.submissions[&created].text, "Exact context");
+        assert!(!bridge.submissions.contains_key(&visible));
+        assert_eq!(store.active_id(), visible);
+    }
+
+    #[test]
+    fn batched_creations_prepare_each_context_for_its_own_chat() {
+        let mut bridge = SharedChats::new("creation-fixture".into());
+        let mut store = ChatStore::default();
+        let first = jterm_core::agent_workspace::SHARED_CHAT_ID_BASE + 1;
+        let second = first + 1;
+        // poll applies both receipts before the UI handles either Created event.
+        bridge
+            .accept_chat(
+                &mut store,
+                navigation_chat(first, "First"),
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        bridge
+            .accept_chat(
+                &mut store,
+                navigation_chat(second, "Second"),
+                None,
+                true,
+                false,
+            )
+            .unwrap();
+        bridge
+            .prepare_for_chat(&store, first, "First context".into(), false)
+            .unwrap();
+        bridge
+            .prepare_for_chat(&store, second, "Second context".into(), false)
+            .unwrap();
+        assert_eq!(bridge.submissions[&first].text, "First context");
+        assert_eq!(bridge.submissions[&second].text, "Second context");
+        assert_eq!(store.active_id(), second);
+        assert!(bridge
+            .prepare_for_chat(&store, second + 1, "Missing".into(), false)
+            .is_err());
+        bridge.submissions.clear();
+        store
+            .begin_turn("Busy target".into(), None, "Thinking".into(), true)
+            .unwrap();
+        assert!(bridge
+            .prepare_for_chat(&store, second, "Do not send".into(), false)
+            .is_err());
+        assert!(bridge.submissions.is_empty());
+        assert!(store.select_chat(first));
+        store.toggle_archive_active().unwrap();
+        assert!(bridge
+            .prepare_for_chat(&store, first, "Archived target".into(), false)
+            .is_err());
+        assert!(bridge.submissions.is_empty());
     }
 
     #[test]
