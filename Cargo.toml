@@ -14,7 +14,7 @@ companion-host = { version = "0.1.0", path = "vendor/companion-host" }
 companion-process = { version = "0.1.0", path = "vendor/companion-process" }
 eva-character-atlas = { version = "0.1.0", git = "https://github.com/beamiter/jcompanion.git", rev = "9aa569540091524d637a7115b64c587b9177a55b" }
 # Cargo, Nix and Flatpak resolve the same published exact Git revision.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "4ffa774138ee89dc2916ce21786c45e411196ca4" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "e8bd7a2b3edd48d7a0f8f0304fa3d8c864dab40e" }
 relm4 = { version = "0.11", features = ["libadwaita", "gnome_46"] }
 vte4 = { version = "0.10.0", features = ["v0_76"] }
 log = { version = "0.4", features = ["std"] }
@@ -44,7 +44,7 @@ io-lifetimes = "3"
 env_logger = "0.11"
 
 [dev-dependencies]
-jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "4ffa774138ee89dc2916ce21786c45e411196ca4" }
+jterm_core = { version = "0.2.0", features = ["session-parity-tests"], git = "https://github.com/beamiter/jterm_core.git", rev = "e8bd7a2b3edd48d7a0f8f0304fa3d8c864dab40e" }
 
 [profile.dev]
 opt-level = 1

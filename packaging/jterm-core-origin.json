@@ -1,12 +1,12 @@
 {
-  "published_core_commit": "4ffa774138ee89dc2916ce21786c45e411196ca4",
-  "published_core_tree": "708de59ad2ae3f67f6af58b23c0a4c1b61433f95",
-  "archive_sha256": "d272b692e74da24075ba42a2724f7f17f7730d684694151b2f729a9faddb71fe",
-  "archive_members": 264,
-  "archive_files": 242,
+  "published_core_commit": "e8bd7a2b3edd48d7a0f8f0304fa3d8c864dab40e",
+  "published_core_tree": "da69582ef8b70eff0a3c287cce6ce04cf1e75977",
+  "archive_sha256": "77fe3c474792fd2387253ad87cbca435cc7f5d93a4d1214e2b3f7d863d2bfe5e",
+  "archive_members": 266,
+  "archive_files": 244,
   "scope": "Cargo files, README.md, src/, runtime/, scripts/, tests/ and assets/ exported from the exact published Git commit; docs and CI excluded.",
   "verification": "Every exported blob and executable bit independently matched the exact Git tree; archive timestamps and owners normalized.",
-  "publication_boundary": "Public master was read back at 2026-11-05T16:20:00Z. This source archive alone does not prove native validation.",
-  "source_nar_sha256": "sha256-CZinWRNrlmclrkzh9GbiKs/SEGraa5xlIL1GyIIljuk=",
+  "publication_boundary": "Public master was read back at 2026-11-07T08:04:12.531403+00:00. This source archive alone does not prove native validation.",
+  "source_nar_sha256": "sha256-MwXJBOTtzVfjNYveL9KMkLAdGR52wP46VDkURdjg12Q=",
   "usage": "Matching audit export only. Cargo, Nix and Flatpak resolve the exact published pin recorded by jterm-core-production.json."
 }
