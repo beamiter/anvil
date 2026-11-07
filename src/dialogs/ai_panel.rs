@@ -610,6 +610,7 @@ impl Component for AiPanelModel {
                 share_command_context,
                 initial_context,
             } => {
+                self.shared.retire_navigation();
                 self.navigation_focus = None;
                 self.history_path = history_path;
                 self.client = Some(client);
@@ -739,6 +740,10 @@ impl Component for AiPanelModel {
                                 widgets.page_stack.set_visible_child_name(CHAT_PAGE);
                                 widgets.composer.grab_focus();
                             }
+                        }
+                        crate::workspace_chats::Event::Refreshed => {
+                            self.render_all(widgets, &sender);
+                            self.publish_snapshot(widgets, &sender);
                         }
                         crate::workspace_chats::Event::Opened(id) => {
                             let focus = matches!(self.navigation_focus.as_ref(),
@@ -1027,12 +1032,14 @@ impl Component for AiPanelModel {
                 self.refresh_library(&widgets.chat_list, &sender);
             }
             AiPanelMsg::ShowLibrary => {
+                self.shared.retire_navigation();
                 self.navigation_focus = None;
                 self.refresh_library(&widgets.chat_list, &sender);
                 widgets.page_stack.set_visible_child_name(LIBRARY_PAGE);
                 widgets.search.grab_focus();
             }
             AiPanelMsg::ShowChat => {
+                self.shared.retire_navigation();
                 widgets.page_stack.set_visible_child_name(CHAT_PAGE);
             }
             AiPanelMsg::Rename(title) => {
@@ -1088,6 +1095,7 @@ impl Component for AiPanelModel {
                 {
                     match self.shared.delete(confirmation.chat_id) {
                         Ok(true) => {
+                            self.shared.retire_navigation();
                             self.invalidate_delete_confirmation();
                             widgets
                                 .status
@@ -1147,6 +1155,7 @@ impl Component for AiPanelModel {
                 paste_focused_text(widgets, self.store.active_archived());
             }
             AiPanelMsg::Close => {
+                self.shared.retire_navigation();
                 self.navigation_focus = None;
                 self.publish_snapshot(widgets, &sender);
                 let _ = sender.output(AiPanelOutput::CloseRequested);
@@ -1240,6 +1249,7 @@ impl AiPanelModel {
     }
 
     fn select_chat(&mut self, id: u64) -> bool {
+        self.shared.retire_navigation();
         let changed = self.store.select_chat(id);
         if changed {
             self.invalidate_delete_confirmation();
@@ -1248,6 +1258,7 @@ impl AiPanelModel {
     }
 
     fn restore_chats(&mut self, snapshot: ai::ConversationSnapshot) {
+        self.shared.retire_navigation();
         self.invalidate_delete_confirmation();
         self.store = restore_chat_store(snapshot);
         self.shared.restore_legacy_sources(&self.store);
@@ -1255,6 +1266,7 @@ impl AiPanelModel {
 
     fn toggle_archive(&mut self) -> Result<(), ChatStoreError> {
         self.store.toggle_archive_active()?;
+        self.shared.retire_navigation();
         self.invalidate_delete_confirmation();
         Ok(())
     }
@@ -1271,6 +1283,7 @@ impl AiPanelModel {
         // Consume this confirmation even if the busy policy refuses deletion.
         self.invalidate_delete_confirmation();
         let outcome = self.store.delete_active()?;
+        self.shared.retire_navigation();
         self.retry_payloads.remove(&outcome.deleted_chat_id);
         self.conversation_systems.remove(&outcome.deleted_chat_id);
         Ok(Some(outcome.deleted_chat_id))

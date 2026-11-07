@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 pub(crate) enum Event {
     Opened(u64),
+    /// Cached data changed without an activation request.
+    Refreshed,
     Created {
         request: u64,
         chat_id: u64,
@@ -44,7 +46,9 @@ enum Pending {
     Import(Vec<u64>),
     Bind(u64),
     Fresh(u64),
-    Open,
+    Open {
+        activate: bool,
+    },
     Create {
         activate: bool,
     },
@@ -318,7 +322,21 @@ impl SharedChats {
         }
     }
 
+    /// A newer explicit navigation permanently retires older read activations.
+    /// Their data may still refresh the cache, but cannot take selection back.
+    pub fn retire_navigation(&mut self) {
+        for pending in self.pending.values_mut() {
+            match pending {
+                Pending::Open { activate } | Pending::Reload { open: activate, .. } => {
+                    *activate = false;
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub fn open(&mut self, id: ConversationId) -> Result<Option<u64>, String> {
+        self.retire_navigation();
         if let Some(local) = self.local_id(&id) {
             if self.known.get(&local).is_some_and(|known| known.writing)
                 || self.receipts.keys().any(|token| token.chat_id == local)
@@ -339,7 +357,7 @@ impl SharedChats {
             }
             return Ok(None);
         }
-        self.send(Command::LoadChat { id }, Pending::Open)?;
+        self.send(Command::LoadChat { id }, Pending::Open { activate: true })?;
         Ok(None)
     }
 
@@ -352,6 +370,7 @@ impl SharedChats {
         self.create_with_activation(false)
     }
     fn create_with_activation(&mut self, activate: bool) -> Result<u64, String> {
+        self.retire_navigation();
         let request = self.client.send(Command::CreateChat {
             title: "New chat".into(),
         })?;
@@ -381,6 +400,7 @@ impl SharedChats {
     }
 
     pub fn reload(&mut self, local: u64) -> Result<(), String> {
+        self.retire_navigation();
         let known = self
             .known
             .get(&local)
@@ -686,10 +706,10 @@ impl SharedChats {
                         }
                     }
                 }
-                (Pending::Open, Reply::Chat { chat }) => {
-                    match self.accept_chat(store, chat, None, true, redact) {
+                (Pending::Open { activate }, Reply::Chat { chat }) => {
+                    match self.accept_chat(store, chat, None, activate, redact) {
                         Ok(Some(local)) => events.push(Event::Opened(local)),
-                        Ok(None) => {}
+                        Ok(None) => events.push(Event::Refreshed),
                         Err(error) => events.push(Event::Error(error)),
                     }
                 }
@@ -787,7 +807,11 @@ impl SharedChats {
                             if !open {
                                 store.select_chat(active);
                             }
-                            events.push(Event::Opened(store.active_id()));
+                            if open {
+                                events.push(Event::Opened(store.active_id()));
+                            } else {
+                                events.push(Event::Refreshed);
+                            }
                         }
                         Err(error) => events.push(Event::Error(error)),
                     }
@@ -1108,6 +1132,110 @@ fn reconcile_draft(local: &str, remote: &str, baseline: &str) -> DraftResolution
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    fn navigation_chat(id: u64, title: &str) -> StoredChat {
+        let snapshot = ChatSnapshot::from_completed_history(id, title, false, &[], None, "");
+        StoredChat {
+            row: WorkspaceRow {
+                id: ConversationId(format!("navigation-{id}")),
+                kind: ConversationKind::Api,
+                title: title.into(),
+                provider: "API".into(),
+                cwd: String::new(),
+                preview: String::new(),
+                updated_at_ms: 0,
+                archived: false,
+                pinned: false,
+                tags: Vec::new(),
+                runtime: jterm_core::agent_workspace::RuntimeState::Idle,
+                facts: Default::default(),
+            },
+            revision: 1,
+            draft_revision: 0,
+            epoch: 0,
+            snapshot_json: ConversationSnapshot::from_chats(id, vec![snapshot])
+                .unwrap()
+                .to_json()
+                .unwrap(),
+            has_older: false,
+            read_position: None,
+            api_job: None,
+            background_api_supported: true,
+        }
+    }
+
+    #[test]
+    fn retired_read_refreshes_cache_without_overriding_newer_selection() {
+        let mut bridge = SharedChats::new("navigation-fixture".into());
+        let mut store = ChatStore::default();
+        let current = store.active_id();
+        store.set_active_draft("Keep my current draft".into());
+        let incoming = jterm_core::agent_workspace::SHARED_CHAT_ID_BASE + 1;
+        bridge.pending.insert(1, Pending::Open { activate: true });
+        bridge.pending.insert(
+            2,
+            Pending::Reload {
+                local: incoming,
+                open: true,
+                keep_local: true,
+            },
+        );
+        bridge.retire_navigation();
+        // Even returning to the original view cannot re-arm an old request.
+        bridge.retire_navigation();
+        let Pending::Open { activate } = bridge.pending.remove(&1).unwrap() else {
+            panic!("open");
+        };
+        assert!(!activate);
+        let result = bridge
+            .accept_chat(
+                &mut store,
+                navigation_chat(incoming, "Read completed"),
+                None,
+                activate,
+                false,
+            )
+            .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(store.active_id(), current);
+        assert_eq!(store.active_draft(), "Keep my current draft");
+        assert!(
+            bridge.known.contains_key(&incoming),
+            "background data must still load"
+        );
+        assert!(matches!(
+            bridge.pending.get(&2),
+            Some(Pending::Reload { open: false, .. })
+        ));
+    }
+
+    #[test]
+    fn a_newer_read_keeps_its_activation_after_older_reads_are_retired() {
+        let mut bridge = SharedChats::new("navigation-fixture".into());
+        let mut store = ChatStore::default();
+        bridge.pending.insert(1, Pending::Open { activate: true });
+        bridge.retire_navigation();
+        bridge.pending.insert(2, Pending::Open { activate: true });
+        let Pending::Open { activate: old } = bridge.pending.remove(&1).unwrap() else {
+            panic!("old open");
+        };
+        assert!(!old);
+        let Pending::Open { activate } = bridge.pending.remove(&2).unwrap() else {
+            panic!("new open");
+        };
+        let incoming = jterm_core::agent_workspace::SHARED_CHAT_ID_BASE + 2;
+        let result = bridge
+            .accept_chat(
+                &mut store,
+                navigation_chat(incoming, "Latest choice"),
+                None,
+                activate,
+                false,
+            )
+            .unwrap();
+        assert_eq!(result, Some(incoming));
+        assert_eq!(store.active_id(), incoming);
+    }
 
     #[test]
     fn rejected_import_binding_releases_only_its_retry_marker() {
