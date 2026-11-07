@@ -16,13 +16,34 @@ enum Pending {
     IndexTasks { rows: Vec<WorkspaceRow> },
 }
 
+/// Preserve catalog arrival order and last-observation-wins semantics without
+/// rescanning all preceding pages for every incoming identity.
+#[derive(Default)]
+struct CatalogStaging {
+    rows: Vec<WorkspaceRow>,
+    positions: HashMap<ConversationId, usize>,
+}
+
+impl CatalogStaging {
+    fn extend(&mut self, rows: Vec<WorkspaceRow>) {
+        for row in rows {
+            if let Some(&position) = self.positions.get(&row.id) {
+                self.rows[position] = row;
+            } else {
+                self.positions.insert(row.id.clone(), self.rows.len());
+                self.rows.push(row);
+            }
+        }
+    }
+}
+
 pub(crate) struct WorkspaceReview {
     client: WorkspaceClient,
     pending: HashMap<u64, Pending>,
     selected: Option<ConversationId>,
     generation: u64,
     catalog_generation: u64,
-    catalog_staging: Vec<WorkspaceRow>,
+    catalog_staging: CatalogStaging,
     started: bool,
     refreshed: Instant,
     local_tasks: Vec<WorkspaceRow>,
@@ -47,7 +68,7 @@ impl Default for WorkspaceReview {
             selected: None,
             generation: 0,
             catalog_generation: 0,
-            catalog_staging: Vec::new(),
+            catalog_staging: CatalogStaging::default(),
             started: false,
             refreshed: Instant::now(),
             local_tasks: Vec::new(),
@@ -194,7 +215,7 @@ impl WorkspaceReview {
         }
         if !self.catalog_loading {
             self.catalog_generation = self.catalog_generation.wrapping_add(1);
-            self.catalog_staging.clear();
+            self.catalog_staging = CatalogStaging::default();
             self.catalog_complete = false;
             self.catalog_loading = self.send(
                 WorkspaceCommand::CatalogPage {
@@ -378,17 +399,9 @@ impl WorkspaceReview {
                         next_before,
                         total,
                     }) => {
-                        for row in rows {
-                            if let Some(old) =
-                                self.catalog_staging.iter_mut().find(|old| old.id == row.id)
-                            {
-                                *old = row;
-                            } else {
-                                self.catalog_staging.push(row);
-                            }
-                        }
+                        self.catalog_staging.extend(rows);
                         if let Some(before) =
-                            next_before.filter(|_| self.catalog_staging.len() < 8192)
+                            next_before.filter(|_| self.catalog_staging.rows.len() < 8192)
                         {
                             self.catalog_loading = self.send(
                                 WorkspaceCommand::CatalogPage {
@@ -398,7 +411,7 @@ impl WorkspaceReview {
                                 Pending::Catalog { generation },
                             );
                         } else {
-                            self.rows = std::mem::take(&mut self.catalog_staging);
+                            self.rows = std::mem::take(&mut self.catalog_staging).rows;
                             self.catalog_complete =
                                 next_before.is_none() && self.rows.len() >= total;
                         }
@@ -445,6 +458,74 @@ mod tests {
         row.facts.source_sequence = sequence;
         row
     }
+    #[test]
+    fn catalog_staging_preserves_order_and_replaces_duplicates_across_pages() {
+        let mut staging = CatalogStaging::default();
+        let first = row(Some(1), "First");
+        let mut second = row(Some(2), "Second");
+        second.id = ConversationId("second-task".into());
+        staging.extend(vec![first.clone(), second.clone(), row(Some(3), "Updated")]);
+        staging.extend(vec![row(Some(4), "Latest"), second.clone()]);
+        assert_eq!(staging.rows.len(), 2);
+        assert_eq!(staging.rows[0], row(Some(4), "Latest"));
+        assert_eq!(staging.rows[1], second);
+        let published = std::mem::take(&mut staging).rows;
+        assert_eq!(published.len(), 2);
+        assert!(staging.positions.is_empty());
+        staging.extend(vec![first.clone()]);
+        assert_eq!(staging.rows, vec![first]);
+    }
+
+    #[test]
+    fn completed_catalog_publishes_rows_and_discards_staging_positions() {
+        let mut state = WorkspaceReview::default();
+        state
+            .catalog_staging
+            .extend(vec![row(Some(1), "Previous page")]);
+        state.pending.insert(1, Pending::Catalog { generation: 0 });
+        state.catalog_loading = true;
+        let newest = row(Some(2), "Final page");
+        assert!(state.receive(
+            1,
+            Ok(WorkspaceReply::CatalogPage {
+                rows: vec![newest.clone()],
+                next_before: None,
+                total: 1,
+            })
+        ));
+        assert_eq!(state.rows, vec![newest]);
+        assert!(state.catalog_complete);
+        assert!(!state.catalog_loading);
+        assert!(state.catalog_staging.rows.is_empty());
+        assert!(state.catalog_staging.positions.is_empty());
+    }
+
+    #[test]
+    fn catalog_staging_matches_linear_merge_for_large_multi_page_catalog() {
+        let mut staging = CatalogStaging::default();
+        let mut expected: Vec<WorkspaceRow> = Vec::new();
+        for page in 0..42 {
+            let rows: Vec<_> = (0..200)
+                .map(|offset| {
+                    let mut item = row(Some(page), "Catalog");
+                    item.id = ConversationId(format!("task-{}", (page * 197 + offset) % 8192));
+                    item
+                })
+                .collect();
+            for item in &rows {
+                if let Some(old) = expected.iter_mut().find(|old| old.id == item.id) {
+                    *old = item.clone();
+                } else {
+                    expected.push(item.clone());
+                }
+            }
+            staging.extend(rows);
+            assert_eq!(staging.rows, expected);
+            assert_eq!(staging.positions.len(), expected.len());
+        }
+        assert_eq!(staging.rows.len(), 8192);
+    }
+
     #[test]
     fn indexed_task_snapshot_matches_single_lookup_and_refresh() {
         let mut state = WorkspaceReview::default();

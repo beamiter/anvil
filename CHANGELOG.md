@@ -5,6 +5,10 @@ versioning for tagged releases while it remains experimental.
 
 ## Unreleased
 
+- Catalog refresh now indexes incoming identities across pages instead of
+  rescanning prior rows, avoiding quadratic UI-thread work in large workspaces
+  while preserving row order and duplicate-update behavior.
+
 - Dependency queue rendering now indexes known task identities once per update
   instead of repeatedly scanning the catalog, reducing UI-thread work for large
   workspaces without changing which tasks can be selected as dependencies.
