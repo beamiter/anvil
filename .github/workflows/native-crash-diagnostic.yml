@@ -1,0 +1,77 @@
+name: Native Vim9 crash diagnosis (not a gate)
+on:
+  push:
+    branches: [diagnostics/anvil-f63-native-crash]
+permissions:
+  contents: read
+jobs:
+  native-stack:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: '0'
+      RUST_BACKTRACE: '1'
+      GDK_BACKEND: x11
+      GSK_RENDERER: cairo
+      GTK_A11Y: none
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: f63fe0d2fced14de028b44b61b26e597c263d846
+          persist-credentials: false
+      - name: Verify exact failing production source
+        run: |
+          mkdir -p native-diagnostics
+          test "$(git rev-parse HEAD)" = f63fe0d2fced14de028b44b61b26e597c263d846
+          git rev-parse HEAD | tee native-diagnostics/source-sha.txt
+          sha256sum Cargo.lock | tee native-diagnostics/lock.sha256
+          bash scripts/materialize-shared-core.sh
+      - name: Install official native dependencies and debugger
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes pkg-config libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev vim ripgrep libxtst6 dbus-x11 xauth xvfb gdb
+          dpkg-query -W libgtk-4-1 libadwaita-1-0 libvte-2.91-gtk4-0 vim gdb | tee native-diagnostics/packages.txt
+      - name: Build exact source with normal test profile
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version | tee native-diagnostics/rustc.txt
+          cargo test --locked --no-run --bin anvil --message-format=json > native-diagnostics/build.jsonl
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          rows = [json.loads(line) for line in Path('native-diagnostics/build.jsonl').read_text().splitlines()]
+          bins = [r['executable'] for r in rows if r.get('reason') == 'compiler-artifact' and r.get('target', {}).get('name') == 'anvil' and r.get('profile', {}).get('test') and r.get('executable')]
+          assert len(bins) == 1, bins
+          Path('native-diagnostics/binary.txt').write_text(bins[0] + '\n')
+          PY
+      - name: Bounded isolated repro with full native stacks
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -uo pipefail
+          export JTERM_VIM9_BIN="$(command -v vim)" VIM9_TEST_VIM="$(command -v vim)"
+          binary="$(cat native-diagnostics/binary.txt)"
+          sha256sum "$binary" | tee native-diagnostics/binary.sha256
+          failed=0
+          for attempt in 1 2 3 4 5; do
+            dbus-run-session -- xvfb-run --auto-servernum gdb --batch --return-child-result \
+              -ex 'set pagination off' -ex 'set debuginfod enabled off' \
+              -ex 'handle SIGPIPE nostop noprint pass' -ex run \
+              -ex 'python gdb.execute("thread apply all bt full") if gdb.selected_thread() else None' \
+              -ex 'python gdb.execute("info registers") if gdb.selected_thread() else None' -ex 'info sharedlibrary' \
+              --args "$binary" vim9_ide::native_tests::native_vim9_command_palette_modes_and_live_availability \
+              --exact --include-ignored --test-threads=1 --nocapture \
+              2>&1 | tee "native-diagnostics/attempt-$attempt.log"
+            status=${PIPESTATUS[0]}
+            printf '%s %s\n' "$attempt" "$status" | tee -a native-diagnostics/statuses.txt
+            if [ "$status" -ne 0 ]; then failed=1; break; fi
+          done
+          exit "$failed"
+      - name: Preserve diagnosis irrespective of result
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: anvil-f63-native-diagnosis
+          path: native-diagnostics/
+          retention-days: 7
