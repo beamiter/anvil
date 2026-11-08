@@ -483,6 +483,53 @@ impl SharedChats {
         Ok(true)
     }
 
+    /// Drop pagination state with its evicted UI pages, including in-flight reads.
+    pub fn retire_history(&mut self, local: u64) {
+        self.history_cursor.remove(&local);
+        self.pending.retain(|_, pending| {
+            !matches!(pending, Pending::History { local: id } | Pending::PrimeHistory { local: id } if *id == local)
+        });
+    }
+
+    /// Keep the bounded displayed pages and their pagination cursor in sync.
+    /// A retired, already-emitted event from the current poll batch is ignored.
+    pub fn append_earlier_history(
+        &mut self,
+        history: &mut HashMap<u64, String>,
+        local: u64,
+        text: String,
+    ) -> bool {
+        if !self.history_cursor.contains_key(&local) {
+            return false;
+        }
+        if history.len() >= 8 && !history.contains_key(&local) {
+            if let Some(evicted) = history.keys().next().copied() {
+                history.remove(&evicted);
+                self.retire_history(evicted);
+            }
+        }
+        let earlier = history.entry(local).or_default();
+        *earlier = format!("{text}{earlier}");
+        if earlier.len() > 1024 * 1024 {
+            let mut end = 1024 * 1024;
+            while !earlier.is_char_boundary(end) {
+                end -= 1;
+            }
+            earlier.truncate(end);
+        }
+        true
+    }
+
+    fn take_pending_reply(
+        &mut self,
+        event: WorkspaceEvent,
+    ) -> Option<(u64, Pending, Result<Reply, String>)> {
+        let WorkspaceEvent::Reply { request_id, result } = event;
+        self.pending
+            .remove(&request_id)
+            .map(|pending| (request_id, pending, result))
+    }
+
     pub fn history(&mut self, local: u64) -> Result<(), String> {
         let known = self
             .known
@@ -625,8 +672,7 @@ impl SharedChats {
     pub fn poll(&mut self, store: &mut ChatStore, redact: bool) -> Vec<Event> {
         let mut events = Vec::new();
         for event in self.client.poll() {
-            let WorkspaceEvent::Reply { request_id, result } = event;
-            let Some(pending) = self.pending.remove(&request_id) else {
+            let Some((request_id, pending, result)) = self.take_pending_reply(event) else {
                 continue;
             };
             let reply = match result {
@@ -848,7 +894,7 @@ impl SharedChats {
                     if let Some(known) = self.known.remove(&local) {
                         self.rows.retain(|row| row.id != known.chat.row.id);
                     }
-                    self.history_cursor.remove(&local);
+                    self.retire_history(local);
                     self.importing.insert(local);
                     events.push(Event::Deleted(local));
                 }
@@ -1189,6 +1235,109 @@ mod tests {
             api_job: None,
             background_api_supported: true,
         }
+    }
+
+    #[test]
+    fn history_cache_eviction_retires_cursor_and_late_pages() {
+        for cursor in [None, Some(42)] {
+            let mut bridge = SharedChats::new("history-cache-fixture".into());
+            let path = std::env::temp_dir().join(format!(
+                "history-cache-no-host-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            bridge.client = WorkspaceClient::for_state_dir(path);
+            let mut store = ChatStore::default();
+            let mut history = HashMap::new();
+            let first = jterm_core::agent_workspace::SHARED_CHAT_ID_BASE + 1;
+            let ids: Vec<_> = (first..first + 9).collect();
+            for &local in &ids {
+                bridge
+                    .accept_chat(
+                        &mut store,
+                        navigation_chat(local, "History"),
+                        None,
+                        false,
+                        false,
+                    )
+                    .unwrap();
+                bridge.history_cursor.insert(local, cursor);
+            }
+            for &local in &ids[..8] {
+                assert!(bridge.append_earlier_history(
+                    &mut history,
+                    local,
+                    format!("page-{local}")
+                ));
+                bridge.pending.insert(local, Pending::History { local });
+                bridge
+                    .pending
+                    .insert(local + 100, Pending::PrimeHistory { local });
+            }
+            bridge.pending.insert(u64::MAX, Pending::Ack);
+            let incoming = ids[8];
+            assert!(bridge.append_earlier_history(&mut history, incoming, "ninth".into()));
+            assert_eq!(history.len(), 8);
+            let evicted = *ids[..8]
+                .iter()
+                .find(|id| !history.contains_key(id))
+                .unwrap();
+            assert!(
+                !bridge.history_cursor.contains_key(&evicted),
+                "evicted cursor must restart"
+            );
+            for &local in &ids[..8] {
+                if local != evicted {
+                    assert_eq!(bridge.history_cursor.get(&local), Some(&cursor));
+                    assert!(bridge.pending.contains_key(&local));
+                    assert!(bridge.pending.contains_key(&(local + 100)));
+                }
+            }
+            assert!(matches!(bridge.pending.get(&u64::MAX), Some(Pending::Ack)));
+            // Responses still in transit are filtered by the exact production gate.
+            for request_id in [evicted, evicted + 100] {
+                assert!(bridge
+                    .take_pending_reply(WorkspaceEvent::Reply {
+                        request_id,
+                        result: Ok(Reply::Messages {
+                            messages: Vec::new(),
+                            next_before: None
+                        }),
+                    })
+                    .is_none());
+            }
+            // Already emitted Earlier events in the same UI batch cannot resurrect it.
+            assert!(!bridge.append_earlier_history(&mut history, evicted, "stale".into()));
+            assert!(!history.contains_key(&evicted));
+            bridge.history(evicted).unwrap();
+            assert!(bridge
+                .pending
+                .values()
+                .any(|p| matches!(p, Pending::PrimeHistory { local } if *local == evicted)));
+            assert!(!bridge.append_earlier_history(&mut history, evicted, "still stale".into()));
+            // A valid new History response installs its cursor before emitting Earlier.
+            bridge.history_cursor.insert(evicted, Some(17));
+            assert!(bridge.append_earlier_history(&mut history, evicted, "new page".into()));
+            assert_eq!(history[&evicted], "new page");
+        }
+    }
+
+    #[test]
+    fn history_cache_keeps_existing_page_order_and_utf8_budget() {
+        let mut bridge = SharedChats::new("history-budget-fixture".into());
+        let mut history = HashMap::new();
+        bridge.history_cursor.insert(1, Some(20));
+        assert!(bridge.append_earlier_history(&mut history, 1, "newer".into()));
+        assert!(bridge.append_earlier_history(&mut history, 1, "older".into()));
+        assert_eq!(history[&1], "oldernewer");
+        let text = "界".repeat(1024 * 1024 / 3 + 1);
+        assert!(bridge.append_earlier_history(&mut history, 1, text));
+        assert_eq!(history[&1].len(), 1024 * 1024 - 1);
+        assert!(history[&1].chars().all(|c| c == '界'));
+        assert_eq!(bridge.history_cursor.get(&1), Some(&Some(20)));
     }
 
     #[test]

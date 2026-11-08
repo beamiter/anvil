@@ -5,6 +5,9 @@ versioning for tagged releases while it remains experimental.
 
 ## Unreleased
 
+- Reset older-message pagination when its displayed cache is evicted, allowing
+  those pages to be loaded again without accepting stale pending replies.
+
 - Preserve selected context materials and evidence in a bounded FIFO while loading;
   report overflow, retain queued items when full, and cancel them on navigation.
 
