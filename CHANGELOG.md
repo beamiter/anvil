@@ -5,6 +5,9 @@ versioning for tagged releases while it remains experimental.
 
 ## Unreleased
 
+- Preserve newer local drafts when duplicate conversation-open replies arrive;
+  reconcile peer edits and protect active submissions instead of replacing them.
+
 - Reset older-message pagination when its displayed cache is evicted, allowing
   those pages to be loaded again without accepting stale pending replies.
 
