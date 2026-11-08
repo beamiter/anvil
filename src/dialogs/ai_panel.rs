@@ -836,21 +836,12 @@ impl Component for AiPanelModel {
                             self.publish_snapshot(widgets, &sender);
                         }
                         crate::workspace_chats::Event::Earlier { chat_id, text } => {
-                            if self.earlier_history.len() >= 8
-                                && !self.earlier_history.contains_key(&chat_id)
-                            {
-                                if let Some(id) = self.earlier_history.keys().next().copied() {
-                                    self.earlier_history.remove(&id);
-                                }
-                            }
-                            let earlier = self.earlier_history.entry(chat_id).or_default();
-                            *earlier = format!("{text}{earlier}");
-                            if earlier.len() > 1024 * 1024 {
-                                let mut end = 1024 * 1024;
-                                while !earlier.is_char_boundary(end) {
-                                    end -= 1;
-                                }
-                                earlier.truncate(end);
+                            if !self.shared.append_earlier_history(
+                                &mut self.earlier_history,
+                                chat_id,
+                                text,
+                            ) {
+                                continue;
                             }
                             if self.store.active_id() == chat_id {
                                 self.render_transcript(widgets);

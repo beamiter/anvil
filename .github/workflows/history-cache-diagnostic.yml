@@ -1,0 +1,63 @@
+name: History cache retirement validation
+on:
+  push:
+    branches: [diagnostics/anvil-history-cache]
+permissions:
+  contents: read
+jobs:
+  history:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: bash scripts/materialize-shared-core.sh
+      - run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y pkg-config libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev libpcre2-dev
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt,clippy
+      - name: Format exact production candidate
+        run: |
+          ulimit -c 0
+          cargo fmt --all
+          python3 - <<'PY'
+          import base64
+          from pathlib import Path
+          for name in ('src/workspace_chats.rs', 'src/dialogs/ai_panel.rs'):
+              print('FORMATTED_SOURCE', name, base64.b64encode(Path(name).read_bytes()).decode())
+          PY
+          cargo fmt --all -- --check
+      - name: Clippy and actual production model regressions
+        run: |
+          ulimit -c 0
+          cargo clippy --bin anvil --locked -- -D warnings
+          cargo test --bin anvil --locked workspace_chats::tests
+      - name: Old eviction semantics must fail
+        run: |
+          ulimit -c 0
+          file=src/workspace_chats.rs
+          cp "$file" "$RUNNER_TEMP/fixed-history.rs"
+          trap 'cp "$RUNNER_TEMP/fixed-history.rs" "$file"' EXIT
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/workspace_chats.rs')
+          s = p.read_text()
+          old = 'self.retire_history(evicted);'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, '// old behavior: UI pages evicted without retiring pagination'))
+          PY
+          set +e
+          cargo test --bin anvil --locked workspace_chats::tests::history_cache_eviction_retires_cursor_and_late_pages -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/history-negative.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -F 'evicted cursor must restart' "$RUNNER_TEMP/history-negative.log"
+          echo "Old eviction semantics rejected with status $status"
