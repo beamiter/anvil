@@ -5,10 +5,11 @@ use super::workspace_navigation::Action;
 use gtk::prelude::*;
 use jterm_core::agent_workspace::{
     ConversationId, WorkspaceContext, WorkspaceMaterial, WorkspaceTextDocument,
+    WORKSPACE_MATERIAL_LIMIT,
 };
 use relm4::gtk;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 #[derive(Clone)]
@@ -17,6 +18,20 @@ struct MaterialWidgets {
     title: gtk::Label,
     source: gtk::Label,
     buffer: gtk::TextBuffer,
+}
+
+enum PendingAddition {
+    Evidence(WorkspaceTextDocument),
+    Material(ConversationId, WorkspaceMaterial),
+}
+
+impl PendingAddition {
+    fn conversation(&self) -> &ConversationId {
+        match self {
+            Self::Evidence(document) => &document.conversation,
+            Self::Material(id, _) => id,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -40,8 +55,7 @@ pub(crate) struct ContextSurface {
     create: gtk::Button,
     rendered: Rc<RefCell<Option<WorkspaceContext>>>,
     rendered_packet: Rc<RefCell<Option<String>>>,
-    pending_evidence: Rc<RefCell<Option<WorkspaceTextDocument>>>,
-    pending_material: Rc<RefCell<Option<(ConversationId, WorkspaceMaterial)>>>,
+    pending_additions: Rc<RefCell<VecDeque<PendingAddition>>>,
 }
 
 fn label(text: &str) -> gtk::Label {
@@ -247,8 +261,7 @@ impl ContextSurface {
             create,
             rendered: Rc::new(RefCell::new(None)),
             rendered_packet: Rc::new(RefCell::new(None)),
-            pending_evidence: Rc::new(RefCell::new(None)),
-            pending_material: Rc::new(RefCell::new(None)),
+            pending_additions: Rc::new(RefCell::new(VecDeque::new())),
         }
     }
 
@@ -272,8 +285,7 @@ impl ContextSurface {
                     }
                 }
             }
-            self.pending_evidence.borrow_mut().take();
-            self.pending_material.borrow_mut().take();
+            self.pending_additions.borrow_mut().clear();
             self.save.set_sensitive(false);
             self.preview.set_sensitive(false);
             self.create.set_sensitive(false);
@@ -289,20 +301,36 @@ impl ContextSurface {
             }
         }
         self.editor.borrow_mut().deselect();
-        self.pending_evidence.borrow_mut().take();
-        self.pending_material.borrow_mut().take();
+        self.pending_additions.borrow_mut().clear();
         self.render();
     }
 
     pub fn add_evidence(&self, document: WorkspaceTextDocument) {
-        self.select(document.conversation.clone());
-        *self.pending_evidence.borrow_mut() = Some(document);
-        self.poll();
+        self.enqueue_addition(PendingAddition::Evidence(document));
     }
 
     pub fn add_material(&self, id: ConversationId, material: WorkspaceMaterial) {
-        self.select(id.clone());
-        *self.pending_material.borrow_mut() = Some((id, material));
+        self.enqueue_addition(PendingAddition::Material(id, material));
+    }
+
+    fn enqueue_addition(&self, addition: PendingAddition) {
+        self.select(addition.conversation().clone());
+        // Apply ready older work before admitting another explicit selection.
+        self.poll();
+        let existing = self
+            .editor
+            .borrow()
+            .draft()
+            .map_or(0, |draft| draft.materials.len());
+        let pending = self.pending_additions.borrow().len();
+        if existing.saturating_add(pending) >= WORKSPACE_MATERIAL_LIMIT {
+            self.editor.borrow_mut().notice = Some(
+                "Context holds at most 16 materials including pending selections. This item was not added; remove a material and try again. Earlier selections were kept.".into(),
+            );
+            self.render();
+            return;
+        }
+        self.pending_additions.borrow_mut().push_back(addition);
         self.poll();
     }
 
@@ -313,16 +341,32 @@ impl ContextSurface {
             editor.draft().is_some() && !editor.loading()
         };
         if ready {
-            if let Some(document) = self.pending_evidence.borrow_mut().take() {
-                let mut editor = self.editor.borrow_mut();
-                if editor.selected() == Some(&document.conversation) {
-                    editor.add_evidence(&document);
+            loop {
+                let full = self
+                    .editor
+                    .borrow()
+                    .draft()
+                    .is_some_and(|draft| draft.materials.len() >= WORKSPACE_MATERIAL_LIMIT);
+                if full {
+                    if !self.pending_additions.borrow().is_empty() {
+                        self.editor.borrow_mut().notice = Some(
+                            "Saved materials filled this context. Earlier selections are still pending; remove a material to add the next one.".into(),
+                        );
+                    }
+                    break;
                 }
-            }
-            if let Some((id, material)) = self.pending_material.borrow_mut().take() {
+                // Release the queue borrow before updating the model. Items that
+                // cannot fit remain queued, including when a cold read was full.
+                let Some(addition) = self.pending_additions.borrow_mut().pop_front() else {
+                    break;
+                };
                 let mut editor = self.editor.borrow_mut();
-                if editor.selected() == Some(&id) {
-                    editor.add_material(material);
+                if editor.selected() != Some(addition.conversation()) {
+                    continue;
+                }
+                match addition {
+                    PendingAddition::Evidence(document) => editor.add_evidence(&document),
+                    PendingAddition::Material(_, material) => editor.add_material(material),
                 }
             }
         }
@@ -543,4 +587,150 @@ fn target_provider(selected: u32) -> &'static str {
         3 => "api",
         _ => "codex",
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jterm_core::agent_workspace::ConversationId;
+
+    fn material(id: &str) -> WorkspaceMaterial {
+        WorkspaceMaterial {
+            id: id.into(),
+            label: id.into(),
+            kind: jterm_core::agent_workspace::MaterialKind::Note,
+            text: id.into(),
+            source: None,
+            truncated: false,
+        }
+    }
+
+    fn evidence(id: &ConversationId, text: &str) -> WorkspaceTextDocument {
+        WorkspaceTextDocument {
+            conversation: id.clone(),
+            event_id: text.into(),
+            revision: "1".into(),
+            source: jterm_core::agent_workspace::SearchSource::Validation,
+            message_sequence: None,
+            text: text.into(),
+            truncated: false,
+        }
+    }
+
+    fn pending_surface(id: &ConversationId) -> ContextSurface {
+        let surface = ContextSurface::new(Rc::new(|_| {}));
+        *surface.editor.borrow_mut() = ContextEditor::with_pending_context_for_test(id.clone());
+        surface
+    }
+
+    fn material_texts(surface: &ContextSurface) -> Vec<String> {
+        surface
+            .editor
+            .borrow()
+            .draft()
+            .unwrap()
+            .materials
+            .iter()
+            .map(|material| material.text.clone())
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display and one test per process"]
+    fn pending_context_additions_preserve_order_capacity_and_cancellation() {
+        gtk::init().expect("isolated GTK display is required");
+        let id = ConversationId("pending-fixture".into());
+        let surface = pending_surface(&id);
+        surface.add_material(id.clone(), material("diff"));
+        surface.add_evidence(evidence(&id, "excerpt"));
+        surface.select(id.clone());
+        surface.add_material(id.clone(), material("log"));
+        assert!(surface.editor.borrow().loading());
+        assert!(surface.editor.borrow().draft().is_none());
+        assert_eq!(surface.pending_additions.borrow().len(), 3);
+        surface
+            .editor
+            .borrow_mut()
+            .complete_context_for_test(WorkspaceContext::empty(id.clone()));
+        surface.poll();
+        assert_eq!(material_texts(&surface), ["diff", "excerpt", "log"]);
+        assert!(surface.pending_additions.borrow().is_empty());
+        surface.poll();
+        assert_eq!(material_texts(&surface), ["diff", "excerpt", "log"]);
+
+        let full = pending_surface(&id);
+        for index in 0..WORKSPACE_MATERIAL_LIMIT {
+            full.add_material(id.clone(), material(&format!("pending-{index}")));
+        }
+        full.add_evidence(evidence(&id, "overflow"));
+        assert_eq!(
+            full.pending_additions.borrow().len(),
+            WORKSPACE_MATERIAL_LIMIT
+        );
+        assert!(full.status.text().contains("This item was not added"));
+        full.editor
+            .borrow_mut()
+            .complete_context_for_test(WorkspaceContext::empty(id.clone()));
+        full.poll();
+        assert_eq!(material_texts(&full).len(), WORKSPACE_MATERIAL_LIMIT);
+        assert_eq!(material_texts(&full)[0], "pending-0");
+        assert_eq!(material_texts(&full)[15], "pending-15");
+        assert!(!material_texts(&full).iter().any(|text| text == "overflow"));
+
+        // Unknown saved material count must not cause queued selections to be
+        // discarded on completion. Make room, then consume each once in order.
+        let occupied = pending_surface(&id);
+        occupied.add_material(id.clone(), material("diff"));
+        occupied.add_evidence(evidence(&id, "excerpt"));
+        let mut saved = WorkspaceContext::empty(id.clone());
+        saved.materials = (0..15)
+            .map(|index| material(&format!("saved-{index}")))
+            .collect();
+        occupied
+            .editor
+            .borrow_mut()
+            .complete_context_for_test(saved);
+        occupied.poll();
+        assert_eq!(material_texts(&occupied).last().unwrap(), "diff");
+        assert_eq!(occupied.pending_additions.borrow().len(), 1);
+        assert!(occupied.status.text().contains("still pending"));
+        occupied.editor.borrow_mut().remove_material("saved-0");
+        occupied.poll();
+        assert_eq!(material_texts(&occupied).last().unwrap(), "excerpt");
+        assert!(occupied.pending_additions.borrow().is_empty());
+        occupied.poll();
+        assert_eq!(material_texts(&occupied).len(), 16);
+
+        let cancelled = pending_surface(&id);
+        cancelled.add_evidence(evidence(&id, "cancelled"));
+        cancelled.deselect();
+        assert!(cancelled.pending_additions.borrow().is_empty());
+        let other = ConversationId("other-fixture".into());
+        // Complete the original read after cancellation without reselecting it.
+        cancelled
+            .editor
+            .borrow_mut()
+            .complete_context_for_test(WorkspaceContext::empty(id.clone()));
+        cancelled.poll();
+        assert!(cancelled.editor.borrow().selected().is_none());
+        *cancelled.editor.borrow_mut() = ContextEditor::with_pending_context_for_test(id.clone());
+        cancelled.add_material(id.clone(), material("old-task"));
+        // Stage both reads so navigation exercises production selection without
+        // sending anything to a host or relying on timing.
+        cancelled
+            .editor
+            .borrow_mut()
+            .stage_context_read_for_test(other.clone());
+        cancelled.select(other);
+        assert!(cancelled.pending_additions.borrow().is_empty());
+        cancelled.select(id.clone());
+        cancelled
+            .editor
+            .borrow_mut()
+            .complete_context_for_test(WorkspaceContext::empty(id));
+        cancelled.poll();
+        assert!(material_texts(&cancelled).is_empty());
+        assert!(cancelled.pending_additions.borrow().is_empty());
+    }
+
 }

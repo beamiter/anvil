@@ -18,7 +18,9 @@ RUNNER = Path(__file__).with_name("test-gtk-display.sh")
 ENTER = "enter_ownership::tests::queued_review_write_claims_enter_at_both_backend_boundaries"
 HELD = "block_view::tests::held_enter_history_recall_does_not_submit_the_recalled_command"
 A11Y = "organism_ui::tests::live_settings_reuse_body_preserve_focus_and_stop_disabled_timers"
+CONTEXT_QUEUE = "workspace_context_ui::tests::pending_context_additions_preserve_order_capacity_and_cancellation"
 IME_TESTS = {
+    CONTEXT_QUEUE,
     "block_view::chat::tests::native_ime_commit_cancel_and_independent_ptys",
     "block_view::chat::tests::native_ime_send_button_preserves_composition",
     "block_view::chat::tests::native_chat_passthrough_initial_focus_accepts_composition",
@@ -41,7 +43,7 @@ with open(env["CONTRACT_LOG"], "a") as log:
     log.write(json.dumps({"command": name, "args": args, "pid": os.getpid(),
                          "env": {key: value for key, value in env.items()
                                  if key.startswith(("XDG_", "ANVIL_QA_")) or key in
-                                 ["ANVIL_ENTER_MODE", "GTK_A11Y", "GTK_IM_MODULE", "RUST_TEST_THREADS",
+                                 ["G_DEBUG", "ANVIL_ENTER_MODE", "GTK_A11Y", "GTK_IM_MODULE", "RUST_TEST_THREADS",
                                   "GDK_BACKEND", "GSK_RENDERER", "LIBGL_ALWAYS_SOFTWARE",
                                   "NO_AT_BRIDGE"]}}) + "\n")
 if name == "dbus-run-session":
@@ -123,7 +125,7 @@ def main():
         inventory.write_text(json.dumps(tests))
         env = {key: value for key, value in os.environ.items() if key not in VARIANT_KEYS}
         env.pop("BASH_ENV", None)
-        env.update(GTK_IM_MODULE="contract-inherited", PATH=str(bindir), CONTRACT_TESTS=str(inventory), TMPDIR=str(root))
+        env.update(G_DEBUG="gc-friendly", GTK_IM_MODULE="contract-inherited", PATH=str(bindir), CONTRACT_TESTS=str(inventory), TMPDIR=str(root))
 
         for mode, status in (("success", 0), ("failures", 1), ("missing-test", 1),
                              ("list-failure", 31), ("missing-wrapper", 1)):
@@ -146,7 +148,8 @@ def main():
                     assert call["args"][2] == test
                     actual = {key: call["env"][key] for key in VARIANT_KEYS if key in call["env"]}
                     assert actual == variant, (test, actual, variant)
-                    for key, value in {"GTK_A11Y": "test" if test == A11Y else "none",
+                    for key, value in {"G_DEBUG": "gc-friendly,fatal-warnings" if test == CONTEXT_QUEUE else "gc-friendly",
+                                       "GTK_A11Y": "test" if test == A11Y else "none",
                                        "GTK_IM_MODULE": "simple" if test in IME_TESTS else "contract-inherited",
                                        "RUST_TEST_THREADS": "1", "GDK_BACKEND": "x11",
                                        "GSK_RENDERER": "cairo", "LIBGL_ALWAYS_SOFTWARE": "1",

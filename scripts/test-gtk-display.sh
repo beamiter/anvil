@@ -53,6 +53,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    workspace_context_ui::tests::pending_context_additions_preserve_order_capacity_and_cancellation
     block_view::allocation_observer::tests::canvas_observer_preserves_resize_without_occluding_picks
     workspace_mission_ui::tests::mission_window_is_narrow_and_construction_does_not_start_work
     workspace_shell::panel_tests::files_inspector_roundtrip_preserves_browser_model_selection_and_draft
@@ -256,7 +257,12 @@ for test_name in "${tests[@]}"; do
     if [[ "${test_name}" == block_view::chat::tests::native_ime_commit_cancel_and_independent_ptys || "${test_name}" == block_view::chat::tests::native_ime_send_button_preserves_composition || "${test_name}" == block_view::chat::tests::native_chat_passthrough_initial_focus_accepts_composition ]]; then
         fixture_im_module=simple
     fi
-    GTK_IM_MODULE="${fixture_im_module}" GTK_A11Y="${fixture_a11y}" run_case "${test_name}" \
+    fixture_g_debug="${G_DEBUG-}"
+    if [[ "${test_name}" == workspace_context_ui::tests::pending_context_additions_preserve_order_capacity_and_cancellation ]]; then
+        fixture_im_module=simple
+        fixture_g_debug="${fixture_g_debug:+$fixture_g_debug,}fatal-warnings"
+    fi
+    G_DEBUG="${fixture_g_debug}" GTK_IM_MODULE="${fixture_im_module}" GTK_A11Y="${fixture_a11y}" run_case "${test_name}" \
         dbus-run-session "${dbus_run_args[@]}" -- \
         xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
         cargo test --locked "${test_name}" -- --ignored --exact --nocapture
