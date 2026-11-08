@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - master
+      - dev/shared-terminal-engine-20261108
   workflow_dispatch:
 
 permissions:

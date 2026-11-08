@@ -1681,11 +1681,13 @@ your selection, and **Copy command** copies the exact resume command. In the
 Tasks panel, **Hide** keeps the worktree and **Hidden tasks (N)** restores a task
 to its previous state; the top-bar Tasks button shows how many tasks need you.
 
-Development builds use the sibling `../jterm_core` checkout. Isolated Nix
-builds unpack the deterministic `packaging/jterm-core-src.tar.gz` snapshot
-beside this application. After shared-core changes, refresh it with
-`scripts/package-shared-core.sh`; its companion SHA-256 file records the exact
-packaged source. Targets and Git internals are excluded.
+Cargo, Nix and Flatpak resolve the same exact `jterm_core` Git revision recorded
+in Cargo.toml and Cargo.lock. No sibling checkout or source archive is a default
+build input. Explicit local candidates use the core repository's
+`scripts/family-cargo.py`; archived `packaging/jterm-core-*` files retain their
+historical provenance. Repinning requires the matching Nix source-tree hash and
+regenerated Flatpak Cargo sources. This architecture candidate does not claim a
+completed shared terminal runtime or native visual acceptance.
 
 Resume resolves the CLI executable and its runtime when activated, including
 Node installations managed by NVM when a desktop launcher supplies a minimal

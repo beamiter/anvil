@@ -17,10 +17,12 @@ test "$(git -C "$core_dir" rev-parse "$revision^{commit}")" = "$revision"
 stage=$(mktemp -d "$repo_dir/packaging/.jterm-core-src.XXXXXX")
 trap 'rm -rf -- "$stage"' EXIT
 # Export committed blobs, not untracked or modified worktree inputs.
-git -C "$core_dir" archive "$revision" Cargo.toml Cargo.lock README.md src runtime scripts tests assets \
+extra=()
+if git -C "$core_dir" cat-file -e "$revision:crates" 2>/dev/null; then extra+=(crates); fi
+git -C "$core_dir" archive "$revision" Cargo.toml Cargo.lock README.md src runtime scripts tests assets "${extra[@]}" \
   | tar -xf - -C "$stage"
 tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
-  -C "$stage" -cf - Cargo.toml Cargo.lock README.md src runtime scripts tests assets \
+  -C "$stage" -cf - Cargo.toml Cargo.lock README.md src runtime scripts tests assets "${extra[@]}" \
   | gzip -n > "$stage/archive.tar.gz"
 chmod 644 "$stage/archive.tar.gz"
 mv -f "$stage/archive.tar.gz" "$repo_dir/packaging/jterm-core-src.tar.gz"

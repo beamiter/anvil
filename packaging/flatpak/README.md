@@ -64,11 +64,11 @@ manifest, and the final Cargo source config.
 The shared `jterm_core` source is an exact Git dependency in `Cargo.lock`.
 The generated manifest fetches that revision and vendors it with the registry
 dependencies, so the Flatpak build uses the locked sources offline.
-`packaging/jterm-core-src.tar.gz` also retains a deterministic source snapshot
-of the same revision. Its `.sha256`, `jterm-core-revision`, and
-`jterm-core-origin.json` files record the checksum and exact Git provenance.
-Refresh all of them from the exact commit when updating the core pin. A staged
-release can be checked against a local commit before publication; the origin
-record states that boundary explicitly. Push that exact core commit before
+`packaging/jterm-core-src.tar.gz` and its `.sha256`, `jterm-core-revision`, and
+`jterm-core-origin.json` retain historical snapshot provenance. They are not
+current build inputs and are not silently overwritten when this architecture
+candidate changes the Cargo pin. `jterm-core-production.json` records the active
+Git revision and source-tree NAR hash. Publish that exact core commit before
 remote builds acquire the new dependency. The source archive SHA-256 and the
-full source tree NAR hash used by Nix are separate values.
+full source-tree NAR hash used by Nix are separate values. The optional snapshot
+script exports committed files, including the independent engine when present.
