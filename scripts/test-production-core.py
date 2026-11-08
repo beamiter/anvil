@@ -112,6 +112,12 @@ class SourceContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fixture lock"):
             checker.check(self.root)
 
+    def test_historical_bundle_may_differ_from_production(self):
+        receipt = json.loads((self.root / "packaging/jterm-core-origin.json").read_text())
+        revision = checker.check(self.root)
+        self.assertNotEqual(receipt["published_core_commit"], revision)
+        self.assertEqual((self.root / "packaging/jterm-core-revision").read_text().strip(), receipt["published_core_commit"])
+
     def test_stale_audit_bundle_revision_is_rejected(self):
         (self.root / "packaging/jterm-core-revision").write_text("0" * 40 + "\n")
         with self.assertRaisesRegex(ValueError, "Audit bundle revision"):

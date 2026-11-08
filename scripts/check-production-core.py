@@ -58,9 +58,16 @@ def check(root):
     if f'"jterm_core-0.2.0" = "{receipt.get("source_nar_sha256")}";' not in flake:
         raise ValueError("Nix hash disagrees with the production source receipt")
     origin = json.loads((root / "packaging/jterm-core-origin.json").read_text())
-    if (root / "packaging/jterm-core-revision").read_text().strip() != revision or origin.get("published_core_commit") != revision:
-        raise ValueError("Audit bundle revision disagrees with the production core")
-    if origin.get("published_core_tree") != receipt.get("tree") or origin.get("source_nar_sha256") != receipt.get("source_nar_sha256"):
+    # The audit export is historical, not a build input. Validate its own
+    # receipt rather than silently relabelling it when production is repinned.
+    archive_revision = (root / "packaging/jterm-core-revision").read_text().strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", archive_revision) or archive_revision == "0" * 40 or origin.get("published_core_commit") != archive_revision:
+        raise ValueError("Audit bundle revision disagrees with its historical receipt")
+    archive_tree = origin.get("published_core_tree", "")
+    archive_nar = origin.get("source_nar_sha256", "")
+    if not re.fullmatch(r"[0-9a-f]{40}", archive_tree) or archive_tree == "0" * 40 or not re.fullmatch(r"sha256-[A-Za-z0-9+/]{43}=", archive_nar):
+        raise ValueError("Audit bundle source identity is malformed")
+    if archive_revision == revision and (archive_tree != receipt.get("tree") or archive_nar != receipt.get("source_nar_sha256")):
         raise ValueError("Audit bundle source identity disagrees with production")
     archive_hash = hashlib.sha256((root / "packaging/jterm-core-src.tar.gz").read_bytes()).hexdigest()
     if origin.get("archive_sha256") != archive_hash or (root / "packaging/jterm-core-src.tar.gz.sha256").read_text().strip() != f"{archive_hash}  jterm-core-src.tar.gz":
