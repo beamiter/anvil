@@ -669,6 +669,99 @@ impl SharedChats {
         Ok((open || old == Some(active)).then_some(local))
     }
 
+    fn receive_reload_chat(
+        &mut self,
+        store: &mut ChatStore,
+        chat: StoredChat,
+        local: u64,
+        navigation: (bool, bool),
+        redact: bool,
+    ) -> Vec<Event> {
+        let (open, keep_local) = navigation;
+        let mut events = Vec::new();
+        let draft = store.chat_draft(local).unwrap_or_default().to_string();
+        let remote_draft = snapshot_draft(&chat.snapshot_json);
+        let baseline = self
+            .known
+            .get(&local)
+            .map(|known| snapshot_draft(&known.chat.snapshot_json))
+            .unwrap_or_default();
+        let resolution = if keep_local {
+            DraftResolution::Local
+        } else {
+            reconcile_draft(&draft, &remote_draft, &baseline)
+        };
+        let active = store.active_id();
+        match self.accept_chat(store, chat, None, open, redact) {
+            Ok(_) => {
+                if resolution != DraftResolution::Remote {
+                    store.set_chat_draft(local, draft);
+                }
+                if resolution == DraftResolution::Conflict {
+                    if let Some(known) = self.known.get_mut(&local) {
+                        known.blocked = true;
+                    }
+                    events.push(Event::Error("Another window edited this draft. Your local draft is kept; use Reload shared history to explicitly keep it with the newer history.".into()));
+                }
+                if !open {
+                    store.select_chat(active);
+                }
+                if open {
+                    events.push(Event::Opened(store.active_id()));
+                } else {
+                    events.push(Event::Refreshed);
+                }
+            }
+            Err(error) => events.push(Event::Error(error)),
+        }
+        events
+    }
+
+    fn receive_open_chat(
+        &mut self,
+        store: &mut ChatStore,
+        chat: StoredChat,
+        activate: bool,
+        redact: bool,
+    ) -> Vec<Event> {
+        // An earlier Open may have bound this identity since this read began.
+        // Activation retirement alone does not make its old snapshot safe.
+        if let Some(local) = self.local_id(&chat.row.id) {
+            let incoming = ConversationSnapshot::from_json(&chat.snapshot_json)
+                .ok()
+                .and_then(|snapshot| snapshot.active_chat().map(ChatSnapshot::id));
+            if incoming != Some(local) {
+                return vec![Event::Error(
+                    "Shared conversation identity changed; the local draft was kept.".into(),
+                )];
+            }
+            let protected = self
+                .known
+                .get(&local)
+                .is_some_and(|known| known.writing || known.blocked)
+                || self.is_pending_write(local)
+                || self.submissions.contains_key(&local)
+                || self.receipts.keys().any(|token| token.chat_id == local)
+                || store
+                    .summaries()
+                    .iter()
+                    .any(|row| row.id == local && row.busy);
+            if protected {
+                return if activate && store.select_chat(local) {
+                    vec![Event::Opened(local)]
+                } else {
+                    vec![Event::Refreshed]
+                };
+            }
+            return self.receive_reload_chat(store, chat, local, (activate, false), redact);
+        }
+        match self.accept_chat(store, chat, None, activate, redact) {
+            Ok(Some(local)) => vec![Event::Opened(local)],
+            Ok(None) => vec![Event::Refreshed],
+            Err(error) => vec![Event::Error(error)],
+        }
+    }
+
     pub fn poll(&mut self, store: &mut ChatStore, redact: bool) -> Vec<Event> {
         let mut events = Vec::new();
         for event in self.client.poll() {
@@ -780,11 +873,7 @@ impl SharedChats {
                     }
                 }
                 (Pending::Open { activate }, Reply::Chat { chat }) => {
-                    match self.accept_chat(store, chat, None, activate, redact) {
-                        Ok(Some(local)) => events.push(Event::Opened(local)),
-                        Ok(None) => events.push(Event::Refreshed),
-                        Err(error) => events.push(Event::Error(error)),
-                    }
+                    events.extend(self.receive_open_chat(store, chat, activate, redact));
                 }
                 (Pending::Save { local, snapshot }, Reply::Chat { chat }) => {
                     let writing = self.is_pending_write(local);
@@ -853,41 +942,13 @@ impl SharedChats {
                     },
                     Reply::Chat { chat },
                 ) => {
-                    let draft = store.chat_draft(local).unwrap_or_default().to_string();
-                    let remote_draft = snapshot_draft(&chat.snapshot_json);
-                    let baseline = self
-                        .known
-                        .get(&local)
-                        .map(|known| snapshot_draft(&known.chat.snapshot_json))
-                        .unwrap_or_default();
-                    let resolution = if keep_local {
-                        DraftResolution::Local
-                    } else {
-                        reconcile_draft(&draft, &remote_draft, &baseline)
-                    };
-                    let active = store.active_id();
-                    match self.accept_chat(store, chat, None, open, redact) {
-                        Ok(_) => {
-                            if resolution != DraftResolution::Remote {
-                                store.set_chat_draft(local, draft);
-                            }
-                            if resolution == DraftResolution::Conflict {
-                                if let Some(known) = self.known.get_mut(&local) {
-                                    known.blocked = true;
-                                }
-                                events.push(Event::Error("Another window edited this draft. Your local draft is kept; use Reload shared history to explicitly keep it with the newer history.".into()));
-                            }
-                            if !open {
-                                store.select_chat(active);
-                            }
-                            if open {
-                                events.push(Event::Opened(store.active_id()));
-                            } else {
-                                events.push(Event::Refreshed);
-                            }
-                        }
-                        Err(error) => events.push(Event::Error(error)),
-                    }
+                    events.extend(self.receive_reload_chat(
+                        store,
+                        chat,
+                        local,
+                        (open, keep_local),
+                        redact,
+                    ));
                 }
 
                 (Pending::Delete { local }, Reply::Ack) => {
@@ -1235,6 +1296,206 @@ mod tests {
             api_job: None,
             background_api_supported: true,
         }
+    }
+
+    fn open_draft_chat(local: u64, draft: &str) -> StoredChat {
+        let mut chat = navigation_chat(local, "Open fixture");
+        let snapshot =
+            ChatSnapshot::from_completed_history(local, "Open fixture", false, &[], None, draft);
+        chat.snapshot_json = ConversationSnapshot::from_chats(local, vec![snapshot])
+            .unwrap()
+            .to_json()
+            .unwrap();
+        chat
+    }
+
+    fn duplicate_open_fixture() -> (SharedChats, ChatStore, u64, Vec<u64>) {
+        let mut bridge = SharedChats::new("duplicate-open".into());
+        let path = std::env::temp_dir().join(format!(
+            "duplicate-open-no-host-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        bridge.client = WorkspaceClient::for_state_dir(path);
+        let local = jterm_core::agent_workspace::SHARED_CHAT_ID_BASE + 100;
+        let chat = open_draft_chat(local, "baseline");
+        assert_eq!(bridge.open(chat.row.id.clone()).unwrap(), None);
+        assert_eq!(bridge.open(chat.row.id).unwrap(), None);
+        let mut requests: Vec<_> = bridge
+            .pending
+            .iter()
+            .filter_map(|(id, pending)| matches!(pending, Pending::Open { .. }).then_some(*id))
+            .collect();
+        requests.sort_unstable();
+        assert_eq!(requests.len(), 2);
+        (bridge, ChatStore::default(), local, requests)
+    }
+
+    fn deliver_open(
+        bridge: &mut SharedChats,
+        store: &mut ChatStore,
+        request: u64,
+        chat: StoredChat,
+    ) -> Vec<Event> {
+        let (_, pending, result) = bridge
+            .take_pending_reply(WorkspaceEvent::Reply {
+                request_id: request,
+                result: Ok(Reply::Chat { chat }),
+            })
+            .unwrap();
+        let Pending::Open { activate } = pending else {
+            panic!("Open request");
+        };
+        let Ok(Reply::Chat { chat }) = result else {
+            panic!("Chat reply");
+        };
+        // The exact production Pending::Open reply handler used by poll.
+        bridge.receive_open_chat(store, chat, activate, false)
+    }
+
+    #[test]
+    fn duplicate_open_reply_preserves_draft_typed_between_polls() {
+        let (mut bridge, mut store, local, requests) = duplicate_open_fixture();
+        let original = store.active_id();
+        let events = deliver_open(
+            &mut bridge,
+            &mut store,
+            requests[0],
+            open_draft_chat(local, "baseline"),
+        );
+        assert!(matches!(events.as_slice(), [Event::Refreshed]));
+        assert_eq!(store.active_id(), original);
+        // The first poll refreshes the library. User selects that cached row,
+        // retiring the second activation, and types before its ordered reply.
+        bridge.retire_navigation();
+        assert!(store.select_chat(local));
+        store.set_active_draft("new local draft".into());
+        let events = deliver_open(
+            &mut bridge,
+            &mut store,
+            requests[1],
+            open_draft_chat(local, "baseline"),
+        );
+        assert_eq!(
+            store.chat_draft(local),
+            Some("new local draft"),
+            "duplicate Open must preserve newer local draft"
+        );
+        assert!(matches!(events.as_slice(), [Event::Refreshed]));
+        assert!(!bridge.known[&local].blocked);
+    }
+
+    #[test]
+    fn duplicate_open_reconciles_remote_edits_without_taking_new_selection() {
+        for (local_draft, remote_draft, expected, conflict) in [
+            ("new local", "peer edit", "new local", true),
+            ("baseline", "peer edit", "peer edit", false),
+            ("same edit", "same edit", "same edit", false),
+        ] {
+            let (mut bridge, mut store, local, requests) = duplicate_open_fixture();
+            let other = store.active_id();
+            deliver_open(
+                &mut bridge,
+                &mut store,
+                requests[0],
+                open_draft_chat(local, "baseline"),
+            );
+            assert!(store.select_chat(local));
+            store.set_chat_draft(local, local_draft.into());
+            bridge.retire_navigation();
+            assert!(store.select_chat(other));
+            let events = deliver_open(
+                &mut bridge,
+                &mut store,
+                requests[1],
+                open_draft_chat(local, remote_draft),
+            );
+            assert_eq!(store.chat_draft(local), Some(expected));
+            assert_eq!(store.active_id(), other);
+            assert_eq!(bridge.known[&local].blocked, conflict);
+            assert_eq!(
+                events.iter().any(|e| matches!(e, Event::Error(_))),
+                conflict
+            );
+        }
+        // Without newer navigation, the newest requested Open still activates.
+        let (mut bridge, mut store, local, requests) = duplicate_open_fixture();
+        deliver_open(
+            &mut bridge,
+            &mut store,
+            requests[0],
+            open_draft_chat(local, "baseline"),
+        );
+        let events = deliver_open(
+            &mut bridge,
+            &mut store,
+            requests[1],
+            open_draft_chat(local, "baseline"),
+        );
+        assert!(matches!(events.as_slice(), [Event::Opened(id)] if *id == local));
+        assert_eq!(store.active_id(), local);
+    }
+
+    #[test]
+    fn duplicate_open_does_not_replace_busy_writing_or_mismatched_identity() {
+        for writing in [false, true] {
+            let (mut bridge, mut store, local, requests) = duplicate_open_fixture();
+            deliver_open(
+                &mut bridge,
+                &mut store,
+                requests[0],
+                open_draft_chat(local, "baseline"),
+            );
+            bridge.retire_navigation();
+            store.select_chat(local);
+            store.set_active_draft("protected draft".into());
+            if writing {
+                bridge.known.get_mut(&local).unwrap().writing = true;
+                bridge.pending.insert(
+                    u64::MAX,
+                    Pending::Save {
+                        local,
+                        snapshot: "pending snapshot".into(),
+                    },
+                );
+            } else {
+                store
+                    .begin_turn("busy user".into(), None, "Thinking".into(), false)
+                    .unwrap();
+            }
+            let before = bridge.known[&local].saved.clone();
+            deliver_open(
+                &mut bridge,
+                &mut store,
+                requests[1],
+                open_draft_chat(local, "old remote"),
+            );
+            assert_eq!(store.chat_draft(local), Some("protected draft"));
+            assert_eq!(bridge.known[&local].saved, before);
+            assert_eq!(bridge.known[&local].writing, writing);
+            if writing {
+                assert!(bridge.pending.contains_key(&u64::MAX));
+            } else {
+                assert!(store.is_active_busy());
+            }
+        }
+        let (mut bridge, mut store, local, requests) = duplicate_open_fixture();
+        deliver_open(
+            &mut bridge,
+            &mut store,
+            requests[0],
+            open_draft_chat(local, "baseline"),
+        );
+        store.set_chat_draft(local, "keep identity".into());
+        let mut mismatched = open_draft_chat(local + 1, "wrong");
+        mismatched.row.id = ConversationId(format!("navigation-{local}"));
+        let events = deliver_open(&mut bridge, &mut store, requests[1], mismatched);
+        assert!(matches!(events.as_slice(), [Event::Error(_)]));
+        assert_eq!(store.chat_draft(local), Some("keep identity"));
+        assert!(!bridge.known.contains_key(&(local + 1)));
     }
 
     #[test]
