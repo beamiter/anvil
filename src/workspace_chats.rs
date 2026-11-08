@@ -601,6 +601,18 @@ impl SharedChats {
         open: bool,
         redact: bool,
     ) -> Result<Option<u64>, String> {
+        self.accept_chat_with_snapshot(store, chat, (old, open), redact, None)
+    }
+
+    fn accept_chat_with_snapshot(
+        &mut self,
+        store: &mut ChatStore,
+        chat: StoredChat,
+        navigation: (Option<u64>, bool),
+        redact: bool,
+        replacement: Option<ChatSnapshot>,
+    ) -> Result<Option<u64>, String> {
+        let (old, open) = navigation;
         let remote = ConversationSnapshot::from_json(&chat.snapshot_json)
             .map_err(|e| format!("Invalid shared conversation: {e}"))?;
         let incoming = remote
@@ -629,7 +641,7 @@ impl SharedChats {
                 )
                 .with_history_truncated(legacy.history_truncated())
             })
-            .unwrap_or_else(|| incoming.clone());
+            .unwrap_or_else(|| replacement.unwrap_or_else(|| incoming.clone()));
         if let Some(old) = old.filter(|old| *old != local) {
             store
                 .replace_imported_legacy_chat(old, snapshot)
@@ -691,17 +703,46 @@ impl SharedChats {
         } else {
             reconcile_draft(&draft, &remote_draft, &baseline)
         };
+        // The read can outlive edits to metadata as well as the draft.
+        // Merge only metadata; history/archive remain authoritative remotely.
+        let local_snapshot = store.snapshot_chat_for_persistence(local, false);
+        let baseline_snapshot = self.known.get(&local)
+            .and_then(|known| ConversationSnapshot::from_json(&known.chat.snapshot_json).ok());
+        let remote_snapshot = ConversationSnapshot::from_json(&chat.snapshot_json).ok();
+        let mut metadata_conflict = false;
+        let replacement = match (
+            local_snapshot.as_ref(),
+            baseline_snapshot.as_ref().and_then(ConversationSnapshot::active_chat),
+            remote_snapshot.as_ref().and_then(ConversationSnapshot::active_chat),
+        ) {
+            (Some(current), Some(base), Some(remote)) if remote.id() == local => {
+                let title_changed = current.title() != base.title();
+                let context_changed = !same_context(current.block_context(), base.block_context());
+                metadata_conflict = (title_changed && remote.title() != base.title() && remote.title() != current.title())
+                    || (context_changed && !same_context(remote.block_context(), base.block_context())
+                        && !same_context(remote.block_context(), current.block_context()));
+                Some(ChatSnapshot::from_completed_history(
+                    local,
+                    if title_changed { current.title() } else { remote.title() },
+                    remote.archived(),
+                    remote.turns(),
+                    if context_changed { current.block_context() } else { remote.block_context() },
+                    remote.draft(),
+                ).with_history_truncated(remote.history_truncated()))
+            }
+            _ => None,
+        };
         let active = store.active_id();
-        match self.accept_chat(store, chat, None, open, redact) {
+        match self.accept_chat_with_snapshot(store, chat, (None, open), redact, replacement) {
             Ok(_) => {
                 if resolution != DraftResolution::Remote {
                     store.set_chat_draft(local, draft);
                 }
-                if resolution == DraftResolution::Conflict {
+                if resolution == DraftResolution::Conflict || metadata_conflict {
                     if let Some(known) = self.known.get_mut(&local) {
                         known.blocked = true;
                     }
-                    events.push(Event::Error("Another window edited this draft. Your local draft is kept; use Reload shared history to explicitly keep it with the newer history.".into()));
+                    events.push(Event::Error("Another window edited this conversation. Your local draft, title and context edits are kept; reload shared history explicitly before sending.".into()));
                 }
                 if !open {
                     store.select_chat(active);
@@ -1262,6 +1303,18 @@ fn reconcile_draft(local: &str, remote: &str, baseline: &str) -> DraftResolution
     }
 }
 
+fn same_context(
+    left: Option<&jterm_core::ai::BlockContext>,
+    right: Option<&jterm_core::ai::BlockContext>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.cmd == b.cmd && a.output == b.output && a.cwd == b.cwd
+            && a.exit_code == b.exit_code && a.truncated == b.truncated,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1296,6 +1349,81 @@ mod tests {
             api_job: None,
             background_api_supported: true,
         }
+    }
+
+
+    fn metadata_chat(local: u64, title: &str, command: &str) -> StoredChat {
+        use jterm_core::ai::{BlockContext, Role, Turn};
+        let mut chat = navigation_chat(local, title);
+        let context = BlockContext {
+            cmd: command.into(), output: "synthetic output".into(),
+            cwd: Some("/tmp/fixture".into()), exit_code: 0, truncated: false,
+        };
+        let turns = [
+            Turn { role: Role::User, text: "synthetic question".into() },
+            Turn { role: Role::Assistant, text: "synthetic answer".into() },
+        ];
+        let snapshot = ChatSnapshot::from_completed_history(
+            local, title, false, &turns, Some(&context), "baseline",
+        );
+        chat.snapshot_json = ConversationSnapshot::from_chats(local, vec![snapshot])
+            .unwrap().to_json().unwrap();
+        chat
+    }
+
+    #[test]
+    fn reload_preserves_metadata_edits_made_while_read_is_pending() {
+        // Independent title/context edits, simultaneous edits, unchanged local,
+        // and divergent remote edits all pass through the real request gate.
+        for local_changes in 0..4 {
+            for remote_changed in [false, true] {
+                let (mut bridge, mut store, local, _) = duplicate_open_fixture();
+                bridge.pending.clear();
+                bridge.accept_chat(&mut store, metadata_chat(local, "Original", "old command"), None, true, false).unwrap();
+                bridge.reload(local).unwrap();
+                let request = *bridge.pending.iter().find(|(_, p)| matches!(p, Pending::Reload { .. })).unwrap().0;
+                if local_changes & 1 != 0 { assert!(store.rename_active("Local title")); }
+                if local_changes & 2 != 0 { assert_eq!(store.clear_active_context(), Ok(true)); }
+                let remote_title = if remote_changed { "Remote title" } else { "Original" };
+                let remote_command = if remote_changed { "remote command" } else { "old command" };
+                let remote = metadata_chat(local, remote_title, remote_command);
+                let remote_json = remote.snapshot_json.clone();
+                let (_, pending, reply) = bridge.take_pending_reply(WorkspaceEvent::Reply {
+                    request_id: request, result: Ok(Reply::Chat { chat: remote }),
+                }).unwrap();
+                let Pending::Reload { local: target, open, keep_local } = pending else { panic!("reload"); };
+                let Ok(Reply::Chat { chat }) = reply else { panic!("chat"); };
+                let events = bridge.receive_reload_chat(&mut store, chat, target, (open, keep_local), false);
+                assert_eq!(store.active_title(), if local_changes & 1 != 0 { "Local title" } else { remote_title },
+                    "reload must preserve newer local title");
+                if local_changes & 2 != 0 {
+                    assert!(store.active_context().is_none(), "reload must preserve cleared local context");
+                } else {
+                    assert_eq!(store.active_context().unwrap().cmd, remote_command);
+                }
+                let conflict = remote_changed && local_changes != 0;
+                assert_eq!(bridge.known[&local].blocked, conflict);
+                assert_eq!(events.iter().any(|e| matches!(e, Event::Error(_))), conflict);
+                assert_eq!(bridge.known[&local].chat.snapshot_json, remote_json);
+                assert_eq!(bridge.known[&local].saved, remote_json, "merged metadata must not pretend to be saved remotely");
+                assert!(!bridge.known[&local].writing);
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_open_preserves_local_title_and_cleared_context() {
+        let (mut bridge, mut store, local, requests) = duplicate_open_fixture();
+        deliver_open(&mut bridge, &mut store, requests[0], metadata_chat(local, "Original", "old command"));
+        bridge.retire_navigation();
+        store.select_chat(local);
+        assert!(store.rename_active("Local title"));
+        assert_eq!(store.clear_active_context(), Ok(true));
+        let events = deliver_open(&mut bridge, &mut store, requests[1], metadata_chat(local, "Original", "old command"));
+        assert_eq!(store.active_title(), "Local title");
+        assert!(store.active_context().is_none());
+        assert!(matches!(events.as_slice(), [Event::Refreshed]));
+        assert!(!bridge.known[&local].blocked);
     }
 
     fn open_draft_chat(local: u64, draft: &str) -> StoredChat {

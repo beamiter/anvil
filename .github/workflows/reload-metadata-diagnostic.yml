@@ -1,0 +1,66 @@
+name: Reload metadata validation
+on:
+  push:
+    branches: [diagnostics/anvil-reload-metadata]
+permissions:
+  contents: read
+jobs:
+  open:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: bash scripts/materialize-shared-core.sh
+      - run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y pkg-config libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev libpcre2-dev
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt,clippy
+      - name: Format and record tested source
+        run: |
+          ulimit -c 0
+          cargo fmt --all
+          python3 - <<'PY'
+          import base64
+          from pathlib import Path
+          p = Path('src/workspace_chats.rs')
+          print('FORMATTED_SOURCE', str(p), base64.b64encode(p.read_bytes()).decode())
+          PY
+          cargo fmt --all -- --check
+      - name: First prove original reload replacement loses metadata
+        run: |
+          ulimit -c 0
+          file=src/workspace_chats.rs
+          cp "$file" "$RUNNER_TEMP/fixed-open.rs"
+          trap 'cp "$RUNNER_TEMP/fixed-open.rs" "$file"' EXIT
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/workspace_chats.rs')
+          s = p.read_text()
+          import re
+          start = s.index('    fn receive_reload_chat(')
+          end = s.index('    fn receive_open_chat(', start)
+          part, count = re.subn(r'\breplacement(?=\s*,?\s*\))', 'None', s[start:end])
+          assert count == 1
+          p.write_text(s[:start] + part + s[end:])
+          PY
+          set +e
+          cargo test --bin anvil --locked workspace_chats::tests::reload_preserves_metadata_edits_made_while_read_is_pending -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/open-negative.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -ne 0
+          grep -F 'reload must preserve newer local title' "$RUNNER_TEMP/open-negative.log"
+          echo "Original reload replacement rejected with status $status"
+      - name: Validate fixed production model and frontend build
+        run: |
+          ulimit -c 0
+          cargo clippy --bin anvil --locked -- -D warnings
+          cargo test --bin anvil --locked workspace_chats::tests

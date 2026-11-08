@@ -1,5 +1,7 @@
 # Changelog
 
+- Preserve title edits and cleared Block context across delayed shared chat reads; reconcile remote metadata independently without treating local changes as already saved.
+
 All notable changes to anvil are documented here. The project follows semantic
 versioning for tagged releases while it remains experimental.
 
