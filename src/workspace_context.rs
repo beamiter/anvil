@@ -58,6 +58,27 @@ impl Default for ContextEditor {
 }
 
 impl ContextEditor {
+    #[cfg(test)]
+    pub(crate) fn with_pending_context_for_test(id: ConversationId) -> Self {
+        let mut editor = Self {
+            selected: Some(id.clone()),
+            ..Default::default()
+        };
+        editor.stage_context_read_for_test(id);
+        editor
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stage_context_read_for_test(&mut self, id: ConversationId) {
+        self.pending
+            .insert(u64::MAX - self.pending.len() as u64, Pending::Read(id));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_context_for_test(&mut self, context: WorkspaceContext) {
+        self.receive(u64::MAX, Ok(WorkspaceReply::Context { context }));
+    }
+
     pub(crate) fn selected(&self) -> Option<&ConversationId> {
         self.selected.as_ref()
     }

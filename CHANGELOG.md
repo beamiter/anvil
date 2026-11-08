@@ -5,6 +5,9 @@ versioning for tagged releases while it remains experimental.
 
 ## Unreleased
 
+- Preserve selected context materials and evidence in a bounded FIFO while loading;
+  report overflow, retain queued items when full, and cancel them on navigation.
+
 - Late new-chat replies preserve newer navigation, and deferred block-context
   messages target the exact created chat even when multiple creations finish
   together. Creation failures no longer clear unrelated pending submissions.
