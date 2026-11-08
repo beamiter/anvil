@@ -1,0 +1,67 @@
+name: Native Vim9 bounded exit-code diagnosis
+on:
+  push:
+    branches: [diagnostics/anvil-f63-native-plain]
+permissions:
+  contents: read
+jobs:
+  native-exit-codes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: '0'
+      RUST_BACKTRACE: '1'
+      GDK_BACKEND: x11
+      GSK_RENDERER: cairo
+      GTK_A11Y: none
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: f63fe0d2fced14de028b44b61b26e597c263d846
+          persist-credentials: false
+      - name: Verify exact source and materialize bundled dependencies
+        run: |
+          ulimit -c 0
+          test "$(ulimit -c)" = 0
+          test "$(git rev-parse HEAD)" = f63fe0d2fced14de028b44b61b26e597c263d846
+          bash scripts/materialize-shared-core.sh
+      - name: Install official native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes pkg-config libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev vim ripgrep libxtst6 dbus-x11 xauth xvfb
+      - name: Build unchanged source using normal test profile
+        run: |
+          ulimit -c 0
+          test "$(ulimit -c)" = 0
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          cargo test --locked --no-run --bin anvil --message-format=json > build.jsonl
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          rows = [json.loads(line) for line in Path('build.jsonl').read_text().splitlines()]
+          bins = [r['executable'] for r in rows if r.get('reason') == 'compiler-artifact' and r.get('target', {}).get('name') == 'anvil' and r.get('profile', {}).get('test') and r.get('executable')]
+          assert len(bins) == 1
+          Path('test-binary.txt').write_text(bins[0] + '\n')
+          PY
+      - name: Run bounded isolated test with only fixed status labels
+        timeout-minutes: 12
+        shell: bash
+        run: |
+          set -uo pipefail
+          ulimit -c 0
+          test "$(ulimit -c)" = 0
+          export JTERM_VIM9_BIN="$(command -v vim)" VIM9_TEST_VIM="$(command -v vim)"
+          binary="$(cat test-binary.txt)"
+          for attempt in $(seq 1 20); do
+            printf 'TEST_START %d\n' "$attempt"
+            status=0
+            timeout --kill-after=10s 30s dbus-run-session -- xvfb-run --auto-servernum \
+              "$binary" vim9_ide::native_tests::native_vim9_command_palette_modes_and_live_availability \
+              --exact --include-ignored --test-threads=1 >/dev/null 2>&1 || status=$?
+            if [ "$status" -ne 0 ]; then
+              printf 'TEST_FAIL %d %d\n' "$attempt" "$status"
+              exit 1
+            fi
+            printf 'TEST_PASS %d %d\n' "$attempt" "$status"
+          done
