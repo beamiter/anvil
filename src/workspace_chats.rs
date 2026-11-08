@@ -1351,6 +1351,7 @@ mod tests {
             let (mut bridge, mut store, local, requests) = duplicate_open_fixture();
             let other = store.active_id();
             deliver_open(&mut bridge, &mut store, requests[0], open_draft_chat(local, "baseline"));
+            assert!(store.select_chat(local));
             store.set_chat_draft(local, local_draft.into());
             bridge.retire_navigation();
             assert!(store.select_chat(other));
