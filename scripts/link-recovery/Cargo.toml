@@ -2,10 +2,11 @@
 name = "anvil-owned-launch-boundary"
 version = "0.0.0"
 edition = "2021"
+rust-version = "1.92"
 publish = false
 
 [dependencies]
 gio = "=0.22.8"
 glib = "=0.22.8"
 # Keep this exact public core revision aligned with production Cargo.toml.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "a6e47726d02bed2ca4a6ba1a682511f970853527" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "598f15808086dbea14d56fc1b86e77b6cb2e3201" }

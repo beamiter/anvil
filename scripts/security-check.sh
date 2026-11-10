@@ -15,6 +15,7 @@ if ! command -v cargo-audit >/dev/null 2>&1; then
 fi
 # Maintenance and other advisory warnings must fail the security gate too.
 cargo audit --deny warnings
+cargo audit --deny warnings --file scripts/link-recovery/Cargo.lock
 
 # Duplicate crates are not automatically vulnerabilities, but surfacing them
 # here makes dependency drift visible during reviews and scheduled audits.
