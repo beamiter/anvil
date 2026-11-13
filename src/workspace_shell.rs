@@ -4074,7 +4074,42 @@ mod tests {
             refresh();
         };
         settle();
-        workspace.emit_clicked();
+        let output = std::process::Command::new("xdotool")
+            .args(["search", "--name", &title])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let id = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_owned();
+        // Exercise native pointer hit testing, press/release dispatch, and the
+        // production rail button callback, not a synthetic clicked signal.
+        let click_workspace = || {
+            assert!(workspace.is_mapped());
+            let bounds = workspace.compute_bounds(&window).expect("mapped rail bounds");
+            let (surface_x, surface_y) = window.surface_transform();
+            let x = (f64::from(bounds.x() + bounds.width() / 2.0) + surface_x)
+                .round()
+                .to_string();
+            let y = (f64::from(bounds.y() + bounds.height() / 2.0) + surface_y)
+                .round()
+                .to_string();
+            assert!(std::process::Command::new("xdotool")
+                .args(["windowfocus", "--sync", &id])
+                .status()
+                .unwrap()
+                .success());
+            assert!(std::process::Command::new("xdotool")
+                .args(["mousemove", "--window", &id, &x, &y, "click", "1"])
+                .status()
+                .unwrap()
+                .success());
+            settle();
+        };
+        click_workspace();
         assert_eq!(
             navigation_actions.get(),
             1,
@@ -4086,7 +4121,7 @@ mod tests {
             !navigation.is_mapped(),
             "first click hides the docked sidebar"
         );
-        workspace.emit_clicked();
+        click_workspace();
         assert_eq!(
             navigation_actions.get(),
             2,
@@ -4100,10 +4135,10 @@ mod tests {
             "second click restores the docked sidebar"
         );
         for _ in 0..2 {
-            workspace.emit_clicked();
+            click_workspace();
             settle();
             assert!(!navigation.is_mapped());
-            workspace.emit_clicked();
+            click_workspace();
             settle();
             assert!(navigation.is_mapped());
         }
@@ -4161,17 +4196,6 @@ mod tests {
         });
         search.add_controller(child_keys);
         search.grab_focus();
-        let output = std::process::Command::new("xdotool")
-            .args(["search", "--name", &title])
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        let id = String::from_utf8(output.stdout)
-            .unwrap()
-            .lines()
-            .next()
-            .unwrap()
-            .to_owned();
         let key = || {
             assert!(std::process::Command::new("xdotool")
                 .args(["windowfocus", "--sync", &id, "key", "Escape"])
