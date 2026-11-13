@@ -519,10 +519,7 @@ pub(crate) fn contains_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool 
     }
 
     let first_upper = needle[0].to_ascii_uppercase();
-    if first_upper != first_lower && scan(haystack, needle, first_upper) {
-        return true;
-    }
-    false
+    first_upper != first_lower && scan(haystack, needle, first_upper)
 }
 
 pub(crate) fn parse_param_first(buf: &[u8], default: usize) -> usize {

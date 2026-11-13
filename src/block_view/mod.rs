@@ -1649,10 +1649,7 @@ fn rerun_is_admissible(guards: PromptRerunGuards, command: &str, bracketed_paste
         return false;
     }
     let _ = bracketed_paste;
-    if !historical_command_is_rerunnable(command) {
-        return false;
-    }
-    true
+    historical_command_is_rerunnable(command)
 }
 
 /// The one selected, command-bearing card Ctrl+Enter may act on.
@@ -20565,8 +20562,8 @@ mod tests {
                 return Some(String::new());
             }
             let mut text = String::new();
-            for index in first..=last {
-                let row: Vec<char> = grid.rows[index].chars().collect();
+            for (index, row) in grid.rows.iter().enumerate().take(last + 1).skip(first) {
+                let row: Vec<char> = row.chars().collect();
                 if index > first {
                     text.push('\n');
                 }
