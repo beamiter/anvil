@@ -461,6 +461,18 @@ fn chrome_button(icon: &str, title: &str) -> gtk::Button {
     button
 }
 
+// Keep the rail on the same visibility/persistence path as the titlebar and
+// keyboard shortcut. Selecting Tabs again cannot collapse a docked sidebar.
+fn rail_action(key: &str) -> AppMsg {
+    match key {
+        "workspace" => AppMsg::ToggleSidebar,
+        "folder" => AppMsg::SetSidebarView(crate::config::SidebarView::Files),
+        "terminal" => AppMsg::FocusShell,
+        "agent" => AppMsg::Action(Action::ToggleTasksPanel),
+        _ => AppMsg::Action(Action::ToggleSearch),
+    }
+}
+
 fn workspace_rail_button(
     title: &str,
     drawers: &std::rc::Rc<DrawerControl>,
@@ -1080,13 +1092,7 @@ impl Chrome {
         rail.set_hexpand(false);
         rail.set_vexpand(true);
         for (key, title) in jterm_core::reference_conversation::RAIL_NAVIGATION {
-            let action = match key {
-                "workspace" => AppMsg::SetSidebarView(crate::config::SidebarView::Tabs),
-                "folder" => AppMsg::SetSidebarView(crate::config::SidebarView::Files),
-                "terminal" => AppMsg::FocusShell,
-                "agent" => AppMsg::Action(Action::ToggleTasksPanel),
-                _ => AppMsg::Action(Action::ToggleSearch),
-            };
+            let action = rail_action(key);
             let control = if key == "workspace" {
                 let sender = sender.clone();
                 workspace_rail_button(title, &drawers, move || sender.input(action.clone()))
@@ -3439,6 +3445,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workspace_rail_toggles_visibility_instead_of_reselecting_tabs() {
+        assert!(matches!(rail_action("workspace"), AppMsg::ToggleSidebar));
+        assert!(matches!(
+            rail_action("folder"),
+            AppMsg::SetSidebarView(crate::config::SidebarView::Files)
+        ));
+    }
+
+    #[test]
     #[ignore = "requires an isolated GTK display; real popup paint and live mode changes"]
     fn workspace_popups_follow_launcher_palette_without_composer_style_leaks() {
         use gtk::gdk::prelude::PaintableExt;
@@ -4007,9 +4022,17 @@ mod tests {
         left.set_shrink_end_child(true);
         let drawers = std::rc::Rc::new(DrawerControl::default());
         let navigation_actions = std::rc::Rc::new(std::cell::Cell::new(0));
+        let widths = std::rc::Rc::new(SidebarWidths::new(280, 306, true));
         let recorded = navigation_actions.clone();
+        let toggled_widths = widths.clone();
+        let toggled_drawers = drawers.clone();
         let workspace = workspace_rail_button("Workspace", &drawers, move || {
-            recorded.set(recorded.get() + 1)
+            recorded.set(recorded.get() + 1);
+            // Mirror AppMsg::ToggleSidebar's visibility update, not page selection.
+            toggled_widths
+                .navigation_visible
+                .set(!toggled_widths.navigation_visible.get());
+            toggled_drawers.refresh();
         });
         let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         let rail = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -4026,7 +4049,6 @@ mod tests {
             button: gtk::ToggleButton::new(),
             refresh: std::cell::RefCell::new(None),
         });
-        let widths = std::rc::Rc::new(SidebarWidths::new(280, 306, true));
         let (refresh, _, _) = install_responsive_sidebars(
             &host,
             navigation.upcast_ref(),
@@ -4056,20 +4078,37 @@ mod tests {
         assert_eq!(
             navigation_actions.get(),
             1,
-            "docked rail keeps its existing navigation action"
+            "docked rail invokes the sidebar toggle"
         );
-        widths.navigation_visible.set(false);
-        refresh();
+        settle();
+        assert!(!widths.navigation_visible.get());
+        assert!(
+            !navigation.is_mapped(),
+            "first click hides the docked sidebar"
+        );
         workspace.emit_clicked();
         assert_eq!(
             navigation_actions.get(),
             2,
             "wide hidden preference is not mistaken for a narrow window"
         );
+        settle();
         assert_eq!(drawers.shown.get(), None);
-        assert!(!widths.navigation_visible.get());
-        widths.navigation_visible.set(true);
-        refresh();
+        assert!(widths.navigation_visible.get());
+        assert!(
+            navigation.is_mapped(),
+            "second click restores the docked sidebar"
+        );
+        for _ in 0..2 {
+            workspace.emit_clicked();
+            settle();
+            assert!(!navigation.is_mapped());
+            workspace.emit_clicked();
+            settle();
+            assert!(navigation.is_mapped());
+        }
+        assert_eq!(search.text().as_str(), "中文 independent navigation draft");
+        assert_eq!(list.selected_row().as_ref(), Some(&selected));
         navigation_actions.set(0);
         scroll.vadjustment().set_value(42.0);
         terminal.grab_focus();
