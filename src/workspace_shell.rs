@@ -4089,7 +4089,9 @@ mod tests {
         // production rail button callback, not a synthetic clicked signal.
         let click_workspace = || {
             assert!(workspace.is_mapped());
-            let bounds = workspace.compute_bounds(&window).expect("mapped rail bounds");
+            let bounds = workspace
+                .compute_bounds(&window)
+                .expect("mapped rail bounds");
             let (surface_x, surface_y) = window.surface_transform();
             let x = (f64::from(bounds.x() + bounds.width() / 2.0) + surface_x)
                 .round()
