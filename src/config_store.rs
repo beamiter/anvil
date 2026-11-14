@@ -2095,6 +2095,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sidebar_visibility_survives_workspace_startup_save_and_restart() {
+        for visible in [false, true] {
+            let dir = temporary_directory("sidebar-startup-restart");
+            let path = dir.join("config.toml");
+            write_fixture(
+                &path,
+                format!("sidebar_visible = {visible}\nsidebar_width = 312\n").as_bytes(),
+            );
+            let snapshot = read_validated_snapshot(&path).unwrap();
+            let (mut config, _, _) = config::load_config_from_table(snapshot.table.as_ref());
+            config.prepare_workspace_startup(false);
+            assert_eq!(config.sidebar_visible, visible);
+            assert_eq!(config.sidebar_width, 312);
+            // An unrelated save must not persist a forced-open startup value.
+            save_config_to_path(&path, &config, Some(&snapshot.revision)).unwrap();
+            let saved = read_validated_snapshot(&path).unwrap();
+            let (mut restarted, _, _) = config::load_config_from_table(saved.table.as_ref());
+            restarted.prepare_workspace_startup(false);
+            assert_eq!(restarted.sidebar_visible, visible);
+            assert_eq!(restarted.sidebar_width, 312);
+            assert_eq!(saved.validation.errors(), 0);
+            fs::remove_dir_all(dir).unwrap();
+        }
+        let mut safe = Config::safe_defaults();
+        safe.prepare_workspace_startup(true);
+        assert!(safe.sidebar_visible);
+        assert_eq!(safe.terminal_mode, config::TerminalMode::Vte);
+    }
+
+    #[test]
     fn font_groups_save_and_restart_without_changing_the_other_group() {
         use crate::font_groups::{set_scale, FontGroup};
         for first in [FontGroup::Content, FontGroup::Ui] {

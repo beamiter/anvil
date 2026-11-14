@@ -869,6 +869,17 @@ pub struct Config {
 }
 
 impl Config {
+    /// Normalize the workspace presentation without overwriting the user's
+    /// saved navigation visibility. A hidden sidebar must stay hidden across
+    /// startup and a later unrelated configuration save.
+    pub(crate) fn prepare_workspace_startup(&mut self, safe_mode: bool) {
+        if !safe_mode {
+            self.terminal_mode = self.terminal_mode.workspace_backend();
+        }
+        self.tab_placement = TabPlacement::Sidebar;
+        self.bottom_bar = false;
+    }
+
     /// Replace the complete configuration with an isolated, built-in VTE
     /// profile. This deliberately ignores both the user's file and ANVIL_*
     /// appearance/behavior overrides, making safe mode useful for diagnosis.

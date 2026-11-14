@@ -879,14 +879,7 @@ impl SimpleComponent for AppModel {
                 };
             }
         }
-        // The reference workspace has one stable navigation shell. Legacy
-        // presentation values remain readable, but only Block and Chat are
-        // offered by the new GUI. Running pane identity is never recreated.
-        if !init.safe_mode {
-            config.terminal_mode = config.terminal_mode.workspace_backend();
-        }
-        config.tab_placement = config::TabPlacement::Sidebar;
-        config.bottom_bar = false;
+        config.prepare_workspace_startup(init.safe_mode);
         let shell_argv = if init.safe_mode {
             Rc::new(vec!["sh".to_string()])
         } else {
@@ -976,8 +969,7 @@ impl SimpleComponent for AppModel {
         let sidebar_width = config.borrow().sidebar_width as i32;
         let tab_placement = config.borrow().tab_placement;
         let sidebar_view = config.borrow().sidebar_view;
-        let sidebar_visible = true;
-        config.borrow_mut().sidebar_visible = true;
+        let sidebar_visible = config.borrow().sidebar_visible;
         let sidebar_toggle = sidebar_toggle::SidebarToggleModel::builder()
             .launch((sidebar_view, true))
             .forward(sender.input_sender(), |output| match output {
