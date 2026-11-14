@@ -1578,14 +1578,52 @@ pub(crate) fn observe_task(window: &gtk::Window, task: Option<&jterm_core::agent
     });
 }
 
+fn clip_intersection(a: Rect, b: Rect) -> Option<Rect> {
+    let left = a.x.max(b.x);
+    let top = a.y.max(b.y);
+    let right = (a.x + a.width).min(b.x + b.width);
+    let bottom = (a.y + a.height).min(b.y + b.height);
+    let width = right - left;
+    let height = bottom - top;
+    (width > 0. && height > 0.).then_some(Rect {
+        x: left,
+        y: top,
+        width,
+        height,
+    })
+}
+
+fn widget_bounds(widget: &gtk::Widget, overlay: &gtk::Overlay, clip: Option<Rect>) -> Option<Rect> {
+    let bounds = widget.compute_bounds(overlay)?;
+    let rect = Rect {
+        x: bounds.x() as f64,
+        y: bounds.y() as f64,
+        width: bounds.width() as f64,
+        height: bounds.height() as f64,
+    };
+    if !rect.valid() {
+        return None;
+    }
+    match clip {
+        Some(c) => clip_intersection(rect, c),
+        None => Some(rect),
+    }
+}
+
 /// Conservative metadata-only native exclusion scan. Never reads label/text contents.
 fn protections(root: &gtk::Widget, overlay: &gtk::Overlay) -> (bool, Vec<Rect>) {
     use vte4::prelude::TerminalExt;
-    let mut pending = vec![root.clone()];
+    let root_clip = (overlay.width() > 0 && overlay.height() > 0).then_some(Rect {
+        x: 0.,
+        y: 0.,
+        width: overlay.width() as f64,
+        height: overlay.height() as f64,
+    });
+    let mut pending = vec![(root.clone(), root_clip, false)];
     let mut exclusions = Vec::new();
     let mut blocked = false;
     let mut visited = 0;
-    while let Some(w) = pending.pop() {
+    while let Some((w, clip, excluded)) = pending.pop() {
         visited += 1;
         if visited > 2048 {
             return (true, Vec::new());
@@ -1604,11 +1642,22 @@ fn protections(root: &gtk::Widget, overlay: &gtk::Overlay) -> (bool, Vec<Rect>) 
         if let Some(vte) = w.downcast_ref::<vte4::Terminal>() {
             blocked |= vte.has_selection();
         }
+        let clips = w.overflow() == gtk::Overflow::Hidden
+            || w.is::<gtk::ScrolledWindow>()
+            || w.is::<gtk::Viewport>();
+        let next_clip = if clips {
+            match widget_bounds(&w, overlay, clip) {
+                Some(clipped) => Some(clipped),
+                None => continue,
+            }
+        } else {
+            clip
+        };
+        // Navigation owns a large empty background. Protect its actual controls
+        // and content below, so that background can host the one shared body.
         let chrome = [
             "reference-inspector",
             "workspace-inspector",
-            "reference-navigation",
-            "workspace-navigation",
             "reference-rail",
             "workspace-rail",
             "reference-toolbar",
@@ -1616,35 +1665,40 @@ fn protections(root: &gtk::Widget, overlay: &gtk::Overlay) -> (bool, Vec<Rect>) 
         ]
         .iter()
         .any(|class| w.has_css_class(class));
-        if chrome
-            || w.is::<vte4::Terminal>()
-            || w.is::<gtk::Label>()
-            || w.is::<gtk::Entry>()
-            || w.is::<gtk::TextView>()
-            || w.is::<gtk::Button>()
-            || w.is::<gtk::Scrollbar>()
+        let card = w.has_css_class("block-finished") || w.has_css_class("developer-command-card");
+        if !excluded
+            && (chrome
+                || card
+                || w.is::<vte4::Terminal>()
+                || w.is::<gtk::Label>()
+                || w.is::<gtk::Entry>()
+                || w.is::<gtk::TextView>()
+                || w.is::<gtk::Button>()
+                || w.is::<gtk::Scrollbar>()
+                || w.has_css_class("file-tree")
+                || w.is::<gtk::ListView>()
+                || w.is::<gtk::ColumnView>())
         {
-            if let Some(r) = w.compute_bounds(overlay) {
-                if r.width() > 0. && r.height() > 0. {
-                    exclusions.push(Rect {
-                        x: r.x() as f64 - 8.,
-                        y: r.y() as f64 - 8.,
-                        width: r.width() as f64 + 16.,
-                        height: r.height() as f64 + 16.,
-                    });
+            if let Some(r) = widget_bounds(&w, overlay, next_clip) {
+                exclusions.push(Rect {
+                    x: r.x - 8.,
+                    y: r.y - 8.,
+                    width: r.width + 16.,
+                    height: r.height + 16.,
+                });
+                if exclusions.len() > host::MAX_REGIONS {
+                    return (true, Vec::new());
                 }
             }
         }
-        if chrome || w.is::<vte4::Terminal>() {
+        if chrome || w.is::<vte4::Terminal>() || w.is::<gtk::Button>() {
             continue;
         }
+        let child_excluded = excluded || card;
         let mut child = w.first_child();
         while let Some(c) = child {
             child = c.next_sibling();
-            pending.push(c);
-        }
-        if exclusions.len() > host::MAX_REGIONS {
-            return (true, Vec::new());
+            pending.push((c, next_clip, child_excluded));
         }
     }
     (blocked, exclusions)
@@ -2753,6 +2807,60 @@ mod tests {
         assert!(body.x + body.width <= 1360. && body.y + body.height <= 840.);
         assert!(exclusions.iter().all(|r| !r.overlaps(body)));
     }
+
+    #[test]
+    #[ignore = "requires native GTK display; run explicitly in native matrix"]
+    fn navigation_background_hosts_body_without_covering_controls() {
+        gtk::init().unwrap();
+        let window = gtk::Window::new();
+        window.set_default_size(900, 700);
+        let overlay = gtk::Overlay::new();
+        let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let navigation = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        navigation.set_width_request(280);
+        let control = gtk::Button::with_label("Select workspace");
+        navigation.append(&control);
+        let gap = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        gap.set_vexpand(true);
+        navigation.append(&gap);
+        navigation.append(&gtk::Label::new(Some("Local session")));
+        root.append(&navigation);
+        let terminal = gtk::TextView::new();
+        terminal.set_hexpand(true);
+        terminal.set_vexpand(true);
+        root.append(&terminal);
+        overlay.set_child(Some(&root));
+        window.set_child(Some(&overlay));
+        window.present();
+        let deadline = Instant::now() + Duration::from_millis(150);
+        while Instant::now() < deadline {
+            while gtk::glib::MainContext::default().pending() {
+                gtk::glib::MainContext::default().iteration(false);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for class in ["reference-navigation", "workspace-navigation"] {
+            navigation.add_css_class(class);
+            let (blocked, exclusions) = protections(overlay.upcast_ref(), &overlay);
+            assert!(!blocked);
+            let (body, _) = safe_edge(
+                (overlay.width(), overlay.height()),
+                &exclusions,
+                (200, 242),
+                (100, 121),
+            )
+            .expect("empty navigation background admits the shared body");
+            let bounds = widget_bounds(navigation.upcast_ref(), &overlay, None).unwrap();
+            assert!(bounds.contains(body));
+            let control = widget_bounds(control.upcast_ref(), &overlay, None).unwrap();
+            assert!(!control.overlaps(body));
+            let terminal = widget_bounds(terminal.upcast_ref(), &overlay, None).unwrap();
+            assert!(!terminal.overlaps(body));
+            navigation.remove_css_class(class);
+        }
+        window.close();
+    }
+
     #[test]
     fn only_actual_receipts_map_to_success() {
         use jterm_core::agent_task::TaskStatus as T;

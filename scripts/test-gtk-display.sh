@@ -53,6 +53,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    eva_companion::tests::navigation_background_hosts_body_without_covering_controls
     workspace_context_ui::tests::pending_context_additions_preserve_order_capacity_and_cancellation
     block_view::allocation_observer::tests::canvas_observer_preserves_resize_without_occluding_picks
     workspace_mission_ui::tests::mission_window_is_narrow_and_construction_does_not_start_work
