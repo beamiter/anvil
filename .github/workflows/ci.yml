@@ -126,6 +126,9 @@ jobs:
       - name: Check Bash OSC transport and redirected bytes
         run: python3 scripts/test-bash-osc-transport.py
 
+      - name: Check support archive atomic publication
+        run: python3 scripts/test-support-bundle.py
+
       - name: Check Files follow ownership
         run: python3 scripts/test-files-follow.py
 

@@ -38,7 +38,9 @@ fi
 mkdir -p -- "${OUTPUT_DIR}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 BUNDLE_NAME="anvil-support-${STAMP}"
-WORK_DIR="$(mktemp -d)"
+# Stage on the destination filesystem so publication can use an atomic hard
+# link. Neither collection nor a failed tar/gzip may expose a partial archive.
+WORK_DIR="$(mktemp -d -- "${OUTPUT_DIR%/}/.${BUNDLE_NAME}.XXXXXX")"
 BUNDLE_DIR="${WORK_DIR}/${BUNDLE_NAME}"
 trap 'rm -rf -- "${WORK_DIR}"' EXIT
 mkdir -m 0700 -- "${BUNDLE_DIR}"
@@ -155,10 +157,11 @@ if [[ -e "${ARCHIVE_PATH}" || -L "${ARCHIVE_PATH}" ]]; then
     printf 'Error: refusing to overwrite %s\n' "${ARCHIVE_PATH}" >&2
     exit 1
 fi
-(
-    set -o noclobber
-    tar --sort=name --owner=0 --group=0 --numeric-owner -C "${WORK_DIR}" -cf - "${BUNDLE_NAME}" \
-        | gzip -n -9 >"${ARCHIVE_PATH}"
-)
-chmod 0600 -- "${ARCHIVE_PATH}"
+STAGED_ARCHIVE="${WORK_DIR}/archive.tar.gz"
+tar --sort=name --owner=0 --group=0 --numeric-owner -C "${WORK_DIR}" -cf - "${BUNDLE_NAME}" \
+    | gzip -n -9 >"${STAGED_ARCHIVE}"
+chmod 0600 -- "${STAGED_ARCHIVE}"
+# -T refuses a concurrent directory symlink as well as a file. Never replace
+# another collector's result, even if it appeared after the existence check.
+ln -T -- "${STAGED_ARCHIVE}" "${ARCHIVE_PATH}"
 printf 'Created %s\n' "${ARCHIVE_PATH}"
