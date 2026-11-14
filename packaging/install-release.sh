@@ -10,6 +10,9 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../scripts/install-config.sh
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/libexec/install-config.sh"
+# shellcheck source=../scripts/install-desktop.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/libexec/install-desktop.sh"
 # Consumed by the bundled config helper.
 # shellcheck disable=SC2034
 DRY_RUN=0
@@ -133,6 +136,9 @@ if [[ ! -x "${SCRIPT_DIR}/bin/anvil" ]]; then
     exit 1
 fi
 
+# Refuse paths the desktop format cannot represent before replacing binaries.
+validate_desktop_exec_path "${INSTALL_DIR}/anvil"
+
 printf 'Installing anvil for %s...\n' "${USER:-the current user}"
 install_release_binary "${SCRIPT_DIR}/bin/anvil" "${INSTALL_DIR}/anvil"
 install_release_binary "${SCRIPT_DIR}/bin/anvil-support-bundle" \
@@ -150,14 +156,8 @@ install -d -m 0755 "${APPLICATIONS_DIR}"
 # The old predictable .desktop.new path may be somebody else's symlink.
 # Reserve a private name and never open or remove the old path.
 reserve_install_temp "${APPLICATIONS_DIR}/io.github.beamiter.anvil.desktop"
-awk -v exec_path="${INSTALL_DIR}/anvil" '
-    /^Exec=anvil([[:space:]]|$)/ || /^TryExec=anvil([[:space:]]|$)/ {
-        eq = index($0, "=")
-        print substr($0, 1, eq) exec_path substr($0, eq + 7)
-        next
-    }
-    { print }
-' "${SCRIPT_DIR}/share/applications/io.github.beamiter.anvil.desktop" \
+render_desktop_entry "${SCRIPT_DIR}/share/applications/io.github.beamiter.anvil.desktop" \
+    "${INSTALL_DIR}/anvil" \
     >&"${INSTALL_TEMP_FD}"
 install_temp_is_owned || die "desktop staging file changed"
 chmod 0644 -- "/proc/self/fd/${INSTALL_TEMP_FD}"

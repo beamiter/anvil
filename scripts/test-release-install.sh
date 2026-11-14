@@ -15,7 +15,15 @@ fail() {
 }
 
 fixture="${TEST_ROOT}/anvil"
-printf '#!/bin/sh\nprintf "anvil release fixture\\n"\n' >"${fixture}"
+cat >"${fixture}" <<'FIXTURE'
+#!/bin/sh
+if [ -n "${ANVIL_TEST_LAUNCH_RECORD:-}" ]; then
+    printf '%s\n' "$0" "$@" >"${ANVIL_TEST_LAUNCH_RECORD}.tmp"
+    mv -- "${ANVIL_TEST_LAUNCH_RECORD}.tmp" "${ANVIL_TEST_LAUNCH_RECORD}"
+else
+    printf 'anvil release fixture\n'
+fi
+FIXTURE
 chmod 0755 "${fixture}"
 env DIST_DIR="${TEST_ROOT}/dist" VERSION=0.0.0-test TARGET=fixture-linux \
     SOURCE_DATE_EPOCH=1700000000 \
@@ -24,6 +32,9 @@ archive="${TEST_ROOT}/dist/anvil-0.0.0-test-fixture-linux.tar.gz"
 (cd "${TEST_ROOT}/dist" && sha256sum --check "${archive##*/}.sha256") >/dev/null
 tar -xzf "${archive}" -C "${TEST_ROOT}"
 bundle="${TEST_ROOT}/anvil-0.0.0-test-fixture-linux"
+
+# Use the system Python that provides the desktop's GLib/GIO bindings.
+/usr/bin/python3 "${SCRIPT_DIR}/test-release-desktop.py" "${bundle}"
 
 run_install() {
     local root="$1"

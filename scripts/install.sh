@@ -12,6 +12,9 @@ PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 # The helper is checked separately by the installer regression suite.
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/install-config.sh"
+# shellcheck source=install-desktop.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/install-desktop.sh"
 HOME_DIR="${HOME:-}"
 DESTDIR="${DESTDIR:-}"
 DESTDIR_ACTIVE=0
@@ -270,87 +273,17 @@ desktop_exec_path() {
     esac
 }
 
-desktop_exec_value() {
-    local remaining="$1" escaped="" character
-    if [[ "${remaining}" == anvil ]]; then
-        printf 'anvil'
-        return
-    fi
-    while [[ -n "${remaining}" ]]; do
-        character="${remaining:0:1}"
-        remaining="${remaining:1}"
-        case "${character}" in
-            \\) escaped="${escaped}\\\\\\\\" ;;
-            '"') escaped+='\"' ;;
-            '`') escaped+='\`' ;;
-            '$') escaped+='\\$' ;;
-            *) escaped+="${character}" ;;
-        esac
-    done
-    printf '"%s"' "${escaped}"
-}
-
-desktop_try_exec_value() {
-    local remaining="$1" escaped="" character
-    while [[ -n "${remaining}" ]]; do
-        character="${remaining:0:1}"
-        remaining="${remaining:1}"
-        case "${character}" in
-            \\) escaped="${escaped}\\\\" ;;
-            *) escaped+="${character}" ;;
-        esac
-    done
-    printf '%s' "${escaped}"
-}
-
-validate_desktop_exec_path() {
-    local path="$1"
-    [[ "${path}" != *'='* ]] \
-        || die "desktop executable path must not contain '=': ${path}"
-    [[ "${path}" != *'%'* ]] \
-        || die "desktop executable path must not contain '%': ${path}"
-    if [[ "${path}" =~ [[:cntrl:]] ]]; then
-        die "desktop executable path must not contain control characters"
-    fi
-}
-
 install_desktop_entry() {
-    local source="$1" dest="$2" exec_path exec_value try_exec_value desktop_dir
+    local source="$1" dest="$2" exec_path desktop_dir
     exec_path="$(desktop_exec_path)"
     validate_desktop_exec_path "${exec_path}"
-    exec_value="$(desktop_exec_value "${exec_path}")"
-    try_exec_value="$(desktop_try_exec_value "${exec_path}")"
     printf '  install -Dm0644 (Exec=%s) %q %q\n' "${exec_path}" "${source}" "${dest}"
     ((DRY_RUN == 0)) || return 0
     desktop_dir="${dest%/*}"
     install -d -m 0755 "${desktop_dir}"
     INSTALL_TEMP="$(mktemp "${desktop_dir}/.${APP_ID}.desktop.install.XXXXXX")" \
         || die "cannot create temporary desktop entry beside ${dest}"
-    if ! ANVIL_DESKTOP_EXEC_VALUE="${exec_value}" \
-        ANVIL_DESKTOP_TRY_EXEC_VALUE="${try_exec_value}" \
-        awk '
-        BEGIN { exec_count = 0; try_exec_count = 0 }
-        /^Exec=anvil([[:space:]]|$)/ {
-            exec_count++
-            eq = index($0, "=")
-            print substr($0, 1, eq) ENVIRON["ANVIL_DESKTOP_EXEC_VALUE"] \
-                substr($0, eq + 6)
-            next
-        }
-        /^TryExec=anvil([[:space:]]|$)/ {
-            try_exec_count++
-            eq = index($0, "=")
-            print substr($0, 1, eq) ENVIRON["ANVIL_DESKTOP_TRY_EXEC_VALUE"] \
-                substr($0, eq + 6)
-            next
-        }
-        /^Exec=/ { exit 45 }
-        /^TryExec=/ { exit 46 }
-        { print }
-        END {
-            if (exec_count < 1 || try_exec_count != 1) exit 44
-        }
-    ' "${source}" >"${INSTALL_TEMP}" \
+    if ! render_desktop_entry "${source}" "${exec_path}" >"${INSTALL_TEMP}" \
         || ! chmod 0644 "${INSTALL_TEMP}" \
         || ! mv -fT -- "${INSTALL_TEMP}" "${dest}"; then
         cleanup_install_temp

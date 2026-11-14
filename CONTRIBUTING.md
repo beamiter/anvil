@@ -63,6 +63,10 @@ The canonical Clippy warning baseline lives in `scripts/clippy.sh`. Update that
 single file only when accepting a new repository-wide lint exception; do not
 add ad-hoc `allow` flags to CI or local scripts.
 
+`bash scripts/test-release-install.sh` checks both installers' desktop launchers
+using the system Python's GIO bindings (`python3-gi` on Debian/Ubuntu). It launches
+only a recording fixture in temporary HOME/XDG trees; no GTK display is needed.
+
 ## Architecture guidelines
 
 - Keep GTK work on the main thread. Filesystem, Git, process, and network work
