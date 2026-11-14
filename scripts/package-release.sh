@@ -32,7 +32,14 @@ PACKAGE_NAME="anvil-${VERSION}-${TARGET}"
 ARCHIVE_NAME="${PACKAGE_NAME}.tar.gz"
 STAGE_DIR="$(mktemp -d)"
 PACKAGE_ROOT="${STAGE_DIR}/${PACKAGE_NAME}"
-trap 'rm -rf -- "${STAGE_DIR}"' EXIT
+PUBLISH_DIR=""
+cleanup() {
+    rm -rf -- "${STAGE_DIR}"
+    if [[ -n "${PUBLISH_DIR}" ]]; then
+        rm -rf -- "${PUBLISH_DIR}"
+    fi
+}
+trap cleanup EXIT
 
 install -Dm755 "${BINARY}" "${PACKAGE_ROOT}/bin/anvil"
 install -Dm755 scripts/support-bundle.sh "${PACKAGE_ROOT}/bin/anvil-support-bundle"
@@ -81,7 +88,9 @@ install -Dm644 scripts/notebooks/welcome.jtnb.md \
     "${PACKAGE_ROOT}/share/anvil/notebooks/welcome.jtnb.md"
 
 mkdir -p "${DIST_DIR}"
-rm -f -- "${DIST_DIR}/${ARCHIVE_NAME}" "${DIST_DIR}/${ARCHIVE_NAME}.sha256"
+# Build both outputs privately on the destination filesystem. A failed tar,
+# compressor or checksum command must leave the last usable release intact.
+PUBLISH_DIR="$(mktemp -d -- "${DIST_DIR%/}/.anvil-package.XXXXXX")"
 
 tar \
     --sort=name \
@@ -91,12 +100,16 @@ tar \
     --numeric-owner \
     -C "${STAGE_DIR}" \
     -cf - "${PACKAGE_NAME}" \
-    | gzip -n -9 > "${DIST_DIR}/${ARCHIVE_NAME}"
+    | gzip -n -9 > "${PUBLISH_DIR}/${ARCHIVE_NAME}"
 
 (
-    cd "${DIST_DIR}"
+    cd "${PUBLISH_DIR}"
     sha256sum "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
 )
+
+# Each rename publishes a complete file; the pair is not a transaction.
+mv -fT -- "${PUBLISH_DIR}/${ARCHIVE_NAME}" "${DIST_DIR}/${ARCHIVE_NAME}"
+mv -fT -- "${PUBLISH_DIR}/${ARCHIVE_NAME}.sha256" "${DIST_DIR}/${ARCHIVE_NAME}.sha256"
 
 echo "Created ${DIST_DIR}/${ARCHIVE_NAME}"
 echo "Created ${DIST_DIR}/${ARCHIVE_NAME}.sha256"

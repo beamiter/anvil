@@ -30,6 +30,49 @@ env DIST_DIR="${TEST_ROOT}/dist" VERSION=0.0.0-test TARGET=fixture-linux \
     bash "${SCRIPT_DIR}/package-release.sh" "${fixture}" >/dev/null
 archive="${TEST_ROOT}/dist/anvil-0.0.0-test-fixture-linux.tar.gz"
 (cd "${TEST_ROOT}/dist" && sha256sum --check "${archive##*/}.sha256") >/dev/null
+# A compressor failure must not destroy the last usable release or expose a
+# partial archive under the public filename.
+mkdir -p "${TEST_ROOT}/failing-tools"
+cat >"${TEST_ROOT}/failing-tools/gzip" <<'FAIL_GZIP'
+#!/bin/sh
+printf 'partial compressed output'
+exit 73
+FAIL_GZIP
+chmod 0755 "${TEST_ROOT}/failing-tools/gzip"
+cp "${archive}" "${TEST_ROOT}/previous.tar.gz"
+cp "${archive}.sha256" "${TEST_ROOT}/previous.sha256"
+if env PATH="${TEST_ROOT}/failing-tools:${PATH}" DIST_DIR="${TEST_ROOT}/dist" \
+    VERSION=0.0.0-test TARGET=fixture-linux SOURCE_DATE_EPOCH=1700000000 \
+    bash "${SCRIPT_DIR}/package-release.sh" "${fixture}" >"${TEST_ROOT}/failed-package.log" 2>&1; then
+    fail "packaging accepted compressor failure"
+fi
+cmp "${archive}" "${TEST_ROOT}/previous.tar.gz" || fail "failed packaging damaged prior archive"
+cmp "${archive}.sha256" "${TEST_ROOT}/previous.sha256" || fail "failed packaging damaged prior checksum"
+[[ -z "$(find "${TEST_ROOT}/dist" -name '.anvil-package.*' -print -quit)" ]] \
+    || fail "failed packaging left staging files"
+# Checksum failure is also pre-publication, after compression completed.
+rm -- "${TEST_ROOT}/failing-tools/gzip"
+cat >"${TEST_ROOT}/failing-tools/sha256sum" <<'FAIL_HASH'
+#!/bin/sh
+printf 'partial checksum'
+exit 74
+FAIL_HASH
+chmod 0755 "${TEST_ROOT}/failing-tools/sha256sum"
+if env PATH="${TEST_ROOT}/failing-tools:${PATH}" DIST_DIR="${TEST_ROOT}/dist" \
+    VERSION=0.0.0-test TARGET=fixture-linux SOURCE_DATE_EPOCH=1700000000 \
+    bash "${SCRIPT_DIR}/package-release.sh" "${fixture}" >"${TEST_ROOT}/failed-hash.log" 2>&1; then
+    fail "packaging accepted checksum failure"
+fi
+cmp "${archive}" "${TEST_ROOT}/previous.tar.gz" || fail "checksum failure damaged prior archive"
+cmp "${archive}.sha256" "${TEST_ROOT}/previous.sha256" || fail "checksum failure damaged prior checksum"
+[[ -z "$(find "${TEST_ROOT}/dist" -name '.anvil-package.*' -print -quit)" ]] \
+    || fail "checksum failure left staging files"
+# Successful replacement remains deterministic and has a matching checksum.
+env DIST_DIR="${TEST_ROOT}/dist" VERSION=0.0.0-test TARGET=fixture-linux \
+    SOURCE_DATE_EPOCH=1700000000 \
+    bash "${SCRIPT_DIR}/package-release.sh" "${fixture}" >/dev/null
+cmp "${archive}" "${TEST_ROOT}/previous.tar.gz" || fail "repeat packaging is not deterministic"
+(cd "${TEST_ROOT}/dist" && sha256sum --check "${archive##*/}.sha256") >/dev/null
 tar -xzf "${archive}" -C "${TEST_ROOT}"
 bundle="${TEST_ROOT}/anvil-0.0.0-test-fixture-linux"
 
