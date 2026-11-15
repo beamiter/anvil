@@ -3,6 +3,7 @@
 
 set -euo pipefail
 umask 022
+export LC_ALL=C
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
@@ -20,6 +21,20 @@ if [[ -z "${VERSION}" ]]; then
 fi
 if [[ -z "${TARGET}" ]]; then
     echo "Error: could not determine the Rust host target." >&2
+    exit 1
+fi
+# These fields become archive paths and line-oriented BUILDINFO values. Reject
+# separators and control characters before creating any staging/output paths.
+# Keep semver build metadata (+) and ordinary Rust target triples supported.
+for field in VERSION TARGET; do
+    value="${!field}"
+    if [[ "${value}" == *[!a-zA-Z0-9._+-]* ]]; then
+        echo "Error: ${field} must contain only ASCII letters, digits, dot, underscore, plus or hyphen." >&2
+        exit 1
+    fi
+done
+if [[ "${SOURCE_DATE_EPOCH}" == *[!0-9]* ]]; then
+    echo "Error: SOURCE_DATE_EPOCH must be a nonnegative integer." >&2
     exit 1
 fi
 if [[ ! -x "${BINARY}" ]]; then

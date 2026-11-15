@@ -25,6 +25,24 @@ else
 fi
 FIXTURE
 chmod 0755 "${fixture}"
+# Invalid package metadata must fail before creating output or temporary files.
+# No real binary, Cargo build or Rust toolchain is needed for this rejection.
+for field in VERSION TARGET SOURCE_DATE_EPOCH; do
+    for value in '../escape' 'path/segment' $'line\nbreak' $'tab\tfield' 'has space'; do
+        mkdir -p "${TEST_ROOT}/metadata-tmp"
+        if env VERSION=0.0.0-test TARGET=fixture-linux SOURCE_DATE_EPOCH=1700000000 \
+            DIST_DIR="${TEST_ROOT}/invalid-dist" TMPDIR="${TEST_ROOT}/metadata-tmp" \
+            "${field}=${value}" bash "${SCRIPT_DIR}/package-release.sh" "${fixture}" \
+            >"${TEST_ROOT}/invalid-metadata.log" 2>&1; then
+            fail "packaging accepted invalid ${field}"
+        fi
+        grep -Fq "Error: ${field} must" "${TEST_ROOT}/invalid-metadata.log" \
+            || fail "invalid ${field} failed for an unrelated reason"
+        [[ ! -e "${TEST_ROOT}/invalid-dist" ]] || fail "invalid metadata created output"
+        [[ -z "$(find "${TEST_ROOT}/metadata-tmp" -mindepth 1 -print -quit)" ]] \
+            || fail "invalid metadata left staging files"
+    done
+done
 env DIST_DIR="${TEST_ROOT}/dist" VERSION=0.0.0-test TARGET=fixture-linux \
     SOURCE_DATE_EPOCH=1700000000 \
     bash "${SCRIPT_DIR}/package-release.sh" "${fixture}" >/dev/null
@@ -73,6 +91,12 @@ env DIST_DIR="${TEST_ROOT}/dist" VERSION=0.0.0-test TARGET=fixture-linux \
     bash "${SCRIPT_DIR}/package-release.sh" "${fixture}" >/dev/null
 cmp "${archive}" "${TEST_ROOT}/previous.tar.gz" || fail "repeat packaging is not deterministic"
 (cd "${TEST_ROOT}/dist" && sha256sum --check "${archive##*/}.sha256") >/dev/null
+# Semver prerelease/build metadata and target punctuation remain supported.
+env DIST_DIR="${TEST_ROOT}/metadata-dist" VERSION=1.2.3-rc.1+build.7 \
+    TARGET=x86_64-unknown-linux-gnu SOURCE_DATE_EPOCH=0 \
+    bash "${SCRIPT_DIR}/package-release.sh" "${fixture}" >/dev/null
+metadata_archive="anvil-1.2.3-rc.1+build.7-x86_64-unknown-linux-gnu.tar.gz"
+(cd "${TEST_ROOT}/metadata-dist" && sha256sum --check "${metadata_archive}.sha256") >/dev/null
 tar -xzf "${archive}" -C "${TEST_ROOT}"
 bundle="${TEST_ROOT}/anvil-0.0.0-test-fixture-linux"
 
