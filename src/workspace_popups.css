@@ -96,5 +96,47 @@ window.anvil-font-sync .workspace-center.block-workspace popover.block-reference
 .workspace-dialog button.destructive-action:not(:disabled) { background:#3b222e; color:#ff646f; }
 .workspace-dialog button.destructive-action:not(:disabled):hover { background:#462538; }
 .workspace-dialog button.suggested-action:disabled,.workspace-dialog button.destructive-action:disabled { background:#263349; color:#91a2bb; opacity:1; filter:none; }
-.workspace-dialog checkbutton check:checked,.workspace-dialog switch:checked { background:#5c7ef0; color:white; }
 .workspace-dialog separator { background:#394960; }
+
+/* Candidate: neutral dialog controls inherit their owning surface's text tone.
+   This does not connect workspace chrome to the selectable terminal palette. */
+.workspace-dialog checkbutton check,
+.workspace-dialog checkbutton radio,
+.workspace-dialog switch,
+.workspace-dialog scale trough {
+  background-image:none;
+  background-color:alpha(currentColor,0.08);
+  border-color:alpha(currentColor,0.22);
+  box-shadow:none;
+}
+.workspace-dialog checkbutton check:not(:checked):hover,
+.workspace-dialog checkbutton radio:not(:checked):hover,
+.workspace-dialog switch:not(:checked):hover {
+  background-color:alpha(currentColor,0.14);
+}
+.workspace-dialog switch slider,
+.workspace-dialog scale slider {
+  background-image:none;
+  background-color:currentColor;
+  border-color:alpha(currentColor,0.22);
+  box-shadow:none;
+}
+.workspace-dialog scale highlight {
+  background-image:none;
+  background-color:alpha(currentColor,0.55);
+}
+.workspace-dialog checkbutton:focus-visible check,
+.workspace-dialog checkbutton:focus-visible radio,
+.workspace-dialog switch:focus-visible,
+.workspace-dialog scale:focus-visible slider {
+  outline:2px solid currentColor;
+  outline-offset:2px;
+}
+.workspace-dialog spinbutton button {
+  background-image:none;
+  background-color:transparent;
+  box-shadow:none;
+  border-color:alpha(currentColor,0.22);
+}
+
+.workspace-dialog checkbutton check:checked,.workspace-dialog checkbutton radio:checked,.workspace-dialog switch:checked { background:#5c7ef0; color:white; }
