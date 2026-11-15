@@ -31,7 +31,7 @@ def build_harness():
     source = (ROOT / "src/search.rs").read_text()
     types = source[source.index("/// Find-bar"):source.index("#[relm4::component")]
     update = item(source, "fn update_with_view(")
-    helpers = source[source.index("fn sync_regex_mode("):]
+    helpers = source[source.index("fn submit_query("):]
     fixture = (ROOT / "scripts/search_lifecycle_harness.rs").read_text()
     for marker, value in [("types", types), ("update", update), ("helpers", helpers)]:
         placeholder = f"// @search-lifecycle:{marker}"

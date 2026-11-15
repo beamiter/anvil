@@ -112,6 +112,7 @@ fn setup() -> (
     (
         SearchModel {
             case_sensitive: false,
+            submitted: None,
         },
         SearchModelWidgets::default(),
         ComponentSender {
@@ -160,6 +161,7 @@ fn delayed_change_after_toggle_close_does_not_restart_hidden_search() {
 fn open_query_and_empty_query_dispatch_normally() {
     let (mut m, mut w, s, r) = setup();
     for text in ["needle", ""] {
+        w.entry.set_text(text);
         apply(&mut m, &mut w, &s, &r, SearchMsg::Changed(text.into()));
         assert!(
             matches!(s.outputs.borrow().last(),Some(SearchOutput::Changed{query,..}) if query==text)
@@ -220,10 +222,8 @@ fn queued_controls_after_either_close_path_leave_search_idle() {
         }
         // The queued option is retained, but only reopening may apply it.
         apply(&mut m, &mut w, &s, &r, SearchMsg::Toggle);
-        assert!(
-            matches!(s.outputs.borrow().as_slice(),
-            [SearchOutput::Changed { query, case_sensitive: true }] if query == "needle")
-        );
+        assert!(matches!(s.outputs.borrow().as_slice(),
+            [SearchOutput::Changed { query, case_sensitive: true }] if query == "needle"));
         assert_eq!(*w.status_label.text.borrow(), "Searching…");
     }
 }
@@ -233,10 +233,8 @@ fn open_search_still_accepts_options_status_and_navigation() {
     let (mut m, mut w, s, r) = setup();
     w.entry.set_text("needle");
     apply(&mut m, &mut w, &s, &r, SearchMsg::CaseSensitive(true));
-    assert!(
-        matches!(s.outputs.borrow().as_slice(),
-        [SearchOutput::Changed { query, case_sensitive: true }] if query == "needle")
-    );
+    assert!(matches!(s.outputs.borrow().as_slice(),
+        [SearchOutput::Changed { query, case_sensitive: true }] if query == "needle"));
     s.outputs.borrow_mut().clear();
     apply(&mut m, &mut w, &s, &r, SearchMsg::CaseSensitive(true));
     assert!(s.outputs.borrow().is_empty());
@@ -256,4 +254,45 @@ fn open_search_still_accepts_options_status_and_navigation() {
         s.outputs.borrow().as_slice(),
         [SearchOutput::Next, SearchOutput::Previous]
     ));
+}
+
+#[test]
+fn navigation_flushes_visible_query_before_direction_and_late_change_is_ignored() {
+    for next in [true, false] {
+        let (mut m, mut w, s, r) = setup();
+        w.entry.set_text("old");
+        apply(&mut m, &mut w, &s, &r, SearchMsg::Changed("old".into()));
+        s.outputs.borrow_mut().clear();
+        w.entry.set_text("new");
+        let direction = if next {
+            SearchMsg::Next
+        } else {
+            SearchMsg::Previous
+        };
+        apply(&mut m, &mut w, &s, &r, direction);
+        let outputs = s.outputs.borrow();
+        assert_eq!(outputs.len(), 2);
+        assert!(matches!(&outputs[0], SearchOutput::Changed { query, .. } if query == "new"));
+        assert!(if next {
+            matches!(outputs[1], SearchOutput::Next)
+        } else {
+            matches!(outputs[1], SearchOutput::Previous)
+        });
+        drop(outputs);
+        s.outputs.borrow_mut().clear();
+        apply(&mut m, &mut w, &s, &r, SearchMsg::Changed("new".into()));
+        assert!(s.outputs.borrow().is_empty());
+    }
+}
+
+#[test]
+fn stale_callback_cannot_overwrite_new_visible_text() {
+    let (mut m, mut w, s, r) = setup();
+    w.entry.set_text("new");
+    apply(&mut m, &mut w, &s, &r, SearchMsg::Changed("old".into()));
+    assert!(s.outputs.borrow().is_empty());
+    apply(&mut m, &mut w, &s, &r, SearchMsg::Changed("new".into()));
+    assert!(
+        matches!(s.outputs.borrow().as_slice(), [SearchOutput::Changed { query, .. }] if query == "new")
+    );
 }

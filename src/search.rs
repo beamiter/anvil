@@ -157,6 +157,7 @@ pub(crate) enum SearchOutput {
 
 pub(crate) struct SearchModel {
     case_sensitive: bool,
+    submitted: Option<(String, bool)>,
 }
 
 #[relm4::component(pub(crate))]
@@ -297,6 +298,7 @@ impl Component for SearchModel {
     ) -> ComponentParts<Self> {
         let model = Self {
             case_sensitive: false,
+            submitted: None,
         };
         let search_root = root.clone();
         let widgets = view_output!();
@@ -326,6 +328,7 @@ impl Component for SearchModel {
         match msg {
             SearchMsg::Toggle | SearchMsg::Open => {
                 let open = matches!(msg, SearchMsg::Open) || !root.is_search_mode();
+                self.submitted = None;
                 root.set_search_mode(open);
                 if open {
                     widgets.entry.grab_focus();
@@ -333,6 +336,7 @@ impl Component for SearchModel {
                     sync_regex_mode(widgets, &query);
                     if !query.is_empty() {
                         apply_status(widgets, &SearchStatus::Searching);
+                        self.submitted = Some((query.clone(), self.case_sensitive));
                         emit_changed(&sender, query, self.case_sensitive);
                     }
                 } else {
@@ -344,7 +348,10 @@ impl Component for SearchModel {
                 // GtkSearchEntry emits search-changed after its own delay.
                 // Closing this bar retains the entry, so a queued change must
                 // not reinstall highlights after SearchOutput::Closed.
-                if !root.is_search_mode() {
+                if !root.is_search_mode()
+                    || query != widgets.entry.text().as_str()
+                    || !submit_query(&mut self.submitted, &query, self.case_sensitive)
+                {
                     return;
                 }
                 sync_regex_mode(widgets, &query);
@@ -371,15 +378,18 @@ impl Component for SearchModel {
                 let query = widgets.entry.text().to_string();
                 if !query.is_empty() {
                     apply_status(widgets, &SearchStatus::Searching);
+                    self.submitted = Some((query.clone(), case_sensitive));
                     emit_changed(&sender, query, case_sensitive);
                 }
             }
             SearchMsg::ActivePaneChanged => {
+                self.submitted = None;
                 let query = widgets.entry.text().to_string();
                 let (status, replay) = pane_transition(root.is_search_mode(), &query);
                 sync_regex_mode(widgets, &query);
                 apply_status(widgets, &status);
                 if let Some(query) = replay {
+                    self.submitted = Some((query.clone(), self.case_sensitive));
                     emit_changed(&sender, query, self.case_sensitive);
                 }
             }
@@ -388,23 +398,46 @@ impl Component for SearchModel {
                     apply_status(widgets, &status);
                 }
             }
-            SearchMsg::Next => {
+            SearchMsg::Next | SearchMsg::Previous => {
                 if root.is_search_mode() {
-                    let _ = sender.output(SearchOutput::Next);
-                }
-            }
-            SearchMsg::Previous => {
-                if root.is_search_mode() {
-                    let _ = sender.output(SearchOutput::Previous);
+                    // Enter and Shift+Enter can precede GTK's delayed search-changed.
+                    // Flush the visible query before navigation, then ignore its
+                    // eventual duplicate notification so it cannot reset the hit.
+                    let query = widgets.entry.text().to_string();
+                    if submit_query(&mut self.submitted, &query, self.case_sensitive) {
+                        sync_regex_mode(widgets, &query);
+                        apply_status(widgets, &SearchStatus::Searching);
+                        emit_changed(&sender, query, self.case_sensitive);
+                    }
+                    let output = if matches!(msg, SearchMsg::Next) {
+                        SearchOutput::Next
+                    } else {
+                        SearchOutput::Previous
+                    };
+                    let _ = sender.output(output);
                 }
             }
             SearchMsg::Close => {
+                self.submitted = None;
                 apply_status(widgets, &SearchStatus::Idle);
                 root.set_search_mode(false);
                 let _ = sender.output(SearchOutput::Closed);
             }
         }
     }
+}
+
+/// Deduplicate only within the current open pane. Closing or changing panes
+/// clears this key, so reopening must still install the query in that backend.
+fn submit_query(submitted: &mut Option<(String, bool)>, query: &str, case_sensitive: bool) -> bool {
+    if submitted
+        .as_ref()
+        .is_some_and(|(previous, case)| previous == query && *case == case_sensitive)
+    {
+        return false;
+    }
+    *submitted = Some((query.to_string(), case_sensitive));
+    true
 }
 
 fn sync_regex_mode(widgets: &SearchModelWidgets, query: &str) {
@@ -549,8 +582,28 @@ fn apply_status(widgets: &SearchModelWidgets, status: &SearchStatus) {
 mod tests {
     use super::{
         active_pane_changed, invalid_regex_message, oversize_query_status, pane_transition,
-        parse_find_query, presentation, SearchPresentation, SearchStatus, SEARCH_QUERY_BYTE_LIMIT,
+        parse_find_query, presentation, submit_query, SearchPresentation, SearchStatus,
+        SEARCH_QUERY_BYTE_LIMIT,
     };
+
+    #[test]
+    fn immediate_navigation_flushes_once_without_late_reset() {
+        let mut submitted = None;
+        assert!(submit_query(&mut submitted, "old", false));
+        assert!(submit_query(&mut submitted, "new", false));
+        assert!(!submit_query(&mut submitted, "new", false));
+        assert!(submit_query(&mut submitted, "new", true));
+        assert!(!submit_query(&mut submitted, "new", true));
+        assert!(submit_query(&mut submitted, "", true));
+    }
+
+    #[test]
+    fn reopened_or_rebound_search_reinstalls_unchanged_query() {
+        let mut submitted = Some(("needle".to_string(), false));
+        assert!(!submit_query(&mut submitted, "needle", false));
+        submitted = None;
+        assert!(submit_query(&mut submitted, "needle", false));
+    }
 
     #[test]
     fn oversized_queries_are_rejected_before_the_backends() {
