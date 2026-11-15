@@ -99,12 +99,15 @@ for transition, dark in enumerate((False, True, False)):
             before = geometry()
             values = state_values()
             assert all(w.get_mapped() for w in controls.values())
-            Gtk.StyleContext.add_provider_for_display(display, patch, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 21)
+            # Replace the complete sheet at the production priority, not an extra overlay.
+            Gtk.StyleContext.remove_provider_for_display(display, base)
+            Gtk.StyleContext.add_provider_for_display(display, patch, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 20)
             settle()
             after = geometry()
             assert before == after, (dark, state, checked, before, after)
             assert state_values() == values, 'Applying paint must not mutate input values'
             Gtk.StyleContext.remove_provider_for_display(display, patch)
+            Gtk.StyleContext.add_provider_for_display(display, base, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 20)
             settle()
             assert geometry() == before, 'Removing candidate must restore the baseline allocation'
             assert state_values() == values

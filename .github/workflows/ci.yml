@@ -90,6 +90,7 @@ jobs:
             python3 \
             python3-venv \
             python3-gi \
+            gir1.2-gtk-4.0 \
             gir1.2-atspi-2.0 \
             at-spi2-core \
             orca \
@@ -230,6 +231,23 @@ jobs:
 
       - name: Check GTK runner failure aggregation
         run: python3 scripts/test-gtk-display-contract.py
+
+      - name: Run dialog control theme state and geometry fixture
+        timeout-minutes: 3
+        env:
+          PYTHONOPTIMIZE: "0"
+          GTK_A11Y: none
+          GDK_BACKEND: x11
+          GSK_RENDERER: cairo
+        run: |
+          python3 scripts/test-dialog-controls-preparation.py
+          mkdir -p gtk-paint-diagnostics/dialog-controls
+          python3 scripts/prepare-dialog-controls-theme.py gtk-paint-diagnostics/dialog-controls
+          dbus-run-session -- xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
+            /usr/bin/python3 scripts/test-dialog-controls-theme.py \
+            --baseline gtk-paint-diagnostics/dialog-controls/baseline.css \
+            --candidate gtk-paint-diagnostics/dialog-controls/candidate.css \
+            --artifacts gtk-paint-diagnostics/dialog-controls
 
       - name: Run display-backed GTK/VTE regressions
         run: GTK_PAINT_DIAGNOSTICS_DIR="$PWD/gtk-paint-diagnostics" ANVIL_XTEST_DRIVER="$PWD/scripts/qa-cross-selection-pointer.py" bash scripts/test-gtk-display.sh 2>&1 | tee gtk-display.log
