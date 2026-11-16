@@ -12,7 +12,16 @@ cd "${PROJECT_ROOT}"
 BINARY="${1:-target/release/anvil}"
 DIST_DIR="${DIST_DIR:-${PROJECT_ROOT}/target/dist}"
 VERSION="${VERSION:-$(awk -F ' *= *' '$1 == "version" { gsub(/"/, "", $2); print $2; exit }' Cargo.toml)}"
-TARGET="${TARGET:-$(rustc -vV | sed -n 's/^host: //p')}"
+# TARGET may be supplied when packaging a prebuilt binary without Rust installed.
+TARGET_EXPLICIT=1
+if [[ -z "${TARGET:-}" ]]; then
+    TARGET_EXPLICIT=0
+    if ! RUSTC_VERBOSE="$(rustc -vV)"; then
+        printf 'Error: cannot determine Rust target; set TARGET for a prebuilt binary.\n' >&2
+        exit 1
+    fi
+    TARGET="$(sed -n 's/^host: //p' <<<"${RUSTC_VERBOSE}")"
+fi
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null || date +%s)}"
 
 if [[ -z "${VERSION}" ]]; then
@@ -37,6 +46,23 @@ if [[ "${SOURCE_DATE_EPOCH}" == *[!0-9]* ]]; then
     echo "Error: SOURCE_DATE_EPOCH must be a nonnegative integer." >&2
     exit 1
 fi
+# This records the packaging environment, not the compiler used for BINARY.
+# A failed probe is permitted for an explicitly targeted prebuilt binary, but
+# successful output must be one nonempty, control-free BUILDINFO value.
+# Map NUL to a rejected control byte before Bash can discard it. pipefail
+# preserves a failed rustc status through this byte filter.
+if ! PACKAGE_RUSTC="$(rustc --version | tr '\000' '\r')"; then
+    if [[ "${TARGET_EXPLICIT}" -eq 0 ]]; then
+        printf 'Error: cannot read packaging rustc version without explicit TARGET.\n' >&2
+        exit 1
+    fi
+    PACKAGE_RUSTC=unknown
+    printf 'Warning: packaging rustc unavailable; BUILDINFO rustc=unknown (not binary provenance).\n' >&2
+elif [[ -z "${PACKAGE_RUSTC}" || "${PACKAGE_RUSTC}" == *[[:cntrl:]]* ]]; then
+    printf 'Error: rustc --version must return one nonempty line without control characters.\n' >&2
+    exit 1
+fi
+
 if [[ ! -x "${BINARY}" ]]; then
     echo "Error: release binary not found or not executable: ${BINARY}" >&2
     echo "Run 'make package' outside a Nix shell, or pass an explicit system-linked release binary." >&2
@@ -86,7 +112,7 @@ version=${VERSION}
 target=${TARGET}
 source_date_epoch=${SOURCE_DATE_EPOCH}
 git_commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)
-rustc=$(rustc --version)
+rustc=${PACKAGE_RUSTC}
 EOF_BUILDINFO
 
 install -d "${PACKAGE_ROOT}/share/anvil/shell-integration"

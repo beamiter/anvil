@@ -5,6 +5,9 @@ versioning for tagged releases while it remains experimental.
 
 ## Unreleased
 
+- Validate packaging compiler metadata before staging; record unavailable tools
+  explicitly and clarify that BUILDINFO is not prebuilt binary provenance.
+
 - Preserve newer local drafts when duplicate conversation-open replies arrive;
   reconcile peer edits and protect active submissions instead of replacing them.
 

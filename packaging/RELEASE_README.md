@@ -51,3 +51,12 @@ replaced file.
 
 The installer writes the binary to `~/.local/bin/anvil` and assets beneath
 `${XDG_DATA_HOME:-$HOME/.local/share}`. Add `~/.local/bin` to `PATH` when needed.
+
+## BUILDINFO scope
+
+`share/doc/anvil/BUILDINFO` describes the packaging context: the declared version
+and target, archive timestamp, packaging checkout commit, and `rustc` found on
+the packager's PATH. It is not proof of the prebuilt binary's source revision or
+build compiler. The binary is copied as supplied, not inspected for provenance.
+With an explicit TARGET, packaging without an available compiler records
+`rustc=unknown` and emits a warning. The existing five metadata keys are retained.
