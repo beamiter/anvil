@@ -16270,9 +16270,10 @@ impl TermView {
         self.selection_feed_hold.flush_now();
         let clipboard = self.active_vte.clipboard();
         let sink = self.paste_sink();
+        let notify = paste_feedback::notifier(&self.active_vte);
         let active_vte = self.active_vte.downgrade();
         clipboard.read_text_async(None::<&gtk::gio::Cancellable>, move |result| {
-            let Ok(Some(text)) = result else {
+            let Some(text) = paste_feedback::read_text(result, notify.as_ref()) else {
                 return;
             };
             if let Err(error) = sink.deliver(text.as_str()) {
