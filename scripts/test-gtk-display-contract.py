@@ -24,6 +24,7 @@ IME_TESTS = {
     "block_view::chat::tests::native_ime_commit_cancel_and_independent_ptys",
     "block_view::chat::tests::native_ime_send_button_preserves_composition",
     "block_view::chat::tests::native_chat_passthrough_initial_focus_accepts_composition",
+    "block_view::chat::tests::native_ime_initial_and_returning_stack_tab_keep_same_owner",
 }
 VARIANT_KEYS = (
     "ANVIL_ENTER_MODE", "ANVIL_QA_PREWARM_ENTER", "ANVIL_QA_INHERITED_ENTER",
