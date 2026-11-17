@@ -3,6 +3,11 @@
 
 Uses the same official libX11/libXtst CI dependencies as the pointer fixture.
 Never accepts arbitrary text, key names, commands, or a target window argument.
+Optional --require-focus observes focus without repairing it, before the sequence
+and each key press. This is a fail-closed test aid, not a real fcitx acceptance.
+Focus checks and XTest injection are not atomic; use only an isolated QA display.
+Held keys are released on failure so modifier state cannot remain stuck.
+The default still activates the QA window for existing isolated-X11 fixtures.
 """
 import ctypes
 import sys
@@ -12,9 +17,28 @@ ACTIONS = {"compose": ("4", "e", "2", "d"), "commit": ("Return",),
            "cancel": ("Escape",), "ascii-a": ("a",), "ascii-b": ("b",)}
 
 
+def parse_args(args):
+    if (len(args) not in (1, 2) or args[0] not in ACTIONS
+            or (len(args) == 2 and args[1] != "--require-focus")):
+        raise SystemExit("Expected ACTION [--require-focus]")
+    return args[0], len(args) == 2
+
+
+def ensure_target_focus(x, display, target, require_focus):
+    # Never repair focus in strict mode: doing so could conceal a startup or
+    # tab-activation failure in the application under test.
+    if not require_focus:
+        x.XSetInputFocus(display, target, 1, 0)
+        x.XSync(display, 0)
+    focused, revert = ctypes.c_ulong(), ctypes.c_int()
+    if not x.XGetInputFocus(display, ctypes.byref(focused), ctypes.byref(revert)):
+        raise RuntimeError("Could not query QA window input focus")
+    if focused.value != target:
+        raise RuntimeError("QA window does not own X input focus")
+
+
 def main():
-    if len(sys.argv) != 2 or sys.argv[1] not in ACTIONS:
-        raise SystemExit("Expected compose, commit, cancel, ascii-a, or ascii-b")
+    action, require_focus = parse_args(sys.argv[1:])
     x = ctypes.CDLL("libX11.so.6")
     xt = ctypes.CDLL("libXtst.so.6")
     pointer, window = ctypes.c_void_p, ctypes.c_ulong
@@ -61,14 +85,11 @@ def main():
         target = find(x.XDefaultRootWindow(display))
         if not target:
             raise RuntimeError("Dedicated nonexecuting native IME QA window is missing")
-        x.XSetInputFocus(display, target, 1, 0)
-        x.XSync(display, 0)
-        focused, revert = window(), ctypes.c_int()
-        x.XGetInputFocus(display, ctypes.byref(focused), ctypes.byref(revert))
-        if focused.value != target:
-            raise RuntimeError("QA window did not acquire X input focus")
+        ensure_target_focus(x, display, target, require_focus)
 
         def key(name, down):
+            if require_focus and down:
+                ensure_target_focus(x, display, target, True)
             code = x.XKeysymToKeycode(display, x.XStringToKeysym(name.encode("ascii")))
             if not code or not xt.XTestFakeKeyEvent(display, code, int(down), 0):
                 raise RuntimeError("XTest key event was refused")
@@ -79,13 +100,13 @@ def main():
             key(name, True)
             key(name, False)
 
-        if sys.argv[1] == "compose":
+        if action == "compose":
             key("Control_L", True)
             key("Shift_L", True)
             tap("u")
             key("Shift_L", False)
             key("Control_L", False)
-        for name in ACTIONS[sys.argv[1]]:
+        for name in ACTIONS[action]:
             tap(name)
     finally:
         for code in held:
@@ -97,3 +118,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
