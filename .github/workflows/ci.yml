@@ -136,6 +136,9 @@ jobs:
       - name: Check search callback lifecycle
         run: python3 scripts/test-search-lifecycle.py
 
+      - name: Check native IME injector focus policy (pure mocks)
+        run: python3 scripts/test-qa-native-ime-keyboard.py
+
       - name: Check workspace search ownership transitions
         run: python3 scripts/test-workspace-search-transition.py
 
