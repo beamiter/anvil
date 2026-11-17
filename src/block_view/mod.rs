@@ -16267,13 +16267,17 @@ impl TermView {
     /// removes paste markers from the body unconditionally and returns the whole
     /// payload as one buffer, so there is no longer a body write to attack.
     pub fn paste_from_clipboard(&self) {
-        self.selection_feed_hold.flush_now();
+        let selection_feed_hold = self.selection_feed_hold.clone();
         let clipboard = self.active_vte.clipboard();
         let sink = self.paste_sink();
         let notify = paste_feedback::notifier(&self.active_vte);
         let active_vte = self.active_vte.downgrade();
         clipboard.read_text_async(None::<&gtk::gio::Cancellable>, move |result| {
-            let Some(text) = paste_feedback::read_text(result, notify.as_ref()) else {
+            let Some(text) =
+                paste_feedback::read_text_before_paste(result, notify.as_ref(), || {
+                    selection_feed_hold.flush_now()
+                })
+            else {
                 return;
             };
             if let Err(error) = sink.deliver(text.as_str()) {

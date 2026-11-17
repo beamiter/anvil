@@ -30,6 +30,19 @@ pub(super) fn read_text<T: AsRef<str>, E>(
     }
 }
 
+/// Failed or empty reads must not release a selected streaming surface.
+/// Replay a successful read's parked output before delivery, so the sink sees
+/// the latest shell/paste mode. This does not bypass its admission checks.
+pub(super) fn read_text_before_paste<T: AsRef<str>, E>(
+    result: Result<Option<T>, E>,
+    notify: &dyn Fn(&str),
+    before_paste: impl FnOnce(),
+) -> Option<T> {
+    let text = read_text(result, notify)?;
+    before_paste();
+    Some(text)
+}
+
 pub(super) fn report(notify: &dyn Fn(&str), truncated: bool, delivered: bool) {
     if truncated {
         notify(if delivered { PARTIAL } else { EMPTY });
@@ -90,6 +103,31 @@ mod tests {
                 panic!("successful nonempty read must not report a failure");
             });
             assert_eq!(result.as_deref(), Some(text));
+        }
+    }
+
+    #[test]
+    fn failed_or_empty_clipboard_read_keeps_streaming_selection_held() {
+        for result in [Err(()), Ok(None), Ok(Some(String::new()))] {
+            let replay_count = std::cell::Cell::new(0);
+            let result = read_text_before_paste(result, &|_| {}, || {
+                replay_count.set(replay_count.get() + 1);
+            });
+            assert!(result.is_none());
+            assert_eq!(replay_count.get(), 0);
+        }
+    }
+
+    #[test]
+    fn successful_clipboard_read_replays_before_delivery_even_for_whitespace() {
+        for text in [" ", "\r\n", "中文"] {
+            let order = std::cell::RefCell::new(Vec::new());
+            let received = read_text_before_paste::<_, ()>(Ok(Some(text)), &|_| {}, || {
+                order.borrow_mut().push("replay");
+            });
+            assert_eq!(received, Some(text));
+            order.borrow_mut().push("deliver");
+            assert_eq!(*order.borrow(), ["replay", "deliver"]);
         }
     }
 
