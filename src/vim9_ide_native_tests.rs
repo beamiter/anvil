@@ -894,6 +894,13 @@ fn native_vim9_quick_open_locations() {
 #[test]
 #[ignore = "needs a display and Vim 9 with +channel +job +timers"]
 fn native_vim9_command_palette_modes_and_live_availability() {
+    // Write directly so a native SIGSEGV cannot discard libtest's captured output.
+    // Fixed fixture stages only: no query, file, environment, or user content.
+    fn stage(label: &'static [u8]) {
+        use std::io::Write;
+        let _ = std::io::stderr().lock().write_all(label);
+    }
+    stage(b"anvil-palette-stage: start\n");
     if !jterm_core::child_env::inherited_environment_is_captured() {
         jterm_core::child_env::capture_inherited_environment().unwrap();
     }
@@ -926,6 +933,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
         .into_iter()
         .next()
         .unwrap();
+    stage(b"anvil-palette-stage: wait-01\n");
     wait_for(widget, "palette bridge", || {
         named_button(widget, "Save (Ctrl+S)").is_sensitive()
     });
@@ -950,6 +958,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
             ),
             "Ctrl+Shift+P opens a dialog without toolbar chrome"
         );
+        stage(b"anvil-palette-stage: wait-02\n");
         wait_for(widget, "palette dialog", || {
             native_window.visible_dialog().is_some()
         });
@@ -976,11 +985,13 @@ fn native_vim9_command_palette_modes_and_live_availability() {
     // Immediate Enter uses command mode without waiting for the file index
     // or SearchEntry debounce. Name the harmless action explicitly because
     // command recency can legitimately change the unfiltered first result.
+    stage(b"anvil-palette-stage: wait-03\n");
     wait_for(widget, "palette save returns focus", || {
         native_window.visible_dialog().is_none() && editor.has_focus()
     });
     let (picker, query, list) = open_picker();
     query.set_text(">");
+    stage(b"anvil-palette-stage: wait-04\n");
     wait_for(widget, "command catalog", || {
         contains(&picker, "Save all buffers") && contains(&picker, "Ctrl+Shift+S")
     });
@@ -998,6 +1009,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
     let settled = Rc::new(Cell::new(false));
     let observed = settled.clone();
     glib::timeout_add_local_once(Duration::from_millis(160), move || observed.set(true));
+    stage(b"anvil-palette-stage: wait-05\n");
     wait_for(
         widget,
         "unavailable command survives picker polling",
@@ -1015,6 +1027,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
     query.emit_activate();
     assert!(contains(&picker, "The quickfix list has no problems"));
     editor.feed_child(b":call setqflist([{'filename':'sample.txt','lnum':1,'col':1,'text':'palette problem','type':'W'}])\r");
+    stage(b"anvil-palette-stage: wait-06\n");
     wait_for(
         widget,
         "live command availability with unchanged query",
@@ -1034,6 +1047,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
         }));
     assert_eq!(query.text(), ">next diagnostic");
     query.emit_by_name::<()>("stop-search", &[]);
+    stage(b"anvil-palette-stage: wait-07\n");
     wait_for(widget, "Escape returns palette focus", || {
         native_window.visible_dialog().is_none() && editor.has_focus()
     });
@@ -1041,11 +1055,13 @@ fn native_vim9_command_palette_modes_and_live_availability() {
     // which can leave Vim waiting for a terminal key sequence after the
     // modified-buffer title has already arrived.
     editor.feed_child(b":call setqflist([]) | call setline(1, 'PALETTE before')\r");
+    stage(b"anvil-palette-stage: wait-08\n");
     wait_for(widget, "unsaved palette fixture", || {
         window.title().is_some_and(|title| title.contains('●'))
     });
     let (picker, query, list) = open_picker();
     query.set_text(">save current buffer");
+    stage(b"anvil-palette-stage: wait-09\n");
     wait_for(widget, "save row before a file query", || {
         contains(&picker, "Save current buffer")
     });
@@ -1054,6 +1070,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
     list.emit_by_name::<()>("row-activated", &[&stale_command]);
     assert!(native_window.visible_dialog().is_some());
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "before\n");
+    stage(b"anvil-palette-stage: wait-10\n");
     wait_for(widget, "file results after switching modes", || {
         contains(&picker, "sample.txt")
     });
@@ -1069,6 +1086,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
     list.emit_by_name::<()>("row-activated", &[&stale_file]);
     assert!(native_window.visible_dialog().is_some());
     query.emit_activate();
+    stage(b"anvil-palette-stage: wait-11\n");
     wait_for(widget, "typed palette split", || {
         native_window.visible_dialog().is_none()
             && buffer
@@ -1076,6 +1094,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
                 .is_some_and(|frame| frame.windows.len() == 2)
     });
     editor.feed_child(b"u");
+    stage(b"anvil-palette-stage: wait-12\n");
     wait_for(widget, "fixture undo retains disk contents", || {
         window.title().is_some_and(|title| !title.contains('●'))
     });
@@ -1103,6 +1122,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
     editor.feed_child(format!(":source {}\r", provider.display()).as_bytes());
     let (picker, query, _) = open_picker();
     query.set_text(">simple git status");
+    stage(b"anvil-palette-stage: wait-13\n");
     wait_for(widget, "Simple provider in native palette", || {
         contains(&picker, "Simple: Show Git status")
             && contains(&picker, "palette-main ↑1")
@@ -1115,6 +1135,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
             .unwrap()
     };
     section_button("vim9-section-plugins").emit_clicked();
+    stage(b"anvil-palette-stage: wait-14\n");
     wait_for(
         widget,
         "Plugins category filters the current picker",
@@ -1126,6 +1147,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
     );
     assert!(navigation::native_text_has_focus(&native_window));
     section_button("vim9-section-git").emit_clicked();
+    stage(b"anvil-palette-stage: wait-15\n");
     wait_for(
         widget,
         "Git category shows cached context and typed actions",
@@ -1136,6 +1158,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
         let clock = window.frame_clock().expect("mapped palette frame clock");
         let frame = clock.frame_counter();
         window.queue_draw();
+        stage(b"anvil-palette-stage: wait-16\n");
         wait_for(widget, "Simple palette paint", || {
             clock.frame_counter() > frame
         });
@@ -1150,6 +1173,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
     }
     query.set_text(">simplegit status");
     editor.feed_child(b":let g:vim9_simple_branch = 'palette-next'\r");
+    stage(b"anvil-palette-stage: wait-17\n");
     wait_for(
         widget,
         "Simple context refresh without query change",
@@ -1157,6 +1181,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
     );
     assert_eq!(query.text(), ">simplegit status");
     query.emit_activate();
+    stage(b"anvil-palette-stage: wait-18\n");
     wait_for(widget, "Simple typed action returns to Vim", || {
         native_window.visible_dialog().is_none()
             && std::fs::read_to_string(&action_output)
@@ -1168,6 +1193,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
     );
     let (picker, query, list) = open_picker();
     query.set_text(">format");
+    stage(b"anvil-palette-stage: wait-19\n");
     wait_for(
         widget,
         "format unavailable before capability refresh",
@@ -1184,6 +1210,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
     let format_error = "The current buffer's language service does not provide this action";
     assert!(contains(&picker, format_error));
     editor.feed_child(b":command! LspFormat echo 'format fixture'\r");
+    stage(b"anvil-palette-stage: wait-20\n");
     wait_for(
         widget,
         "format capability refresh preserves activation feedback",
@@ -1197,17 +1224,20 @@ fn native_vim9_command_palette_modes_and_live_availability() {
     );
     assert!(contains(&picker, format_error));
     query.set_text(">simple");
+    stage(b"anvil-palette-stage: wait-21\n");
     wait_for(
         widget,
         "query change clears prior activation feedback",
         || contains(&picker, "Simple: Show Git status") && !contains(&picker, format_error),
     );
     query.emit_by_name::<()>("stop-search", &[]);
+    stage(b"anvil-palette-stage: wait-22\n");
     wait_for(widget, "format feedback fixture dismissal", || {
         native_window.visible_dialog().is_none()
     });
     let (picker, query, _) = open_picker();
     query.set_text(">simple");
+    stage(b"anvil-palette-stage: wait-23\n");
     wait_for(widget, "Simple palette screenshot catalog", || {
         contains(&picker, "Simple: Show Git status") && contains(&picker, "palette-next ↑1")
     });
@@ -1215,6 +1245,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
         let clock = window.frame_clock().unwrap();
         let previous = clock.frame_counter();
         window.queue_draw();
+        stage(b"anvil-palette-stage: wait-24\n");
         wait_for(widget, "palette reaches a painted window frame", || {
             clock.frame_counter() > previous
         });
@@ -1233,12 +1264,14 @@ fn native_vim9_command_palette_modes_and_live_availability() {
             .unwrap();
     }
     query.emit_by_name::<()>("stop-search", &[]);
+    stage(b"anvil-palette-stage: wait-25\n");
     wait_for(widget, "catalog dismissal", || {
         native_window.visible_dialog().is_none()
     });
     let (_, query, _) = open_picker();
     query.set_text("./>notes");
     query.emit_activate();
+    stage(b"anvil-palette-stage: wait-26\n");
     wait_for(
         widget,
         "literal greater-than filename remains reachable",
@@ -1248,8 +1281,11 @@ fn native_vim9_command_palette_modes_and_live_availability() {
         },
     );
     editor.feed_child(b":qa!\r");
+    stage(b"anvil-palette-stage: wait-27\n");
     wait_for(widget, "palette fixture exit", || app.windows().is_empty());
+    stage(b"anvil-palette-stage: cleanup\n");
     std::fs::remove_dir_all(root).unwrap();
+    stage(b"anvil-palette-stage: complete\n");
 }
 
 #[test]
