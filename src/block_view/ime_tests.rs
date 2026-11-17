@@ -346,3 +346,79 @@ fn native_ime_send_button_preserves_composition() {
     first.pty.kill();
     second.pty.kill();
 }
+
+// Exercise the production request ordering without a shell or AppModel: initial
+// GrabFocus arrives before mapping, whereas a returning tab is already mapped.
+// This is GTK simple-IM coverage only, not an fcitx activation test.
+#[test]
+#[ignore = "requires isolated X11 DISPLAY and GTK_IM_MODULE=simple"]
+fn native_ime_initial_and_returning_stack_tab_keep_same_owner() {
+    assert_eq!(std::env::var("GTK_IM_MODULE").as_deref(), Ok("simple"));
+    crate::child_env::capture_inherited_environment().expect("test child environment");
+    gtk::init().expect("GTK display");
+    for mode in [
+        crate::config::TerminalMode::Block,
+        crate::config::TerminalMode::Chat,
+        crate::config::TerminalMode::Unified,
+    ] {
+        let view = TermView::new_with_spawner(
+            &crate::config::Config::safe_defaults(),
+            &mode,
+            &["sh".into()],
+            None,
+            false,
+            None,
+            "initial-returning-ime-test",
+            &[],
+            &[],
+            |_, _, _, _| crate::pty::OwnedPty::from_live_openpty(Some(true)),
+        )
+        .expect("nonexecuting PTY recorder");
+        view.block_onboarding.history_resolved(false);
+        let other = gtk::Entry::new();
+        let stack = gtk::Stack::new();
+        stack.set_transition_type(gtk::StackTransitionType::None);
+        stack.add_named(&view.root, Some("terminal"));
+        stack.add_named(&other, Some("other"));
+        let window = gtk::Window::builder()
+            .title("anvil-native-ime-qa")
+            .default_width(800)
+            .default_height(600)
+            .child(&stack)
+            .build();
+        assert!(!view.active_vte.is_mapped());
+        stack.set_visible_child_name("terminal");
+        view.grab_focus();
+        window.present();
+        for returning in [false, true] {
+            if returning {
+                stack.set_visible_child_name("other");
+                wait_for("other tab mapped", || other.is_mapped());
+                assert!(other.grab_focus());
+                pump_for(Duration::from_millis(80));
+                assert!(!view.active_vte.is_mapped());
+                stack.set_visible_child_name("terminal");
+                view.grab_focus();
+            }
+            wait_for("terminal focus owner", || {
+                view.active_vte.is_mapped() && view.active_vte.has_focus()
+            });
+            pump_for(Duration::from_millis(180));
+            assert!(
+                view.active_vte.has_focus(),
+                "focus survives deferred layout"
+            );
+            view.pty.drain_test_slave(Duration::from_millis(30));
+            native_ime_keys("compose");
+            assert!(view
+                .pty
+                .drain_test_slave(Duration::from_millis(30))
+                .is_empty());
+            native_ime_keys("commit");
+            native_ime_expect(&view.pty, "中".as_bytes());
+        }
+        window.close();
+        view.pty.kill();
+        pump_for(Duration::from_millis(80));
+    }
+}
