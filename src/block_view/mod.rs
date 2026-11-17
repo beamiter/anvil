@@ -16271,7 +16271,6 @@ impl TermView {
         let clipboard = self.active_vte.clipboard();
         let sink = self.paste_sink();
         let notify = paste_feedback::notifier(&self.active_vte);
-        let active_vte = self.active_vte.downgrade();
         clipboard.read_text_async(None::<&gtk::gio::Cancellable>, move |result| {
             let Some(text) =
                 paste_feedback::read_text_before_paste(result, notify.as_ref(), || {
@@ -16282,9 +16281,7 @@ impl TermView {
             };
             if let Err(error) = sink.deliver(text.as_str()) {
                 log::warn!("clipboard paste refused: {error}");
-                if let Some(active_vte) = active_vte.upgrade() {
-                    show_clipboard_failure(&active_vte, &format!("{error}. Nothing was pasted."));
-                }
+                paste_feedback::report_refusal(notify.as_ref(), &error);
             }
         });
     }

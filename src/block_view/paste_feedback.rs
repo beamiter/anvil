@@ -49,6 +49,11 @@ pub(super) fn report(notify: &dyn Fn(&str), truncated: bool, delivered: bool) {
     }
 }
 
+/// Delivery admission failures belong to the original pane, never a late modal.
+pub(super) fn report_refusal(notify: &dyn Fn(&str), reason: &str) {
+    notify(&format!("Paste failed: {reason}. Nothing was pasted."));
+}
+
 /// Resolve only the original, still-visible pane. Toasts contain no clipboard
 /// content, have no action button, and never acquire keyboard focus.
 pub(super) fn notifier(target: &impl IsA<gtk::Widget>) -> Rc<dyn Fn(&str)> {
@@ -132,10 +137,28 @@ mod tests {
     }
 
     #[test]
+    fn refusal_keeps_admission_reason_and_reports_no_delivery() {
+        let messages = std::cell::RefCell::new(Vec::new());
+        report_refusal(
+            &|message| messages.borrow_mut().push(message.to_owned()),
+            "Input queue is full",
+        );
+        assert_eq!(
+            *messages.borrow(),
+            ["Paste failed: Input queue is full. Nothing was pasted."]
+        );
+    }
+
+    #[test]
     #[ignore = "requires DISPLAY; verifies passive paste feedback"]
     fn notice_preserves_focus() {
         relm4::adw::init().expect("gtk display");
-        for message in [PARTIAL, READ_FAILED, NO_TEXT] {
+        for message in [
+            PARTIAL,
+            READ_FAILED,
+            NO_TEXT,
+            "Paste failed: Input queue is full. Nothing was pasted.",
+        ] {
             let target = gtk::Entry::new();
             let newer = gtk::Entry::new();
             let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -151,7 +174,27 @@ mod tests {
             let before = gtk::prelude::GtkWindowExt::focus(&window);
             let notify = notifier(&target);
             assert!(before.is_some());
-            notify(message);
+            target.set_visible(false);
+            assert!(!target.is_mapped());
+            report_refusal(notify.as_ref(), "Late refusal after switching tabs");
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_millis(200) {
+                while gtk::glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(!has_notice(
+                overlay.upcast_ref(),
+                "Paste failed: Late refusal after switching tabs. Nothing was pasted."
+            ));
+            assert_eq!(gtk::prelude::GtkWindowExt::focus(&window), before);
+            target.set_visible(true);
+            while gtk::glib::MainContext::default().iteration(false) {}
+            assert!(target.is_mapped());
+            if message.starts_with("Paste failed:") {
+                report_refusal(notify.as_ref(), "Input queue is full");
+            } else {
+                notify(message);
+            }
             let start = std::time::Instant::now();
             while start.elapsed() < std::time::Duration::from_millis(200) {
                 while gtk::glib::MainContext::default().iteration(false) {}
