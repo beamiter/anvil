@@ -5,12 +5,9 @@
 //! is spawned on init. VTE signals (cwd/exit/bell/title/activity) are forwarded
 //! as component Output messages instead of forge's callback-Vec observer model.
 
-use gtk::gdk::ffi::GDK_BUTTON_PRIMARY;
-use gtk::gdk::ModifierType;
 use gtk::gdk::RGBA;
 use gtk::gio;
 use gtk::prelude::*;
-use gtk::GestureClick;
 use gtk::Orientation;
 use relm4::gtk;
 use relm4::prelude::*;
@@ -219,27 +216,16 @@ pub(crate) fn default_tab_title(tab_index_1based: u32, working_directory: Option
 /// program's mouse reporting. Hovering an OSC 8 link shows its target.
 pub(crate) fn setup_terminal_click_handler(terminal: &Terminal) {
     super::url::show_hyperlink_target_on_hover(terminal);
-    let click_controller = GestureClick::new();
-    click_controller.set_button(GDK_BUTTON_PRIMARY as u32);
-    click_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
-    let terminal_clone = terminal.clone();
+    crate::vte_reference::install_hover(terminal);
+    let weak = terminal.downgrade();
     let opener = super::url::LinkOpener::new(terminal);
     let on_changed = opener.clone();
     terminal.connect_contents_changed(move |_| on_changed.invalidate());
-    click_controller.connect_pressed(move |controller, n_press, x, y| {
-        if n_press == 1 {
-            let state = controller.current_event_state();
-            if state.contains(ModifierType::CONTROL_MASK) {
-                if let Some(uri) = super::url::openable_link_at(&terminal_clone, x, y) {
-                    opener.open(&uri);
-                    controller.set_state(gtk::EventSequenceState::Claimed);
-                    return;
-                }
-            }
-        }
-        controller.set_state(gtk::EventSequenceState::Denied);
-    });
-    terminal.add_controller(click_controller);
+    crate::vte_reference::click(
+        terminal,
+        move |x, y| super::url::openable_link_at(&weak.upgrade()?, x, y),
+        move |uri| opener.open(&uri),
+    );
 }
 
 fn launch_failure_message(error: &impl std::fmt::Display) -> String {
@@ -806,7 +792,7 @@ impl Component for VteTerminal {
                 if let Some(message) = copy_empty_notice(self.terminal.has_selection()) {
                     let _ = sender.output(VteOutput::Notice(message.to_string()));
                 } else {
-                    self.terminal.copy_clipboard_format(vte4::Format::Text);
+                    crate::vte_reference::copy_selection(&self.terminal);
                 }
             }
             VteInput::Paste => self.terminal.paste_clipboard(),

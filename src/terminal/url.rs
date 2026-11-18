@@ -233,7 +233,7 @@ pub(crate) fn openable_link_at(terminal: &vte4::Terminal, x: f64, y: f64) -> Opt
 
     link_to_open(
         terminal.check_hyperlink_at(x, y).map(|uri| uri.to_string()),
-        terminal.check_match_at(x, y).0.map(|uri| uri.to_string()),
+        crate::vte_reference::web_match(terminal, x, y),
     )
 }
 

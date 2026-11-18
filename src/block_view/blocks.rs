@@ -5172,37 +5172,7 @@ impl FinishedBlock {
         collapsed_summary.set_visible(false);
         content.append(&collapsed_summary);
 
-        // Ctrl+click on a URL inside the output VTE → open in browser.
-        // VTE's `match_add_regex` (registered in create_finished_terminal) makes
-        // `check_match_at` return the matching URL at the pointer position, and
-        // an OSC 8 link answers `check_hyperlink_at`; VTE handles
-        // word/line double/triple-click selection natively.
-        crate::terminal::url::show_hyperlink_target_on_hover(&output_vte);
-        {
-            let click = gtk::GestureClick::new();
-            click.set_button(1);
-            let vte_for_click = output_vte.downgrade();
-            let opener = crate::terminal::url::LinkOpener::new(&output_vte);
-            let on_changed = opener.clone();
-            output_vte.connect_contents_changed(move |_| on_changed.invalidate());
-            click.connect_pressed(move |controller, n_press, x, y| {
-                if n_press != 1 {
-                    return;
-                }
-                let state = controller.current_event_state();
-                if !state.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
-                    return;
-                }
-                let Some(vte_for_click) = vte_for_click.upgrade() else {
-                    return;
-                };
-                if let Some(uri) = crate::terminal::url::openable_link_at(&vte_for_click, x, y) {
-                    opener.open(&uri);
-                    controller.set_state(gtk::EventSequenceState::Claimed);
-                }
-            });
-            output_vte.add_controller(click);
-        }
+        crate::terminal::vte::setup_terminal_click_handler(&output_vte);
 
         let has_output = !output.trim().is_empty();
         let has_images = images_box.is_some();

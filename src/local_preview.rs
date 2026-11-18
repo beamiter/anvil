@@ -19,14 +19,6 @@ struct PreviewState {
     restore: RefCell<Option<Box<dyn Fn()>>>,
 }
 
-// Match semantic shortcut modifiers, not lock/button/backend bookkeeping bits.
-fn ctrl_preview_shortcut(state: gtk4::gdk::ModifierType) -> bool {
-    use gtk4::gdk::ModifierType as M;
-    state.contains(M::CONTROL_MASK)
-        && !state
-            .intersects(M::SHIFT_MASK | M::ALT_MASK | M::SUPER_MASK | M::HYPER_MASK | M::META_MASK)
-}
-
 fn candidate(raw: &str) -> Option<PathBuf> {
     if raw.len() > local_reference::MAX_REFERENCE_BYTES {
         return None;
@@ -79,7 +71,7 @@ struct PreviewUi {
     capture: Box<dyn Fn() -> Box<dyn Fn()>>,
 }
 
-fn hit(window: &gtk4::Widget, x: f64, y: f64) -> Option<PathBuf> {
+fn hit(window: &gtk4::Widget, x: f64, y: f64) -> Option<(usize, PathBuf)> {
     let mut picked = window.pick(x, y, gtk4::PickFlags::DEFAULT)?;
     let terminal = loop {
         if let Ok(terminal) = picked.clone().downcast::<vte4::Terminal>() {
@@ -97,13 +89,18 @@ fn hit(window: &gtk4::Widget, x: f64, y: f64) -> Option<PathBuf> {
         .check_hyperlink_at(point.x().into(), point.y().into())
         .map(|s| s.to_string())
         .or_else(|| {
+            crate::vte_reference::hit(&terminal, point.x().into(), point.y().into())
+                .map(|reference| reference.target)
+        })
+        .or_else(|| {
             terminal
                 .check_match_at(point.x().into(), point.y().into())
                 .0
                 .map(|s| s.to_string())
         });
+    let owner = terminal.as_ptr() as usize;
     if let Some(raw) = raw {
-        return candidate(&raw);
+        return candidate(&raw).map(|path| (owner, path));
     }
     // Click-local probing does not register a competing URL/selection matcher.
     thread_local! {
@@ -115,6 +112,7 @@ fn hit(window: &gtk4::Widget, x: f64, y: f64) -> Option<PathBuf> {
             .check_regex_simple_at(point.x().into(), point.y().into(), &[regex.as_ref()?], 0)
             .first()
             .and_then(|raw| candidate(raw))
+            .map(|path| (owner, path))
     })
 }
 
@@ -351,52 +349,16 @@ pub(crate) fn install(
     });
     let state = Rc::new(PreviewState::default());
     let weak_window = window.downgrade();
-    let click = gtk4::GestureClick::new();
-    click.set_button(1);
-    click.set_propagation_phase(gtk4::PropagationPhase::Capture);
-    click.connect_pressed(move |gesture, count, x, y| {
-        let accepted = (|| {
-            if count != 1 || !ctrl_preview_shortcut(gesture.current_event_state()) {
-                return None;
-            }
-            let window = weak_window.upgrade()?;
-            let path = hit(&window, x, y)?;
-            show_candidate(&ui, &state, path);
-            Some(())
-        })()
-        .is_some();
-        gesture.set_state(if accepted {
-            gtk4::EventSequenceState::Claimed
-        } else {
-            gtk4::EventSequenceState::Denied
-        });
-    });
-    window.add_controller(click);
+    crate::vte_reference::click(
+        window,
+        move |x, y| hit(&weak_window.upgrade()?, x, y),
+        move |(_, path)| show_candidate(&ui, &state, path),
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn ctrl_shortcut_ignores_lock_and_event_bookkeeping_not_competing_shortcuts() {
-        use gtk4::gdk::ModifierType as M;
-        let irrelevant = M::LOCK_MASK | M::BUTTON1_MASK | M::from_bits_retain(1 << 20);
-        for extra in [M::empty(), M::LOCK_MASK, M::BUTTON1_MASK, irrelevant] {
-            assert!(ctrl_preview_shortcut(M::CONTROL_MASK | extra));
-            assert!(!ctrl_preview_shortcut(extra));
-            for conflicting in [
-                M::SHIFT_MASK,
-                M::ALT_MASK,
-                M::SUPER_MASK,
-                M::HYPER_MASK,
-                M::META_MASK,
-            ] {
-                assert!(!ctrl_preview_shortcut(
-                    M::CONTROL_MASK | extra | conflicting
-                ));
-            }
-        }
-    }
     #[test]
     fn candidates_are_not_remote_uris_or_relative_cwd_guesses() {
         for name in ["README.md", "package.json", "App.tsx:12:3"] {

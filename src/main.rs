@@ -3,6 +3,8 @@
 mod composer_geometry;
 
 mod agent_cli;
+mod delimited_reference;
+mod vte_reference;
 mod gtk_presentation;
 mod gtk_process;
 mod gtk_spawn;
