@@ -61,6 +61,7 @@ mod keybindings;
 mod launch_path;
 mod local_preview;
 mod local_preview_file;
+mod local_preview_tokens;
 mod local_reference;
 mod navigation_ui;
 mod notebook;

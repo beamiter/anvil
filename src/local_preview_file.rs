@@ -4,6 +4,34 @@ use std::path::Path;
 
 pub const MAX_BYTES: u64 = 256 * 1024;
 
+/// Resolve only the directory explicitly typed into the local confirmation UI.
+/// Never consult terminal cwd, environment variables, home expansion or the OS cwd.
+pub fn selected_local_path(candidate: &Path, directory: &str) -> io::Result<std::path::PathBuf> {
+    use std::path::Component;
+    let invalid = |p: &Path| {
+        p.components()
+            .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+    };
+    if candidate.as_os_str().is_empty() || invalid(candidate) {
+        return Err(io::Error::other("Parent paths are not previewed"));
+    }
+    if candidate.is_absolute() {
+        return Ok(candidate.to_path_buf());
+    }
+    if directory.is_empty() || directory.len() > 4096 || directory.chars().any(char::is_control) {
+        return Err(io::Error::other(
+            "Enter an absolute directory on this machine",
+        ));
+    }
+    let base = Path::new(directory);
+    if !base.is_absolute() || invalid(base) || candidate.starts_with("~") {
+        return Err(io::Error::other(
+            "Choose a local directory without parent or home expansion",
+        ));
+    }
+    Ok(base.join(candidate))
+}
+
 pub fn read_source(path: &Path) -> io::Result<String> {
     if !path.is_absolute() {
         return Err(io::Error::other("Choose an absolute local path"));
@@ -111,6 +139,36 @@ fn open_without_symlink_components(_: &Path) -> io::Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn relative_paths_require_an_explicit_local_directory() {
+        assert_eq!(
+            selected_local_path(Path::new("src/App.tsx"), "/chosen/project").unwrap(),
+            Path::new("/chosen/project/src/App.tsx")
+        );
+        assert_eq!(
+            selected_local_path(Path::new("./README.md"), "/chosen/project").unwrap(),
+            Path::new("/chosen/project/./README.md")
+        );
+        assert_eq!(
+            selected_local_path(Path::new("/tmp/source.md"), "").unwrap(),
+            Path::new("/tmp/source.md")
+        );
+        for (path, base) in [
+            ("src/a.md", ""),
+            ("src/a.md", "relative"),
+            ("../a.md", "/tmp"),
+            ("src/../a.md", "/tmp"),
+            ("a.md", "/tmp/../other"),
+            ("~/a.md", "/tmp"),
+            ("a.md", "/tmp/\nspoof"),
+        ] {
+            assert!(
+                selected_local_path(Path::new(path), base).is_err(),
+                "{path} {base}"
+            );
+        }
+        assert!(selected_local_path(Path::new("a.md"), &format!("/{}", "a".repeat(4096))).is_err());
+    }
     #[test]
     #[cfg(target_os = "linux")]
     fn local_source_is_bounded_and_never_interpreted() {

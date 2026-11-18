@@ -37,8 +37,15 @@ fn candidate(raw: &str) -> Option<PathBuf> {
         raw.to_owned()
     };
     let parsed = local_reference::parse_candidate(&path)?;
-    let path = PathBuf::from(parsed.exact_path);
-    path.is_absolute().then_some(path)
+    let path = PathBuf::from(&parsed.exact_path);
+    let plausible = path.is_absolute() || parsed.exact_path.contains('/');
+    (plausible
+        && !parsed.exact_path.contains('$')
+        && !path.starts_with("~")
+        && !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir)))
+    .then_some(path)
 }
 
 thread_local! {
@@ -98,10 +105,10 @@ fn hit(window: &gtk4::Widget, x: f64, y: f64) -> Option<PathBuf> {
     }
     // Click-local probing does not register a competing URL/selection matcher.
     thread_local! {
-        static ABSOLUTE: Option<vte4::Regex> = vte4::Regex::for_match(
-            r#"/[^[:space:]<>"'`()\[\]{}]+"#, pcre2_sys::PCRE2_MULTILINE).ok();
+        static LOCAL_REFERENCE: Option<vte4::Regex> = vte4::Regex::for_match(
+            super::local_preview_tokens::PATTERN, pcre2_sys::PCRE2_MULTILINE).ok();
     }
-    ABSOLUTE.with(|regex| {
+    LOCAL_REFERENCE.with(|regex| {
         terminal
             .check_regex_simple_at(point.x().into(), point.y().into(), &[regex.as_ref()?], 0)
             .first()
@@ -137,9 +144,83 @@ fn show_candidate(ui: &Rc<PreviewUi>, state: &Rc<PreviewState>, path: PathBuf) {
     let warning = gtk4::Label::new(Some("Output does not prove this file is local. Confirm before reading this machine. Read-only UTF-8 source, up to 256 KiB. No code is executed; images are not decoded."));
     warning.set_wrap(true);
     warning.set_max_width_chars(40);
-    let confirm = gtk4::Button::with_label("Read this machine's local file");
-    let close = gtk4::Button::with_label("Close preview");
     let text = gtk4::TextView::new();
+    let directory = gtk4::Entry::new();
+    directory.set_placeholder_text(Some("Absolute local directory, e.g. /home/me/project"));
+    directory.set_tooltip_text(Some(
+        "Type the actual directory on this machine. Terminal cwd is never used.",
+    ));
+    directory.set_max_length(4096);
+    directory.set_visible(!path.is_absolute());
+    let resolved = gtk4::Label::new(None);
+    resolved.set_wrap(true);
+    resolved.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+    resolved.set_max_width_chars(40);
+    let update_path = path.clone();
+    let weak_resolved = resolved.downgrade();
+    let weak_preview_buffer = text.buffer().downgrade();
+    directory.connect_changed(move |entry| {
+        if let Some(buffer) = weak_preview_buffer.upgrade() {
+            buffer.set_text("Confirm to read the selected local target");
+        }
+        if let Some(label) = weak_resolved.upgrade() {
+            label.set_text(&match local_preview_file::selected_local_path(
+                &update_path,
+                entry.text().as_str(),
+            ) {
+                Ok(path) => format!("Local file: {}", path.display()),
+                Err(_) => "Choose an absolute local directory before confirming".into(),
+            });
+        }
+    });
+    resolved.set_text(if path.is_absolute() {
+        "Read only the local file shown above"
+    } else {
+        "Choose an absolute local directory before confirming"
+    });
+    // Preparation cannot read. It freezes the complete target before a separate
+    // confirmation, so a queued activation never authorizes a changed directory.
+    let prepared = Rc::new(std::cell::OnceCell::<PathBuf>::new());
+    if path.is_absolute() {
+        let _ = prepared.set(path.clone());
+    }
+    let confirm = gtk4::Button::with_label("Read this machine's local file");
+    confirm.set_sensitive(path.is_absolute());
+    let prepare = gtk4::Button::with_label("Prepare this local target");
+    prepare.set_visible(!path.is_absolute());
+    let prepare_path = path.clone();
+    let prepare_target = prepared.clone();
+    let prepare_directory = directory.clone();
+    let prepare_confirm = confirm.downgrade();
+    let prepare_label = resolved.downgrade();
+    prepare.connect_clicked(move |button| {
+        if prepare_target.get().is_some() {
+            return;
+        }
+        match local_preview_file::selected_local_path(
+            &prepare_path,
+            prepare_directory.text().as_str(),
+        ) {
+            Ok(target) => {
+                if let Some(label) = prepare_label.upgrade() {
+                    label.set_text(&format!("Prepared local file: {}", target.display()));
+                }
+                if prepare_target.set(target).is_ok() {
+                    prepare_directory.set_sensitive(false);
+                    button.set_sensitive(false);
+                    if let Some(confirm) = prepare_confirm.upgrade() {
+                        confirm.set_sensitive(true);
+                    }
+                }
+            }
+            Err(_) => {
+                if let Some(label) = prepare_label.upgrade() {
+                    label.set_text("Enter an absolute local directory without parent components");
+                }
+            }
+        }
+    });
+    let close = gtk4::Button::with_label("Close preview");
     text.set_editable(false);
     text.set_cursor_visible(false);
     text.set_monospace(true);
@@ -153,6 +234,9 @@ fn show_candidate(ui: &Rc<PreviewUi>, state: &Rc<PreviewState>, path: PathBuf) {
         title.upcast::<gtk4::Widget>(),
         path_label.upcast(),
         warning.upcast(),
+        directory.clone().upcast(),
+        resolved.upcast(),
+        prepare.upcast(),
         confirm.clone().upcast(),
         close.clone().upcast(),
         scroll.upcast(),
@@ -184,11 +268,13 @@ fn show_candidate(ui: &Rc<PreviewUi>, state: &Rc<PreviewState>, path: PathBuf) {
     confirm.connect_clicked(move |button| {
         if state.generation.get() != token { return; }
         let Some(buffer) = buffer.upgrade() else { return; };
+        let Some(path) = prepared.get().cloned() else {
+            buffer.set_text("Prepare the complete local target before confirming"); return;
+        };
         if READER_BUSY.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_err() {
             buffer.set_text("Another local preview reader is still busy"); return;
         }
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let path = path.clone();
         button.set_sensitive(false);
         buffer.set_text("Reading bounded local source…");
         if std::thread::Builder::new().name("local-source-preview".into()).spawn(move || {
@@ -286,6 +372,16 @@ mod tests {
     }
     #[test]
     fn candidates_are_not_remote_uris_or_relative_cwd_guesses() {
+        assert_eq!(candidate("src/App.tsx"), Some(PathBuf::from("src/App.tsx")));
+        assert_eq!(candidate("./README.md"), Some(PathBuf::from("./README.md")));
+        assert!(candidate("src/../secrets").is_none());
+        assert!(candidate("~/notes.md").is_none());
+        assert!(candidate("$HOME/src/App.tsx").is_none());
+        assert!(candidate(r"C:\src/App.tsx").is_none());
+        assert_eq!(
+            candidate("日本語/src/App.tsx"),
+            Some(PathBuf::from("日本語/src/App.tsx"))
+        );
         assert_eq!(
             candidate("file:///tmp/source.tsx").unwrap(),
             PathBuf::from("/tmp/source.tsx")
