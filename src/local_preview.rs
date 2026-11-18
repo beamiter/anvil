@@ -38,7 +38,9 @@ fn candidate(raw: &str) -> Option<PathBuf> {
     };
     let parsed = local_reference::parse_candidate(&path)?;
     let path = PathBuf::from(&parsed.exact_path);
-    let plausible = path.is_absolute() || parsed.exact_path.contains('/');
+    let plausible = path.is_absolute()
+        || parsed.exact_path.contains('/')
+        || super::local_preview_tokens::is_bare_source_name(&parsed.exact_path);
     (plausible
         && !parsed.exact_path.contains('$')
         && !path.starts_with("~")
@@ -372,6 +374,16 @@ mod tests {
     }
     #[test]
     fn candidates_are_not_remote_uris_or_relative_cwd_guesses() {
+        for name in ["README.md", "package.json", "App.tsx:12:3"] {
+            assert_eq!(
+                candidate(name),
+                Some(PathBuf::from(name)),
+                "exact filename is preserved"
+            );
+        }
+        for rejected in ["ordinary", "example.com", "README.md:notes", "mailto:a.md"] {
+            assert!(candidate(rejected).is_none());
+        }
         assert_eq!(candidate("src/App.tsx"), Some(PathBuf::from("src/App.tsx")));
         assert_eq!(candidate("./README.md"), Some(PathBuf::from("./README.md")));
         assert!(candidate("src/../secrets").is_none());

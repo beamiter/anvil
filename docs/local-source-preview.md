@@ -1,7 +1,8 @@
 # Local source preview (initial slice)
 
 Ctrl+left-click an OSC8 local `file:///` link or an unambiguous absolute Unix
-path (or a relative path such as `src/App.tsx`) in host-owned Block output to open the right inspector's **Local source
+path (or a relative path such as `src/App.tsx` or a common source filename
+such as `README.md` / `package.json`) in host-owned Block output to open the right inspector's **Local source
 preview** page. No file is read by the click. Confirm **Read this machine's
 local file** only when the displayed path belongs to this machine: terminal
 output, including a `file:` URI, does not authenticate a local filesystem.
@@ -30,6 +31,10 @@ Unknown live conventional VTE mouse ownership is left to VTE. Live Block output
 is eligible only while its host reports mouse mode off and no alternate screen;
 read-only finished output has no application mouse receiver. Existing OSC8/web
 URLs, ordinary selection, and non-Ctrl clicks retain their existing routing.
+
+Numeric `:line[:column]` suffixes remain part of the exact filename in this slice;
+they are not stripped and do not imply source navigation. Non-numeric ambiguous
+bare colon forms and ordinary prose are not treated as source filenames.
 
 Not yet covered: automatic cwd inference, `:line` navigation, image
 rendering, syntax highlighting, Markdown rendering, remote files, and a full
