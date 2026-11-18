@@ -180,15 +180,15 @@ fn show_candidate(ui: &Rc<PreviewUi>, state: &Rc<PreviewState>, path: PathBuf) {
                 &update_path,
                 entry.text().as_str(),
             ) {
-                Ok(path) => format!("Local file: {}", path.display()),
+                Ok(path) => crate::local_preview_content::confirmation_target(&path),
                 Err(_) => "Choose an absolute local directory before confirming".into(),
             });
         }
     });
-    resolved.set_text(if path.is_absolute() {
-        "Read only the local file shown above"
+    resolved.set_text(&if path.is_absolute() {
+        crate::local_preview_content::confirmation_target(&path)
     } else {
-        "Choose an absolute local directory before confirming"
+        "Choose an absolute local directory before confirming".into()
     });
     // Preparation cannot read. It freezes the complete target before a separate
     // confirmation, so a queued activation never authorizes a changed directory.
@@ -215,7 +215,7 @@ fn show_candidate(ui: &Rc<PreviewUi>, state: &Rc<PreviewState>, path: PathBuf) {
         ) {
             Ok(target) => {
                 if let Some(label) = prepare_label.upgrade() {
-                    label.set_text(&format!("Prepared local file: {}", target.display()));
+                    label.set_text(&crate::local_preview_content::confirmation_target(&target));
                 }
                 if prepare_target.set(target).is_ok() {
                     prepare_directory.set_sensitive(false);
@@ -250,7 +250,7 @@ fn show_candidate(ui: &Rc<PreviewUi>, state: &Rc<PreviewState>, path: PathBuf) {
         path_label.upcast(),
         warning.upcast(),
         directory.clone().upcast(),
-        resolved.upcast(),
+        resolved.clone().upcast(),
         prepare.upcast(),
         confirm.clone().upcast(),
         close.clone().upcast(),
@@ -280,6 +280,8 @@ fn show_candidate(ui: &Rc<PreviewUi>, state: &Rc<PreviewState>, path: PathBuf) {
     });
     let state = state.clone();
     let buffer = text.buffer().downgrade();
+    let view = text.downgrade();
+    let result_label = resolved.downgrade();
     confirm.connect_clicked(move |button| {
         if state.generation.get() != token { return; }
         let Some(buffer) = buffer.upgrade() else { return; };
@@ -298,7 +300,7 @@ fn show_candidate(ui: &Rc<PreviewUi>, state: &Rc<PreviewState>, path: PathBuf) {
             struct Release;
             impl Drop for Release { fn drop(&mut self) { READER_BUSY.store(false, Ordering::Release); } }
             let _release = Release;
-            let result = crate::local_preview_content::read_confirmed(&path).map_err(|_| "Cannot preview: require a regular local UTF-8 source (256 KiB) or bounded PNG/JPEG (4 MiB, 4096-pixel edges, 4M pixels), with no symlink or parent components.".to_owned());
+            let result = crate::local_preview_content::read_reference(&path).map_err(|_| "Cannot preview: require a regular local UTF-8 source (256 KiB) or bounded PNG/JPEG (4 MiB, 4096-pixel edges, 4M pixels), with no symlink or parent components.".to_owned());
             let _ = tx.send(result);
         }).is_err() {
             READER_BUSY.store(false, Ordering::Release);
@@ -309,6 +311,8 @@ fn show_candidate(ui: &Rc<PreviewUi>, state: &Rc<PreviewState>, path: PathBuf) {
         let weak_button = button.downgrade();
         let weak_buffer = buffer.downgrade();
         let state = state.clone();
+        let view = view.clone();
+        let result_label = result_label.clone();
         gtk4::glib::timeout_add_local(Duration::from_millis(40), move || {
             if state.generation.get() != token || weak_buffer.upgrade().is_none() { return gtk4::glib::ControlFlow::Break; }
             match rx.try_recv() {
@@ -317,8 +321,29 @@ fn show_candidate(ui: &Rc<PreviewUi>, state: &Rc<PreviewState>, path: PathBuf) {
                     if let Some(button) = weak_button.upgrade() { button.set_sensitive(true); }
                     if let Some(buffer) = weak_buffer.upgrade() {
                         match result {
-                            Ok(Ok(crate::local_preview_content::Content::Text(text))) => buffer.set_text(&text),
-                            Ok(Ok(crate::local_preview_content::Content::Image(image))) => {
+                            Ok(Ok(located)) => {
+                                if let Some(label) = result_label.upgrade() {
+                                    label.set_text(&format!("Read local file: {}", located.path.display()));
+                                }
+                                match located.content {
+                            crate::local_preview_content::Content::Text(text) => {
+                                buffer.set_text(&text);
+                                if let Some(location) = located.location {
+                                    let iter = i32::try_from(location.line.get() - 1).ok()
+                                        .filter(|line| *line < buffer.line_count())
+                                        .and_then(|line| buffer.iter_at_line(line));
+                                    if let Some(mut iter) = iter {
+                                        buffer.place_cursor(&iter);
+                                        if let Some(view) = view.upgrade() {
+                                            view.scroll_to_iter(&mut iter, 0.1, true, 0.0, 0.1);
+                                        }
+                                    }
+                                    if let Some(label) = result_label.upgrade() {
+                                        label.set_text(&format!("Read local file: {} — requested line {}, column {:?}. Column is informational; out-of-range lines are not clamped.", located.path.display(), location.line, location.column.map(|c| c.get())));
+                                    }
+                                }
+                            },
+                            crate::local_preview_content::Content::Image(image) => {
                                 if let Some(picture) = weak_picture.upgrade() {
                                     let bytes = gtk4::glib::Bytes::from_owned(image.pixels);
                                     let texture = gtk4::gdk::MemoryTexture::new(
@@ -329,6 +354,8 @@ fn show_candidate(ui: &Rc<PreviewUi>, state: &Rc<PreviewState>, path: PathBuf) {
                                     buffer.set_text(&format!("Read-only image: {} × {} pixels", image.width, image.height));
                                 }
                             }
+                                }
+                            },
                             Ok(Err(error)) => buffer.set_text(&error),
                             Err(_) => buffer.set_text("Preview reader stopped"),
                         }

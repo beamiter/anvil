@@ -35,11 +35,16 @@ is eligible only while its host reports mouse mode off and no alternate screen;
 read-only finished output has no application mouse receiver. Existing OSC8/web
 URLs, ordinary selection, and non-Ctrl clicks retain their existing routing.
 
-Numeric `:line[:column]` suffixes remain part of the exact filename in this slice;
-they are not stripped and do not imply source navigation. Non-numeric ambiguous
-bare colon forms and ordinary prose are not treated as source filenames.
+Numeric `:line[:column]` suffixes are tried as the exact literal filename first.
+The confirmation panel discloses both candidates before reading; only a definite
+path-lookup NotFound permits the displayed suffix-free fallback. Permission,
+symlink, decoding, and post-open errors never fall back. The result names the
+file actually read. Text fallback navigates to the requested one-based line if
+present; columns are informational because source tools may use different units
+and the viewer escapes controls. Out-of-range lines are not clamped. Non-numeric
+ambiguous bare colon forms and ordinary prose remain excluded.
 
-Not yet covered: automatic cwd inference, `:line` navigation, other image codecs,
+Not yet covered: automatic cwd inference, precise column navigation, other image codecs,
 syntax highlighting, Markdown rendering, remote files, and a full
 Codex GUI workflow. The initial source viewer does not imply these features are
 implemented or that native pointer propagation has been validated locally.

@@ -40,16 +40,27 @@ pub fn read_bounded(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
         ));
     }
     let file = open_without_symlink_components(path, max_bytes)?;
-    let metadata = file.metadata()?;
+    let metadata = file.metadata().map_err(non_lookup_error)?;
     if !metadata.is_file() || metadata.len() > max_bytes {
         return Err(io::Error::other("Preview requires a bounded regular file"));
     }
     let mut bytes = Vec::new();
-    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(non_lookup_error)?;
     if bytes.len() as u64 > max_bytes {
         return Err(io::Error::other("Preview input exceeded its budget"));
     }
     Ok(bytes)
+}
+
+// Only original path-component lookup may report absence to a location fallback.
+fn non_lookup_error(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::NotFound {
+        io::Error::other("Opened local file became unavailable")
+    } else {
+        error
+    }
 }
 
 #[cfg(test)]
@@ -124,7 +135,7 @@ fn open_without_symlink_components(path: &Path, max_bytes: u64) -> io::Result<st
         let opened = unsafe { OwnedFd::from_raw_fd(raw) };
         if final_component {
             let source = std::fs::File::from(opened);
-            let before = source.metadata()?;
+            let before = source.metadata().map_err(non_lookup_error)?;
             if !before.is_file() || before.len() > max_bytes {
                 return Err(io::Error::other("Expected a bounded regular file"));
             }
@@ -133,8 +144,9 @@ fn open_without_symlink_components(path: &Path, max_bytes: u64) -> io::Result<st
             let file = std::fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC)
-                .open(format!("/proc/self/fd/{}", source.as_raw_fd()))?;
-            let after = file.metadata()?;
+                .open(format!("/proc/self/fd/{}", source.as_raw_fd()))
+                .map_err(non_lookup_error)?;
+            let after = file.metadata().map_err(non_lookup_error)?;
             if !after.is_file() || before.dev() != after.dev() || before.ino() != after.ino() {
                 return Err(io::Error::other("Local file identity changed"));
             }
@@ -154,6 +166,19 @@ fn open_without_symlink_components(_: &Path, _: u64) -> io::Result<std::fs::File
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn post_lookup_absence_is_not_a_fallback_signal() {
+        assert_eq!(
+            super::non_lookup_error(std::io::Error::from(std::io::ErrorKind::NotFound)).kind(),
+            std::io::ErrorKind::Other
+        );
+        assert_eq!(
+            super::non_lookup_error(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn crlf_display_preserves_line_numbers_and_original_bytes() {
