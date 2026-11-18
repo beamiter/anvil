@@ -79,3 +79,7 @@ regex fallback. Single-row URLs and explicit OSC 8 keep priority. Copy remains
 verbatim VTE selection. A dedicated mapped VTE fixture checks the production URL
 activation lookup, both blocked rows, exact copy, a single-row positive control,
 and OSC 8 priority; it never launches a browser or claims physical-device coverage.
+
+CRLF source line endings are displayed as ordinary line breaks. This only
+normalizes the read-only presentation; source bytes and line numbers are unchanged.
+A lone carriage return, ESC, and bidi controls remain visible escapes.

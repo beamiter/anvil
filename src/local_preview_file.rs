@@ -65,6 +65,9 @@ pub fn source_text(bytes: Vec<u8>) -> io::Result<String> {
     }
     let text = String::from_utf8(bytes)
         .map_err(|_| io::Error::other("Preview requires UTF-8 source text"))?;
+    // Display CRLF as one line break without rewriting the source file.
+    // Lone CR remains a visible escape; it must never act as cursor movement.
+    let text = text.replace("\r\n", "\n");
     // Render controls explicitly, including bidi direction and invisible formatting.
     Ok(text.chars().flat_map(|c| {
         if (c.is_control() && c != '\n' && c != '\t')
@@ -151,6 +154,28 @@ fn open_without_symlink_components(_: &Path, _: u64) -> io::Result<std::fs::File
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn crlf_display_preserves_line_numbers_and_original_bytes() {
+        let dir = std::env::temp_dir().join(format!("anvil-preview-crlf-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("source.md");
+        let original = "first\r\nsecond\nthird\r\r\nfourth\rtail\t\u{1b}\u{202e}\r\n";
+        std::fs::write(&path, original.as_bytes()).unwrap();
+        let displayed = read_source(&path).unwrap();
+        assert_eq!(
+            displayed,
+            "first\nsecond\nthird\\u{d}\nfourth\\u{d}tail\t\\u{1b}\\u{202e}\n"
+        );
+        assert_eq!(
+            displayed.matches('\n').count(),
+            original.matches('\n').count()
+        );
+        assert_eq!(displayed.lines().nth(1), Some("second"));
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     use super::*;
     #[test]
     fn relative_paths_require_an_explicit_local_directory() {
