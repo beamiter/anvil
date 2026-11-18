@@ -11,6 +11,8 @@ keywords = ["terminal", "gtk", "rust", "shell", "productivity"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
+# Static local previews only; no other image codecs or default features.
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 companion-host = { version = "0.1.0", path = "vendor/companion-host" }
 companion-process = { version = "0.1.0", path = "vendor/companion-process" }
 eva-character-atlas = { version = "0.1.0", git = "https://github.com/beamiter/jcompanion.git", rev = "9aa569540091524d637a7115b64c587b9177a55b" }

@@ -16,11 +16,14 @@ a different directory.
 
 The viewer shows bounded UTF-8 source text, including Markdown, TSX, HTML, and
 SVG, without evaluating or rendering those formats. There is no shell, editor,
-network fetch, or external opener. Binary images are not decoded in this slice.
+network fetch, or external opener. PNG/JPEG files (.png/.jpg/.jpeg,
+case-insensitive) are decoded on the single background worker and displayed as
+an inert RGBA texture. SVG and HTML remain plain source text, never rendered.
+Other image codecs are not supported.
 
 Reads are Linux-only and require an absolute path with no parent (`..`) or
 symlink components. A fixed descriptor is checked as a regular file before a
-read open. Input is limited to 256 KiB, NUL and invalid UTF-8 are rejected, and
+read open. Text input is limited to 256 KiB; NUL and invalid UTF-8 are rejected, and
 control/directional characters are shown as escapes. One reader may run at a
 time; a stalled filesystem prevents another reader rather than creating an
 unbounded queue. Closing or replacing the preview retires its result. This is
@@ -36,7 +39,18 @@ Numeric `:line[:column]` suffixes remain part of the exact filename in this slic
 they are not stripped and do not imply source navigation. Non-numeric ambiguous
 bare colon forms and ordinary prose are not treated as source filenames.
 
-Not yet covered: automatic cwd inference, `:line` navigation, image
-rendering, syntax highlighting, Markdown rendering, remote files, and a full
+Not yet covered: automatic cwd inference, `:line` navigation, other image codecs,
+syntax highlighting, Markdown rendering, remote files, and a full
 Codex GUI workflow. The initial source viewer does not imply these features are
 implemented or that native pointer propagation has been validated locally.
+
+## Image resource bounds
+
+PNG/JPEG encoded input is limited to 4 MiB. Dimensions must be nonzero, at most
+4096 pixels per edge, and at most 4,194,304 pixels before full decode. The codec
+must agree on dimensions and produce exactly width × height × 4 RGBA bytes.
+A 32 MiB best-effort decoder allocation limit is configured, not a strict total
+memory guarantee; image/codec implementations (notably JPEG) may not enforce
+all allocation limits. Conversion and GTK textures allocate additional memory.
+One worker runs at a time; there is no hard CPU deadline, process RSS ceiling,
+or isolated decoder sandbox. Native GTK image display remains unverified locally.

@@ -137,16 +137,20 @@ fn show_candidate(ui: &Rc<PreviewUi>, state: &Rc<PreviewState>, path: PathBuf) {
         ui.side_stack.remove(&old);
     }
     let panel = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-    let title = gtk4::Label::new(Some("Local source preview"));
+    let title = gtk4::Label::new(Some("Local file preview"));
     let path_label = gtk4::Label::new(Some(&path.to_string_lossy()));
     path_label.set_wrap(true);
     path_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
     path_label.set_max_width_chars(40);
     path_label.set_selectable(true);
-    let warning = gtk4::Label::new(Some("Output does not prove this file is local. Confirm before reading this machine. Read-only UTF-8 source, up to 256 KiB. No code is executed; images are not decoded."));
+    let warning = gtk4::Label::new(Some("Output does not prove this file is local. Confirm before reading this machine. Read-only UTF-8 source up to 256 KiB, or PNG/JPEG up to 4 MiB and 4 million pixels. No code is executed."));
     warning.set_wrap(true);
     warning.set_max_width_chars(40);
     let text = gtk4::TextView::new();
+    let picture = gtk4::Picture::new();
+    picture.set_can_shrink(true);
+    picture.set_content_fit(gtk4::ContentFit::Contain);
+    picture.set_visible(false);
     let directory = gtk4::Entry::new();
     directory.set_placeholder_text(Some("Absolute local directory, e.g. /home/me/project"));
     directory.set_tooltip_text(Some(
@@ -231,7 +235,10 @@ fn show_candidate(ui: &Rc<PreviewUi>, state: &Rc<PreviewState>, path: PathBuf) {
     scroll.set_hexpand(true);
     scroll.set_vexpand(true);
     scroll.set_min_content_width(1);
-    scroll.set_child(Some(&text));
+    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    content.append(&text);
+    content.append(&picture);
+    scroll.set_child(Some(&content));
     for widget in [
         title.upcast::<gtk4::Widget>(),
         path_label.upcast(),
@@ -278,18 +285,21 @@ fn show_candidate(ui: &Rc<PreviewUi>, state: &Rc<PreviewState>, path: PathBuf) {
         }
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         button.set_sensitive(false);
-        buffer.set_text("Reading bounded local source…");
+        picture.set_paintable(None::<&gtk4::gdk::Paintable>);
+        picture.set_visible(false);
+        buffer.set_text("Reading bounded local preview…");
         if std::thread::Builder::new().name("local-source-preview".into()).spawn(move || {
             struct Release;
             impl Drop for Release { fn drop(&mut self) { READER_BUSY.store(false, Ordering::Release); } }
             let _release = Release;
-            let result = local_preview_file::read_source(&path).map_err(|_| "Cannot preview: use a readable regular UTF-8 file up to 256 KiB, with no symlink or parent-path components.".to_owned());
+            let result = crate::local_preview_content::read_confirmed(&path).map_err(|_| "Cannot preview: require a regular local UTF-8 source (256 KiB) or bounded PNG/JPEG (4 MiB, 4096-pixel edges, 4M pixels), with no symlink or parent components.".to_owned());
             let _ = tx.send(result);
         }).is_err() {
             READER_BUSY.store(false, Ordering::Release);
             button.set_sensitive(true);
             buffer.set_text("Could not start preview reader"); return;
         }
+        let weak_picture = picture.downgrade();
         let weak_button = button.downgrade();
         let weak_buffer = buffer.downgrade();
         let state = state.clone();
@@ -300,7 +310,22 @@ fn show_candidate(ui: &Rc<PreviewUi>, state: &Rc<PreviewState>, path: PathBuf) {
                 result => {
                     if let Some(button) = weak_button.upgrade() { button.set_sensitive(true); }
                     if let Some(buffer) = weak_buffer.upgrade() {
-                        buffer.set_text(&match result { Ok(Ok(text)) => text, Ok(Err(error)) => error, Err(_) => "Preview reader stopped".into() });
+                        match result {
+                            Ok(Ok(crate::local_preview_content::Content::Text(text))) => buffer.set_text(&text),
+                            Ok(Ok(crate::local_preview_content::Content::Image(image))) => {
+                                if let Some(picture) = weak_picture.upgrade() {
+                                    let bytes = gtk4::glib::Bytes::from_owned(image.pixels);
+                                    let texture = gtk4::gdk::MemoryTexture::new(
+                                        image.width as i32, image.height as i32,
+                                        gtk4::gdk::MemoryFormat::R8g8b8a8, &bytes, image.width as usize * 4);
+                                    picture.set_paintable(Some(&texture));
+                                    picture.set_visible(true);
+                                    buffer.set_text(&format!("Read-only image: {} × {} pixels", image.width, image.height));
+                                }
+                            }
+                            Ok(Err(error)) => buffer.set_text(&error),
+                            Err(_) => buffer.set_text("Preview reader stopped"),
+                        }
                     }
                     gtk4::glib::ControlFlow::Break
                 }

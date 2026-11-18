@@ -36,7 +36,11 @@ pub fn is_bare_source_name(token: &str) -> bool {
         && stem.chars().any(char::is_alphanumeric)
         && matches!(
             extension.to_ascii_lowercase().as_str(),
-            "md" | "mdx"
+            "png"
+                | "jpg"
+                | "jpeg"
+                | "md"
+                | "mdx"
                 | "txt"
                 | "json"
                 | "jsonc"

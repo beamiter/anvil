@@ -32,19 +32,32 @@ pub fn selected_local_path(candidate: &Path, directory: &str) -> io::Result<std:
     Ok(base.join(candidate))
 }
 
-pub fn read_source(path: &Path) -> io::Result<String> {
-    if !path.is_absolute() {
-        return Err(io::Error::other("Choose an absolute local path"));
-    }
-    let file = open_without_symlink_components(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_BYTES {
+/// The caller chooses a small fixed input budget for its supported content type.
+pub fn read_bounded(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    if !path.is_absolute() || max_bytes > 4 * 1024 * 1024 {
         return Err(io::Error::other(
-            "Preview requires a regular file of at most 256 KiB",
+            "Choose an absolute local path within the preview budget",
         ));
     }
+    let file = open_without_symlink_components(path, max_bytes)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(io::Error::other("Preview requires a bounded regular file"));
+    }
     let mut bytes = Vec::new();
-    file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(io::Error::other("Preview input exceeded its budget"));
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+pub fn read_source(path: &Path) -> io::Result<String> {
+    source_text(read_bounded(path, MAX_BYTES)?)
+}
+
+pub fn source_text(bytes: Vec<u8>) -> io::Result<String> {
     if bytes.len() as u64 > MAX_BYTES || bytes.contains(&0) {
         return Err(io::Error::other(
             "Preview is too large or contains binary data",
@@ -62,7 +75,7 @@ pub fn read_source(path: &Path) -> io::Result<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn open_without_symlink_components(path: &Path) -> io::Result<std::fs::File> {
+fn open_without_symlink_components(path: &Path, max_bytes: u64) -> io::Result<std::fs::File> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
@@ -109,7 +122,7 @@ fn open_without_symlink_components(path: &Path) -> io::Result<std::fs::File> {
         if final_component {
             let source = std::fs::File::from(opened);
             let before = source.metadata()?;
-            if !before.is_file() || before.len() > MAX_BYTES {
+            if !before.is_file() || before.len() > max_bytes {
                 return Err(io::Error::other("Expected a bounded regular file"));
             }
             use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -130,7 +143,7 @@ fn open_without_symlink_components(path: &Path) -> io::Result<std::fs::File> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_without_symlink_components(_: &Path) -> io::Result<std::fs::File> {
+fn open_without_symlink_components(_: &Path, _: u64) -> io::Result<std::fs::File> {
     Err(io::Error::other(
         "Safe local preview is only supported on Linux",
     ))
