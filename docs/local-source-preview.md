@@ -54,3 +54,19 @@ memory guarantee; image/codec implementations (notably JPEG) may not enforce
 all allocation limits. Conversion and GTK textures allocate additional memory.
 One worker runs at a time; there is no hard CPU deadline, process RSS ceiling,
 or isolated decoder sandbox. Native GTK image display remains unverified locally.
+
+## Wrapped references and copying
+
+Physical-row width and a trailing hyphen do not establish a soft wrap. Anvil
+therefore reserves, but does not activate, parenthesized local references across
+multiple extracted VTE rows. Whitespace is not trimmed into a different filename,
+and the reserved region cannot fall back to a partial local/URL match. Exact
+single-row paths containing spaces remain supported, after the same local-machine
+confirmation. Explicit OSC 8 retains priority. Existing web-link policy is unchanged.
+
+Copy returns VTE's native selection verbatim; Anvil no longer trims or joins
+hard-line fragments. VTE remains responsible for actual soft-wrap selection. The
+current adapter exposes no reliable soft-wrap provenance, so hard-wrapped TUI
+paths require an unambiguous single-row reference instead. Pure double-file tests
+are not desktop acceptance; the GTK fixture separately checks blocked hard-line
+hits, exact single-line hits, release/drag handling and native selection equality.

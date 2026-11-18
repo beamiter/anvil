@@ -4,11 +4,11 @@ mod composer_geometry;
 
 mod agent_cli;
 mod delimited_reference;
-mod vte_reference;
 mod gtk_presentation;
 mod gtk_process;
 mod gtk_spawn;
 mod immersive_command;
+mod vte_reference;
 
 mod action_ops;
 mod agent;

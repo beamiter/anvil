@@ -85,13 +85,21 @@ fn hit(window: &gtk4::Widget, x: f64, y: f64) -> Option<(usize, PathBuf)> {
     let point = window.compute_point(&terminal, &gtk4::graphene::Point::new(x as f32, y as f32))?;
     // Explicit hyperlinks and the existing URL matcher take priority; never
     // reinterpret a refused remote OSC8 label as a local path.
-    let raw = terminal
-        .check_hyperlink_at(point.x().into(), point.y().into())
+    let explicit = terminal.check_hyperlink_at(point.x().into(), point.y().into());
+    let reference = if explicit.is_none() {
+        crate::vte_reference::hit(&terminal, point.x().into(), point.y().into())
+    } else {
+        None
+    };
+    if reference
+        .as_ref()
+        .is_some_and(|reference| reference.blocked)
+    {
+        return None;
+    }
+    let raw = explicit
         .map(|s| s.to_string())
-        .or_else(|| {
-            crate::vte_reference::hit(&terminal, point.x().into(), point.y().into())
-                .map(|reference| reference.target)
-        })
+        .or_else(|| reference.map(|reference| reference.target))
         .or_else(|| {
             terminal
                 .check_match_at(point.x().into(), point.y().into())

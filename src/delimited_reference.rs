@@ -8,6 +8,8 @@ const MAX_BYTES: usize = 4096;
 pub(crate) struct Reference {
     pub target: String,
     pub web: bool,
+    /// Reserve the visible region without authorizing a guessed target.
+    pub blocked: bool,
     pub spans: Vec<(usize, Range<usize>)>,
 }
 
@@ -43,6 +45,45 @@ pub(crate) fn detect(rows: &[(&str, bool)]) -> Vec<Reference> {
             continue;
         }
         let first_row = row_starts.partition_point(|&start| start <= raw.start()) - 1;
+        let is_web = raw.as_str().split_once("://").is_some_and(|(scheme, _)| {
+            scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+        });
+        if !is_web {
+            // VTE row width is not proof of a soft wrap. Never remove whitespace
+            // or guess a local filename across physical rows. Retain the whole
+            // region so rejected references cannot fall back to a partial match.
+            let spans = raw
+                .as_str()
+                .split('\n')
+                .enumerate()
+                .map(|(index, fragment)| {
+                    let row = first_row + index;
+                    let start = if index == 0 {
+                        raw.start() - row_starts[row]
+                    } else {
+                        0
+                    };
+                    (row, start..start + fragment.len())
+                })
+                .collect::<Vec<_>>();
+            let target = raw.as_str().to_owned();
+            let blocked = spans.len() > 1
+                || target.chars().any(char::is_control)
+                || target.contains("://")
+                || target.contains(['\\', '<', '>', '|'])
+                || !FILE_END.is_match(&target);
+            // Exact single-line spaced references are the extra capability;
+            // ordinary single-line tokens remain owned by existing matchers.
+            if blocked || target.contains(char::is_whitespace) {
+                references.push(Reference {
+                    target,
+                    web: false,
+                    blocked,
+                    spans,
+                });
+            }
+            continue;
+        }
         let mut spans = Vec::new();
         let mut target = String::new();
         for (index, fragment) in raw.as_str().split('\n').enumerate() {
@@ -84,7 +125,12 @@ pub(crate) fn detect(rows: &[(&str, bool)]) -> Vec<Reference> {
         {
             continue;
         }
-        references.push(Reference { target, web, spans });
+        references.push(Reference {
+            target,
+            web,
+            blocked: false,
+            spans,
+        });
     }
     references
 }
@@ -106,15 +152,61 @@ mod tests {
         assert_eq!(references.len(), 2);
         assert_eq!(
             references[0].target,
-            "/tmp/中 文/PMG-SOTA-roadmap.canvas.tsx"
+            "/tmp/中 文/PMG-SOTA-\n    roadmap.canvas.tsx"
         );
-        assert_eq!(references[0].spans[1], (1, 4..22));
+        assert!(references[0].blocked);
+        assert_eq!(references[0].spans[1], (1, 0..22));
+        assert!(!references[1].blocked);
         assert_eq!(references[1].target, "reports/接触 优化.md");
     }
 
     #[test]
+    fn ambiguous_local_rows_never_select_the_other_real_file() {
+        let dir = std::env::temp_dir().join(format!("anvil-delimited-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exact = dir.join("foo-  bar.md");
+        let compact = dir.join("foo-bar.md");
+        std::fs::write(&exact, "EXACT SPACES").unwrap();
+        std::fs::write(&compact, "WRONG COMPACT").unwrap();
+        let first = format!("({}/foo- ", dir.display());
+        for fills in [false, true] {
+            let references = detect(&[(&first, fills), (" bar.md)", false)]);
+            assert_eq!(references.len(), 1);
+            assert!(references[0].blocked, "width is not soft-wrap evidence");
+            assert_ne!(references[0].target, compact.to_str().unwrap());
+            assert!(references[0].target.contains("- \n "));
+        }
+        let single = format!("({})", exact.display());
+        let references = detect(&[(&single, false)]);
+        assert!(!references[0].blocked);
+        assert_eq!(references[0].target, exact.to_str().unwrap());
+        match crate::local_preview_content::read_confirmed(std::path::Path::new(
+            &references[0].target,
+        ))
+        .unwrap()
+        {
+            crate::local_preview_content::Content::Text(text) => assert_eq!(text, "EXACT SPACES"),
+            _ => panic!("expected literal source"),
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_multiline_groups_still_reserve_partial_match_spans() {
+        for tail in ["sub/file.bin)", "sub/file.md )", " sub/file.md)"] {
+            for full_width in [false, true] {
+                let references = detect(&[("(/tmp/dir-", full_width), (tail, false)]);
+                assert_eq!(references.len(), 1, "must not lose blocking region: {tail}");
+                assert!(references[0].blocked);
+                assert_eq!(references[0].spans.len(), 2);
+                assert_eq!(references[0].spans[1], (1, 0..tail.len() - 1));
+            }
+        }
+    }
+
+    #[test]
     fn joins_only_with_a_supported_boundary_and_delimiter() {
-        assert!(detect(&[("(/tmp/first", false), ("second.md)", false)]).is_empty());
+        assert!(detect(&[("(/tmp/first", false), ("second.md)", false)])[0].blocked);
         assert!(detect(&[("(/tmp/first-", false), ("second.md", false)]).is_empty());
         let rejected = detect(&[("(https://user@host/a-", false), ("b)", false)]);
         assert!(!jterm_core::link::is_openable_url(&rejected[0].target));

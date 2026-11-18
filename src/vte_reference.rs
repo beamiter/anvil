@@ -67,7 +67,7 @@ pub(crate) fn hit(terminal: &Terminal, x: f64, y: f64) -> Option<Reference> {
 
 pub(crate) fn web_match(terminal: &Terminal, x: f64, y: f64) -> Option<String> {
     if let Some(reference) = hit(terminal, x, y) {
-        return reference.web.then_some(reference.target);
+        return (reference.web && !reference.blocked).then_some(reference.target);
     }
     let text = terminal.check_match_at(x, y).0?;
     let mut url: &str = text.as_str();
@@ -84,33 +84,11 @@ pub(crate) fn web_match(terminal: &Terminal, x: f64, y: f64) -> Option<String> {
 }
 
 pub(crate) fn selected_text(terminal: &Terminal) -> Option<String> {
-    let selected = terminal.text_selected(Format::Text)?.to_string();
-    if selected.len() > 4096 || !selected.trim_end_matches('\n').contains('\n') {
-        return Some(selected);
-    }
-    let Some(adjustment) = terminal.vadjustment() else {
-        return Some(selected);
-    };
-    let first = adjustment.value().floor() as i64;
-    let last = (first + terminal.row_count()).min(adjustment.upper().ceil() as i64 - 1);
-    let lines = rows(terminal, first, last);
-    let fragments: Vec<_> = selected
-        .trim_end_matches('\n')
-        .split('\n')
-        .map(str::trim)
-        .collect();
-    for reference in detect(terminal, &lines) {
-        if (!reference.web || jterm_core::link::is_openable_url(&reference.target))
-            && reference
-                .spans
-                .iter()
-                .map(|(row, span)| &lines[*row][span.clone()])
-                .eq(fragments.iter().copied())
-        {
-            return Some(reference.target);
-        }
-    }
-    Some(selected)
+    // VTE owns selection boundaries and genuine soft-wrap handling. In
+    // particular, do not trim or join hard-line fragments into another name.
+    terminal
+        .text_selected(Format::Text)
+        .map(|text| text.to_string())
 }
 
 pub(crate) fn copy_selection(terminal: &Terminal) {
@@ -183,7 +161,8 @@ pub(crate) fn install_hover(terminal: &Terminal) {
         };
         let matched = terminal.check_hyperlink_at(x, y).is_none()
             && hit(&terminal, x, y).is_some_and(|reference| {
-                !reference.web || jterm_core::link::is_openable_url(&reference.target)
+                !reference.blocked
+                    && (!reference.web || jterm_core::link::is_openable_url(&reference.target))
             });
         if matched != previous.replace(matched) {
             terminal.set_cursor_from_name(matched.then_some("pointer"));
@@ -214,8 +193,9 @@ mod tests {
     }
 
     #[test]
-    fn mapped_vte_resolves_both_fragments_of_a_codex_reference() {
-        let exercise_pointer = std::env::var_os("JTERM_TEST_VTE_POINTER").is_some();
+    #[ignore = "requires an isolated X11 display and xdotool"]
+    fn mapped_vte_blocks_ambiguous_paths_and_preserves_native_selection() {
+        let exercise_pointer = true;
         if gtk4::init().is_err() {
             assert!(!exercise_pointer, "pointer test requires an X11 display");
             return;
@@ -239,19 +219,30 @@ mod tests {
                 left + (col + 0.5) * terminal.char_width() as f64,
                 top + (row + 0.5) * terminal.char_height() as f64,
             )
+            .filter(|reference| !reference.blocked)
             .map(|reference| reference.target)
         };
         let expected = Some("/tmp/中 文/PMG-SOTA-roadmap.canvas.tsx".into());
-        assert_eq!(hit_col(0.0, 12.0), expected);
-        assert_eq!(hit_col(1.0, 8.0), expected);
+        assert_eq!(hit_col(0.0, 12.0), None);
+        assert_eq!(hit_col(1.0, 8.0), None);
         assert_eq!(hit_col(1.0, 2.0), None);
+        // Positive control: the identical exact target on one physical row is
+        // still available. Keep the same click coordinates for the OS fixture.
+        terminal
+            .feed("\x1b[2J\x1b[H\r\n    (/tmp/中 文/PMG-SOTA-roadmap.canvas.tsx) \r\n".as_bytes());
+        settle();
+        assert_eq!(hit_col(1.0, 8.0), expected);
         if exercise_pointer {
             let target = Rc::new(RefCell::new(None));
             let activated = target.clone();
             let weak = terminal.downgrade();
             click(
                 &terminal,
-                move |x, y| hit(&weak.upgrade()?, x, y).map(|reference| reference.target),
+                move |x, y| {
+                    hit(&weak.upgrade()?, x, y)
+                        .filter(|reference| !reference.blocked)
+                        .map(|reference| reference.target)
+                },
                 move |path| *activated.borrow_mut() = Some(path),
             );
             let xdotool = |args: &[&str]| {
@@ -305,6 +296,30 @@ mod tests {
             settle();
             assert!(target.borrow().is_none());
 
+            // Hard-line whitespace remains native selection data, never a
+            // synthesized no-space path. No blocked region may activate.
+            terminal.feed(
+                "\x1b[2J\x1b[H路线图 (/tmp/中 文/PMG-SOTA- \r\n    roadmap.canvas.tsx) \r\n"
+                    .as_bytes(),
+            );
+            settle();
+            xdotool(&[
+                "mousemove",
+                "--window",
+                id,
+                &x,
+                &y,
+                "keydown",
+                "Control_L",
+                "mousedown",
+                "1",
+                "mouseup",
+                "1",
+                "keyup",
+                "Control_L",
+            ]);
+            settle();
+            assert!(target.borrow().is_none());
             let start_x = (left + 8.1 * terminal.char_width() as f64)
                 .ceil()
                 .to_string();
@@ -328,11 +343,18 @@ mod tests {
             settle();
             xdotool(&["mouseup", "1"]);
             settle();
+            let native = terminal
+                .text_selected(Format::Text)
+                .expect("drag must select native text")
+                .to_string();
+            assert!(
+                native.contains('\n'),
+                "fixture must select both hard lines: {native:?}"
+            );
             assert_eq!(
                 selected_text(&terminal),
-                expected,
-                "raw VTE selection: {:?}",
-                terminal.text_selected(Format::Text),
+                Some(native),
+                "selection must remain exactly VTE-owned"
             );
         }
         window.close();

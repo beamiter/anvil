@@ -53,6 +53,7 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    vte_reference::tests::mapped_vte_blocks_ambiguous_paths_and_preserves_native_selection
     eva_companion::tests::navigation_background_hosts_body_without_covering_controls
     workspace_context_ui::tests::pending_context_additions_preserve_order_capacity_and_cancellation
     block_view::allocation_observer::tests::canvas_observer_preserves_resize_without_occluding_picks
