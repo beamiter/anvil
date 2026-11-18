@@ -59,7 +59,9 @@ jobs:
   rust:
     name: Rust quality, smoke tests, and bundle
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # The complete serial GTK + release pipeline exceeded 45m at bundle finish.
+    # Keep individual fixture timeouts; allow bounded headroom for the full job.
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
