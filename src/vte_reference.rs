@@ -197,6 +197,9 @@ mod tests {
     fn mapped_url_rows_cannot_retarget_the_origin_or_bypass_osc8() {
         gtk4::init().expect("isolated display is required");
         let terminal = Terminal::new();
+        // Match production live/block VTE construction: OSC8 is opt-in,
+        // independent of installing the plain-text URL matcher below.
+        terminal.set_allow_hyperlink(true);
         terminal.set_size(80, 4);
         crate::block_view::add_url_match_regex(&terminal);
         let window = gtk4::Window::new();
