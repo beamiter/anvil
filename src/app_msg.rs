@@ -8,6 +8,7 @@ use crate::keybindings::Action;
 #[derive(Debug, Clone)]
 pub(crate) enum AppMsg {
     NewTab,
+    ShowLocalSourcePreview,
     WorkspaceTick,
     WorkspaceAction(crate::workspace_navigation::Action),
     ResumeAgentSession(Box<crate::agent_sessions::ResumeRequest>),

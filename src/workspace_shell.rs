@@ -1857,6 +1857,44 @@ impl Chrome {
         self.inspector_pages.visible_child_name().as_deref() == Some("live")
     }
 
+    /// Snapshot the outer inspector before a temporary source preview changes
+    /// the inner live stack. Restore with weak widgets, never retain a window.
+    pub(crate) fn local_preview_capture(
+        &self,
+        stack: &gtk::Stack,
+    ) -> impl Fn() -> Box<dyn Fn()> + use<> {
+        let pages = self.inspector_pages.downgrade();
+        let stack = stack.downgrade();
+        let control = self.inspector_control.clone();
+        let drawers = self.drawers.clone();
+        move || {
+            let page = pages.upgrade().and_then(|p| p.visible_child_name());
+            let visible = stack.upgrade().is_some_and(|s| s.is_visible());
+            let requested = control.requested.get();
+            let active_drawer = drawers.active.get();
+            let inspector_dismissed = drawers.inspector_dismissed.get();
+            let drawers = drawers.clone();
+            let pages = pages.clone();
+            let stack = stack.clone();
+            let control = control.clone();
+            Box::new(move || {
+                if let Some(stack) = stack.upgrade() {
+                    stack.set_visible(visible);
+                }
+                if let (Some(pages), Some(page)) = (pages.upgrade(), page.as_ref()) {
+                    pages.set_visible_child_name(page);
+                }
+                control.requested.set(requested);
+                drawers.active.set(active_drawer);
+                drawers.inspector_dismissed.set(inspector_dismissed);
+                let refresh = control.refresh.borrow().clone();
+                if let Some(refresh) = refresh {
+                    refresh();
+                }
+            })
+        }
+    }
+
     pub(crate) fn show_inspector_live(&self) {
         self.drawers.request_inspector();
         self.inspector_control.requested.set(Some(true));

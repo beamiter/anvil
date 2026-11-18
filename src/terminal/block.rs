@@ -893,6 +893,7 @@ impl Component for BlockTerminal {
         let mut launch_error = None;
         let view = match view {
             Ok(view) => {
+                crate::local_preview::register_owner(&view);
                 init.probe.shell_pid.set(view.pid_i32());
                 init.probe.pty_fd.set(view.pty_fd_i32());
                 connect_view_outputs(&view, &sender, &terminal_done);

@@ -59,6 +59,9 @@ mod eva_companion_paint;
 mod jsh_ops;
 mod keybindings;
 mod launch_path;
+mod local_preview;
+mod local_preview_file;
+mod local_reference;
 mod navigation_ui;
 mod notebook;
 mod organism_ui;
@@ -2086,11 +2089,22 @@ impl SimpleComponent for AppModel {
                 glib::ControlFlow::Continue
             });
         }
+        let preview_sender = sender.clone();
+        let capture_preview = model.shell.local_preview_capture(&model.side_stack);
+        local_preview::install(
+            root.upcast_ref(),
+            &model.side_stack,
+            move || {
+                preview_sender.input(AppMsg::ShowLocalSourcePreview);
+            },
+            capture_preview,
+        );
         ComponentParts { model, widgets }
     }
 
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
         match msg {
+            AppMsg::ShowLocalSourcePreview => self.shell.show_inspector_live(),
             AppMsg::WorkspaceTick => {
                 self.poll_desktop_sessions(&sender);
                 self.ai_panel
