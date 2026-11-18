@@ -62,7 +62,7 @@ therefore reserves, but does not activate, parenthesized local references across
 multiple extracted VTE rows. Whitespace is not trimmed into a different filename,
 and the reserved region cannot fall back to a partial local/URL match. Exact
 single-row paths containing spaces remain supported, after the same local-machine
-confirmation. Explicit OSC 8 retains priority. Existing web-link policy is unchanged.
+confirmation. Explicit OSC 8 retains priority. Ordinary single-row web URLs retain the native matcher and URL safety policy.
 
 Copy returns VTE's native selection verbatim; Anvil no longer trims or joins
 hard-line fragments. VTE remains responsible for actual soft-wrap selection. The
@@ -70,3 +70,12 @@ current adapter exposes no reliable soft-wrap provenance, so hard-wrapped TUI
 paths require an unambiguous single-row reference instead. Pure double-file tests
 are not desktop acceptance; the GTK fixture separately checks blocked hard-line
 hits, exact single-line hits, release/drag handling and native selection equality.
+
+Cross-row parenthesized web destinations are now also reserved but blocked:
+trimming `https://safe. ` plus ` example/path` would synthesize a different
+authority. Full-looking rows are not soft-wrap evidence. No URL is opened or
+rewritten from such ambiguous fragments; the reserved region suppresses native
+regex fallback. Single-row URLs and explicit OSC 8 keep priority. Copy remains
+verbatim VTE selection. A dedicated mapped VTE fixture checks the production URL
+activation lookup, both blocked rows, exact copy, a single-row positive control,
+and OSC 8 priority; it never launches a browser or claims physical-device coverage.

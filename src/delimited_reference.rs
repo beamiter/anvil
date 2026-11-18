@@ -2,7 +2,6 @@
 use std::ops::Range;
 use std::sync::LazyLock;
 
-const MAX_ROWS: usize = 8;
 const MAX_BYTES: usize = 4096;
 
 pub(crate) struct Reference {
@@ -48,89 +47,43 @@ pub(crate) fn detect(rows: &[(&str, bool)]) -> Vec<Reference> {
         let is_web = raw.as_str().split_once("://").is_some_and(|(scheme, _)| {
             scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
         });
-        if !is_web {
-            // VTE row width is not proof of a soft wrap. Never remove whitespace
-            // or guess a local filename across physical rows. Retain the whole
-            // region so rejected references cannot fall back to a partial match.
-            let spans = raw
-                .as_str()
-                .split('\n')
-                .enumerate()
-                .map(|(index, fragment)| {
-                    let row = first_row + index;
-                    let start = if index == 0 {
-                        raw.start() - row_starts[row]
-                    } else {
-                        0
-                    };
-                    (row, start..start + fragment.len())
-                })
-                .collect::<Vec<_>>();
-            let target = raw.as_str().to_owned();
-            let blocked = spans.len() > 1
-                || target.chars().any(char::is_control)
-                || target.contains("://")
-                || target.contains(['\\', '<', '>', '|'])
-                || !FILE_END.is_match(&target);
-            // Exact single-line spaced references are the extra capability;
-            // ordinary single-line tokens remain owned by existing matchers.
-            if blocked || target.contains(char::is_whitespace) {
-                references.push(Reference {
-                    target,
-                    web: false,
-                    blocked,
-                    spans,
-                });
-            }
-            continue;
-        }
-        let mut spans = Vec::new();
-        let mut target = String::new();
-        for (index, fragment) in raw.as_str().split('\n').enumerate() {
-            let row = first_row + index;
-            let fragment_offset = if index == 0 {
-                raw.start() - row_starts[row]
-            } else {
-                0
-            };
-            let trimmed = fragment.trim();
-            if trimmed.is_empty() || index >= MAX_ROWS {
-                break;
-            }
-            // A full row or an explicit token break is evidence of wrapping.
-            // A short row ending in prose must not capture the next line.
-            if index != 0 && !rows[row - 1].1 && !target.ends_with(['-', '/', '_', '.']) {
-                break;
-            }
-            let start = fragment_offset + fragment.len() - fragment.trim_start().len();
-            spans.push((row, start..start + trimmed.len()));
-            target.push_str(trimmed);
-        }
-        if spans.len() != raw.as_str().bytes().filter(|&b| b == b'\n').count() + 1
+        // A full-looking physical row is not reliable soft-wrap metadata.
+        // Preserve raw bytes and reserve every ambiguous region BEFORE format
+        // validation, so neither a file nor a URL can fall back to a fragment.
+        let spans = raw
+            .as_str()
+            .split('\n')
+            .enumerate()
+            .map(|(index, fragment)| {
+                let row = first_row + index;
+                let start = if index == 0 {
+                    raw.start() - row_starts[row]
+                } else {
+                    0
+                };
+                (row, start..start + fragment.len())
+            })
+            .collect::<Vec<_>>();
+        let target = raw.as_str().to_owned();
+        let blocked = spans.len() > 1
             || target.chars().any(char::is_control)
-        {
-            continue;
+            || if is_web {
+                !jterm_core::link::is_openable_url(&target)
+            } else {
+                target.contains("://")
+                    || target.contains(['\\', '<', '>', '|'])
+                    || !FILE_END.is_match(&target)
+            };
+        // Unambiguous single-row URLs remain owned by the native URL matcher.
+        // Only exact single-row local paths with spaces need extra activation.
+        if blocked || (!is_web && target.contains(char::is_whitespace)) {
+            references.push(Reference {
+                target,
+                web: is_web,
+                blocked,
+                spans,
+            });
         }
-        let web = target.split_once("://").is_some_and(|(scheme, _)| {
-            scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
-        });
-        if web {
-            if spans.len() == 1 {
-                continue;
-            }
-        } else if target.contains("://")
-            || target.contains(['\\', '<', '>', '|'])
-            || !FILE_END.is_match(&target)
-            || (spans.len() == 1 && !target.contains(char::is_whitespace))
-        {
-            continue;
-        }
-        references.push(Reference {
-            target,
-            web,
-            blocked: false,
-            spans,
-        });
     }
     references
 }
@@ -205,6 +158,29 @@ mod tests {
     }
 
     #[test]
+    fn url_host_boundaries_are_never_trimmed_into_another_origin() {
+        for full_width in [false, true] {
+            for (head, tail) in [
+                ("(https://safe. ", " example/path)"),
+                ("(https://safe.", "example/path)"),
+                ("(https://safe.example/", " https://other.example/x)"),
+                ("(https://safe.example/", "file.bin )"),
+            ] {
+                let refs = detect(&[(head, full_width), (tail, false)]);
+                assert_eq!(refs.len(), 1);
+                assert!(refs[0].web && refs[0].blocked);
+                assert_eq!(
+                    refs[0].target,
+                    format!("{}\n{}", &head[1..], &tail[..tail.len() - 1])
+                );
+                assert_eq!(refs[0].spans[1], (1, 0..tail.len() - 1));
+            }
+        }
+        assert!(detect(&[("(https://safe.example/path)", false)]).is_empty());
+        assert!(detect(&[("(https://safe. example/path)", false)])[0].blocked);
+    }
+
+    #[test]
     fn joins_only_with_a_supported_boundary_and_delimiter() {
         assert!(detect(&[("(/tmp/first", false), ("second.md)", false)])[0].blocked);
         assert!(detect(&[("(/tmp/first-", false), ("second.md", false)]).is_empty());
@@ -212,6 +188,7 @@ mod tests {
         assert!(!jterm_core::link::is_openable_url(&rejected[0].target));
         let links = detect(&[("(https://example.org/one-", false), ("two)", false)]);
         assert!(links[0].web);
-        assert_eq!(links[0].target, "https://example.org/one-two");
+        assert!(links[0].blocked);
+        assert_eq!(links[0].target, "https://example.org/one-\ntwo");
     }
 }

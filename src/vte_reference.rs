@@ -193,6 +193,55 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an isolated X11 display"]
+    fn mapped_url_rows_cannot_retarget_the_origin_or_bypass_osc8() {
+        gtk4::init().expect("isolated display is required");
+        let terminal = Terminal::new();
+        terminal.set_size(80, 4);
+        crate::block_view::add_url_match_regex(&terminal);
+        let window = gtk4::Window::new();
+        window.set_child(Some(&terminal));
+        window.present();
+        terminal.feed(b"(https://safe. \r\n example/path)\r\n");
+        settle();
+        let border = terminal.border();
+        let (left, top) = border.map_or((0.0, 0.0), |b| (f64::from(b.left()), f64::from(b.top())));
+        let at = |row: f64, col: f64| {
+            (
+                left + (col + 0.5) * terminal.char_width() as f64,
+                top + (row + 0.5) * terminal.char_height() as f64,
+            )
+        };
+        for (row, col) in [(0.0, 5.0), (1.0, 4.0)] {
+            let (x, y) = at(row, col);
+            let reference = hit(&terminal, x, y).expect("must reserve both URL fragments");
+            assert!(reference.web && reference.blocked);
+            assert!(web_match(&terminal, x, y).is_none());
+            assert!(crate::terminal::url::openable_link_at(&terminal, x, y).is_none());
+        }
+        terminal.select_all();
+        let native = terminal.text_selected(Format::Text).unwrap().to_string();
+        assert!(native.contains('\n'));
+        assert_eq!(selected_text(&terminal), Some(native));
+        terminal.unselect_all();
+        terminal.feed(b"\x1b[2J\x1b[H(https://safe.example/path)\r\n");
+        settle();
+        let (x, y) = at(0.0, 5.0);
+        assert_eq!(
+            crate::terminal::url::openable_link_at(&terminal, x, y).as_deref(),
+            Some("https://safe.example/path")
+        );
+        // Explicit targets retain priority, even over an ambiguous visible label.
+        terminal.feed(b"\x1b[2J\x1b[H\x1b]8;;https://explicit.example/target\x1b\\(https://safe. \r\n example/path)\x1b]8;;\x1b\\\r\n");
+        settle();
+        assert_eq!(
+            crate::terminal::url::openable_link_at(&terminal, x, y).as_deref(),
+            Some("https://explicit.example/target")
+        );
+        window.close();
+    }
+
+    #[test]
     #[ignore = "requires an isolated X11 display and xdotool"]
     fn mapped_vte_blocks_ambiguous_paths_and_preserves_native_selection() {
         let exercise_pointer = true;
