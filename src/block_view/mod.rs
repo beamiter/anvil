@@ -57,6 +57,8 @@ mod output_compare;
 mod palette;
 mod paste_feedback;
 mod prepared_search;
+mod resize_presentation;
+use resize_presentation::InlineResize;
 mod review;
 mod scroll;
 pub(crate) use native_transcript_scroll::install_inline_cli_reading;
@@ -6721,6 +6723,11 @@ impl ReaderCtx {
     }
 
     fn on_decset_mode(&self, mode: u32, set: bool) {
+        if mode == 2026 {
+            if let Some(resize) = &self.pty_winsize.inline_resize {
+                resize.set_synchronized(set);
+            }
+        }
         if mode == 2004 {
             self.bracketed_paste_rc.set(set);
             self.pty_for_init.set_shell_bracketed_paste(set);
@@ -6734,6 +6741,9 @@ impl ReaderCtx {
     }
 
     fn on_hard_reset(&self) {
+        if let Some(resize) = &self.pty_winsize.inline_resize {
+            resize.set_synchronized(false);
+        }
         self.watch_reader.reset(Instant::now());
         self.reset_kitty_keyboard();
         self.forget_unanswered_cpr_later();
@@ -6854,6 +6864,9 @@ impl ReaderCtx {
     fn process_watch_input(&self, data: &[u8], origin: Option<watch_batch::ReaderBatchOrigin>) {
         self.watch_reader.begin_dispatch(origin, Instant::now());
         self.process_parser_input(data);
+        if let Some(resize) = &self.pty_winsize.inline_resize {
+            resize.note_output();
+        }
         self.watch_reader.end_dispatch(Instant::now());
     }
 
@@ -10631,6 +10644,7 @@ type SettleKick = Rc<dyn Fn()>;
 struct PtyWinsize {
     /// `(cols, rows)` last sent; `(0, 0)` until the first publish.
     sent: Rc<Cell<(u16, u16)>>,
+    inline_resize: Option<Rc<InlineResize>>,
     /// Arms the settle tick. Filled once the tick exists, which is after the
     /// render backends that sync through this are built.
     settle: Rc<RefCell<Option<SettleKick>>>,
@@ -10641,7 +10655,7 @@ impl PtyWinsize {
     /// it was sent. An identical TIOCSWINSZ would be dropped by the kernel
     /// anyway; skipping it here keeps the one shared memory truthful.
     fn publish(&self, pty: &OwnedPty, sample: (u16, u16)) -> bool {
-        publish_winsize(&self.sent, pty, sample)
+        publish_winsize(&self.sent, pty, sample, self.inline_resize.as_deref())
     }
 
     /// Arm the settle tick (a no-op while one is already running), so a grid
@@ -10658,11 +10672,21 @@ impl PtyWinsize {
 /// publishes through this: holding the whole `PtyWinsize` would hold its
 /// `settle` cell, which holds the tick's kick, which would hold it back — a
 /// cycle that kept the kick's PTY and layout captures alive past the pane.
-fn publish_winsize(sent: &Cell<(u16, u16)>, pty: &OwnedPty, sample: (u16, u16)) -> bool {
+fn publish_winsize(
+    sent: &Cell<(u16, u16)>,
+    pty: &OwnedPty,
+    sample: (u16, u16),
+    inline_resize: Option<&InlineResize>,
+) -> bool {
     match next_winsize_to_publish(sent.get(), sample) {
         Some((cols, rows)) => {
-            sent.set((cols, rows));
+            let previous = sent.replace((cols, rows));
             pty.resize(cols, rows);
+            if previous != (0, 0) {
+                if let Some(resize) = inline_resize {
+                    resize.resized(pty);
+                }
+            }
             true
         }
         None => false,
@@ -13356,7 +13380,16 @@ impl TermView {
         // True while an alt-screen app owns the viewport (finished blocks hidden).
         let fullscreen: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         // The pane's one winsize memory, shared by every PTY resize below.
-        let pty_winsize = PtyWinsize::default();
+        let running_cmd = Rc::new(RefCell::new(String::new()));
+        let pty_winsize = PtyWinsize {
+            inline_resize: Some(Rc::new(InlineResize::new(
+                &active.borrow().resize_surface,
+                bstate.clone(),
+                running_cmd.clone(),
+                direct_cli,
+            ))),
+            ..PtyWinsize::default()
+        };
         let cwd_callbacks: CwdCallbacks = Rc::new(RefCell::new(vec![]));
         let remote_session_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
         let exited_callbacks: IntCallbacks = Rc::new(RefCell::new(vec![]));
@@ -13524,7 +13557,6 @@ impl TermView {
         // Sticky running-command header state: true while a command is executing,
         // plus the command text captured at CommandStart.
         let cmd_running: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let running_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let armed_agent_execution: Rc<RefCell<Option<ArmedAgentExecution>>> =
             Rc::new(RefCell::new(None));
 
@@ -15109,6 +15141,7 @@ impl TermView {
             // must still count as sent here, or a tick sample equal to this
             // tick's own last value would skip the correction of it.
             let winsize_for_resize = pty_winsize.sent.clone();
+            let inline_resize = pty_winsize.inline_resize.clone();
             let last_pane: Rc<Cell<(i32, i32)>> = Rc::new(Cell::new((0, 0)));
             let stable_frames: Rc<Cell<u32>> = Rc::new(Cell::new(0));
             let tick_id = resize_tick_id.clone();
@@ -15124,6 +15157,7 @@ impl TermView {
                 let layout_for_resize = layout_for_resize.clone();
                 let clip_for_resize = clip_for_resize.clone();
                 let winsize_for_resize = winsize_for_resize.clone();
+                let inline_resize = inline_resize.clone();
                 let last_pane = last_pane.clone();
                 let stable_frames = stable_frames.clone();
                 let tick_id_for_callback = tick_id.clone();
@@ -15148,11 +15182,24 @@ impl TermView {
                             layout_for_resize();
                             changed = true;
                         }
-                        if publish_winsize(
-                            &winsize_for_resize,
-                            &pty_for_resize,
-                            pty_grid_size(vte, &scroll),
-                        ) {
+                        let sample = pty_grid_size(vte, &scroll);
+                        let deferred = inline_resize.as_deref().is_some_and(|resize| {
+                            resize.defer_layout(
+                                &pty_for_resize,
+                                winsize_for_resize.get(),
+                                sample,
+                                pane,
+                                vte,
+                            )
+                        });
+                        if deferred
+                            || publish_winsize(
+                                &winsize_for_resize,
+                                &pty_for_resize,
+                                sample,
+                                inline_resize.as_deref(),
+                            )
+                        {
                             changed = true;
                         }
                     }

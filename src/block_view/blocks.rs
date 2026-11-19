@@ -6288,6 +6288,7 @@ pub(crate) struct ActiveBlock {
     live_spacer: gtk::Box,
     /// The clip itself; its allocated width is the space the terminal may use.
     live_clip: gtk::Overlay,
+    pub(super) resize_surface: super::resize_presentation::ResizeSurface,
     /// Last applied `(width_px, grid_px, visible_px)`, so a layout pass that
     /// changes nothing does not queue a resize.
     live_geometry: Cell<(i32, i32, i32)>,
@@ -6501,7 +6502,7 @@ impl ActiveBlock {
         let live_spacer = gtk::Box::new(Orientation::Vertical, 0);
         live_spacer.set_hexpand(true);
         live_spacer.set_vexpand(false);
-        let live_surface = gtk::Fixed::new();
+        let live_surface = super::resize_presentation::ResizeSurface::new();
         live_surface.set_overflow(gtk::Overflow::Hidden);
         live_surface.set_halign(gtk::Align::Fill);
         live_surface.set_valign(gtk::Align::Fill);
@@ -6539,6 +6540,7 @@ impl ActiveBlock {
             vte_overlay,
             live_spacer,
             live_clip,
+            resize_surface: live_surface,
             live_geometry: Cell::new((0, 0, 0)),
             live_extent_rows: Rc::new(Cell::new(0)),
             live_cursor_origin: Rc::new(Cell::new(None)),
