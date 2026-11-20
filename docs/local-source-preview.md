@@ -19,9 +19,11 @@ The directory is locked after preparation. Close and reopen the preview to selec
 a different directory.
 
 The read-only toolbar offers **Copy path**, **Copy text**, and **Reload**.
-**Go to line** takes a one-based line number and highlights it in the source.
-Reload reads the file named in the result, including after source-location
-fallback. The image view displays pixel dimensions and fits the available
+**Go to line** highlights a one-based source line. **Find** searches the source
+with case-sensitive text matching. **Prev** and **Next** move between matching
+lines and wrap around. Reload reads the file named in the result, including
+after source-location fallback. The last preview stays available while reloading
+and if the file cannot be read. The image view displays pixel dimensions and fits the available
 space. **Actual size** lets you scroll through a larger image.
 
 The viewer shows bounded UTF-8 source text, including Markdown, TSX, HTML, and

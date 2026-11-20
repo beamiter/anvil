@@ -143,12 +143,20 @@ struct PreviewPanel {
     prepare: gtk4::Button,
     confirm: gtk4::Button,
     status: gtk4::Label,
+    read_status: gtk4::Label,
     tools: gtk4::FlowBox,
     reload: gtk4::Button,
     copy_path: gtk4::Button,
     copy_text: gtk4::Button,
     source_tools: gtk4::Box,
     line: gtk4::Entry,
+    find: gtk4::ToggleButton,
+    find_tools: gtk4::Box,
+    find_query: gtk4::Entry,
+    find_count: gtk4::Label,
+    find_previous: gtk4::Button,
+    find_next: gtk4::Button,
+    matches: RefCell<SourceMatches>,
     actual_size: gtk4::ToggleButton,
     body: gtk4::Stack,
     text: gtk4::TextView,
@@ -161,6 +169,47 @@ struct PreviewPanel {
     loading: Cell<bool>,
     seek: Cell<Option<(u32, Option<u32>)>>,
     pending_scroll: RefCell<Option<gtk4::TickCallbackId>>,
+}
+
+#[derive(Default)]
+struct SourceMatches(Vec<usize>);
+
+impl SourceMatches {
+    fn update(&mut self, source: &str, query: &str) {
+        self.0.clear();
+        if !query.is_empty() {
+            self.0.extend(
+                source
+                    .split('\n')
+                    .enumerate()
+                    .filter_map(|(index, line)| line.contains(query).then_some(index + 1)),
+            );
+        }
+    }
+
+    fn step(&self, line: Option<usize>, previous: bool) -> Option<usize> {
+        let index = if previous {
+            line.map_or(self.0.len(), |line| {
+                self.0.partition_point(|hit| *hit < line)
+            })
+            .checked_sub(1)
+            .or_else(|| self.0.len().checked_sub(1))?
+        } else {
+            line.map_or(0, |line| self.0.partition_point(|hit| *hit <= line))
+        };
+        self.0.get(index).or_else(|| self.0.first()).copied()
+    }
+
+    fn status(&self, line: Option<usize>) -> String {
+        if self.0.is_empty() {
+            return "No matching lines".into();
+        }
+        match line.and_then(|line| self.0.binary_search(&line).ok()) {
+            Some(index) => format!("Match {} of {}", index + 1, self.0.len()),
+            None if self.0.len() == 1 => "1 matching line".into(),
+            None => format!("{} matching lines", self.0.len()),
+        }
+    }
 }
 
 fn wrapped_label(text: &str) -> gtk4::Label {
@@ -258,23 +307,49 @@ impl PreviewPanel {
 
         let source_tools = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         let line = gtk4::Entry::builder()
-            .placeholder_text("Line number")
+            .placeholder_text("Line")
             .tooltip_text("One-based source line")
             .input_purpose(gtk4::InputPurpose::Digits)
             .max_length(10)
-            .width_chars(8)
+            .width_chars(4)
             .hexpand(true)
             .build();
         let jump = gtk4::Button::with_label("Go to line");
         source_tools.append(&line);
         source_tools.append(&jump);
+        let find = gtk4::ToggleButton::with_label("Find");
+        source_tools.append(&find);
         source_tools.set_visible(false);
+
+        let find_query = gtk4::Entry::builder()
+            .placeholder_text("Find text")
+            .tooltip_text("Search source text with case-sensitive matching")
+            .width_chars(1)
+            .max_length(256)
+            .hexpand(true)
+            .build();
+        let find_previous = gtk4::Button::with_label("Prev");
+        find_previous.set_tooltip_text(Some("Previous matching line"));
+        let find_next = gtk4::Button::with_label("Next");
+        find_next.set_tooltip_text(Some("Next matching line"));
+        let search_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        search_row.append(&find_query);
+        search_row.append(&find_previous);
+        search_row.append(&find_next);
+        let find_count = wrapped_label("");
+        find_count.add_css_class("dim-label");
+        let find_tools = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        find_tools.append(&search_row);
+        find_tools.append(&find_count);
+        find_tools.set_visible(false);
         let actual_size = gtk4::ToggleButton::with_label("Actual size");
         actual_size.set_halign(gtk4::Align::Start);
         actual_size.set_visible(false);
         let status = wrapped_label("");
         status.add_css_class("dim-label");
         status.set_visible(false);
+        let read_status = wrapped_label("");
+        read_status.set_visible(false);
 
         let text = gtk4::TextView::builder()
             .editable(false)
@@ -304,9 +379,11 @@ impl PreviewPanel {
         root.append(&header);
         root.append(&path_label);
         root.append(&status);
+        root.append(&read_status);
         root.append(&approval);
         root.append(&tools);
         root.append(&source_tools);
+        root.append(&find_tools);
         root.append(&actual_size);
         root.append(&body);
 
@@ -319,12 +396,20 @@ impl PreviewPanel {
             prepare,
             confirm,
             status,
+            read_status,
             tools,
             reload,
             copy_path,
             copy_text,
             source_tools,
             line,
+            find,
+            find_tools,
+            find_query,
+            find_count,
+            find_previous,
+            find_next,
+            matches: RefCell::new(SourceMatches::default()),
             actual_size,
             body,
             text,
@@ -430,6 +515,36 @@ impl PreviewPanel {
             }
         });
         let weak = Rc::downgrade(&panel);
+        panel.find.connect_toggled(move |toggle| {
+            if let Some(panel) = weak.upgrade() {
+                panel.find_tools.set_visible(toggle.is_active());
+                if toggle.is_active() {
+                    panel.update_matches();
+                    panel.find_query.grab_focus();
+                }
+            }
+        });
+        let weak = Rc::downgrade(&panel);
+        panel.find_query.connect_changed(move |_| {
+            if let Some(panel) = weak.upgrade() {
+                panel.update_matches();
+            }
+        });
+        let weak = Rc::downgrade(&panel);
+        panel.find_query.connect_activate(move |_| {
+            if let Some(panel) = weak.upgrade() {
+                panel.find_step(false);
+            }
+        });
+        for (button, previous) in [(&panel.find_next, false), (&panel.find_previous, true)] {
+            let weak = Rc::downgrade(&panel);
+            button.connect_clicked(move |_| {
+                if let Some(panel) = weak.upgrade() {
+                    panel.find_step(previous);
+                }
+            });
+        }
+        let weak = Rc::downgrade(&panel);
         panel.copy_path.connect_clicked(move |button| {
             if let Some(panel) = weak.upgrade().filter(|panel| panel.loaded.get()) {
                 button.clipboard().set_text(panel.path.text().as_str());
@@ -469,6 +584,52 @@ impl PreviewPanel {
         self.status.set_visible(!value.is_empty());
     }
 
+    fn show_read_status(&self, value: &str) {
+        self.read_status.set_text(value);
+        self.read_status.set_visible(!value.is_empty());
+    }
+
+    fn selected_line(&self) -> Option<usize> {
+        self.seek.get().map(|(line, _)| line as usize)
+    }
+
+    fn update_matches(&self) {
+        let query = self.find_query.text();
+        let mut matches = self.matches.borrow_mut();
+        if query.is_empty() || !self.source_tools.is_visible() {
+            matches.update("", "");
+        } else {
+            let buffer = self.text.buffer();
+            let (start, end) = buffer.bounds();
+            matches.update(buffer.text(&start, &end, true).as_str(), query.as_str());
+        }
+        drop(matches);
+        self.show_match_count();
+    }
+
+    fn show_match_count(&self) {
+        let has_query = !self.find_query.text().is_empty();
+        let matches = self.matches.borrow();
+        let available = has_query && !matches.0.is_empty();
+        self.find_previous.set_sensitive(available);
+        self.find_next.set_sensitive(available);
+        self.find_count.set_visible(has_query);
+        if has_query {
+            self.find_count
+                .set_text(&matches.status(self.selected_line()));
+        }
+    }
+
+    fn find_step(&self, previous: bool) {
+        if !self.active.get() || !self.find_tools.is_visible() {
+            return;
+        }
+        let line = self.matches.borrow().step(self.selected_line(), previous);
+        if let Some(line) = line {
+            self.jump_to(line as u32, None, true);
+        }
+    }
+
     fn read(self: &Rc<Self>) {
         if !self.active.get() || self.loading.get() {
             return;
@@ -480,23 +641,18 @@ impl PreviewPanel {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_err()
         {
-            self.show_status("Another preview is still reading. Try again shortly.");
+            self.show_read_status("Another preview is still reading. Try again shortly.");
             return;
         }
-        self.cancel_scroll();
         self.loading.set(true);
-        self.loaded.set(false);
         self.approval.set_visible(false);
         self.tools.set_visible(true);
         self.reload.set_sensitive(false);
-        self.copy_path.set_sensitive(false);
-        self.copy_text.set_visible(false);
-        self.source_tools.set_visible(false);
-        self.actual_size.set_visible(false);
-        self.body.set_visible(false);
-        self.text.buffer().set_text("");
-        self.picture.set_paintable(None::<&gtk4::gdk::Texture>);
-        self.show_status("Reading local file…");
+        self.show_read_status(if self.loaded.get() {
+            "Reloading local file…"
+        } else {
+            "Reading local file…"
+        });
 
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         if std::thread::Builder::new()
@@ -561,10 +717,24 @@ impl PreviewPanel {
                     }
                     _ => error.to_string(),
                 };
-                self.show_status(&description);
+                if self.loaded.get() {
+                    self.show_read_status(&format!(
+                        "Reload failed. Showing the last preview.\n{description}"
+                    ));
+                } else {
+                    self.reload.set_label("Retry");
+                    self.show_read_status(&description);
+                }
                 return;
             }
         };
+        let previous = self
+            .loaded
+            .get()
+            .then(|| self.body.visible_child_name())
+            .flatten();
+        self.show_read_status("");
+        self.reload.set_label("Reload");
         self.show_path(&preview.path);
         self.loaded.set(true);
         self.copy_path.set_sensitive(true);
@@ -575,10 +745,29 @@ impl PreviewPanel {
         self.body.set_visible(true);
         match preview.content {
             PreviewContent::Text(source) => {
+                let same_kind = previous.as_deref() == Some("source");
+                let buffer = self.text.buffer();
+                let (start, end) = buffer.bounds();
+                let changed = !same_kind || buffer.text(&start, &end, true).as_str() != source;
+                let anchor = if same_kind && changed {
+                    let y = self.text.visible_rect().y();
+                    let (line, top) = self.text.line_at_y(y);
+                    let x = self.text.hadjustment().map_or(0.0, |scroll| scroll.value());
+                    Some((line.line(), x, f64::from(y - top)))
+                } else {
+                    None
+                };
                 self.body.set_visible_child_name("source");
-                self.text.buffer().set_text(&source);
+                self.actual_size.set_visible(false);
+                self.picture.set_paintable(None::<&gtk4::gdk::Texture>);
                 self.copy_text.set_visible(!source.is_empty());
                 self.source_tools.set_visible(!source.is_empty());
+                self.find_tools
+                    .set_visible(!source.is_empty() && self.find.is_active());
+                if changed {
+                    self.cancel_scroll();
+                    buffer.set_text(&source);
+                }
                 let target = preview
                     .location
                     .map(|location| {
@@ -588,16 +777,26 @@ impl PreviewPanel {
                         )
                     })
                     .or(self.seek.get());
-                if let Some((line, column)) = target {
-                    self.jump_to(line, column);
-                } else if source.is_empty() {
+                if source.is_empty() {
                     self.show_status("Empty file");
+                } else if let Some((line, column)) = target {
+                    self.jump_to(line, column, !same_kind);
                 } else {
-                    self.show_status(&format!("{} lines", self.text.buffer().line_count()));
+                    self.show_status(&format!("{} lines", buffer.line_count()));
                 }
+                if let Some((line, x, offset)) = anchor.filter(|_| !source.is_empty()) {
+                    self.scroll_to_line(line.min(buffer.line_count() - 1), x, Some(offset));
+                }
+                self.update_matches();
             }
             PreviewContent::Image(image) => {
                 self.body.set_visible_child_name("image");
+                self.cancel_scroll();
+                self.text.buffer().set_text("");
+                self.copy_text.set_visible(false);
+                self.source_tools.set_visible(false);
+                self.find_tools.set_visible(false);
+                self.update_matches();
                 let bytes = gtk4::glib::Bytes::from_owned(image.pixels);
                 let texture = gtk4::gdk::MemoryTexture::new(
                     image.width as i32,
@@ -608,7 +807,9 @@ impl PreviewPanel {
                 );
                 self.picture.set_paintable(Some(&texture));
                 self.actual_size.set_visible(true);
-                self.resize_image();
+                if previous.as_deref() != Some("image") {
+                    self.resize_image();
+                }
                 self.show_status(&format!("{} × {} pixels", image.width, image.height));
             }
         }
@@ -619,12 +820,12 @@ impl PreviewPanel {
             return;
         }
         match self.line.text().trim().parse() {
-            Ok(line) => self.jump_to(line, None),
+            Ok(line) => self.jump_to(line, None, true),
             Err(_) => self.show_status("Enter a line number."),
         }
     }
 
-    fn jump_to(&self, line: u32, column: Option<u32>) {
+    fn jump_to(&self, line: u32, column: Option<u32>, reveal: bool) {
         let buffer = self.text.buffer();
         let count = buffer.line_count() as u32;
         let location = match column {
@@ -643,8 +844,11 @@ impl PreviewPanel {
             let mut end = start;
             end.forward_to_line_end();
             buffer.apply_tag(&self.highlight, &start, &end);
-            self.scroll_to_line(start.line());
+            if reveal {
+                self.scroll_to_line(start.line(), 0.0, None);
+            }
             self.seek.set(Some((line, column)));
+            self.show_match_count();
             self.line.set_text(&line.to_string());
             self.show_status(&format!("{location} · {count} lines"));
         }
@@ -656,7 +860,7 @@ impl PreviewPanel {
         }
     }
 
-    fn scroll_to_line(&self, line: i32) {
+    fn scroll_to_line(&self, line: i32, x: f64, offset: Option<f64>) {
         self.cancel_scroll();
         // The adjustment describes a partially validated layout just after a
         // buffer replacement. Wait for the target row to have real geometry.
@@ -678,9 +882,10 @@ impl PreviewPanel {
                 };
             }
             let limit = (scroll.upper() - scroll.page_size()).max(0.0);
-            scroll.set_value((f64::from(y) - scroll.page_size() * 0.12).clamp(0.0, limit));
+            let offset = offset.unwrap_or_else(|| -scroll.page_size() * 0.12);
+            scroll.set_value((f64::from(y) + offset).clamp(0.0, limit));
             if let Some(horizontal) = view.hadjustment() {
-                horizontal.set_value(0.0);
+                horizontal.set_value(x);
             }
             gtk4::glib::ControlFlow::Break
         });
@@ -870,7 +1075,7 @@ mod tests {
         let source = (1..=1600)
             .map(|line| format!("row {line}\n"))
             .collect::<String>();
-        std::fs::write(&path, source).unwrap();
+        std::fs::write(&path, &source).unwrap();
 
         let stack = gtk4::Stack::new();
         stack.add_named(&gtk4::Label::new(Some("Files")), Some("files"));
@@ -916,11 +1121,37 @@ mod tests {
         assert!(panel.status.text().contains("column 3"));
         assert_eq!(panel.target.borrow().as_ref().unwrap().path, path);
 
+        panel.find.set_active(true);
+        panel.find_query.set_text("row 160");
+        assert_eq!(panel.find_count.text(), "2 matching lines");
+        panel.find_next.emit_clicked();
+        assert_eq!(panel.selected_line(), Some(1600));
+        panel.find_next.emit_clicked();
+        assert_eq!(panel.selected_line(), Some(160));
+        panel.find_previous.emit_clicked();
+        assert_eq!(panel.find_count.text(), "Match 2 of 2");
+        panel.find.set_active(false);
+        panel.jump_to(1400, Some(3), true);
+        wait("source navigation after find", &target_visible);
+
         std::fs::write(&reference, "literal colon filename").unwrap();
+        std::fs::remove_file(&path).unwrap();
         panel.reload.emit_clicked();
-        wait("source reload", &target_visible);
-        assert_eq!(panel.target.borrow().as_ref().unwrap().path, path);
+        assert!(panel.loaded.get() && panel.body.is_visible());
         assert_eq!(panel.text.buffer().line_count(), 1601);
+        wait("failed reload", &|| !panel.loading.get());
+        assert!(panel
+            .read_status
+            .text()
+            .contains("Showing the last preview"));
+        assert_eq!(panel.text.buffer().line_count(), 1601);
+        std::fs::write(&path, format!("{source}updated\n")).unwrap();
+        panel.reload.emit_clicked();
+        wait("source reload", &|| {
+            !panel.loading.get() && target_visible()
+        });
+        assert_eq!(panel.target.borrow().as_ref().unwrap().path, path);
+        assert_eq!(panel.text.buffer().line_count(), 1602);
 
         state.present(&stack, reference, false);
         let exact = state.current.borrow().as_ref().unwrap().clone();
