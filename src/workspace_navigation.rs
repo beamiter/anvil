@@ -17,6 +17,8 @@ pub(crate) enum Action {
     Cli(jterm_core::agent_workspace::ConversationId),
     PinCli(jterm_core::agent_workspace::ConversationId, bool),
     ArchiveCli(jterm_core::agent_workspace::ConversationId, bool),
+    DeleteCli(jterm_core::agent_workspace::ConversationId),
+    ConfirmDeleteCli(jterm_core::agent_workspace::ConversationId),
     SharedApi(jterm_core::agent_workspace::ConversationId),
     Task(TaskId, jterm_core::agent_workspace::ConversationId),
     ExternalTask(jterm_core::agent_workspace::ConversationId),
@@ -238,6 +240,7 @@ struct RowWidgets {
     pin: Option<(gtk::Button, Rc<RefCell<Action>>)>,
     archive: Option<(gtk::Button, Rc<RefCell<Action>>)>,
     popover: Option<gtk::Popover>,
+    delete: Option<gtk::Button>,
 }
 
 #[derive(Clone)]
@@ -245,6 +248,8 @@ pub(crate) struct Navigation {
     pub root: gtk::Box,
     list: gtk::ListBox,
     rows: Rc<RefCell<Vec<Row>>>,
+    retired_cli:
+        Rc<RefCell<std::collections::HashSet<jterm_core::agent_workspace::ConversationId>>>,
     all_rows: Rc<RefCell<Vec<Row>>>,
     widgets: Rc<RefCell<Vec<RowWidgets>>>,
     scroll: gtk::ScrolledWindow,
@@ -491,6 +496,7 @@ impl Navigation {
             root,
             list,
             rows,
+            retired_cli: Default::default(),
             all_rows,
             widgets: Rc::new(RefCell::new(Vec::new())),
             scroll,
@@ -554,6 +560,18 @@ impl Navigation {
         true
     }
 
+    pub fn retire_conversation(&self, id: &jterm_core::agent_workspace::ConversationId) {
+        self.retired_cli.borrow_mut().insert(id.clone());
+        self.search.retire_conversation(id);
+        if let Some((_, surface)) = self.scoped_search.borrow().as_ref() {
+            surface.retire_conversation(id);
+        }
+    }
+
+    pub fn confirm_cli_deletion(&self, id: jterm_core::agent_workspace::ConversationId) {
+        (self.callback)(Action::ConfirmDeleteCli(id));
+    }
+
     pub fn filters_changed(&self) {
         (self.callback)(Action::FiltersChanged);
     }
@@ -571,6 +589,8 @@ impl Navigation {
     }
 
     pub fn sync(&self, mut rows: Vec<Row>, filter: &Filter) {
+        let retired = self.retired_cli.borrow();
+        rows.retain(|row| row.shared_id().is_none_or(|id| !retired.contains(id)));
         self.context.poll();
         self.missions.poll();
         let attention = self.missions.needs_attention();
@@ -581,7 +601,13 @@ impl Navigation {
         });
         self.review
             .sync(rows.iter().filter_map(|row| row.source.clone()).collect());
-        let catalog = self.review.catalog_rows();
+        let catalog: Vec<_> = self
+            .review
+            .catalog_rows()
+            .into_iter()
+            .filter(|row| !retired.contains(&row.id))
+            .collect();
+        drop(retired);
         let catalog_by_id: HashMap<_, _> = catalog.iter().map(|row| (&row.id, row)).collect();
         for row in &mut rows {
             if let Some(source) = row
@@ -791,6 +817,9 @@ impl Navigation {
         &self,
         id: &jterm_core::agent_workspace::ConversationId,
     ) -> Option<jterm_core::agent_workspace::WorkspaceRow> {
+        if self.retired_cli.borrow().contains(id) {
+            return None;
+        }
         self.review.row(id).or_else(|| {
             // Exact search evidence remains navigable even when its source is
             // outside the bounded, currently loaded navigation catalog.
@@ -1023,6 +1052,7 @@ impl RowWidgets {
             pin: None,
             archive: None,
             popover: None,
+            delete: None,
         };
         if let Some(id) = row.shared_id() {
             let menu = gtk::MenuButton::new();
@@ -1051,6 +1081,19 @@ impl RowWidgets {
                 } else {
                     result.pin = Some((button, action));
                 }
+            }
+            if matches!(row.action, Action::Cli(_)) {
+                let delete = gtk::Button::with_label("Delete session…");
+                delete.add_css_class("destructive-action");
+                let target = id.clone();
+                let popup = popover.clone();
+                let activate = callback.clone();
+                delete.connect_clicked(move |_| {
+                    popup.popdown();
+                    activate(Action::DeleteCli(target.clone()));
+                });
+                actions.append(&delete);
+                result.delete = Some(delete);
             }
             let inspect = gtk::Button::with_label("Conversation details");
             let id = id.clone();
@@ -1103,6 +1146,13 @@ impl RowWidgets {
             self.widget.add_css_class("active-conversation");
         } else {
             self.widget.remove_css_class("active-conversation");
+        }
+        if let Some(delete) = &self.delete {
+            delete.set_sensitive(!row.busy && row.source.is_some());
+            delete.set_tooltip_text(
+                row.busy
+                    .then_some("Stop the running CLI session before deleting it"),
+            );
         }
         // A visible menu is a concrete action snapshot. A remote change must
         // not reverse Pin/Unpin between the user's press and release.
@@ -1509,6 +1559,32 @@ mod tests {
             "deleted identity silently selected another conversation"
         );
         assert_eq!(actions.borrow().len(), 1);
+        let id = jterm_core::agent_workspace::ConversationId("cli-delete-fixture".into());
+        let mut cli = row();
+        cli.action = Action::Cli(id.clone());
+        cli.source = None;
+        cli.busy = false;
+        cli.source = Some(cli.search_row());
+        cli.busy = true;
+        navigation.sync(vec![cli.clone()], &Filter::default());
+        let delete = navigation.widgets.borrow()[0]
+            .delete
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert!(!delete.is_sensitive());
+        cli.busy = false;
+        navigation.sync(vec![cli.clone()], &Filter::default());
+        assert!(delete.is_sensitive());
+        delete.emit_clicked();
+        assert_eq!(
+            actions.borrow().last(),
+            Some(&Action::DeleteCli(id.clone()))
+        );
+        navigation.retire_conversation(&id);
+        navigation.sync(vec![cli], &Filter::default());
+        assert!(navigation.rows.borrow().is_empty());
+
         let fixture = row().search_row();
         let inspector = navigation.inspect(&fixture);
         window.set_child(Some(&inspector));

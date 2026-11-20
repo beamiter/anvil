@@ -65,12 +65,30 @@ impl Sidebar {
 
     pub fn cli_rows(&self) -> Vec<super::workspace_navigation::Row> {
         use super::workspace_navigation::{Action, Row};
-        let catalog = self.manager.catalog.borrow();
-        let library = self.manager.library.borrow();
-        let mut shared = self.manager.shared.borrow_mut();
-        if library.is_loaded() {
-            shared.poll(&catalog, library.snapshot());
+        let deleted = {
+            let catalog = self.manager.catalog.borrow();
+            let library = self.manager.library.borrow();
+            let mut shared = self.manager.shared.borrow_mut();
+            if library.is_loaded() {
+                shared.poll(&catalog, library.snapshot());
+            }
+            shared.take_deleted_updates()
+        };
+        if !deleted.is_empty() {
+            let catalog = self.manager.catalog.borrow().clone();
+            self.manager.accept_catalog(catalog);
+            self.manager.scanner.borrow_mut().refresh();
+            if let Some(navigation) = self.manager.navigation.borrow().as_ref() {
+                for id in deleted {
+                    navigation.retire_conversation(&id);
+                }
+            }
+            self.manager
+                .notice
+                .set_text("Session deleted from Agent Workspace.");
         }
+        let catalog = self.manager.catalog.borrow();
+        let shared = self.manager.shared.borrow();
         if let Some(error) = shared.error.as_ref() {
             self.manager.notice.set_text(error);
         }
@@ -162,6 +180,36 @@ impl Sidebar {
             .sessions
             .iter()
             .any(|session| shared.id(session) == Some(id))
+    }
+
+    pub fn cli_deletion_target(&self, id: &RuntimeIdentity) -> Result<AgentSession, String> {
+        let catalog = self.manager.catalog.borrow();
+        let shared = self.manager.shared.borrow();
+        let session = catalog
+            .sessions
+            .iter()
+            .find(|session| shared.id(session) == Some(id))
+            .ok_or("This session source changed. Refresh before deleting it.")?;
+        let row = shared
+            .rows
+            .get(id)
+            .ok_or("Wait for this session to finish indexing before deleting it.")?;
+        if row.runtime.is_live() || !catalog.live_pids(session).is_empty() {
+            return Err("Stop the running CLI session before deleting it.".into());
+        }
+        let mut target = session.clone();
+        target.title.clone_from(&row.title);
+        Ok(target)
+    }
+
+    pub fn delete_cli_session(&self, id: &RuntimeIdentity) -> Result<(), String> {
+        let session = self.cli_deletion_target(id)?;
+        self.manager
+            .shared
+            .borrow_mut()
+            .delete(id.clone(), session)?;
+        self.manager.notice.set_text("Deleting session…");
+        Ok(())
     }
 
     pub fn organize(&self, id: &RuntimeIdentity, pinned: Option<bool>, archived: Option<bool>) {
@@ -652,7 +700,13 @@ impl Manager {
         }
     }
 
-    fn accept_catalog(&self, catalog: SessionCatalog) {
+    fn accept_catalog(&self, mut catalog: SessionCatalog) {
+        {
+            let shared = self.shared.borrow();
+            catalog
+                .sessions
+                .retain(|session| !shared.is_deleted(session));
+        }
         self.refresh.set_sensitive(true);
         let changed = *self.catalog.borrow() != catalog;
         if changed {

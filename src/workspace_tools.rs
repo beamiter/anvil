@@ -184,6 +184,22 @@ impl WorkspaceTools {
         }
     }
 
+    pub(crate) fn retire_conversation(&mut self, id: &ConversationId) {
+        if self
+            .selected_hit
+            .as_ref()
+            .is_some_and(|hit| &hit.row.id == id)
+        {
+            self.close_document();
+        }
+        self.search_epoch = self.search_epoch.wrapping_add(1);
+        self.page = WorkspaceSearchPage::default();
+        self.search_loading = false;
+        self.changed = Instant::now();
+        self.notice = WorkspaceQuery::parse(&self.query).err();
+        self.search_due = !self.query.is_empty() && self.notice.is_none();
+    }
+
     pub(crate) fn close_document(&mut self) {
         self.document_epoch = self.document_epoch.wrapping_add(1);
         self.document_loading = false;

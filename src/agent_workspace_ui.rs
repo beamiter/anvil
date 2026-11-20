@@ -30,6 +30,30 @@ impl AppModel {
             WorkspaceAction::ArchiveCli(id, archived) => {
                 self.session_sidebar.organize(&id, None, Some(archived))
             }
+            WorkspaceAction::DeleteCli(id) => match self.session_sidebar.cli_deletion_target(&id) {
+                Ok(session) => {
+                    let title = jterm_core::review_input::safe_inline_display(&session.title, 180);
+                    let body = format!("Delete “{title}” from Agent Workspace and its history search? The original {} history is kept.", session.provider.label());
+                    let dialog = adw::AlertDialog::new(Some("Delete CLI session?"), Some(&body));
+                    dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete session")]);
+                    dialog.set_default_response(Some("cancel"));
+                    dialog.set_close_response("cancel");
+                    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+                    let confirm = self.workspace_navigation.clone();
+                    dialog.connect_response(None, move |_, response| {
+                        if response == "delete" {
+                            confirm.confirm_cli_deletion(id.clone());
+                        }
+                    });
+                    dialog.present(Some(&self.window));
+                }
+                Err(error) => self.show_toast(&error),
+            },
+            WorkspaceAction::ConfirmDeleteCli(id) => {
+                if let Err(error) = self.session_sidebar.delete_cli_session(&id) {
+                    self.show_toast(&error);
+                }
+            }
             WorkspaceAction::Api(id) => {
                 self.show_ai_session_panel();
                 self.ai_panel

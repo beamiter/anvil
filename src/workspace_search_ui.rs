@@ -148,6 +148,12 @@ impl SearchSurface {
         self.render();
     }
 
+    pub fn retire_conversation(&self, id: &ConversationId) {
+        self.tools.borrow_mut().retire_conversation(id);
+        self.render();
+        self.render_document();
+    }
+
     pub fn search_entry(&self, conversation: ConversationId) -> gtk::SearchEntry {
         let entry = gtk::SearchEntry::new();
         entry.set_placeholder_text(Some("Search this conversation's history"));

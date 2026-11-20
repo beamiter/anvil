@@ -8,6 +8,8 @@ anvil 默认把会话导航放在左侧，中央显示选中的真实终端、AP
 
 会话区可直接按 **All types / CLI sessions / API chats / Tasks** 筛选，也可查看活动库、归档或全部会话，叠加 **Pinned only** 和项目筛选。**All activity / Running / Needs you** 只切换活动状态，保留其他筛选。搜索历史使用同一筛选范围。结果区显示当前会话数；**Clear filters** 恢复默认视图。普通终端与 Missions 仍有独立入口。
 
+打开 CLI 会话行的 **⋯** 菜单，选择 **Delete session…**，再确认删除。该会话会从各终端的 Agent Workspace 和历史搜索移除，Codex 或 Claude 的原始记录会保留。运行中的会话需要先结束。
+
 **＋ New** 提供 **New API chat / New task / New terminal**，以及独立的 **Remote workspace · read only** 入口。API 对话和原生任务显示在中央工作区；终端输入继续进入原来的 PTY。原生 API / Agent 编辑器支持多行：**Enter 换行，Ctrl+Enter 发送**，输入法先处理候选字。右侧检查器可单独打开，不占用聊天主视图。
 
 ## 三类会话的运行边界

@@ -6,7 +6,7 @@ use jterm_core::agent_workspace::{
     ConversationId, ConversationKind, WorkspaceClient, WorkspaceCommand, WorkspaceEvent,
     WorkspaceOrganization, WorkspaceReply, WorkspaceRow,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
@@ -53,6 +53,7 @@ enum Pending {
     Index,
     Catalog,
     Organize(Vec<WorkspaceOrganization>),
+    Delete(ConversationId),
 }
 
 pub(crate) struct SharedCli {
@@ -68,6 +69,8 @@ pub(crate) struct SharedCli {
     indexed_tasks: Vec<WorkspaceRow>,
     pending: HashMap<u64, Pending>,
     settled: HashMap<ConversationId, Result<(), String>>,
+    deleted: HashSet<ConversationId>,
+    deleted_updates: Vec<ConversationId>,
     refreshed: Option<Instant>,
     retry_after: Option<Instant>,
     pub error: Option<String>,
@@ -87,6 +90,8 @@ impl SharedCli {
             indexed_tasks: Vec::new(),
             pending: HashMap::new(),
             settled: HashMap::new(),
+            deleted: HashSet::new(),
+            deleted_updates: Vec::new(),
             refreshed: None,
             retry_after: None,
             error: None,
@@ -150,9 +155,30 @@ impl SharedCli {
         self.indexed_tasks = rows;
     }
     pub fn is_writing(&self, id: &ConversationId) -> bool {
-        self.pending
-            .values()
-            .any(|p| matches!(p, Pending::Organize(changes) if changes.iter().any(|c| &c.id == id)))
+        self.pending.values().any(|pending| match pending {
+            Pending::Organize(changes) => changes.iter().any(|change| &change.id == id),
+            Pending::Delete(target) => target == id,
+            _ => false,
+        })
+    }
+
+    pub fn delete(&mut self, id: ConversationId, session: AgentSession) -> Result<(), String> {
+        if self.is_writing(&id) {
+            return Err("This conversation is still saving. Try again when it finishes.".into());
+        }
+        let command = WorkspaceCommand::DeleteCliSession {
+            id: id.clone(),
+            session: Box::new(session),
+        };
+        self.send(command, Pending::Delete(id))
+    }
+
+    pub fn is_deleted(&self, session: &AgentSession) -> bool {
+        self.id(session).is_some_and(|id| self.deleted.contains(id))
+    }
+
+    pub fn take_deleted_updates(&mut self) -> Vec<ConversationId> {
+        std::mem::take(&mut self.deleted_updates)
     }
     pub fn take_result(&mut self, id: &ConversationId) -> Option<Result<(), String>> {
         self.settled.remove(id)
@@ -176,6 +202,13 @@ impl SharedCli {
                 }
                 (Pending::Index, Ok(WorkspaceReply::Ack)) => {
                     self.refreshed = None;
+                }
+                (Pending::Delete(id), Ok(WorkspaceReply::Ack)) => {
+                    self.rows.remove(&id);
+                    self.deleted.insert(id.clone());
+                    self.deleted_updates.push(id);
+                    self.refreshed = None;
+                    self.error = None;
                 }
                 (Pending::Organize(changes), Ok(WorkspaceReply::Ack)) => {
                     for change in changes {
