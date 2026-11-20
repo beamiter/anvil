@@ -9,4 +9,4 @@ publish = false
 gio = "=0.22.8"
 glib = "=0.22.8"
 # Keep this exact public core revision aligned with production Cargo.toml.
-jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "598f15808086dbea14d56fc1b86e77b6cb2e3201" }
+jterm_core = { version = "0.2.0", git = "https://github.com/beamiter/jterm_core.git", rev = "f0107afaf631d29d06358abec3997f1b5712b627" }
