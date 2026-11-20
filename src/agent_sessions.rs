@@ -1,4 +1,5 @@
 //! Native session switcher for provider-owned CLI conversations.
+use crate::workspace_scope::{project_choices, ConversationScope};
 use gtk::prelude::*;
 use jterm_core::agent_sessions::{
     validate_session_details, AgentSession, SessionArchiveFilter, SessionCatalog, SessionLaunch,
@@ -246,9 +247,8 @@ impl Sidebar {
         }
     }
 
-    pub fn set_projects(&self, mut projects: Vec<PathBuf>) {
-        projects.sort();
-        projects.dedup();
+    pub fn set_projects(&self, projects: Vec<PathBuf>) {
+        let projects = project_choices(projects);
         if *self.manager.supplemental_projects.borrow() != projects {
             *self.manager.supplemental_projects.borrow_mut() = projects;
             self.manager.render_view(true);
@@ -258,6 +258,10 @@ impl Sidebar {
     pub fn filter(&self) -> super::workspace_navigation::Filter {
         super::workspace_navigation::Filter {
             query: self.manager.search.text().to_string(),
+            kind: ConversationScope::ALL
+                .get(self.manager.kind_scope.selected() as usize)
+                .copied()
+                .unwrap_or_default(),
             provider: match self.manager.provider.selected() {
                 1 => Some("Codex".into()),
                 2 => Some("Claude".into()),
@@ -370,6 +374,7 @@ struct Manager {
     completed_activation: Rc<Cell<bool>>,
     saved_view: gtk::DropDown,
     archive_view: gtk::DropDown,
+    kind_scope: gtk::DropDown,
     quick_views: Vec<(SessionQuickView, gtk::Button)>,
     project: gtk::DropDown,
     project_paths: RefCell<Vec<PathBuf>>,
@@ -676,6 +681,9 @@ impl Manager {
         self.selected.borrow_mut().take();
         self.hidden_selection.borrow_mut().take();
         self.render();
+        if let Some(navigation) = self.navigation.borrow().as_ref() {
+            navigation.filters_changed();
+        }
     }
 
     fn clear_filters(&self) {
@@ -688,14 +696,12 @@ impl Manager {
         self.sort.set_selected(0);
         self.saved_view.set_selected(0);
         self.archive_view.set_selected(0);
+        self.kind_scope.set_selected(0);
         self.project.set_selected(0);
         self.selected_project.borrow_mut().take();
         self.pinned_first.set_active(true);
         self.updating.set(false);
-        self.page.set(0);
-        self.selected.borrow_mut().take();
-        self.hidden_selection.borrow_mut().take();
-        self.render();
+        self.filters_changed();
         self.search.grab_focus();
     }
 
@@ -708,18 +714,20 @@ impl Manager {
                 0
             });
         self.live_only.set_active(view == SessionQuickView::Live);
-        self.saved_view
-            .set_selected(if view == SessionQuickView::Pinned {
-                1
-            } else {
-                0
-            });
-        self.archive_view
-            .set_selected(if view == SessionQuickView::Archived {
-                1
-            } else {
-                0
-            });
+        if !self.embedded || matches!(view, SessionQuickView::Pinned | SessionQuickView::Archived) {
+            self.saved_view
+                .set_selected(if view == SessionQuickView::Pinned {
+                    1
+                } else {
+                    0
+                });
+            self.archive_view
+                .set_selected(if view == SessionQuickView::Archived {
+                    1
+                } else {
+                    0
+                });
+        }
         self.updating.set(false);
         self.filters_changed();
     }
@@ -884,7 +892,7 @@ impl Manager {
                 }];
                 if self.embedded {
                     button.set_label(match view {
-                        SessionQuickView::All => "Recent",
+                        SessionQuickView::All => "All activity",
                         SessionQuickView::NeedsInput => "Needs you",
                         SessionQuickView::Live => "Running",
                         _ => view.label(),
@@ -896,20 +904,23 @@ impl Manager {
                     SessionQuickView::All => {
                         self.status.selected() == 0
                             && !self.live_only.is_active()
-                            && self.saved_view.selected() == 0
-                            && self.archive_view.selected() == 0
+                            && (self.embedded
+                                || (self.saved_view.selected() == 0
+                                    && self.archive_view.selected() == 0))
                     }
                     SessionQuickView::NeedsInput => {
                         self.status.selected() == 2
                             && !self.live_only.is_active()
-                            && self.saved_view.selected() == 0
-                            && self.archive_view.selected() == 0
+                            && (self.embedded
+                                || (self.saved_view.selected() == 0
+                                    && self.archive_view.selected() == 0))
                     }
                     SessionQuickView::Live => {
                         self.status.selected() == 0
                             && self.live_only.is_active()
-                            && self.saved_view.selected() == 0
-                            && self.archive_view.selected() == 0
+                            && (self.embedded
+                                || (self.saved_view.selected() == 0
+                                    && self.archive_view.selected() == 0))
                     }
                     SessionQuickView::Pinned => {
                         self.status.selected() == 0
@@ -989,18 +1000,21 @@ impl Manager {
         );
         self.previous_page.set_sensitive(self.page.get() > 0);
         self.next_page.set_sensitive(self.page.get() + 1 < pages);
-        self.clear.set_sensitive(
-            !query_text.is_empty()
-                || self.provider.selected() != 0
-                || self.status.selected() != 0
-                || self.live_only.is_active()
-                || self.project_only.is_active()
-                || self.sort.selected() != 0
-                || self.saved_view.selected() != 0
-                || self.archive_view.selected() != 0
-                || selected_project.is_some()
-                || !self.pinned_first.is_active(),
-        );
+        let can_clear = !query_text.trim().is_empty()
+            || self.provider.selected() != 0
+            || self.status.selected() != 0
+            || self.live_only.is_active()
+            || self.project_only.is_active()
+            || self.sort.selected() != 0
+            || self.saved_view.selected() != 0
+            || self.archive_view.selected() != 0
+            || selected_project.is_some()
+            || self.kind_scope.selected() != 0
+            || !self.pinned_first.is_active();
+        self.clear.set_sensitive(can_clear);
+        if self.embedded {
+            self.clear.set_visible(can_clear);
+        }
         self.notice.set_text(if self.embedded {
             catalog.warnings.first().map(String::as_str).unwrap_or("")
         } else if catalog.sessions.is_empty() {
@@ -1010,8 +1024,10 @@ impl Manager {
         } else if catalog.warnings.is_empty() {
             "↑ / ↓ navigate · PgUp / PgDn change page · Ctrl+Home / End jump · Ctrl+L search · Enter resume · Esc close. States describe the latest saved event."
         } else { &catalog.warnings[0] });
-        if let Some(error) = SessionSearchIndex::query_error(query_text.as_str()) {
-            self.notice.set_text(&error);
+        if !self.embedded {
+            if let Some(error) = SessionSearchIndex::query_error(query_text.as_str()) {
+                self.notice.set_text(&error);
+            }
         }
         drop(catalog);
         drop(selected_project);
@@ -2242,6 +2258,10 @@ fn build(
     project.set_list_factory(Some(&project_factory));
     let archive_labels = SessionArchiveFilter::ALL.map(SessionArchiveFilter::label);
     let archive_view = gtk::DropDown::from_strings(&archive_labels);
+    let kind_scope =
+        gtk::DropDown::from_strings(&ConversationScope::ALL.map(ConversationScope::label));
+    kind_scope.update_property(&[gtk::accessible::Property::Label("Conversation type")]);
+    kind_scope.set_tooltip_text(Some("Filter conversations and indexed history by type"));
     archive_view.set_tooltip_text(Some("Local organization shared across terminals"));
     archive_view.update_property(&[gtk::accessible::Property::Label("Session archive view")]);
     project_row.append(&project_label);
@@ -2439,16 +2459,14 @@ fn build(
         options_box.set_width_request(430);
         filters.set_orientation(gtk::Orientation::Vertical);
         saved_filters.set_orientation(gtk::Orientation::Vertical);
-        saved_view.set_model(Some(&gtk::StringList::new(&[
-            "All conversations",
-            "Pinned only",
-        ])));
+        saved_view.set_model(Some(&gtk::StringList::new(&["Any pin", "Pinned only"])));
         sort.set_visible(false);
         pinned_first.set_visible(false);
         options_box.append(&filters);
         options_box.append(&saved_filters);
         project_row.remove(&archive_view);
-        options_box.append(&archive_view);
+        saved_filters.remove(&saved_view);
+        saved_filters.remove(&clear);
         bulk.root.set_visible(false);
         options_box.append(&bulk.root);
         paned.set_end_child(None::<&gtk::Widget>);
@@ -2467,6 +2485,17 @@ fn build(
         root.append(&search);
         project_row.remove(&project_label);
         root.append(&project_row);
+        let scope_row = gtk::FlowBox::builder()
+            .min_children_per_line(1)
+            .max_children_per_line(3)
+            .column_spacing(4)
+            .row_spacing(4)
+            .selection_mode(gtk::SelectionMode::None)
+            .build();
+        scope_row.append(&kind_scope);
+        scope_row.append(&archive_view);
+        scope_row.append(&saved_view);
+        root.append(&scope_row);
         quick_row.set_spacing(2);
         // Full filters remain in the menu. These three primary views fit the
         // 237 px sidebar without widening the terminal canvas.
@@ -2477,13 +2506,17 @@ fn build(
                 SessionQuickView::All | SessionQuickView::NeedsInput | SessionQuickView::Live
             ));
             button.set_label(match view {
-                SessionQuickView::All => "Recent",
+                SessionQuickView::All => "All activity",
                 SessionQuickView::NeedsInput => "Needs you",
                 SessionQuickView::Live => "Running",
                 _ => view.label(),
             });
         }
         root.append(&quick_row);
+        clear.add_css_class("flat");
+        clear.set_halign(gtk::Align::Start);
+        clear.set_visible(false);
+        root.append(&clear);
         root.append(&supplemental);
         paned.set_start_child(None::<&gtk::Widget>);
         list_scroll.set_min_content_width(190);
@@ -2524,6 +2557,7 @@ fn build(
         completed_activation: Rc::new(Cell::new(false)),
         saved_view,
         archive_view,
+        kind_scope,
         quick_views,
         project,
         project_paths: RefCell::new(Vec::new()),
@@ -2614,6 +2648,12 @@ fn build(
     });
     let weak = Rc::downgrade(&manager);
     manager.archive_view.connect_selected_notify(move |_| {
+        if let Some(manager) = weak.upgrade() {
+            manager.filters_changed();
+        }
+    });
+    let weak = Rc::downgrade(&manager);
+    manager.kind_scope.connect_selected_notify(move |_| {
         if let Some(manager) = weak.upgrade() {
             manager.filters_changed();
         }
@@ -3069,6 +3109,23 @@ mod native_tests {
                 context.iteration(false);
             }
         }
+        sidebar.manager.kind_scope.set_selected(2);
+        navigation.sync(sidebar.cli_rows(), &sidebar.filter());
+        assert_eq!(sidebar.filter().kind, ConversationScope::Api);
+        assert!(!navigation.navigate(gtk::gdk::Key::Down));
+        assert!(activated.borrow().is_empty());
+
+        sidebar.manager.archive_view.set_selected(1);
+        sidebar.manager.saved_view.set_selected(1);
+        sidebar.manager.set_quick_view(SessionQuickView::NeedsInput);
+        let filtered = sidebar.filter();
+        assert!(filtered.needs_attention && filtered.pinned);
+        assert_eq!(filtered.archive, 1);
+        assert_eq!(filtered.kind, ConversationScope::Api);
+
+        sidebar.manager.clear_filters();
+        navigation.sync(sidebar.cli_rows(), &sidebar.filter());
+        assert_eq!(sidebar.filter().kind, ConversationScope::All);
         assert!(navigation.navigate(gtk::gdk::Key::Down));
         assert!(
             activated.borrow().is_empty(),

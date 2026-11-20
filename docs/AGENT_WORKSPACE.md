@@ -6,6 +6,8 @@ anvil 默认把会话导航放在左侧，中央显示选中的真实终端、AP
 
 左侧 **Conversations** 同时列出本机 Codex / Claude CLI 历史、共享 API 对话和任务记录。搜索、项目筛选、Pinned / Recent、Needs you / Running 作用于同一列表。单击标题或在搜索栏用方向键选中后按 Enter，打开明确选中的会话；仅移动选择不会启动进程或发送提示。会话菜单提供 Pin / Unpin；API 和 CLI 会话还可以归档、恢复。CLI 的名称和标签可在侧栏更多菜单编辑。
 
+会话区可直接按 **All types / CLI sessions / API chats / Tasks** 筛选，也可查看活动库、归档或全部会话，叠加 **Pinned only** 和项目筛选。**All activity / Running / Needs you** 只切换活动状态，保留其他筛选。搜索历史使用同一筛选范围。结果区显示当前会话数；**Clear filters** 恢复默认视图。普通终端与 Missions 仍有独立入口。
+
 **＋ New** 提供 **New API chat / New task / New terminal**，以及独立的 **Remote workspace · read only** 入口。API 对话和原生任务显示在中央工作区；终端输入继续进入原来的 PTY。原生 API / Agent 编辑器支持多行：**Enter 换行，Ctrl+Enter 发送**，输入法先处理候选字。右侧检查器可单独打开，不占用聊天主视图。
 
 ## 三类会话的运行边界

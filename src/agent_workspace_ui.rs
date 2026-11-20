@@ -15,6 +15,7 @@ impl AppModel {
         sender: &ComponentSender<Self>,
     ) {
         match action {
+            WorkspaceAction::FiltersChanged => {}
             WorkspaceAction::Cli(id) => {
                 if self.session_sidebar.contains(&id) {
                     self.session_sidebar.activate(&id);

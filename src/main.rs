@@ -105,6 +105,7 @@ mod workspace_conversation;
 mod workspace_mission_model;
 mod workspace_mission_ui;
 mod workspace_navigation;
+mod workspace_scope;
 mod workspace_ops;
 mod workspace_remote;
 mod workspace_remote_ui;
