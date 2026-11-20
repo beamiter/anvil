@@ -1,18 +1,28 @@
-# Local source preview (initial slice)
+# Local file preview
+
+In **Files**, right-click a single file in the local tree and choose
+**Preview file**. The sidebar reads that exact filename, including any
+literal colons.
 
 Ctrl+left-click an OSC8 local `file:///` link or an unambiguous absolute Unix
 path (or a relative path such as `src/App.tsx` or a common source filename
 such as `README.md` / `package.json`) in host-owned Block output to open the right inspector's **Local source
-preview** page. No file is read by the click. Confirm **Read this machine's
-local file** only when the displayed path belongs to this machine: terminal
+preview** page. No file is read by the click. Confirm **Read local
+file** only when the displayed path belongs to this machine: terminal
 output, including a `file:` URI, does not authenticate a local filesystem.
 
 Relative paths require an explicitly typed absolute local directory in the sidebar.
-Click **Prepare this local target** to freeze the complete path, then separately
-confirm **Read this machine's local file**. No terminal-reported cwd,
+Click **Prepare local target** to freeze the complete path, then separately
+confirm **Read local file**. No terminal-reported cwd,
 remote URI, home expansion, or process cwd is used; parent components are rejected.
 The directory is locked after preparation. Close and reopen the preview to select
 a different directory.
+
+The read-only toolbar offers **Copy path**, **Copy text**, and **Reload**.
+**Go to line** takes a one-based line number and highlights it in the source.
+Reload reads the file named in the result, including after source-location
+fallback. The image view displays pixel dimensions and fits the available
+space. **Actual size** lets you scroll through a larger image.
 
 The viewer shows bounded UTF-8 source text, including Markdown, TSX, HTML, and
 SVG, without evaluating or rendering those formats. There is no shell, editor,

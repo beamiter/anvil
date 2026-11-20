@@ -18,7 +18,12 @@ pub fn selected_local_path(candidate: &Path, directory: &str) -> io::Result<std:
     if candidate.is_absolute() {
         return Ok(candidate.to_path_buf());
     }
-    if directory.is_empty() || directory.len() > 4096 || directory.chars().any(char::is_control) {
+    if directory.is_empty()
+        || directory.len() > 4096
+        || directory
+            .chars()
+            .any(|c| c.is_control() || jterm_core::review_input::is_visual_spoofing_character(c))
+    {
         return Err(io::Error::other(
             "Enter an absolute directory on this machine",
         ));
@@ -29,7 +34,11 @@ pub fn selected_local_path(candidate: &Path, directory: &str) -> io::Result<std:
             "Choose a local directory without parent or home expansion",
         ));
     }
-    Ok(base.join(candidate))
+    let target = base.join(candidate);
+    if target.as_os_str().len() > 4096 {
+        return Err(io::Error::other("Local path is too long"));
+    }
+    Ok(target)
 }
 
 /// The caller chooses a small fixed input budget for its supported content type.
@@ -41,17 +50,29 @@ pub fn read_bounded(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
     }
     let file = open_without_symlink_components(path, max_bytes)?;
     let metadata = file.metadata().map_err(non_lookup_error)?;
-    if !metadata.is_file() || metadata.len() > max_bytes {
-        return Err(io::Error::other("Preview requires a bounded regular file"));
+    if !metadata.is_file() {
+        return Err(io::Error::other("Only regular files can be previewed"));
+    }
+    if metadata.len() > max_bytes {
+        return Err(size_error(max_bytes));
     }
     let mut bytes = Vec::new();
     file.take(max_bytes + 1)
         .read_to_end(&mut bytes)
         .map_err(non_lookup_error)?;
     if bytes.len() as u64 > max_bytes {
-        return Err(io::Error::other("Preview input exceeded its budget"));
+        return Err(size_error(max_bytes));
     }
     Ok(bytes)
+}
+
+fn size_error(limit: u64) -> io::Error {
+    let message = if limit == MAX_BYTES {
+        "Text preview exceeds the 256 KiB limit"
+    } else {
+        "PNG/JPEG preview exceeds the 4 MiB limit"
+    };
+    io::Error::other(message)
 }
 
 // Only original path-component lookup may report absence to a location fallback.
@@ -136,8 +157,11 @@ fn open_without_symlink_components(path: &Path, max_bytes: u64) -> io::Result<st
         if final_component {
             let source = std::fs::File::from(opened);
             let before = source.metadata().map_err(non_lookup_error)?;
-            if !before.is_file() || before.len() > max_bytes {
-                return Err(io::Error::other("Expected a bounded regular file"));
+            if !before.is_file() {
+                return Err(io::Error::other("Only regular files can be previewed"));
+            }
+            if before.len() > max_bytes {
+                return Err(size_error(max_bytes));
             }
             use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
             // This is our still-owned descriptor, not a second lookup of the input path.

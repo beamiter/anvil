@@ -15,10 +15,22 @@ pub struct LocatedContent {
 
 /// Pure disclosure; never probes either candidate before user confirmation.
 pub fn confirmation_target(path: &Path) -> String {
-    let exact = format!("Literal local file: {}", path.display());
-    match path.to_str().and_then(crate::local_reference::parse_candidate)
-        .and_then(|candidate| candidate.source_location) {
-        Some(location) => format!("{exact}\nOnly if that literal file does not exist: {} (line {}, requested column {:?}; only line navigation).", location.path, location.line, location.column.map(|c| c.get())),
+    let exact = format!("Literal local file\n{}", path.display());
+    match path
+        .to_str()
+        .and_then(crate::local_reference::parse_candidate)
+        .and_then(|candidate| candidate.source_location)
+    {
+        Some(location) => {
+            let coordinates = match location.column {
+                Some(column) => format!("line {}, column {column} (reported)", location.line),
+                None => format!("line {}", location.line),
+            };
+            format!(
+                "{exact}\n\nFallback when the literal file is missing\n{} ({coordinates})",
+                location.path
+            )
+        }
         None => exact,
     }
 }
@@ -79,13 +91,13 @@ mod tests {
     #[test]
     fn disclosure_names_both_candidates_without_io() {
         let note = confirmation_target(Path::new("/missing/project/App.tsx:12:3"));
-        assert!(note.contains("Literal local file: /missing/project/App.tsx:12:3"));
+        assert!(note.contains("Literal local file\n/missing/project/App.tsx:12:3"));
         assert!(note.contains(
-            "Only if that literal file does not exist: /missing/project/App.tsx (line 12"
+            "Fallback when the literal file is missing\n/missing/project/App.tsx (line 12"
         ));
         assert_eq!(
             confirmation_target(Path::new("/missing/plain.md")),
-            "Literal local file: /missing/plain.md"
+            "Literal local file\n/missing/plain.md"
         );
     }
 

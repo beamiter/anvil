@@ -1544,7 +1544,7 @@ impl AppModel {
         });
     }
 
-    fn file_tree_intent_is_current(&self, intent: &file_tree::FileTreeIntent) -> bool {
+    pub(crate) fn file_tree_intent_is_current(&self, intent: &file_tree::FileTreeIntent) -> bool {
         let location = self.file_tree_location.borrow();
         let config = self.config.borrow();
         file_tree::file_tree_user_intent_is_current(

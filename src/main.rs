@@ -501,6 +501,7 @@ struct AppModel {
     /// Right-side stack holding the AI Chats panel and the agent Tasks panel;
     /// it is the `ai_paned` end child, so both share the persisted width.
     side_stack: gtk::Stack,
+    preview_tree_file: Option<Box<dyn Fn(std::path::PathBuf)>>,
     tasks_panel: Controller<dialogs::tasks_panel::TasksPanelModel>,
     tasks_panel_visible: std::cell::Cell<bool>,
     /// Native Codex agent task domain: the reducer, the app-server runtime,
@@ -1594,6 +1595,7 @@ impl SimpleComponent for AppModel {
             ai_panel_visible: std::cell::Cell::new(initial_ai_panel_visible),
             sidebar_width_persist_generation: Rc::new(std::cell::Cell::new(0)),
             side_stack: side_stack.clone(),
+            preview_tree_file: None,
             tasks_panel,
             tasks_panel_visible: std::cell::Cell::new(false),
             task_manager: crate::agent_task::TaskManager::new(),
@@ -2096,14 +2098,14 @@ impl SimpleComponent for AppModel {
         }
         let preview_sender = sender.clone();
         let capture_preview = model.shell.local_preview_capture(&model.side_stack);
-        local_preview::install(
+        model.preview_tree_file = Some(local_preview::install(
             root.upcast_ref(),
             &model.side_stack,
             move || {
                 preview_sender.input(AppMsg::ShowLocalSourcePreview);
             },
             capture_preview,
-        );
+        ));
         ComponentParts { model, widgets }
     }
 
@@ -2810,6 +2812,17 @@ impl SimpleComponent for AppModel {
                     self.show_toast(
                         "File path contains non-UTF-8 bytes and cannot be inserted safely.",
                     );
+                }
+            }
+            AppMsg::FileTreePreview { path, intent } => {
+                if !self.file_tree_location.borrow().is_remote()
+                    && self.file_tree_intent_is_current(&intent)
+                {
+                    if let Some(preview) = &self.preview_tree_file {
+                        preview(path);
+                    }
+                } else {
+                    self.show_toast("Files changed. Reopen the file menu to preview.");
                 }
             }
             AppMsg::OpenNotebook(path) => {

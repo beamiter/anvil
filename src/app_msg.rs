@@ -180,6 +180,10 @@ pub(crate) enum AppMsg {
     TabRowAction(u64, crate::tab_strip::TabAction),
     SetTabFilter(String),
     FileTreeActivateFile(std::path::PathBuf),
+    FileTreePreview {
+        path: std::path::PathBuf,
+        intent: Box<crate::file_tree::FileTreeIntent>,
+    },
     /// Header location selector moved: 0 is Local, i > 0 is
     /// `config.remote_hosts[i - 1]`.
     FileTreeSelectLocation(usize),
