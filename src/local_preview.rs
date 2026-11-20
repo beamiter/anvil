@@ -4,6 +4,7 @@ use crate::local_preview_content::{
     self as reader, read_confirmed as read_exact, Content as PreviewContent,
     LocatedContent as LoadedPreview,
 };
+use crate::preview_navigation::{match_background, ImageZoom, Occurrence, SourceMatches};
 use crate::{local_preview_file, local_reference};
 use gtk4::prelude::*;
 use relm4::gtk as gtk4;
@@ -148,19 +149,24 @@ struct PreviewPanel {
     reload: gtk4::Button,
     copy_path: gtk4::Button,
     copy_text: gtk4::Button,
+    copy_line: gtk4::Button,
     source_tools: gtk4::Box,
     line: gtk4::Entry,
     find: gtk4::ToggleButton,
     find_tools: gtk4::Box,
     find_query: gtk4::Entry,
+    match_case: gtk4::CheckButton,
     find_count: gtk4::Label,
     find_previous: gtk4::Button,
     find_next: gtk4::Button,
     matches: RefCell<SourceMatches>,
-    actual_size: gtk4::ToggleButton,
+    zoom: gtk4::DropDown,
+    texture: RefCell<Option<gtk4::gdk::Texture>>,
     body: gtk4::Stack,
     text: gtk4::TextView,
     highlight: gtk4::TextTag,
+    match_tag: gtk4::TextTag,
+    active_match_tag: gtk4::TextTag,
     picture: gtk4::Picture,
     image_scroll: gtk4::ScrolledWindow,
     target: RefCell<Option<ReadTarget>>,
@@ -171,45 +177,17 @@ struct PreviewPanel {
     pending_scroll: RefCell<Option<gtk4::TickCallbackId>>,
 }
 
-#[derive(Default)]
-struct SourceMatches(Vec<usize>);
+enum HorizontalTarget {
+    Offset(f64),
+    MatchStart(usize),
+}
 
-impl SourceMatches {
-    fn update(&mut self, source: &str, query: &str) {
-        self.0.clear();
-        if !query.is_empty() {
-            self.0.extend(
-                source
-                    .split('\n')
-                    .enumerate()
-                    .filter_map(|(index, line)| line.contains(query).then_some(index + 1)),
-            );
-        }
-    }
-
-    fn step(&self, line: Option<usize>, previous: bool) -> Option<usize> {
-        let index = if previous {
-            line.map_or(self.0.len(), |line| {
-                self.0.partition_point(|hit| *hit < line)
-            })
-            .checked_sub(1)
-            .or_else(|| self.0.len().checked_sub(1))?
-        } else {
-            line.map_or(0, |line| self.0.partition_point(|hit| *hit <= line))
-        };
-        self.0.get(index).or_else(|| self.0.first()).copied()
-    }
-
-    fn status(&self, line: Option<usize>) -> String {
-        if self.0.is_empty() {
-            return "No matching lines".into();
-        }
-        match line.and_then(|line| self.0.binary_search(&line).ok()) {
-            Some(index) => format!("Match {} of {}", index + 1, self.0.len()),
-            None if self.0.len() == 1 => "1 matching line".into(),
-            None => format!("{} matching lines", self.0.len()),
-        }
-    }
+fn match_tag(active: bool) -> gtk4::TextTag {
+    let [red, green, blue] = match_background(active).map(|channel| f32::from(channel) / 255.0);
+    gtk4::TextTag::builder()
+        .background_rgba(&gtk4::gdk::RGBA::new(red, green, blue, 1.0))
+        .foreground_rgba(&gtk4::gdk::RGBA::new(0.14, 0.09, 0.03, 1.0))
+        .build()
 }
 
 fn wrapped_label(text: &str) -> gtk4::Label {
@@ -299,10 +277,15 @@ impl PreviewPanel {
         let copy_path = gtk4::Button::with_label("Copy path");
         let copy_text = gtk4::Button::with_label("Copy text");
         copy_text.set_visible(false);
+        let copy_line = gtk4::Button::with_label("Copy line");
+        copy_line.set_tooltip_text(Some("Copy the highlighted line without its line number"));
+        copy_line.set_visible(false);
+        copy_line.set_sensitive(false);
         copy_path.set_sensitive(false);
         tools.append(&reload);
         tools.append(&copy_path);
         tools.append(&copy_text);
+        tools.append(&copy_line);
         tools.set_visible(!from_terminal);
 
         let source_tools = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
@@ -323,28 +306,39 @@ impl PreviewPanel {
 
         let find_query = gtk4::Entry::builder()
             .placeholder_text("Find text")
-            .tooltip_text("Search source text with case-sensitive matching")
+            .tooltip_text("Search for literal text in this file")
             .width_chars(1)
             .max_length(256)
             .hexpand(true)
             .build();
         let find_previous = gtk4::Button::with_label("Prev");
-        find_previous.set_tooltip_text(Some("Previous matching line"));
+        find_previous.set_tooltip_text(Some("Previous match"));
         let find_next = gtk4::Button::with_label("Next");
-        find_next.set_tooltip_text(Some("Next matching line"));
-        let search_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
-        search_row.append(&find_query);
+        find_next.set_tooltip_text(Some("Next match"));
+        let match_case = gtk4::CheckButton::with_label("Match case");
+        match_case.set_active(true);
+        let search_row = gtk4::FlowBox::builder()
+            .min_children_per_line(1)
+            .max_children_per_line(3)
+            .column_spacing(4)
+            .row_spacing(4)
+            .selection_mode(gtk4::SelectionMode::None)
+            .build();
         search_row.append(&find_previous);
         search_row.append(&find_next);
+        search_row.append(&match_case);
         let find_count = wrapped_label("");
         find_count.add_css_class("dim-label");
         let find_tools = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        find_tools.append(&find_query);
         find_tools.append(&search_row);
         find_tools.append(&find_count);
         find_tools.set_visible(false);
-        let actual_size = gtk4::ToggleButton::with_label("Actual size");
-        actual_size.set_halign(gtk4::Align::Start);
-        actual_size.set_visible(false);
+        let zoom_labels = ImageZoom::OPTIONS.map(|zoom| zoom.to_string());
+        let zoom = gtk4::DropDown::from_strings(&zoom_labels.each_ref().map(String::as_str));
+        zoom.set_tooltip_text(Some("Image zoom"));
+        zoom.set_halign(gtk4::Align::Start);
+        zoom.set_visible(false);
         let status = wrapped_label("");
         status.add_css_class("dim-label");
         status.set_visible(false);
@@ -362,7 +356,12 @@ impl PreviewPanel {
         let highlight = gtk4::TextTag::builder()
             .underline(gtk4::pango::Underline::Single)
             .build();
-        text.buffer().tag_table().add(&highlight);
+        let table = text.buffer().tag_table();
+        let active_match_tag = match_tag(true);
+        let match_tag = match_tag(false);
+        for tag in [&highlight, &match_tag, &active_match_tag] {
+            table.add(tag);
+        }
         let source_scroll = scroll_body();
         source_scroll.set_child(Some(&text));
         let picture = gtk4::Picture::builder()
@@ -384,7 +383,7 @@ impl PreviewPanel {
         root.append(&tools);
         root.append(&source_tools);
         root.append(&find_tools);
-        root.append(&actual_size);
+        root.append(&zoom);
         root.append(&body);
 
         let panel = Rc::new(Self {
@@ -401,19 +400,24 @@ impl PreviewPanel {
             reload,
             copy_path,
             copy_text,
+            copy_line,
             source_tools,
             line,
             find,
             find_tools,
             find_query,
+            match_case,
             find_count,
             find_previous,
             find_next,
             matches: RefCell::new(SourceMatches::default()),
-            actual_size,
+            zoom,
+            texture: RefCell::new(None),
             body,
             text,
             highlight,
+            match_tag,
+            active_match_tag,
             picture,
             image_scroll,
             target: RefCell::new((!relative).then(|| ReadTarget {
@@ -518,8 +522,8 @@ impl PreviewPanel {
         panel.find.connect_toggled(move |toggle| {
             if let Some(panel) = weak.upgrade() {
                 panel.find_tools.set_visible(toggle.is_active());
+                panel.update_match_tags();
                 if toggle.is_active() {
-                    panel.update_matches();
                     panel.find_query.grab_focus();
                 }
             }
@@ -527,6 +531,14 @@ impl PreviewPanel {
         let weak = Rc::downgrade(&panel);
         panel.find_query.connect_changed(move |_| {
             if let Some(panel) = weak.upgrade() {
+                panel.matches.borrow_mut().clear_active();
+                panel.update_matches();
+            }
+        });
+        let weak = Rc::downgrade(&panel);
+        panel.match_case.connect_toggled(move |_| {
+            if let Some(panel) = weak.upgrade() {
+                panel.matches.borrow_mut().clear_active();
                 panel.update_matches();
             }
         });
@@ -565,9 +577,24 @@ impl PreviewPanel {
             }
         });
         let weak = Rc::downgrade(&panel);
-        panel.actual_size.connect_toggled(move |_| {
+        panel.copy_line.connect_clicked(move |button| {
+            if let Some(line) = weak
+                .upgrade()
+                .and_then(|panel| panel.selected_source_line())
+            {
+                button.clipboard().set_text(&line);
+            }
+        });
+        let weak = Rc::downgrade(&panel);
+        panel.zoom.connect_selected_notify(move |_| {
             if let Some(panel) = weak.upgrade() {
-                panel.resize_image();
+                panel.resize_image(true);
+            }
+        });
+        let weak = Rc::downgrade(&panel);
+        panel.picture.connect_scale_factor_notify(move |_| {
+            if let Some(panel) = weak.upgrade() {
+                panel.resize_image(false);
             }
         });
         panel
@@ -593,30 +620,77 @@ impl PreviewPanel {
         self.seek.get().map(|(line, _)| line as usize)
     }
 
-    fn update_matches(&self) {
-        let query = self.find_query.text();
-        let mut matches = self.matches.borrow_mut();
-        if query.is_empty() || !self.source_tools.is_visible() {
-            matches.update("", "");
-        } else {
-            let buffer = self.text.buffer();
-            let (start, end) = buffer.bounds();
-            matches.update(buffer.text(&start, &end, true).as_str(), query.as_str());
+    fn selected_source_line(&self) -> Option<gtk4::glib::GString> {
+        if !self.source_tools.is_visible() {
+            return None;
         }
-        drop(matches);
-        self.show_match_count();
+        let buffer = self.text.buffer();
+        let line = self.selected_line()?.checked_sub(1)?;
+        let start = buffer.iter_at_line(line as i32)?;
+        let mut end = start;
+        if !start.ends_line() {
+            end.forward_to_line_end();
+        }
+        Some(buffer.text(&start, &end, true))
     }
 
-    fn show_match_count(&self) {
-        let has_query = !self.find_query.text().is_empty();
+    fn update_matches(&self) {
+        let query = self.find_query.text();
+        let buffer = self.text.buffer();
+        let mut matches = self.matches.borrow_mut();
+        if query.is_empty() || !self.source_tools.is_visible() {
+            matches.update("", "", true);
+        } else {
+            let (start, end) = buffer.bounds();
+            matches.update(
+                buffer.text(&start, &end, true).as_str(),
+                query.as_str(),
+                self.match_case.is_active(),
+            );
+        }
+        drop(matches);
+        self.update_match_tags();
+    }
+
+    fn tag_occurrence(&self, buffer: &gtk4::TextBuffer, tag: &gtk4::TextTag, hit: Occurrence) {
+        let line = (hit.line - 1) as i32;
+        if let (Some(start), Some(end)) = (
+            buffer.iter_at_line_index(line, hit.start as i32),
+            buffer.iter_at_line_index(line, hit.end as i32),
+        ) {
+            buffer.apply_tag(tag, &start, &end);
+        }
+    }
+
+    fn update_match_tags(&self) {
+        let buffer = self.text.buffer();
+        let (start, end) = buffer.bounds();
+        buffer.remove_tag(&self.match_tag, &start, &end);
+        if self.find_tools.is_visible() {
+            let matches = self.matches.borrow();
+            for hit in matches.hits(None) {
+                self.tag_occurrence(&buffer, &self.match_tag, *hit);
+            }
+        }
+        self.update_active_match();
+    }
+
+    fn update_active_match(&self) {
+        let buffer = self.text.buffer();
+        let (start, end) = buffer.bounds();
+        buffer.remove_tag(&self.active_match_tag, &start, &end);
         let matches = self.matches.borrow();
-        let available = has_query && !matches.0.is_empty();
-        self.find_previous.set_sensitive(available);
-        self.find_next.set_sensitive(available);
+        if self.find_tools.is_visible() {
+            if let Some(hit) = matches.active() {
+                self.tag_occurrence(&buffer, &self.active_match_tag, hit);
+            }
+        }
+        let has_query = !self.find_query.text().is_empty();
+        self.find_previous.set_sensitive(!matches.is_empty());
+        self.find_next.set_sensitive(!matches.is_empty());
         self.find_count.set_visible(has_query);
         if has_query {
-            self.find_count
-                .set_text(&matches.status(self.selected_line()));
+            self.find_count.set_text(&matches.status());
         }
     }
 
@@ -624,9 +698,18 @@ impl PreviewPanel {
         if !self.active.get() || !self.find_tools.is_visible() {
             return;
         }
-        let line = self.matches.borrow().step(self.selected_line(), previous);
-        if let Some(line) = line {
-            self.jump_to(line as u32, None, true);
+        let hit = self
+            .matches
+            .borrow_mut()
+            .step(self.selected_line(), previous);
+        if let Some(hit) = hit {
+            self.jump_to(hit.line as u32, None, false);
+            self.update_active_match();
+            self.scroll_to_line(
+                (hit.line - 1) as i32,
+                HorizontalTarget::MatchStart(hit.start),
+                None,
+            );
         }
     }
 
@@ -758,9 +841,12 @@ impl PreviewPanel {
                     None
                 };
                 self.body.set_visible_child_name("source");
-                self.actual_size.set_visible(false);
+                self.zoom.set_visible(false);
+                self.texture.replace(None);
                 self.picture.set_paintable(None::<&gtk4::gdk::Texture>);
                 self.copy_text.set_visible(!source.is_empty());
+                self.copy_line.set_visible(!source.is_empty());
+                self.copy_line.set_sensitive(false);
                 self.source_tools.set_visible(!source.is_empty());
                 self.find_tools
                     .set_visible(!source.is_empty() && self.find.is_active());
@@ -785,7 +871,11 @@ impl PreviewPanel {
                     self.show_status(&format!("{} lines", buffer.line_count()));
                 }
                 if let Some((line, x, offset)) = anchor.filter(|_| !source.is_empty()) {
-                    self.scroll_to_line(line.min(buffer.line_count() - 1), x, Some(offset));
+                    self.scroll_to_line(
+                        line.min(buffer.line_count() - 1),
+                        HorizontalTarget::Offset(x),
+                        Some(offset),
+                    );
                 }
                 self.update_matches();
             }
@@ -794,6 +884,7 @@ impl PreviewPanel {
                 self.cancel_scroll();
                 self.text.buffer().set_text("");
                 self.copy_text.set_visible(false);
+                self.copy_line.set_visible(false);
                 self.source_tools.set_visible(false);
                 self.find_tools.set_visible(false);
                 self.update_matches();
@@ -805,11 +896,9 @@ impl PreviewPanel {
                     &bytes,
                     image.width as usize * 4,
                 );
-                self.picture.set_paintable(Some(&texture));
-                self.actual_size.set_visible(true);
-                if previous.as_deref() != Some("image") {
-                    self.resize_image();
-                }
+                self.texture.replace(Some(texture.upcast()));
+                self.zoom.set_visible(true);
+                self.resize_image(previous.as_deref() != Some("image"));
                 self.show_status(&format!("{} × {} pixels", image.width, image.height));
             }
         }
@@ -820,7 +909,13 @@ impl PreviewPanel {
             return;
         }
         match self.line.text().trim().parse() {
-            Ok(line) => self.jump_to(line, None, true),
+            Ok(line) => {
+                if (1..=self.text.buffer().line_count() as u32).contains(&line) {
+                    self.matches.borrow_mut().clear_active();
+                    self.update_active_match();
+                }
+                self.jump_to(line, None, true);
+            }
             Err(_) => self.show_status("Enter a line number."),
         }
     }
@@ -842,13 +937,15 @@ impl PreviewPanel {
         if let Some(start) = buffer.iter_at_line((line - 1) as i32) {
             buffer.remove_tag(&self.highlight, &buffer.start_iter(), &buffer.end_iter());
             let mut end = start;
-            end.forward_to_line_end();
-            buffer.apply_tag(&self.highlight, &start, &end);
+            if !start.ends_line() {
+                end.forward_to_line_end();
+                buffer.apply_tag(&self.highlight, &start, &end);
+            }
             if reveal {
-                self.scroll_to_line(start.line(), 0.0, None);
+                self.scroll_to_line(start.line(), HorizontalTarget::Offset(0.0), None);
             }
             self.seek.set(Some((line, column)));
-            self.show_match_count();
+            self.copy_line.set_sensitive(true);
             self.line.set_text(&line.to_string());
             self.show_status(&format!("{location} · {count} lines"));
         }
@@ -860,7 +957,7 @@ impl PreviewPanel {
         }
     }
 
-    fn scroll_to_line(&self, line: i32, x: f64, offset: Option<f64>) {
+    fn scroll_to_line(&self, line: i32, target: HorizontalTarget, offset: Option<f64>) {
         self.cancel_scroll();
         // The adjustment describes a partially validated layout just after a
         // buffer replacement. Wait for the target row to have real geometry.
@@ -885,24 +982,51 @@ impl PreviewPanel {
             let offset = offset.unwrap_or_else(|| -scroll.page_size() * 0.12);
             scroll.set_value((f64::from(y) + offset).clamp(0.0, limit));
             if let Some(horizontal) = view.hadjustment() {
-                horizontal.set_value(x);
+                let x = match target {
+                    HorizontalTarget::Offset(x) => x,
+                    HorizontalTarget::MatchStart(index) => view
+                        .buffer()
+                        .iter_at_line_index(line, index as i32)
+                        .map_or(0.0, |hit| {
+                            f64::from(view.iter_location(&hit).x()) - horizontal.page_size() * 0.2
+                        }),
+                };
+                horizontal.set_value(x.max(0.0));
             }
             gtk4::glib::ControlFlow::Break
         });
         self.pending_scroll.replace(Some(callback));
     }
 
-    fn resize_image(&self) {
-        let actual = self.actual_size.is_active();
-        let policy = if actual {
-            gtk4::PolicyType::Automatic
-        } else {
+    fn resize_image(&self, reset_scroll: bool) {
+        let texture = self.texture.borrow();
+        let Some(texture) = texture.as_ref() else {
+            return;
+        };
+        let zoom = ImageZoom::OPTIONS
+            .get(self.zoom.selected() as usize)
+            .copied()
+            .unwrap_or_default();
+        let policy = if zoom == ImageZoom::Fit {
             gtk4::PolicyType::Never
+        } else {
+            gtk4::PolicyType::Automatic
         };
         self.image_scroll.set_policy(policy, policy);
-        self.picture.set_can_shrink(!actual);
-        self.image_scroll.hadjustment().set_value(0.0);
-        self.image_scroll.vadjustment().set_value(0.0);
+        self.picture.set_can_shrink(zoom == ImageZoom::Fit);
+        let scale = zoom.scale().unwrap_or(1.0) / self.picture.scale_factor().max(1) as f32;
+        let width = (texture.width() as f32 * scale).round().max(1.0);
+        let height = (texture.height() as f32 * scale).round().max(1.0);
+        // The snapshot draws the same texture into a paintable whose intrinsic
+        // size is the zoomed size. This also lets GtkPicture shrink below 100%.
+        let snapshot = gtk4::Snapshot::new();
+        snapshot.append_texture(texture, &gtk4::graphene::Rect::new(0.0, 0.0, width, height));
+        let paintable = snapshot.to_paintable(Some(&gtk4::graphene::Size::new(width, height)));
+        self.picture.set_paintable(paintable.as_ref());
+        if reset_scroll {
+            self.image_scroll.hadjustment().set_value(0.0);
+            self.image_scroll.vadjustment().set_value(0.0);
+        }
     }
 }
 
@@ -1073,7 +1197,13 @@ mod tests {
         std::fs::create_dir(&fixture).unwrap();
         let path = fixture.join("source.rs");
         let source = (1..=1600)
-            .map(|line| format!("row {line}\n"))
+            .map(|line| {
+                if line == 1600 {
+                    format!("row 1600 {} ROW 1600\n", "x".repeat(220))
+                } else {
+                    format!("row {line}\n")
+                }
+            })
             .collect::<String>();
         std::fs::write(&path, &source).unwrap();
 
@@ -1123,13 +1253,29 @@ mod tests {
 
         panel.find.set_active(true);
         panel.find_query.set_text("row 160");
-        assert_eq!(panel.find_count.text(), "2 matching lines");
+        assert_eq!(panel.find_count.text(), "2 matches");
+        panel.match_case.set_active(false);
+        assert_eq!(panel.find_count.text(), "3 matches");
         panel.find_next.emit_clicked();
         assert_eq!(panel.selected_line(), Some(1600));
         panel.find_next.emit_clicked();
+        assert_eq!(panel.selected_line(), Some(1600));
+        assert_eq!(panel.find_count.text(), "Match 3 of 3");
+        wait("horizontal match reveal", &|| {
+            panel.text.hadjustment().unwrap().value() > 100.0
+        });
+        assert!(panel.selected_source_line().unwrap().ends_with("ROW 1600"));
+        let hit = panel.matches.borrow().active().unwrap();
+        assert!(panel
+            .text
+            .buffer()
+            .iter_at_line_index(1599, hit.start as i32)
+            .unwrap()
+            .has_tag(&panel.active_match_tag));
+        panel.find_next.emit_clicked();
         assert_eq!(panel.selected_line(), Some(160));
         panel.find_previous.emit_clicked();
-        assert_eq!(panel.find_count.text(), "Match 2 of 2");
+        assert_eq!(panel.find_count.text(), "Match 3 of 3");
         panel.find.set_active(false);
         panel.jump_to(1400, Some(3), true);
         wait("source navigation after find", &target_visible);
@@ -1172,8 +1318,14 @@ mod tests {
             image.image_scroll.hscrollbar_policy(),
             gtk4::PolicyType::Never
         );
-        image.actual_size.set_active(true);
-        wait("actual size", &|| {
+        image.zoom.set_selected(1);
+        let expected_width = (160.0 / f64::from(image.picture.scale_factor())).round() as i32;
+        assert_eq!(
+            image.picture.paintable().unwrap().intrinsic_width(),
+            expected_width
+        );
+        image.zoom.set_selected(7);
+        wait("image zoom", &|| {
             let scroll = image.image_scroll.hadjustment();
             scroll.upper() > scroll.page_size() + 100.0
         });

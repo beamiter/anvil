@@ -66,6 +66,7 @@ mod local_preview_content;
 mod local_preview_file;
 mod local_preview_image;
 mod local_preview_tokens;
+mod preview_navigation;
 mod local_reference;
 mod navigation_ui;
 mod notebook;
