@@ -1197,12 +1197,10 @@ mod tests {
         std::fs::create_dir(&fixture).unwrap();
         let path = fixture.join("source.rs");
         let source = (1..=1600)
-            .map(|line| {
-                if line == 1600 {
-                    format!("row 1600 {} ROW 1600\n", "x".repeat(220))
-                } else {
-                    format!("row {line}\n")
-                }
+            .map(|line| match line {
+                1399 => "row 1399\u{2029}inline\n".to_owned(),
+                1600 => format!("row 1600 {} ROW 1600\n", "x".repeat(220)),
+                _ => format!("row {line}\n"),
             })
             .collect::<String>();
         std::fs::write(&path, &source).unwrap();
@@ -1248,6 +1246,14 @@ mod tests {
         };
         wait("source navigation", &target_visible);
         assert_eq!(panel.line.text(), "1400");
+        assert_eq!(panel.selected_source_line().unwrap().as_str(), "row 1400");
+        let buffer = panel.text.buffer();
+        let (start, end) = buffer.bounds();
+        assert!(buffer
+            .text(&start, &end, true)
+            .contains("row 1399\\u{2029}inline"));
+        assert_eq!(buffer.line_count(), 1601);
+        assert_eq!(std::fs::read(&path).unwrap(), source.as_bytes());
         assert!(panel.status.text().contains("column 3"));
         assert_eq!(panel.target.borrow().as_ref().unwrap().path, path);
 

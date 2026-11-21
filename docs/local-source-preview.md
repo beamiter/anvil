@@ -102,4 +102,7 @@ and OSC 8 priority; it never launches a browser or claims physical-device covera
 
 CRLF source line endings are displayed as ordinary line breaks. This only
 normalizes the read-only presentation; source bytes and line numbers are unchanged.
-A lone carriage return, ESC, and bidi controls remain visible escapes.
+A lone carriage return, ESC, bidi controls, and the Unicode paragraph separator
+(U+2029) appear as visible escapes in the preview and its copy commands. Escaping
+U+2029 keeps GTK from creating an extra paragraph that would shift source line
+numbers or search highlights; it does not alter the file.

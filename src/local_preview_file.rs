@@ -101,9 +101,10 @@ pub fn source_text(bytes: Vec<u8>) -> io::Result<String> {
     // Lone CR remains a visible escape; it must never act as cursor movement.
     let text = text.replace("\r\n", "\n");
     // Render controls explicitly, including bidi direction and invisible formatting.
+    // GTK treats U+2029 as a paragraph delimiter, but source line numbers use LF.
     Ok(text.chars().flat_map(|c| {
         if (c.is_control() && c != '\n' && c != '\t')
-            || matches!(c, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}') {
+            || matches!(c, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{2029}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}') {
             c.escape_unicode().collect::<Vec<_>>()
         } else { vec![c] }
     }).collect())
@@ -200,6 +201,16 @@ mod tests {
             super::non_lookup_error(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
                 .kind(),
             std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn unicode_paragraph_separator_does_not_create_a_source_line() {
+        let original = "first\u{2029}inline\r\nsecond\nthird";
+        let displayed = super::source_text(original.as_bytes().to_vec()).unwrap();
+        assert_eq!(
+            displayed.lines().collect::<Vec<_>>(),
+            ["first\\u{2029}inline", "second", "third"]
         );
     }
 
