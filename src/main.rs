@@ -60,6 +60,10 @@ mod eva_companion_clip;
 mod eva_companion_paint;
 mod jsh_ops;
 mod keybindings;
+#[path = "../vendor/jwm-remote/client.rs"]
+mod jwm_remote_session;
+#[path = "../vendor/jwm-remote/gtk.rs"]
+mod jwm_remote_gtk;
 mod launch_path;
 mod local_preview;
 mod local_preview_content;
@@ -394,6 +398,7 @@ struct AppModel {
     sidebar_tab_strip: gtk::Box,
     sidebar_tab_rows: FactoryVecDeque<tab_strip::TabRow>,
     window: adw::ApplicationWindow,
+    remote_desktop_window: Rc<glib::WeakRef<gtk::Window>>,
     toast_overlay: adw::ToastOverlay,
     task_feedback: gtk::Label,
     /// The live opacity-hotkey toast, if one is currently shown. Held so rapid
@@ -1529,6 +1534,7 @@ impl SimpleComponent for AppModel {
             sidebar_tab_rows,
             window: root.clone(),
             toast_overlay: toast_overlay.clone(),
+            remote_desktop_window: Default::default(),
             task_feedback,
             opacity_toast: Rc::new(RefCell::new(None)),
             font_toast: Rc::new(RefCell::new(None)),

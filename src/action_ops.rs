@@ -590,6 +590,13 @@ impl AppModel {
                 let id = self.tabs[target].id;
                 self.select_tab(id, sender);
             }
+            Action::ShowRemoteDesktop => {
+                if self.safe_mode {
+                    self.show_toast("Remote connections are disabled in safe mode.");
+                } else {
+                    crate::jwm_remote_gtk::present(&self.window, &self.remote_desktop_window);
+                }
+            }
             Action::ShowRemotePicker => {
                 if self.safe_mode {
                     self.show_toast("Remote connections are disabled in safe mode.");

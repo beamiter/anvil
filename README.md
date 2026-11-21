@@ -17,6 +17,12 @@ restoration as the only copy of work in progress.
 
 ## Highlights
 
+- JWM remote desktop in the command palette (`Ctrl+Shift+P`, **Remote desktop**).
+  Install `jwm-remote` on PATH, enter the host address, and connect. The session
+  starts in view-only mode. Use the panel to switch authorized sources, inspect
+  presentation metrics, release input, or disconnect. Wayland keyboard and
+  pointer control uses the host's one-shot lease for a fixed source.
+
 - Native [Vim9 GUI buffer](docs/VIM9_IDE.md): optional IDE panels default off; real Vim 9 editing with
   GTK/Pango buffer rendering from GUI RGB highlights, editor font/line spacing,
   ligatures and native IME preedit; explicit compatibility display for complex
