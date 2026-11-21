@@ -59,11 +59,11 @@ mod eva_companion;
 mod eva_companion_clip;
 mod eva_companion_paint;
 mod jsh_ops;
-mod keybindings;
-#[path = "../vendor/jwm-remote/client.rs"]
-mod jwm_remote_session;
 #[path = "../vendor/jwm-remote/gtk.rs"]
 mod jwm_remote_gtk;
+#[path = "../vendor/jwm-remote/client.rs"]
+mod jwm_remote_session;
+mod keybindings;
 mod launch_path;
 mod local_preview;
 mod local_preview_content;
