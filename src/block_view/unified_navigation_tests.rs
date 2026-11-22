@@ -141,6 +141,17 @@ fn unified_navigation_preserves_native_ownership_and_follows_live() {
         view.return_to_live().unwrap();
         settle();
     }
+    let retained_record_two = view
+        .record_snapshot_view(2)
+        .expect("retained record output");
+    assert_eq!(retained_record_two.cmd, commands[1]);
+    assert_eq!(retained_record_two.exit_code, Some(0));
+    assert_eq!(retained_record_two.duration_ms, Some(80));
+    assert!(!retained_record_two.is_background);
+    assert!(!retained_record_two.truncated);
+    assert!(retained_record_two.output.contains("needle 2.01"));
+    assert!(retained_record_two.output.contains("needle 2.24"));
+    assert!(!retained_record_two.output.contains("needle 3.01"));
     view.render_backend
         .feed_live(b"\x1b[32m~/project\x1b[0m $ unfinished draft");
     settle();
@@ -398,6 +409,10 @@ fn unified_navigation_preserves_native_ownership_and_follows_live() {
         "read-only Browse fallback cannot move the TUI viewport"
     );
     assert_eq!(gtk::prelude::GtkWindowExt::focus(&window), alt_focus);
+    assert_eq!(
+        view.record_snapshot_view(2),
+        Some(retained_record_two.clone())
+    );
     view.render_backend.feed_live(b"\x1b[?1049l");
     view.bstate.set(BlockState::AwaitingCommand);
     view.render_backend.exit_fullscreen();
@@ -424,6 +439,18 @@ fn unified_navigation_preserves_native_ownership_and_follows_live() {
     if let BackendRecords::Metadata(zones) = view.render_backend.records() {
         assert_eq!(zones.records.len(), 6);
     }
+    // The dialog looks up the payload by stable id again. It must not borrow
+    // screen text after a reset, or show a different record's retained text.
+    assert_eq!(view.record_snapshot_view(2), Some(retained_record_two));
+    assert!(view.record_snapshot_view(u64::MAX).is_none());
+    let no_output = record(7, "silent command", false);
+    finalize(&view, &no_output, "\x1b[0m");
+    assert!(view
+        .render_backend
+        .records()
+        .iter()
+        .any(|item| item.id() == no_output.id));
+    assert!(view.record_snapshot_view(no_output.id).is_none());
     assert!(
         view.pty
             .drain_test_slave(std::time::Duration::from_millis(40))
