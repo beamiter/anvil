@@ -723,11 +723,17 @@ pub(crate) struct FinishedBlock {
     /// without remeasuring an allocation which still has the old margins.
     compact: Rc<Cell<bool>>,
     pub(crate) prompt_text: String,
-    /// Read-only VTE displaying the executed command line (single-row typically).
-    pub(crate) command_vte: vte4::Terminal,
+    /// Read-only VTE displaying the executed command when the card has one.
+    pub(crate) command_vte: Option<vte4::Terminal>,
+    #[cfg(anvil_shared_terminal)]
+    pub(crate) command_document: Option<jterm_gtk_view::FinishedTextView>,
     /// Read-only VTE displaying the captured output. Finished output takes its
     /// full natural height; scrolling belongs to the outer block canvas.
-    pub(crate) output_vte: vte4::Terminal,
+    pub(crate) output_vte: Option<vte4::Terminal>,
+    #[cfg(anvil_shared_terminal)]
+    pub(crate) output_document: Option<jterm_gtk_view::FinishedTextView>,
+    #[cfg(anvil_shared_terminal)]
+    output_document_height: Rc<Cell<i32>>,
     /// Visible per-block scrollbar for long output, bound to `output_vte`'s
     /// private adjustment.
     output_scrollbar: gtk::Scrollbar,
@@ -826,7 +832,13 @@ impl Clone for FinishedBlock {
             compact: self.compact.clone(),
             prompt_text: self.prompt_text.clone(),
             command_vte: self.command_vte.clone(),
+            #[cfg(anvil_shared_terminal)]
+            command_document: self.command_document.clone(),
             output_vte: self.output_vte.clone(),
+            #[cfg(anvil_shared_terminal)]
+            output_document: self.output_document.clone(),
+            #[cfg(anvil_shared_terminal)]
+            output_document_height: self.output_document_height.clone(),
             output_scrollbar: self.output_scrollbar.clone(),
             cmd_text: self.cmd_text.clone(),
             full_output: self.full_output.clone(),
@@ -1698,7 +1710,7 @@ mod tests {
             .child(&scroll)
             .build();
         window.present();
-        spin_main_context_until(|| card.output_vte.is_mapped());
+        spin_main_context_until(|| card.output_vte_for_test().is_mapped());
         spin_main_context_for(std::time::Duration::from_millis(120));
         let expanded_height = card.widget().height();
         assert!(expanded_height > 40);
@@ -1707,7 +1719,7 @@ mod tests {
         // ANSI decoration must never become command-output bytes.
         card.copy_output_btn.emit_clicked();
         let copied = glib::MainContext::default()
-            .block_on(card.output_vte.clipboard().read_text_future())
+            .block_on(card.output_vte_for_test().clipboard().read_text_future())
             .expect("native clipboard read")
             .expect("copied output");
         assert_eq!(copied.as_str(), strip_ansi(&output));
@@ -1716,10 +1728,10 @@ mod tests {
         // collapse button still needs a strong native parent to own it.
         (card.toggle_collapsed)();
         assert!(card.is_output_collapsed());
-        spin_main_context_until(|| !card.output_vte.is_mapped());
+        spin_main_context_until(|| !card.output_vte_for_test().is_mapped());
         (card.toggle_collapsed)();
         assert!(!card.is_output_collapsed());
-        spin_main_context_until(|| card.output_vte.is_mapped());
+        spin_main_context_until(|| card.output_vte_for_test().is_mapped());
         spin_main_context_for(std::time::Duration::from_millis(120));
         assert_eq!(card.widget().height(), expanded_height);
 
@@ -1752,7 +1764,7 @@ mod tests {
             card.widget().queue_draw();
             spin_main_context_for(std::time::Duration::from_millis(25));
         }
-        if let Some(adjustment) = card.output_vte.vadjustment() {
+        if let Some(adjustment) = card.output_vte_for_test().vadjustment() {
             adjustment
                 .set_value((adjustment.upper() - adjustment.page_size()).max(adjustment.lower()));
         }
@@ -1785,7 +1797,7 @@ mod tests {
             None,
             80,
         );
-        assert!(!block.output_vte.is_mapped());
+        assert!(!block.output_vte_for_test().is_mapped());
         OUTPUT_VISUAL_ROW_COUNT_CALLS.with(|calls| calls.set(0));
 
         assert_eq!(block.refit_output_to_viewport(), None);
@@ -1807,7 +1819,7 @@ mod tests {
         let window = gtk::Window::builder().child(&scrolled).build();
         reset_visual_row_cache_counters();
         window.present();
-        spin_main_context_until(|| block.output_vte.is_mapped());
+        spin_main_context_until(|| block.output_vte_for_test().is_mapped());
         let (hits, misses) = visual_row_cache_counters();
         assert_eq!(hits + misses, 1, "map resolves output rows exactly once");
         assert!(block.dynamic_viewport_rows.get() > 0);
@@ -1898,11 +1910,11 @@ mod tests {
             .build();
         let window = gtk::Window::builder().child(&scrolled).build();
         window.present();
-        spin_main_context_until(|| block.output_vte.is_mapped());
+        spin_main_context_until(|| block.output_vte_for_test().is_mapped());
         let card_text = || {
             let stream = gio::MemoryOutputStream::new_resizable();
             block
-                .output_vte
+                .output_vte_for_test()
                 .write_contents_sync(&stream, vte4::WriteFlags::Default, gio::Cancellable::NONE)
                 .expect("VTE writes its contents");
             stream.close(gio::Cancellable::NONE).expect("close");
@@ -2032,6 +2044,8 @@ mod tests {
         let background = FinishedBlock::new(
             7, "$ ", "", None, "async\n", None, &config, None, None, None, 80,
         );
+        assert!(background.command_vte.is_none());
+        assert!(!background.output_vte_for_test().is_input_enabled());
         background.set_lifecycle(BlockLifecycleHealth::Degraded, Some("no end marker"));
         assert!(!background.lifecycle_chip.is_visible());
     }
@@ -2377,7 +2391,9 @@ mod tests {
             .build();
         let window = gtk::Window::builder().child(&scrolled).build();
         window.present();
-        spin_main_context_until(|| block.output_vte.is_mapped() && block.output_vte.width() > 0);
+        spin_main_context_until(|| {
+            block.output_vte_for_test().is_mapped() && block.output_vte_for_test().width() > 0
+        });
 
         // Whether this scrollbar is shown is decided from VTE's ring measured
         // against the visible page — a quantity the terminal's own width
@@ -2388,10 +2404,10 @@ mod tests {
         // render-stamp guard can break it; the width edge has to not exist.
         block.output_scrollbar.set_visible(true);
         spin_main_context_for(std::time::Duration::from_millis(60));
-        let with_scrollbar = block.output_vte.width();
+        let with_scrollbar = block.output_vte_for_test().width();
         block.output_scrollbar.set_visible(false);
         spin_main_context_for(std::time::Duration::from_millis(60));
-        let without_scrollbar = block.output_vte.width();
+        let without_scrollbar = block.output_vte_for_test().width();
 
         assert!(
             with_scrollbar > 0,
@@ -2453,7 +2469,7 @@ mod tests {
             .child(&scrolled)
             .build();
         window.present();
-        spin_main_context_until(|| block.output_vte.is_mapped());
+        spin_main_context_until(|| block.output_vte_for_test().is_mapped());
 
         (block.toggle_filter)();
         let root = block.widget().clone().upcast::<gtk::Widget>();
@@ -2482,9 +2498,9 @@ mod tests {
 
         reset_visual_row_cache_counters();
         block.set_virtualized(true);
-        spin_main_context_until(|| !block.output_vte.is_mapped());
+        spin_main_context_until(|| !block.output_vte_for_test().is_mapped());
         block.set_virtualized(false);
-        spin_main_context_until(|| block.output_vte.is_mapped());
+        spin_main_context_until(|| block.output_vte_for_test().is_mapped());
         assert_eq!(
             visual_row_cache_counters(),
             (1, 0),
@@ -2500,11 +2516,13 @@ mod tests {
             "expand must reuse the current displayed rows",
         );
 
-        let old_cols = effective_render_cols(&block.output_vte, block.cols);
+        let old_cols = effective_render_cols(block.output_vte_for_test(), block.cols);
         window.set_default_size(320, 420);
         window.queue_resize();
-        spin_main_context_until(|| effective_render_cols(&block.output_vte, block.cols) < old_cols);
-        let new_cols = effective_render_cols(&block.output_vte, block.cols);
+        spin_main_context_until(|| {
+            effective_render_cols(block.output_vte_for_test(), block.cols) < old_cols
+        });
+        let new_cols = effective_render_cols(block.output_vte_for_test(), block.cols);
         reset_visual_row_cache_counters();
         assert!(block.refit_output_to_viewport().is_some());
         assert_eq!(
@@ -3727,6 +3745,10 @@ fn finished_card_refit_height(rows: i64, cell_height: i32, compact: bool) -> i32
 /// old self-sufficient behavior for restore paths and tests.
 #[derive(Clone, Default)]
 pub(crate) struct FinishedBlockPrecomputed {
+    #[cfg(anvil_shared_terminal)]
+    pub(crate) document_command: bool,
+    #[cfg(anvil_shared_terminal)]
+    pub(crate) document_output: bool,
     pub(crate) output_preview: Option<String>,
     pub(crate) output_rows: Option<i64>,
     pub(crate) retained_bytes: Option<usize>,
@@ -4768,18 +4790,38 @@ impl FinishedBlock {
         // A constructor-level one-logical-row settling pass can otherwise run
         // after the wrapped feed and discard its prefix before the command's
         // own settling pass expands it again (notably with the 12px default).
-        let command_vte = create_finished_terminal(
-            config,
-            command_cols,
-            cmd_rows.max(1),
-            cmd_rows.max(1),
-            false,
-        );
-        if chat {
-            command_vte.set_hexpand(false);
-            command_vte.add_css_class("chat-command-terminal");
-            command_vte.set_color_background(&RGBA::new(0.0, 0.0, 0.0, 0.0));
-        }
+        #[cfg(anvil_shared_terminal)]
+        let command_document = if precomputed.document_command && cmd_ansi.is_none() {
+            jterm_gtk_view::FinishedTextView::command(
+                cmd,
+                cmd_bytes.as_slice(),
+                crate::font::terminal_font_description(&config.font_desc, config),
+                config.default_font_scale,
+                config.foreground,
+                &config.palette,
+            )
+        } else {
+            None
+        };
+        #[cfg(anvil_shared_terminal)]
+        let uses_command_vte = !is_background && command_document.is_none();
+        #[cfg(not(anvil_shared_terminal))]
+        let uses_command_vte = !is_background;
+        let command_vte = uses_command_vte.then(|| {
+            let terminal = create_finished_terminal(
+                config,
+                command_cols,
+                cmd_rows.max(1),
+                cmd_rows.max(1),
+                false,
+            );
+            if chat {
+                terminal.set_hexpand(false);
+                terminal.add_css_class("chat-command-terminal");
+                terminal.set_color_background(&RGBA::new(0.0, 0.0, 0.0, 0.0));
+            }
+            terminal
+        });
         let command_render_cols = Rc::new(Cell::new(0_i64));
         // Defer feeds until the widget is actually mapped — VTE's internal
         // grid resize from set_size() doesn't take effect until the widget is
@@ -4787,7 +4829,7 @@ impl FinishedBlock {
         // width (the ls-output misalignment bug). connect_map fires once the
         // widget has been allocated, when the grid actually matches set_size.
         // One-shot: re-mapping during scroll must not re-feed.
-        {
+        if let Some(command_vte) = &command_vte {
             let cmd_bytes_for_map = cmd_bytes.clone();
             let cols_for_map = command_cols.max(1);
             let cmd_rows_for_map = cmd_rows.max(1);
@@ -4827,22 +4869,49 @@ impl FinishedBlock {
         let displayed_output: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let output_scrollable = output_rows > viewport_cap;
         let initial_visible_rows = output_rows.min(viewport_cap).clamp(1, 32);
-        let output_vte = create_finished_terminal(
-            config,
-            cols,
-            initial_visible_rows,
-            initial_visible_rows,
-            !output_scrollable,
-        );
-        output_vte.set_height_request(finished_vte_height_px(
-            initial_visible_rows,
-            estimated_cell_height_px(config),
-        ));
+        #[cfg(anvil_shared_terminal)]
+        let output_document = if precomputed.document_output
+            && command_document.is_some()
+            && images.is_empty()
+            && output_rows <= i64::from(config.finished_block_viewport_rows)
+        {
+            jterm_core::screen_replay::project_bounded_archive(output)
+                .filter(|document| !document.text.trim().is_empty())
+                .map(|document| {
+                    jterm_gtk_view::FinishedTextView::output(
+                        &document,
+                        crate::font::terminal_font_description(&config.font_desc, config),
+                        config.default_font_scale,
+                        config.foreground,
+                        &config.palette,
+                    )
+                })
+        } else {
+            None
+        };
+        #[cfg(anvil_shared_terminal)]
+        let uses_output_vte = output_document.is_none();
+        #[cfg(not(anvil_shared_terminal))]
+        let uses_output_vte = true;
+        let output_vte = uses_output_vte.then(|| {
+            let output_vte = create_finished_terminal(
+                config,
+                cols,
+                initial_visible_rows,
+                initial_visible_rows,
+                !output_scrollable,
+            );
+            output_vte.set_height_request(finished_vte_height_px(
+                initial_visible_rows,
+                estimated_cell_height_px(config),
+            ));
+            output_vte
+        });
         // Tracks whether the user has toggled this block to its expanded
         // height. Survives unmap/remap so re-feeding picks the right cap.
         let expanded: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let render_stamp = Rc::new(RenderStampState::new(NEUTRAL_RENDER_STAMP));
-        {
+        if let Some(output_vte) = &output_vte {
             let render_stamp = Rc::downgrade(&render_stamp);
             output_vte.connect_contents_changed(move |_| {
                 if let Some(render_stamp) = render_stamp.upgrade() {
@@ -4861,7 +4930,7 @@ impl FinishedBlock {
             displayed_generation: 0,
             rows: output_rows,
         })));
-        {
+        if let Some(output_vte) = &output_vte {
             let cols_for_map = cols.max(1);
             let cap_for_map = dynamic_viewport_rows.clone();
             let fallback_cap_for_map = viewport_cap;
@@ -4901,7 +4970,7 @@ impl FinishedBlock {
                 };
                 let cap = bounded_finished_viewport_rows(effective_cols, requested_cap);
                 if let Some(expand_btn) = expand_btn_for_map.upgrade() {
-                    expand_btn.set_visible(rows > fitted_cap);
+                    expand_btn.set_visible(uses_output_vte && (rows > fitted_cap));
                 }
                 if let Some(jump_btn) = jump_btn_for_map.upgrade() {
                     jump_btn.set_visible(rows > fitted_cap);
@@ -4956,7 +5025,7 @@ impl FinishedBlock {
         // updates the icon (expand ↔ compress). The map handler reads the
         // shared `expanded` flag so a re-feed after scroll-off/on respects it.
         expand_btn.set_visible(output_rows > viewport_cap);
-        {
+        if let Some(output_vte) = &output_vte {
             let expand_for_btn = expanded.clone();
             let viewport_for_btn = dynamic_viewport_rows.clone();
             let output_vte_for_btn = output_vte.clone();
@@ -5023,11 +5092,22 @@ impl FinishedBlock {
         // terminal's pixel width, so the card would re-wrap `ls` differently
         // from the live pane the user watched it in.
         let cmd_row = super::command_row::CommandRow::new();
-        cmd_row.append(&command_vte);
-        if chat {
-            super::command_row::fit(&cmd_row, &command_vte, command_cols, cmd);
-            cmd_row.add_css_class("chat-command-capsule");
-            cmd_row.set_hexpand(false);
+        if let Some(terminal) = &command_vte {
+            cmd_row.append(terminal);
+            if chat {
+                super::command_row::fit(&cmd_row, terminal, command_cols, cmd);
+                cmd_row.add_css_class("chat-command-capsule");
+                cmd_row.set_hexpand(false);
+            }
+        }
+
+        #[cfg(anvil_shared_terminal)]
+        if let Some(command) = &command_document {
+            cmd_row.append(command.widget());
+            if chat {
+                cmd_row.add_css_class("chat-command-capsule");
+                super::command_row::fit_document(&cmd_row, command);
+            }
         }
 
         content.append(&cmd_row);
@@ -5051,49 +5131,70 @@ impl FinishedBlock {
         // live card's scrollbar already rides its clip for the same reason.
         let output_box = gtk::Overlay::new();
         output_box.set_hexpand(true);
-        if reference_block {
-            let body = gtk::Box::new(Orientation::Horizontal, super::block_reference::OUTPUT_GAP);
-            body.add_css_class("block-reference-output");
-            body.set_margin_start(16);
-            body.set_margin_end(16);
-            let gutter = super::block_reference::output_gutter(
-                &output_vte,
-                full_output.clone(),
-                displayed_output.clone(),
-                displayed_generation.clone(),
-            );
-            body.append(&gutter);
-            body.append(&output_vte);
-            output_box.set_child(Some(&body));
-            // Observe native allocation without a tick or layout owner. A
-            // width-only pane resize must redraw labels even at the same font.
-            let observer = gtk::DrawingArea::new();
-            observer.set_can_target(false);
-            observer.set_focusable(false);
-            let gutter = gutter.downgrade();
-            observer.connect_resize(move |_, _, _| {
-                if let Some(gutter) = gutter.upgrade() {
-                    gutter.queue_draw();
-                }
-            });
-            output_box.add_overlay(&observer);
-            output_box.set_measure_overlay(&observer, false);
-            output_box.set_clip_overlay(&observer, true);
-        } else {
-            output_box.set_child(Some(&output_vte));
+        if let Some(output_vte) = &output_vte {
+            if reference_block {
+                let body =
+                    gtk::Box::new(Orientation::Horizontal, super::block_reference::OUTPUT_GAP);
+                body.add_css_class("block-reference-output");
+                body.set_margin_start(16);
+                body.set_margin_end(16);
+                let gutter = super::block_reference::output_gutter(
+                    output_vte,
+                    full_output.clone(),
+                    displayed_output.clone(),
+                    displayed_generation.clone(),
+                );
+                body.append(&gutter);
+                body.append(output_vte);
+                output_box.set_child(Some(&body));
+                // Observe native allocation without a tick or layout owner. A
+                // width-only pane resize must redraw labels even at the same font.
+                let observer = gtk::DrawingArea::new();
+                observer.set_can_target(false);
+                observer.set_focusable(false);
+                let gutter = gutter.downgrade();
+                observer.connect_resize(move |_, _, _| {
+                    if let Some(gutter) = gutter.upgrade() {
+                        gutter.queue_draw();
+                    }
+                });
+                output_box.add_overlay(&observer);
+                output_box.set_measure_overlay(&observer, false);
+                output_box.set_clip_overlay(&observer, true);
+            } else {
+                output_box.set_child(Some(output_vte));
+            }
+            if chat {
+                output_vte.add_css_class("chat-output-terminal");
+                output_vte.set_color_background(&RGBA::new(0.0, 0.0, 0.0, 0.0));
+            }
         }
-        if chat {
-            output_vte.add_css_class("chat-output-terminal");
-            output_vte.set_color_background(&RGBA::new(0.0, 0.0, 0.0, 0.0));
+        #[cfg(anvil_shared_terminal)]
+        if let Some(output) = &output_document {
+            if reference_block {
+                let body =
+                    gtk::Box::new(Orientation::Horizontal, super::block_reference::OUTPUT_GAP);
+                body.add_css_class("block-reference-output");
+                body.set_margin_start(16);
+                body.set_margin_end(16);
+                body.append(&output.output_gutter());
+                body.append(output.widget());
+                output_box.set_child(Some(&body));
+            } else {
+                output_box.set_child(Some(output.widget()));
+            }
         }
+        let output_adjustment = output_vte
+            .as_ref()
+            .and_then(|terminal| terminal.vadjustment());
         let output_scrollbar =
-            gtk::Scrollbar::new(Orientation::Vertical, output_vte.vadjustment().as_ref());
+            gtk::Scrollbar::new(Orientation::Vertical, output_adjustment.as_ref());
         output_scrollbar.add_css_class("block-output-scrollbar");
-        output_scrollbar.set_visible(output_scrollable);
+        output_scrollbar.set_visible(uses_output_vte && output_scrollable);
         output_scrollbar.set_tooltip_text(Some("Scroll within this block"));
         output_scrollbar.set_halign(gtk::Align::End);
         output_scrollbar.set_valign(gtk::Align::Fill);
-        if let Some(adjustment) = output_vte.vadjustment() {
+        if let Some(adjustment) = output_adjustment {
             let scrollbar = output_scrollbar.downgrade();
             let sync_visibility = move |adjustment: &gtk::Adjustment| {
                 if let Some(scrollbar) = scrollbar.upgrade() {
@@ -5172,7 +5273,9 @@ impl FinishedBlock {
         collapsed_summary.set_visible(false);
         content.append(&collapsed_summary);
 
-        crate::terminal::vte::setup_terminal_click_handler(&output_vte);
+        if let Some(terminal) = &output_vte {
+            crate::terminal::vte::setup_terminal_click_handler(terminal);
+        }
 
         let has_output = !output.trim().is_empty();
         let has_images = images_box.is_some();
@@ -5301,7 +5404,9 @@ impl FinishedBlock {
                 Rc<dyn Fn()>,
             );
             type FilterRowBuilder = dyn Fn(&gtk::Box, &gtk::Widget) -> Option<FilterRowHandles>;
-            let output_vte = output_vte.downgrade();
+            let output_vte = output_vte.as_ref().map(ObjectExt::downgrade);
+            #[cfg(anvil_shared_terminal)]
+            let output_document = output_document.clone();
             let expand_btn = expand_btn.downgrade();
             let output_scrollbar = output_scrollbar.downgrade();
             let collapsed_summary = collapsed_summary.downgrade();
@@ -5355,6 +5460,8 @@ impl FinishedBlock {
 
                     let apply = {
                         let output_vte = output_vte.clone();
+                        #[cfg(anvil_shared_terminal)]
+                        let output_document = output_document.clone();
                         let full_output = full_output.clone();
                         let displayed_output = displayed_output.clone();
                         let filter_entry = filter_entry.downgrade();
@@ -5375,7 +5482,6 @@ impl FinishedBlock {
                         let visual_rows_cache = visual_rows_cache.clone();
                         move || {
                             let (
-                                Some(output_vte),
                                 Some(filter_entry),
                                 Some(regex_tg),
                                 Some(case_tg),
@@ -5386,7 +5492,6 @@ impl FinishedBlock {
                                 Some(output_scrollbar),
                                 Some(collapsed_summary),
                             ) = (
-                                output_vte.upgrade(),
                                 filter_entry.upgrade(),
                                 regex_tg.upgrade(),
                                 case_tg.upgrade(),
@@ -5421,7 +5526,7 @@ impl FinishedBlock {
                             } else {
                                 output_row_count(&full)
                             };
-                            let effective_cols = effective_render_cols(&output_vte, cols);
+
                             let display_changed =
                                 displayed_output.borrow().as_deref() != next_display.as_deref();
                             let generation = if display_changed {
@@ -5432,43 +5537,75 @@ impl FinishedBlock {
                             } else {
                                 displayed_generation.get()
                             };
-                            let shown_visual_rows = cached_output_visual_row_count(
-                                &visual_rows_cache,
-                                shown,
-                                effective_cols,
-                                generation,
-                            );
-                            let requested_cap = if expanded.get() {
-                                max_expanded_cap
-                            } else {
-                                dynamic_viewport_rows.get()
-                            };
-                            let active_cap =
-                                bounded_finished_viewport_rows(effective_cols, requested_cap);
-                            let stamp = output_render_stamp(
-                                effective_cols,
-                                shown_visual_rows,
-                                active_cap,
-                                generation,
-                            );
-                            if render_stamp.replace(stamp) != stamp {
-                                render_bytes_into_finished_vte(
-                                    &output_vte,
+                            let (can_expand, has_private_scroll) = if let Some(output_vte) =
+                                output_vte.as_ref().and_then(glib::WeakRef::upgrade)
+                            {
+                                let effective_cols = effective_render_cols(&output_vte, cols);
+                                let shown_visual_rows = cached_output_visual_row_count(
+                                    &visual_rows_cache,
                                     shown,
+                                    effective_cols,
+                                    generation,
+                                );
+                                let requested_cap = if expanded.get() {
+                                    max_expanded_cap
+                                } else {
+                                    dynamic_viewport_rows.get()
+                                };
+                                let active_cap =
+                                    bounded_finished_viewport_rows(effective_cols, requested_cap);
+                                let stamp = output_render_stamp(
                                     effective_cols,
                                     shown_visual_rows,
                                     active_cap,
-                                    capture_rows,
-                                    shown_visual_rows <= active_cap,
-                                    &render_stamp,
+                                    generation,
                                 );
-                                let ch = output_vte.char_height() as i32;
-                                if ch > 0 {
-                                    let probe_rows = shown_visual_rows.min(active_cap).clamp(1, 32);
-                                    output_vte
-                                        .set_height_request(finished_vte_height_px(probe_rows, ch));
+                                if render_stamp.replace(stamp) != stamp {
+                                    render_bytes_into_finished_vte(
+                                        &output_vte,
+                                        shown,
+                                        effective_cols,
+                                        shown_visual_rows,
+                                        active_cap,
+                                        capture_rows,
+                                        shown_visual_rows <= active_cap,
+                                        &render_stamp,
+                                    );
+                                    let ch = output_vte.char_height() as i32;
+                                    if ch > 0 {
+                                        let probe_rows =
+                                            shown_visual_rows.min(active_cap).clamp(1, 32);
+                                        output_vte.set_height_request(finished_vte_height_px(
+                                            probe_rows, ch,
+                                        ));
+                                    }
                                 }
-                            }
+                                (
+                                    shown_visual_rows > dynamic_viewport_rows.get(),
+                                    shown_visual_rows > active_cap,
+                                )
+                            } else {
+                                #[cfg(anvil_shared_terminal)]
+                                if display_changed {
+                                    if let Some(output) = &output_document {
+                                        let Some(document) =
+                                            jterm_core::screen_replay::project_bounded_archive(
+                                                shown,
+                                            )
+                                        else {
+                                            return;
+                                        };
+                                        output.present_output(&document);
+                                        render_stamp.replace(output_render_stamp(
+                                            cols,
+                                            shown_rows.max(1),
+                                            shown_rows.max(1),
+                                            generation,
+                                        ));
+                                    }
+                                }
+                                (false, false)
+                            };
                             let has_query = filter_enabled.get() && !q.trim().is_empty();
                             if has_query {
                                 filter_status.set_visible(true);
@@ -5488,8 +5625,8 @@ impl FinishedBlock {
                                 filter_status.remove_css_class("block-filter-empty");
                                 filter_status.set_visible(false);
                             }
-                            expand_btn.set_visible(shown_visual_rows > dynamic_viewport_rows.get());
-                            output_scrollbar.set_visible(shown_visual_rows > active_cap);
+                            expand_btn.set_visible(can_expand);
+                            output_scrollbar.set_visible(has_private_scroll);
                             let preview = display_changed.then(|| {
                                 if next_display.is_none() {
                                     original_preview.as_ref().clone()
@@ -5659,7 +5796,7 @@ impl FinishedBlock {
                 content: &content,
                 header: &header_row,
                 command: &cmd_row,
-                command_vte: &command_vte,
+                command_vte: command_vte.as_ref(),
                 command_text: cmd,
                 metadata: &metadata,
                 status,
@@ -5694,7 +5831,13 @@ impl FinishedBlock {
             compact: Rc::new(Cell::new(config.block_compact)),
             prompt_text: prompt.to_string(),
             command_vte,
+            #[cfg(anvil_shared_terminal)]
+            command_document,
             output_vte,
+            #[cfg(anvil_shared_terminal)]
+            output_document,
+            #[cfg(anvil_shared_terminal)]
+            output_document_height: Rc::new(Cell::new(0)),
             output_scrollbar,
             full_output,
             displayed_output,
@@ -5737,8 +5880,8 @@ impl FinishedBlock {
             output_rows,
             expanded,
             expand_btn,
-            output_scrollable,
-            long_output,
+            output_scrollable: uses_output_vte && output_scrollable,
+            long_output: uses_output_vte && long_output,
             estimated_retained_bytes,
         }
     }
@@ -5925,6 +6068,59 @@ impl FinishedBlock {
         self.virtualized_height.get().max(1)
     }
 
+    pub(super) fn command_surface(&self) -> Option<super::text_surface::TerminalTextSurface> {
+        use super::text_surface::TerminalTextSurface;
+        #[cfg(anvil_shared_terminal)]
+        if let Some(command) = &self.command_document {
+            return Some(TerminalTextSurface::Document(command.widget().clone()));
+        }
+        self.command_vte
+            .as_ref()
+            .cloned()
+            .map(TerminalTextSurface::Native)
+    }
+
+    pub(super) fn output_surface(&self) -> super::text_surface::TerminalTextSurface {
+        use super::text_surface::TerminalTextSurface;
+        #[cfg(anvil_shared_terminal)]
+        if let Some(output) = &self.output_document {
+            return TerminalTextSurface::Document(output.widget().clone());
+        }
+        TerminalTextSurface::Native(
+            self.output_vte
+                .as_ref()
+                .expect("completed output surface")
+                .clone(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn output_vte_for_test(&self) -> &vte4::Terminal {
+        self.output_vte
+            .as_ref()
+            .expect("test requires a native output surface")
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    fn refit_output_document_height(&self) -> Option<i32> {
+        if !self.content.is_mapped() {
+            return None;
+        }
+        let height = self.widget.height();
+        if height > 0 && self.output_document_height.replace(height) != height {
+            Some(height)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn command_vte_for_test(&self) -> &vte4::Terminal {
+        self.command_vte
+            .as_ref()
+            .expect("test requires a command card")
+    }
+
     /// What this card's output VTE currently holds.
     ///
     /// A find pass records this value per surface. If it changes before the
@@ -5951,20 +6147,25 @@ impl FinishedBlock {
     /// [`fitted_output_rows_for_viewport`]. Virtualized (unmapped) cards are
     /// left alone; their own `connect_map` handler fits them on the way back in.
     pub(crate) fn refit_output_to_viewport(&self) -> Option<i32> {
+        #[cfg(anvil_shared_terminal)]
+        if self.output_document.is_some() {
+            return self.refit_output_document_height();
+        }
+        let output_vte = self.output_vte.as_ref()?;
         #[cfg(test)]
         super::alt_screen::trace_find_render(
             &format!("output-refit-entry stamp={:?}", self.render_stamp()),
-            &self.output_vte,
+            output_vte,
         );
         // This method is called for every retained block on a pane resize.
         // Reject parked cards before borrowing their output or counting visual
         // rows: `connect_map` recomputes the cap when a card becomes visible,
         // while scanning an off-screen transcript cannot affect this frame.
-        if !self.output_vte.is_mapped() {
+        if !output_vte.is_mapped() {
             return None;
         }
-        let cell_height = (self.output_vte.char_height() as i32).max(1);
-        let effective_cols = effective_render_cols(&self.output_vte, self.cols);
+        let cell_height = (output_vte.char_height() as i32).max(1);
+        let effective_cols = effective_render_cols(output_vte, self.cols);
         let full = self.full_output.borrow();
         let displayed = self.displayed_output.borrow();
         let text = displayed.as_deref().unwrap_or(full.as_str());
@@ -5976,16 +6177,19 @@ impl FinishedBlock {
         );
         let fitted_rows = bounded_finished_viewport_rows(
             effective_cols,
-            fitted_output_rows_for_widget(&self.output_vte, self.viewport_cap, output_rows),
+            fitted_output_rows_for_widget(output_vte, self.viewport_cap, output_rows),
         );
         let generation = self.displayed_generation.get();
         let (last_cols, ..) = self.render_stamp.get();
         let geometry_changed =
             last_cols != effective_cols || self.dynamic_viewport_rows.get() != fitted_rows;
-        let command_effective_cols = effective_render_cols(&self.command_vte, self.cols);
-        let command_needs_refit = self.command_vte.is_mapped()
-            && self.command_render_cols.get() != command_effective_cols;
-        if !geometry_changed && !command_needs_refit {
+        let command_effective_cols = self.command_vte.as_ref().map_or(self.cols, |terminal| {
+            effective_render_cols(terminal, self.cols)
+        });
+        let command_needs_refit = self.command_vte.as_ref().filter(|terminal| {
+            terminal.is_mapped() && self.command_render_cols.get() != command_effective_cols
+        });
+        if !geometry_changed && command_needs_refit.is_none() {
             return None;
         }
 
@@ -6007,7 +6211,7 @@ impl FinishedBlock {
         #[cfg(test)]
         super::alt_screen::trace_find_render(
             &format!("output-refit stamp={previous_stamp:?} -> {stamp:?}"),
-            &self.output_vte,
+            output_vte,
         );
         if previous_stamp != stamp {
             // Same columns and same displayed generation means VTE already
@@ -6016,7 +6220,7 @@ impl FinishedBlock {
             // and re-parsing the transcript.
             if !stamp_change_needs_refeed(previous_stamp, stamp) {
                 rewindow_finished_vte(
-                    &self.output_vte,
+                    output_vte,
                     effective_cols,
                     visible_rows,
                     self.capture_rows.max(output_rows),
@@ -6024,7 +6228,7 @@ impl FinishedBlock {
                 );
             } else {
                 render_bytes_into_finished_vte(
-                    &self.output_vte,
+                    output_vte,
                     text,
                     effective_cols,
                     output_rows,
@@ -6035,10 +6239,9 @@ impl FinishedBlock {
                 );
             }
         }
-        self.output_vte
-            .set_height_request(finished_vte_height_px(visible_rows, cell_height));
+        output_vte.set_height_request(finished_vte_height_px(visible_rows, cell_height));
         self.output_scrollbar.set_visible(output_rows > fitted_rows);
-        self.output_vte.queue_allocate();
+        output_vte.queue_allocate();
 
         let command_text = String::from_utf8_lossy(self.command_bytes.as_slice());
         let unbounded_command_rows = if self.is_background {
@@ -6049,23 +6252,20 @@ impl FinishedBlock {
         };
         let (bounded_command_cols, bounded_command_rows, command_scrollback) =
             bounded_finished_vte_geometry(command_effective_cols, unbounded_command_rows.max(1), 0);
-        if command_needs_refit {
+        if let Some(terminal) = command_needs_refit {
             self.command_render_cols.set(bounded_command_cols);
-            self.command_vte
-                .set_size(bounded_command_cols, bounded_command_rows);
-            self.command_vte.set_scrollback_lines(command_scrollback);
-            self.command_vte.reset(true, true);
-            self.command_vte
-                .set_size(bounded_command_cols, bounded_command_rows);
-            self.command_vte.set_scrollback_lines(command_scrollback);
-            feed_snapshot_bytes(&self.command_vte, self.command_bytes.as_slice());
+            terminal.set_size(bounded_command_cols, bounded_command_rows);
+            terminal.set_scrollback_lines(command_scrollback);
+            terminal.reset(true, true);
+            terminal.set_size(bounded_command_cols, bounded_command_rows);
+            terminal.set_scrollback_lines(command_scrollback);
+            feed_snapshot_bytes(terminal, self.command_bytes.as_slice());
             settle_finished_terminal_after_feed(
-                &self.command_vte,
+                terminal,
                 bounded_command_rows,
                 bounded_command_rows,
             );
-            self.command_vte
-                .set_height_request(finished_vte_height_px(bounded_command_rows, cell_height));
+            terminal.set_height_request(finished_vte_height_px(bounded_command_rows, cell_height));
         }
 
         let command_height_rows = if self.is_background {
@@ -6145,10 +6345,33 @@ impl FinishedBlock {
             );
             glib::Propagation::Stop
         });
-        self.command_vte.add_controller(command_scroll);
+        if let Some(surface) = self.command_surface() {
+            surface.widget().add_controller(command_scroll);
+        }
+
+        #[cfg(anvil_shared_terminal)]
+        if let Some(output) = &self.output_document {
+            let wheel = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+            wheel.set_propagation_phase(gtk::PropagationPhase::Capture);
+            debouncer.watch_gesture(&wheel, outer);
+            let outer = outer.downgrade();
+            let debouncer = debouncer.clone();
+            wheel.connect_scroll(move |event, _, dy| {
+                let Some(outer) = outer.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                debouncer.scroll_wheel(&outer, dy, event.unit() == gtk::gdk::ScrollUnit::Surface);
+                glib::Propagation::Stop
+            });
+            output.widget().add_controller(wheel);
+        }
+
+        let Some(output_vte) = &self.output_vte else {
+            return;
+        };
 
         let targets: [gtk::Widget; 2] = [
-            self.output_vte.clone().upcast(),
+            output_vte.clone().upcast(),
             self.output_scrollbar.clone().upcast(),
         ];
         for target in targets {
@@ -6158,7 +6381,7 @@ impl FinishedBlock {
             // to the same event. Slider dragging is a pointer gesture and stays
             // native to gtk::Scrollbar.
             scroll_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
-            let vte = self.output_vte.downgrade();
+            let vte = output_vte.downgrade();
             let outer_for_vte = outer.downgrade();
             let debouncer = debouncer.clone();
             debouncer.watch_gesture(&scroll_ctrl, outer);
@@ -6283,6 +6506,10 @@ pub(crate) struct ActiveBlock {
     /// The measured wrapper around the live VTE. It carries the terminal's
     /// requested pixel size — see [`ActiveBlock::set_live_geometry`], which
     /// keeps the grid at the full viewport while the card shows less.
+    #[cfg(anvil_shared_terminal)]
+    shared_live_output: Option<jterm_gtk_view::LiveOutputView>,
+    #[cfg(anvil_shared_terminal)]
+    shared_live_foreground: Cell<gtk::gdk::RGBA>,
     vte_overlay: gtk::Overlay,
     /// Sole measured child of the clip: its height IS the live card's height.
     live_spacer: gtk::Box,
@@ -6428,7 +6655,27 @@ impl ActiveBlock {
         let vte_overlay = gtk::Overlay::new();
         vte_overlay.set_hexpand(true);
         vte_overlay.set_vexpand(false);
-        vte_overlay.set_child(Some(&active_vte));
+
+        #[cfg(anvil_shared_terminal)]
+        let shared_live_output = (matches!(
+            config.terminal_mode,
+            crate::config::TerminalMode::Block | crate::config::TerminalMode::Chat
+        ) && std::env::var_os("JTERM_SHARED_LIVE_OUTPUT")
+            .is_some_and(|value| value == "1"))
+        .then(|| {
+            let view = jterm_gtk_view::LiveOutputView::new(&active_vte);
+            vte_overlay.add_overlay(view.widget());
+            vte_overlay.set_measure_overlay(view.widget(), false);
+            vte_overlay.set_clip_overlay(view.widget(), true);
+            view
+        });
+
+        let native_surface = active_vte.upcast_ref::<gtk::Widget>();
+        #[cfg(anvil_shared_terminal)]
+        let native_surface = shared_live_output
+            .as_ref()
+            .map_or(native_surface, |view| view.native_surface());
+        vte_overlay.set_child(Some(native_surface));
 
         let live_organism_surface = gtk::Fixed::new();
         live_organism_surface.set_hexpand(true);
@@ -6534,8 +6781,14 @@ impl ActiveBlock {
             adjustment.connect_changed(sync_visibility);
         }
 
+        #[cfg(anvil_shared_terminal)]
+        let shared_live_foreground = Cell::new(config.foreground);
         ActiveBlock {
             widget,
+            #[cfg(anvil_shared_terminal)]
+            shared_live_output,
+            #[cfg(anvil_shared_terminal)]
+            shared_live_foreground,
             active_vte,
             vte_overlay,
             live_spacer,
@@ -6560,6 +6813,160 @@ impl ActiveBlock {
     /// the same ring into the finished card at finalize.
     pub(crate) fn output_text(&self) -> String {
         super::live_output_text(&self.raw_output)
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    pub(super) fn connect_shared_live_output(
+        active: &Rc<RefCell<Self>>,
+        state: Rc<Cell<BlockState>>,
+        contents_generation: Rc<Cell<u64>>,
+    ) {
+        let clip = {
+            let active = active.borrow();
+            if active.shared_live_output.is_none() {
+                return;
+            }
+            active.live_clip()
+        };
+        let weak = Rc::downgrade(active);
+        let last_snapshot = Cell::new(None);
+        clip.add_tick_callback(move |clip, _| {
+            let Some(active) = weak.upgrade() else {
+                return gtk::glib::ControlFlow::Break;
+            };
+            let Ok(active) = active.try_borrow() else {
+                return gtk::glib::ControlFlow::Continue;
+            };
+            let terminal = &active.active_vte;
+            let capture_size = active.raw_output.borrow().len();
+            let follows_output = terminal.vadjustment().is_none_or(|adjustment| {
+                adjustment.value() + adjustment.page_size() + 0.5 >= adjustment.upper()
+            });
+            let can_present = state.get() == BlockState::CollectingOutput
+                && !active.preserve_live_scrollback()
+                && !active.live_organism_visible.get()
+                && !terminal.has_selection()
+                && terminal.search_get_regex().is_none()
+                && follows_output
+                && capture_size <= jterm_gtk_view::MAX_LIVE_OUTPUT_BYTES;
+            let geometry = (
+                terminal.width(),
+                terminal.height(),
+                clip.width(),
+                clip.height(),
+                terminal.char_width(),
+                terminal.char_height(),
+            );
+            let stamp = (
+                can_present,
+                contents_generation.get(),
+                capture_size,
+                geometry,
+                active.shared_live_foreground.get(),
+                terminal.color_background_for_draw(),
+            );
+            if last_snapshot.replace(Some(stamp)) != Some(stamp) {
+                active.present_shared_live_output(can_present);
+            }
+            gtk::glib::ControlFlow::Continue
+        });
+
+        let active = active.borrow();
+        let label = active
+            .shared_live_widget()
+            .expect("enabled live output")
+            .downgrade();
+        active
+            .active_vte
+            .connect_selection_changed(move |terminal| {
+                if terminal.has_selection() {
+                    if let Some(label) = label.upgrade() {
+                        label.set_visible(false);
+                    }
+                }
+            });
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    pub(super) fn shared_live_widget(&self) -> Option<gtk::Label> {
+        self.shared_live_output
+            .as_ref()
+            .map(|view| view.widget().clone())
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    pub(super) fn set_shared_live_foreground(&self, foreground: gtk::gdk::RGBA) {
+        self.shared_live_foreground.set(foreground);
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    fn present_shared_live_output(&self, can_present: bool) {
+        let Some(view) = &self.shared_live_output else {
+            return;
+        };
+        view.clear();
+        if !can_present {
+            return;
+        }
+        let (capture, truncated) = self.output_text_prefix(jterm_gtk_view::MAX_LIVE_OUTPUT_BYTES);
+        let terminal = &self.active_vte;
+        let (column, cursor) = terminal.cursor_position();
+        let columns = terminal.column_count();
+        let Some(text) = jterm_gtk_view::captured_live_row(&capture, columns.max(0) as usize)
+            .filter(|_| !truncated && column == 0)
+        else {
+            return;
+        };
+        let row = cursor.saturating_sub(1);
+        let Some(origin) = super::displayed_live_origin(terminal) else {
+            return;
+        };
+        let screen_row = row.saturating_sub(origin);
+        if screen_row < 0 || screen_row >= terminal.row_count() {
+            return;
+        }
+        let (native, _) = terminal.text_range_format(vte4::Format::Html, row, 0, row, columns - 1);
+        let Some(native) = native
+            .as_deref()
+            .and_then(|html| html.trim().strip_prefix("<pre>")?.strip_suffix("</pre>"))
+        else {
+            return;
+        };
+        if native.trim_end_matches([' ', '\n']) != gtk::glib::markup_escape_text(text) {
+            return;
+        }
+        let Some(font) = terminal.font() else {
+            return;
+        };
+        let background = terminal.color_background_for_draw();
+        if terminal.font_scale() != 1.0 {
+            return;
+        }
+        #[allow(deprecated)] // The host needs VTE's actual CSS content origin.
+        let (padding, border) = {
+            let style = terminal.style_context();
+            (style.padding(), style.border())
+        };
+        let x = i32::from(padding.left()) + i32::from(border.left()) + terminal.margin_start();
+        let height = terminal.char_height() as i32;
+        let y = i32::from(padding.top())
+            + i32::from(border.top())
+            + terminal.margin_top()
+            + screen_row as i32 * height;
+        let width = (terminal.char_width() as i32) * text.len() as i32;
+        if width > 0
+            && height > 0
+            && x + width <= self.live_clip.width()
+            && y + height <= self.live_visible_height_px()
+        {
+            view.present(
+                text,
+                gtk::gdk::Rectangle::new(x, y, width, height),
+                &font,
+                self.shared_live_foreground.get(),
+                background,
+            );
+        }
     }
 
     /// Return at most `max_bytes` from the live capture for bounded find.

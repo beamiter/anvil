@@ -250,7 +250,10 @@ fn more_fold_round_trip_reconciles_the_actual_document_height() {
         paint_barrier();
         assert_eq!(view.finished_blocks.borrow().len(), 1);
         let card = view.finished_blocks.borrow()[0].clone();
-        let native_output = card.output_vte.text_format(vte4::Format::Text).unwrap();
+        let native_output = card
+            .output_vte_for_test()
+            .text_format(vte4::Format::Text)
+            .unwrap();
         let source_output = view.block_data.borrow()[0].output.clone();
         view.pty.drain_test_slave(Duration::from_millis(20));
         view.scroll_debouncer.user_scrolled_up.set(true);
@@ -269,7 +272,7 @@ fn more_fold_round_trip_reconciles_the_actual_document_height() {
         action("Fold Output").emit_clicked();
         paint_barrier();
         assert!(card.is_output_collapsed());
-        assert!(!card.output_vte.is_mapped());
+        assert!(!card.output_vte_for_test().is_mapped());
         assert!(card.widget().height() < expanded);
         assert_eq!(
             view.block_data.borrow()[0].estimated_height,
@@ -281,7 +284,7 @@ fn more_fold_round_trip_reconciles_the_actual_document_height() {
         action("Unfold Output").emit_clicked();
         paint_barrier();
         assert!(!card.is_output_collapsed());
-        assert!(card.output_vte.is_mapped());
+        assert!(card.output_vte_for_test().is_mapped());
         assert_eq!(card.widget().height(), expanded);
         assert_eq!(view.block_data.borrow()[0].estimated_height, expanded);
         let indexed_height: i32 = view
@@ -292,7 +295,9 @@ fn more_fold_round_trip_reconciles_the_actual_document_height() {
             .sum();
         assert_eq!(indexed_height, expanded);
         assert_eq!(
-            card.output_vte.text_format(vte4::Format::Text).unwrap(),
+            card.output_vte_for_test()
+                .text_format(vte4::Format::Text)
+                .unwrap(),
             native_output
         );
         assert_eq!(view.block_data.borrow()[0].output, source_output);

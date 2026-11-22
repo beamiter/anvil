@@ -871,6 +871,16 @@ pub(crate) fn composer_tools(
 }
 
 impl Chrome {
+    #[cfg(anvil_shared_terminal)]
+    pub(crate) fn install_shared_terminal_action(&self, sender: &ComponentSender<AppModel>) {
+        self.canvas_header.append(&button(
+            "utilities-terminal-symbolic",
+            "New shared terminal tab",
+            sender,
+            AppMsg::NewSharedTerminalTab,
+        ));
+    }
+
     pub(crate) fn new(
         sender: &ComponentSender<AppModel>,
         terminal_stack: &gtk::Stack,

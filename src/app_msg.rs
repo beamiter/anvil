@@ -8,6 +8,8 @@ use crate::keybindings::Action;
 #[derive(Debug, Clone)]
 pub(crate) enum AppMsg {
     NewTab,
+    #[cfg(anvil_shared_terminal)]
+    NewSharedTerminalTab,
     ShowLocalSourcePreview,
     WorkspaceTick,
     WorkspaceAction(crate::workspace_navigation::Action),

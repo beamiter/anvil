@@ -27,6 +27,10 @@ use jterm_core::kitty_keyboard::{
 };
 use jterm_core::terminal_report::{classify_terminal_report, TerminalReport};
 use jterm_core::wheel::WheelAccumulator;
+#[cfg(all(anvil_shared_terminal, test))]
+use jterm_gtk_view::authenticated_boundaries::private_command_id as command_id_uses_shell_token;
+#[cfg(anvil_shared_terminal)]
+use jterm_gtk_view::authenticated_boundaries::AuthenticatedBoundaries;
 
 mod activity_knowledge;
 mod alt_screen;
@@ -39,6 +43,8 @@ mod chat;
 mod chat_layout_tests;
 mod command_row;
 mod cross_selection;
+mod text_surface;
+use text_surface::TerminalTextSurface;
 mod css;
 pub(crate) mod export;
 pub(crate) mod export_policy;
@@ -1005,6 +1011,7 @@ fn normalize_captured_command(captured: &str, _prompt: &str) -> String {
     captured.trim().to_string()
 }
 
+#[cfg(not(anvil_shared_terminal))]
 fn command_id_uses_shell_token(id: &str, token: &str) -> bool {
     !token.is_empty()
         && id
@@ -4866,7 +4873,10 @@ struct EngineState {
     /// local `SystemTime`, because the duration fallback must not subtract a
     /// possibly remote shell's clock from this machine's.
     shell_started_at_ms: Option<u64>,
+    #[cfg(not(anvil_shared_terminal))]
     execution_id_trusted: bool,
+    #[cfg(anvil_shared_terminal)]
+    authenticated_boundaries: AuthenticatedBoundaries,
     agent_completion_trusted: bool,
     /// cwd the running command was started in, as the shell reported it at
     /// CommandStart. The pane's tracked cwd has already moved on after a `cd`.
@@ -4881,9 +4891,35 @@ struct EngineState {
     idle_kitty_pipeline_dirty: bool,
 }
 
+impl EngineState {
+    fn observe_command_start_identity(&mut self, id: Option<&str>, token: Option<&str>) -> bool {
+        #[cfg(anvil_shared_terminal)]
+        {
+            self.authenticated_boundaries
+                .observe_start(id, token.unwrap_or_default())
+        }
+        #[cfg(not(anvil_shared_terminal))]
+        {
+            self.execution_id_trusted = id
+                .zip(token)
+                .is_some_and(|(id, token)| command_id_uses_shell_token(id, token));
+            self.execution_id_trusted
+        }
+    }
+
+    fn clear_command_identity(&mut self) {
+        #[cfg(anvil_shared_terminal)]
+        self.authenticated_boundaries.clear();
+        #[cfg(not(anvil_shared_terminal))]
+        {
+            self.execution_id_trusted = false;
+        }
+    }
+}
+
 /// The VTE/widget pair that presents one field of a completed record.
 struct RecordSearchTarget {
-    terminal: Terminal,
+    presentation: TerminalTextSurface,
     widget: gtk::Widget,
     /// Unified deliberately cannot return a record-specific target until
     /// marker ranges exist. Kept explicit for Block's ordinary card targets.
@@ -4919,7 +4955,7 @@ struct BackendSearchSurface {
     /// window. Both the persistent Unified VTE and per-card Block VTEs retain
     /// anchors across queries.
     reset_cursor: bool,
-    terminal: Terminal,
+    presentation: TerminalTextSurface,
     /// What the terminal held when these windows were scanned.
     render_stamp: blocks::RenderStamp,
 }
@@ -4948,12 +4984,15 @@ struct BackendSearchBatch {
 /// the document once avoids the former per-hit `record_search_target` lookup,
 /// which rescanned the mounted block vector for every rendered result row.
 fn mounted_jumpable_records(
-    mounted_ids: impl IntoIterator<Item = u64>,
+    mounted_cards: impl IntoIterator<Item = (u64, bool)>,
     candidates: &HashSet<(u64, bool)>,
 ) -> HashSet<(u64, bool)> {
     let mut jumpable = HashSet::with_capacity(candidates.len());
-    for block_id in mounted_ids {
-        for is_output in [false, true] {
+    for (block_id, has_command) in mounted_cards {
+        for is_output in [false, true]
+            .into_iter()
+            .filter(|is_output| *is_output || has_command)
+        {
             let candidate = (block_id, is_output);
             if candidates.contains(&candidate) {
                 jumpable.insert(candidate);
@@ -6767,7 +6806,7 @@ impl ReaderCtx {
             engine.command_finished_event_pending = false;
             engine.shell_duration_ms = None;
             engine.shell_started_at_ms = None;
-            engine.execution_id_trusted = false;
+            engine.clear_command_identity();
             engine.agent_completion_trusted = false;
             engine.command_cwd = None;
             engine.idle_kitty_pipeline_dirty = false;
@@ -7348,7 +7387,7 @@ impl ReaderCtx {
             // before touching the lazy payload; jterm_core::submit repeats the
             // same capability check at its queue boundary.
             //
-            // Deliberately NOT gated on `execution_id_trusted`. That flag asks
+            // Deliberately independent of the private shell proof. That asks
             // whether the id embeds *this pane's* shell-integration token,
             // which is how anvil's own bash/zsh/fish/pwsh scripts authenticate
             // their marks — jsh does not use it, so requiring it here would
@@ -7514,7 +7553,7 @@ impl ReaderCtx {
         self.armed_agent_execution_rc.borrow_mut().take();
         self.active_agent_execution_rc.set(None);
         self.engine.borrow_mut().agent_completion_trusted = false;
-        self.engine.borrow_mut().execution_id_trusted = false;
+        self.engine.borrow_mut().clear_command_identity();
         // Snapshot the live VTE cursor at the moment the
         // prompt finishes drawing — this is where the user's
         // command starts. CommandStart will read text from
@@ -7628,12 +7667,10 @@ impl ReaderCtx {
             .and_then(|started| started.lifecycle.as_ref())
             .map(jterm_core::execution_journal::ExecutionLifecycle::started_at_ms);
         *self.started_execution_rc.borrow_mut() = started_execution;
-        let trusted_execution_id = meta.id.as_deref().is_some_and(|id| {
-            self.pty_for_init
-                .shell_integration_token()
-                .is_some_and(|token| command_id_uses_shell_token(id, token))
-        });
-        self.engine.borrow_mut().execution_id_trusted = trusted_execution_id;
+        let trusted_execution_id = self.engine.borrow_mut().observe_command_start_identity(
+            meta.id.as_deref(),
+            self.pty_for_init.shell_integration_token(),
+        );
         self.engine.borrow_mut().agent_completion_trusted = false;
         // The cwd the command runs *in*. The pane's tracked cwd
         // comes from an OSC 7 the shell emits with its next
@@ -7781,12 +7818,15 @@ impl ReaderCtx {
                 return;
             }
         }
-        let execution_id_trusted = self.engine.borrow().execution_id_trusted;
-        // The same comparison the depth arbitration above already made,
-        // against a slot nothing between here and there writes; the Agent
-        // simply additionally requires that the id carry this pane's private
-        // shell-integration token.
-        let trusted_match = execution_id_trusted && matches_started_id;
+        #[cfg(anvil_shared_terminal)]
+        let trusted_match = matches_started_id
+            && self
+                .engine
+                .borrow_mut()
+                .authenticated_boundaries
+                .observe_end(meta.id.as_deref(), shell_is_foreground == Some(true));
+        #[cfg(not(anvil_shared_terminal))]
+        let trusted_match = self.engine.borrow().execution_id_trusted && matches_started_id;
         match decide_agent_command_end(
             active_agent_execution.is_some(),
             shell_is_foreground,
@@ -7869,6 +7909,8 @@ impl ReaderCtx {
         // to collapse to a green `exit 0`.
         {
             let mut engine = self.engine.borrow_mut();
+            #[cfg(anvil_shared_terminal)]
+            engine.clear_command_identity();
             engine.pending_exit_code = exit;
             engine.pending_completion_provenance = CompletionProvenance::ShellReported;
         }
@@ -9153,6 +9195,12 @@ impl RenderBackend for BlockBackend {
     }
 
     fn feed_live(&self, bytes: &[u8]) {
+        #[cfg(anvil_shared_terminal)]
+        if let Ok(active) = self.active_rc.try_borrow() {
+            if let Some(widget) = active.shared_live_widget() {
+                widget.set_visible(false);
+            }
+        }
         self.active_vte.feed(bytes);
     }
 
@@ -9185,16 +9233,21 @@ impl RenderBackend for BlockBackend {
     fn record_search_target(&self, block_id: u64, is_output: bool) -> Option<RecordSearchTarget> {
         let finished = self.finished_blocks_for_cb.borrow();
         let block = finished.iter().find(|block| block.id == block_id)?;
-        let terminal = if is_output {
-            block.output_vte.clone()
+        let presentation = if is_output {
+            block.output_surface()
         } else {
-            block.command_vte.clone()
+            block.command_surface()?
+        };
+        let render_stamp = if is_output || presentation.native().is_some() {
+            block.render_stamp()
+        } else {
+            blocks::NEUTRAL_RENDER_STAMP
         };
         Some(RecordSearchTarget {
-            terminal,
+            presentation,
             widget: block.widget().clone().upcast(),
             uses_live_surface: false,
-            render_stamp: block.render_stamp(),
+            render_stamp,
         })
     }
 
@@ -9221,7 +9274,12 @@ impl RenderBackend for BlockBackend {
 
     fn jumpable_records(&self, candidates: &HashSet<(u64, bool)>) -> HashSet<(u64, bool)> {
         let finished = self.finished_blocks_for_cb.borrow();
-        mounted_jumpable_records(finished.iter().map(|block| block.id), candidates)
+        mounted_jumpable_records(
+            finished
+                .iter()
+                .map(|block| (block.id, block.command_surface().is_some())),
+            candidates,
+        )
     }
 
     fn completed_search_surfaces(
@@ -9240,61 +9298,109 @@ impl RenderBackend for BlockBackend {
                     native_fallback: None,
                 };
             }
-            let mut command_incomplete = false;
-            if !push_search_surface_before_deadline(&mut surfaces, deadline_exhausted, || {
-                let command_prefix = utf8_prefix_bounded(&block.cmd_text, remaining);
-                command_incomplete = command_prefix.len() < block.cmd_text.len();
-                remaining = remaining.saturating_sub(command_prefix.len());
-                BackendSearchSurface {
-                    block_id: block.id,
-                    block_index,
-                    is_output: false,
-                    is_live: false,
-                    windows: vec![BackendSearchWindow {
-                        text: command_prefix.to_string(),
-                        incomplete: command_incomplete,
-                        initial_wrap: false,
-                    }],
-                    scanned_bytes: command_prefix.len(),
-                    reset_cursor: true,
-                    terminal: block.command_vte.clone(),
-                    render_stamp: block.render_stamp(),
+            if let Some(command) = block.command_surface() {
+                if command.native().is_none() && block.cmd_text.len() > remaining {
+                    // A partial immutable command would change anchored regex matches.
+                    return BackendSearchBatch {
+                        surfaces,
+                        incomplete: true,
+                        native_fallback: None,
+                    };
                 }
-            }) {
-                return BackendSearchBatch {
-                    surfaces,
-                    incomplete: true,
-                    native_fallback: None,
-                };
-            }
-            if command_incomplete {
-                return BackendSearchBatch {
-                    surfaces,
-                    incomplete: true,
-                    native_fallback: None,
-                };
-            }
-            if remaining == 0 {
-                let has_more = block.with_searchable_output(|output| !output.is_empty())
-                    || block_index + 1 < finished.len();
-                surfaces
-                    .last_mut()
-                    .expect("the command surface was just appended")
-                    .windows
-                    .last_mut()
-                    .expect("a command search window exists")
-                    .incomplete = has_more;
-                return BackendSearchBatch {
-                    surfaces,
-                    incomplete: has_more,
-                    native_fallback: None,
-                };
+                let mut command_incomplete = false;
+                if !push_search_surface_before_deadline(&mut surfaces, deadline_exhausted, || {
+                    let command_prefix = utf8_prefix_bounded(&block.cmd_text, remaining);
+                    command_incomplete = command_prefix.len() < block.cmd_text.len();
+                    remaining = remaining.saturating_sub(command_prefix.len());
+                    BackendSearchSurface {
+                        block_id: block.id,
+                        block_index,
+                        is_output: false,
+                        is_live: false,
+                        windows: vec![BackendSearchWindow {
+                            text: command_prefix.to_string(),
+                            incomplete: command_incomplete,
+                            initial_wrap: false,
+                        }],
+                        scanned_bytes: command_prefix.len(),
+                        reset_cursor: true,
+                        render_stamp: if command.native().is_some() {
+                            block.render_stamp()
+                        } else {
+                            blocks::NEUTRAL_RENDER_STAMP
+                        },
+                        presentation: command,
+                    }
+                }) {
+                    return BackendSearchBatch {
+                        surfaces,
+                        incomplete: true,
+                        native_fallback: None,
+                    };
+                }
+                if command_incomplete {
+                    return BackendSearchBatch {
+                        surfaces,
+                        incomplete: true,
+                        native_fallback: None,
+                    };
+                }
+                if remaining == 0 {
+                    let has_more = block.with_searchable_output(|output| !output.is_empty())
+                        || block_index + 1 < finished.len();
+                    surfaces
+                        .last_mut()
+                        .expect("the command surface was just appended")
+                        .windows
+                        .last_mut()
+                        .expect("a command search window exists")
+                        .incomplete = has_more;
+                    return BackendSearchBatch {
+                        surfaces,
+                        incomplete: has_more,
+                        native_fallback: None,
+                    };
+                }
+
+                // Bound the decorated prefix before ANSI stripping so both the
+                // copied input and retained UTF-8 stay under the aggregate budget.
+                // The haystack is what the card displays, so the count this pass
+                // reports and the hit the VTE can actually step to are the same set.
             }
 
-            // Bound the decorated prefix before ANSI stripping so both the
-            // copied input and retained UTF-8 stay under the aggregate budget.
-            // The haystack is what the card displays, so the count this pass
-            // reports and the hit the VTE can actually step to are the same set.
+            let output_surface = block.output_surface();
+            if let Some(text) = output_surface.document_text() {
+                let scanned_bytes = text.len();
+                if scanned_bytes > remaining
+                    || !push_search_surface_before_deadline(
+                        &mut surfaces,
+                        deadline_exhausted,
+                        || BackendSearchSurface {
+                            block_id: block.id,
+                            block_index,
+                            is_output: true,
+                            is_live: false,
+                            windows: vec![BackendSearchWindow {
+                                text,
+                                incomplete: false,
+                                initial_wrap: false,
+                            }],
+                            scanned_bytes,
+                            reset_cursor: true,
+                            presentation: output_surface.clone(),
+                            render_stamp: block.render_stamp(),
+                        },
+                    )
+                {
+                    return BackendSearchBatch {
+                        surfaces,
+                        incomplete: true,
+                        native_fallback: None,
+                    };
+                }
+                remaining -= scanned_bytes;
+                continue;
+            }
             let mut output_incomplete = false;
             if !push_search_surface_before_deadline(&mut surfaces, deadline_exhausted, || {
                 block.with_searchable_output(|output| {
@@ -9313,7 +9419,7 @@ impl RenderBackend for BlockBackend {
                         }],
                         scanned_bytes: raw_prefix.len(),
                         reset_cursor: true,
-                        terminal: block.output_vte.clone(),
+                        presentation: output_surface,
                         render_stamp: block.render_stamp(),
                     }
                 })
@@ -9730,6 +9836,16 @@ impl RenderBackend for BlockBackend {
             plain_output_bytes,
             recycled,
             FinishedBlockPrecomputed {
+                #[cfg(anvil_shared_terminal)]
+                document_command: record.command_source == CommandTextSource::ShellReported
+                    && matches!(
+                        block_config.terminal_mode,
+                        crate::config::TerminalMode::Block | crate::config::TerminalMode::Chat
+                    )
+                    && std::env::var("JTERM_SHARED_FINISHED_COMMANDS").as_deref() == Ok("1"),
+                #[cfg(anvil_shared_terminal)]
+                document_output: !output_head_dropped
+                    && std::env::var("JTERM_SHARED_FINISHED_OUTPUT").as_deref() == Ok("1"),
                 output_rows: Some(output_rows),
                 output_preview: Some(fold_preview::from_plain(output_plain)),
                 retained_bytes: Some(newest_estimated_bytes),
@@ -10251,7 +10367,7 @@ impl RenderBackend for UnifiedBackend {
                 windows,
                 scanned_bytes,
                 reset_cursor: true,
-                terminal: self.vte.clone(),
+                presentation: TerminalTextSurface::Native(self.vte.clone()),
                 render_stamp: blocks::NEUTRAL_RENDER_STAMP,
             }],
             incomplete,
@@ -12213,6 +12329,10 @@ impl TermView {
         self.active
             .borrow()
             .set_preserve_live_scrollback(config.preserve_live_scrollback);
+        #[cfg(anvil_shared_terminal)]
+        self.active
+            .borrow()
+            .set_shared_live_foreground(config.foreground);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -13377,6 +13497,13 @@ impl TermView {
             });
         }
 
+        #[cfg(anvil_shared_terminal)]
+        blocks::ActiveBlock::connect_shared_live_output(
+            &active,
+            bstate.clone(),
+            contents_generation.clone(),
+        );
+
         // True while an alt-screen app owns the viewport (finished blocks hidden).
         let fullscreen: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         // The pane's one winsize memory, shared by every PTY resize below.
@@ -13852,7 +13979,10 @@ impl TermView {
                     // ParserEvent::CommandStart).
                     shell_duration_ms: None,
                     shell_started_at_ms: None,
+                    #[cfg(not(anvil_shared_terminal))]
                     execution_id_trusted: false,
+                    #[cfg(anvil_shared_terminal)]
+                    authenticated_boundaries: AuthenticatedBoundaries::default(),
                     agent_completion_trusted: false,
                     command_cwd: None,
                     pending_zone: None,
@@ -17443,8 +17573,20 @@ impl TermView {
         let config = self.config.borrow();
         apply_theme_to_vte(&self.active_vte, &config);
         for block in self.finished_blocks.borrow().iter() {
-            apply_snapshot_theme_to_vte(&block.command_vte, &config);
-            apply_snapshot_theme_to_vte(&block.output_vte, &config);
+            if let Some(terminal) = &block.command_vte {
+                apply_snapshot_theme_to_vte(terminal, &config);
+            }
+            #[cfg(anvil_shared_terminal)]
+            if let Some(command) = &block.command_document {
+                command.set_colors(config.foreground, &config.palette);
+            }
+            if let Some(terminal) = &block.output_vte {
+                apply_snapshot_theme_to_vte(terminal, &config);
+            }
+            #[cfg(anvil_shared_terminal)]
+            if let Some(output) = &block.output_document {
+                output.set_colors(config.foreground, &config.palette);
+            }
         }
         install_block_css(&config);
     }
@@ -17458,8 +17600,20 @@ impl TermView {
         let font_desc = crate::font::terminal_font_description(desc, &self.config.borrow());
         self.active_vte.set_font(Some(&font_desc));
         for block in self.finished_blocks.borrow().iter() {
-            block.command_vte.set_font(Some(&font_desc));
-            block.output_vte.set_font(Some(&font_desc));
+            if let Some(terminal) = &block.command_vte {
+                terminal.set_font(Some(&font_desc));
+            }
+            #[cfg(anvil_shared_terminal)]
+            if let Some(command) = &block.command_document {
+                command.set_font(&font_desc);
+            }
+            if let Some(terminal) = &block.output_vte {
+                terminal.set_font(Some(&font_desc));
+            }
+            #[cfg(anvil_shared_terminal)]
+            if let Some(output) = &block.output_document {
+                output.set_font(&font_desc);
+            }
         }
         // Update config and regenerate CSS with new font
         self.config.borrow_mut().font_desc = desc.to_string();
@@ -17477,8 +17631,20 @@ impl TermView {
     pub fn set_font_scale(&self, scale: f64) {
         self.active_vte.set_font_scale(scale);
         for block in self.finished_blocks.borrow().iter() {
-            block.command_vte.set_font_scale(scale);
-            block.output_vte.set_font_scale(scale);
+            if let Some(terminal) = &block.command_vte {
+                terminal.set_font_scale(scale);
+            }
+            #[cfg(anvil_shared_terminal)]
+            if let Some(command) = &block.command_document {
+                command.set_font_scale(scale);
+            }
+            if let Some(terminal) = &block.output_vte {
+                terminal.set_font_scale(scale);
+            }
+            #[cfg(anvil_shared_terminal)]
+            if let Some(output) = &block.output_document {
+                output.set_font_scale(scale);
+            }
         }
         self.config.borrow_mut().default_font_scale = scale;
         // Regenerate CSS with updated font scale
@@ -20909,7 +21075,10 @@ mod tests {
                     command_finished_event_pending: false,
                     shell_duration_ms: None,
                     shell_started_at_ms: None,
+                    #[cfg(not(anvil_shared_terminal))]
                     execution_id_trusted: false,
+                    #[cfg(anvil_shared_terminal)]
+                    authenticated_boundaries: Default::default(),
                     agent_completion_trusted: false,
                     command_cwd: None,
                     pending_zone: None,
@@ -22222,7 +22391,7 @@ mod tests {
             engine.prompt_display.push_str("display");
             engine.vte_typed_cmd.push_str("vte command");
             engine.background_output.extend(b"background");
-            engine.execution_id_trusted = true;
+            assert!(engine.observe_command_start_identity(Some("test-token-1"), Some("test-token")));
             engine.agent_completion_trusted = true;
         }
 
@@ -22233,9 +22402,17 @@ mod tests {
         assert!(engine.prompt_display.is_empty());
         assert!(engine.vte_typed_cmd.is_empty());
         assert!(engine.background_output.is_empty());
+        #[cfg(not(anvil_shared_terminal))]
         assert!(!engine.execution_id_trusted);
         assert!(!engine.agent_completion_trusted);
         drop(engine);
+        #[cfg(anvil_shared_terminal)]
+        assert!(!harness
+            .ctx
+            .engine
+            .borrow_mut()
+            .authenticated_boundaries
+            .observe_end(Some("test-token-1"), true));
         assert!(!harness.prompt_ready.get());
         assert_eq!(harness.ctx.agent_prompt_generation_rc.get(), 42);
         assert!(harness.ctx.typed_cmd_rc.borrow().is_empty());
@@ -22743,12 +22920,17 @@ mod tests {
         };
         harness.feed_all([ParserEvent::PromptStart, ParserEvent::PromptEnd]);
         harness.feed(dispatch_command_start(Some("agent-unknown")));
-        let trusted_id = "0123456789abcdef0123456789abcdef-7".to_string();
+        let token = "0123456789abcdef0123456789abcdef";
+        let trusted_id = format!("{token}-7");
         *harness.ctx.started_execution_rc.borrow_mut() = Some(super::StartedExecution {
             id: trusted_id.clone(),
             lifecycle: None,
         });
-        harness.ctx.engine.borrow_mut().execution_id_trusted = true;
+        assert!(harness
+            .ctx
+            .engine
+            .borrow_mut()
+            .observe_command_start_identity(Some(&trusted_id), Some(token)));
         harness.ctx.active_agent_execution_rc.set(Some(execution));
         harness.feed(ParserEvent::CommandEnd {
             exit: None,
@@ -29300,10 +29482,10 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
 
     #[test]
     fn mounted_jumpability_intersects_both_surfaces_in_one_document_pass() {
-        let candidates = HashSet::from([(2, false), (2, true), (3, true), (9, false)]);
+        let candidates = HashSet::from([(2, false), (2, true), (3, false), (3, true), (9, false)]);
         let visited = Cell::new(0);
         let jumpable = mounted_jumpable_records(
-            [1, 2, 3, 4]
+            [(1, true), (2, true), (3, false), (4, true)]
                 .into_iter()
                 .inspect(|_| visited.set(visited.get() + 1)),
             &candidates,
@@ -29339,7 +29521,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         let batched_started = Instant::now();
         for _ in 0..REPETITIONS {
             std::hint::black_box(mounted_jumpable_records(
-                mounted.iter().copied(),
+                mounted.iter().map(|&id| (id, true)),
                 &candidates,
             ));
         }

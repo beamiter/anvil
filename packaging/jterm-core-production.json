@@ -1,10 +1,10 @@
 {
   "repository": "https://github.com/beamiter/jterm_core.git",
-  "revision": "f0107afaf631d29d06358abec3997f1b5712b627",
-  "tree": "bcb15f04c6d5ff9140969850f90abb945cd76ed6",
-  "source_nar_sha256": "sha256-0F0lqp7SKxEk4gkYuam0dUMw2w1SKWJgV00WnQljrEw=",
-  "publication_verified_at": "2026-11-20T06:14:04.4569287+00:00",
-  "publication_url": "https://github.com/beamiter/jterm_core/commit/f0107afaf631d29d06358abec3997f1b5712b627",
+  "revision": "dfc87c88acf3f9877680d2dad6a5885eb7209974",
+  "tree": "537171903689377ff03d84a573a3e20d16c69228",
+  "source_nar_sha256": "sha256-jLwY4rS8qxBFPXw6zmMVZfAp5WRgx1zbRQdzYu7NOdw=",
+  "publication_verified_at": "2026-11-22T15:32:40Z",
+  "publication_url": "https://github.com/beamiter/jterm_core/commit/dfc87c88acf3f9877680d2dad6a5885eb7209974",
   "source_policy": "Cargo, Nix and Flatpak use this exact published Git source. Older audit archives retain their historical identity and are not production build inputs.",
-  "nar_verification": "Exact revision and tree matched public GitHub metadata. Nix CI job 136121059730 observed this fixed-output source hash; package build verification is separate."
+  "nar_verification": "Canonical Git-tree NAR serialization reproduced the previous production hash before computing this revision. The commit was verified against the public Git master ref."
 }

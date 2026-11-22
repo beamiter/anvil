@@ -61,6 +61,9 @@ mod eva_companion_paint;
 mod jsh_ops;
 #[path = "../vendor/jwm-remote/gtk.rs"]
 mod jwm_remote_gtk;
+#[cfg(anvil_shared_terminal)]
+use jterm_core::jterm_remote_client as jwm_remote_session;
+#[cfg(not(anvil_shared_terminal))]
 #[path = "../vendor/jwm-remote/client.rs"]
 mod jwm_remote_session;
 mod keybindings;
@@ -87,6 +90,8 @@ mod review_text;
 mod search;
 mod session;
 mod settings_ops;
+#[cfg(anvil_shared_terminal)]
+mod shared_terminal;
 mod sidebar;
 mod sidebar_toggle;
 mod startup_ui;
@@ -110,13 +115,22 @@ mod workspace_mission_model;
 mod workspace_mission_ui;
 mod workspace_navigation;
 mod workspace_ops;
+#[cfg(anvil_shared_terminal)]
+use jterm_core::agent_workspace::controllers::remote as workspace_remote;
+#[cfg(not(anvil_shared_terminal))]
 mod workspace_remote;
 mod workspace_remote_ui;
 mod workspace_review;
 mod workspace_review_ui;
+#[cfg(anvil_shared_terminal)]
+use jterm_core::agent_workspace::controllers::scope as workspace_scope;
+#[cfg(not(anvil_shared_terminal))]
 mod workspace_scope;
 mod workspace_search_ui;
 mod workspace_shell;
+#[cfg(anvil_shared_terminal)]
+use jterm_core::agent_workspace::controllers::tools as workspace_tools;
+#[cfg(not(anvil_shared_terminal))]
 mod workspace_tools;
 mod workspace_visibility;
 
@@ -1444,6 +1458,10 @@ impl SimpleComponent for AppModel {
             &side_stack,
             &config.borrow(),
         );
+        #[cfg(anvil_shared_terminal)]
+        if !init.safe_mode {
+            shell.install_shared_terminal_action(&sender);
+        }
         shell.connect_files_browser(&files_page);
         {
             let header = shell.canvas_header.clone();
@@ -2139,6 +2157,8 @@ impl SimpleComponent for AppModel {
                 let startup = self.config.borrow().startup_commands.clone();
                 self.add_tab(startup, &sender);
             }
+            #[cfg(anvil_shared_terminal)]
+            AppMsg::NewSharedTerminalTab => self.add_shared_terminal_tab(&sender),
             AppMsg::CloseTab(id) => self.request_close_tab(id, &sender),
             AppMsg::ForceCloseTab(id) => self.close_tab(id, &sender),
             AppMsg::ForceClosePane(pane_id) => self.close_pane(pane_id, &sender),

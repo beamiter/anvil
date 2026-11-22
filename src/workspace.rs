@@ -17,13 +17,15 @@ use crate::terminal::{self, BlockTerminal, VteInput, VteTerminal};
 pub(crate) enum TermCtl {
     Vte(Controller<VteTerminal>),
     Block(Controller<BlockTerminal>),
+    #[cfg(anvil_shared_terminal)]
+    Shared(crate::shared_terminal::SharedTerminal),
 }
 
 impl TermCtl {
     pub(crate) fn mode(&self) -> TerminalMode {
         match self {
-            Self::Vte(_) => TerminalMode::Vte,
             Self::Block(controller) => controller.model().mode(),
+            _ => TerminalMode::Vte,
         }
     }
 
@@ -31,6 +33,8 @@ impl TermCtl {
         match self {
             Self::Vte(controller) => controller.emit(msg),
             Self::Block(controller) => controller.emit(msg),
+            #[cfg(anvil_shared_terminal)]
+            Self::Shared(view) => view.emit(msg),
         }
     }
 
@@ -39,7 +43,7 @@ impl TermCtl {
     ) -> Option<std::rc::Rc<crate::organism_ui::vte_surface::VteCompanion>> {
         match self {
             Self::Vte(controller) => Some(controller.model().companion()),
-            Self::Block(_) => None,
+            _ => None,
         }
     }
 
@@ -47,6 +51,8 @@ impl TermCtl {
         match self {
             Self::Vte(controller) => controller.widget().clone().upcast(),
             Self::Block(controller) => controller.widget().clone().upcast(),
+            #[cfg(anvil_shared_terminal)]
+            Self::Shared(view) => view.widget.clone(),
         }
     }
 
@@ -55,15 +61,15 @@ impl TermCtl {
     /// synchronous error to expose here.
     pub(crate) fn synchronous_launch_error(&self) -> Option<String> {
         match self {
-            Self::Vte(_) => None,
             Self::Block(controller) => controller.model().launch_error().map(str::to_owned),
+            _ => None,
         }
     }
 
     pub(crate) fn term_view(&self) -> Option<std::rc::Rc<crate::block_view::TermView>> {
         match self {
-            Self::Vte(_) => None,
             Self::Block(controller) => controller.model().term_view(),
+            _ => None,
         }
     }
 
@@ -71,12 +77,12 @@ impl TermCtl {
     /// Plain VTE panes have no structured finished-block history.
     pub(crate) fn command_history(&self) -> Vec<String> {
         match self {
-            Self::Vte(_) => Vec::new(),
             Self::Block(controller) => controller
                 .model()
                 .term_view()
                 .map(|view| view.command_history())
                 .unwrap_or_default(),
+            _ => Vec::new(),
         }
     }
 
@@ -84,22 +90,22 @@ impl TermCtl {
     /// shell-integrated prompt with no existing user or programmatic input.
     pub(crate) fn can_accept_agent_command(&self) -> bool {
         match self {
-            Self::Vte(_) => false,
             Self::Block(controller) => controller.model().can_accept_agent_command(),
+            _ => false,
         }
     }
 
     pub(crate) fn command_prompt_status(&self) -> crate::block_view::CommandPromptStatus {
         match self {
-            Self::Vte(_) => crate::block_view::CommandPromptStatus::ShellIntegrationUnavailable,
             Self::Block(controller) => controller.model().command_prompt_status(),
+            _ => crate::block_view::CommandPromptStatus::ShellIntegrationUnavailable,
         }
     }
 
     pub(crate) fn agent_command_prompt_status(&self) -> crate::block_view::CommandPromptStatus {
         match self {
-            Self::Vte(_) => crate::block_view::CommandPromptStatus::ShellIntegrationUnavailable,
             Self::Block(controller) => controller.model().agent_command_prompt_status(),
+            _ => crate::block_view::CommandPromptStatus::ShellIntegrationUnavailable,
         }
     }
 
@@ -108,8 +114,8 @@ impl TermCtl {
         max_output_lines: usize,
     ) -> Option<crate::ai::BlockContext> {
         match self {
-            Self::Vte(_) => None,
             Self::Block(controller) => controller.model().selected_block_context(max_output_lines),
+            _ => None,
         }
     }
 
@@ -120,24 +126,24 @@ impl TermCtl {
         max_output_lines: usize,
     ) -> Option<crate::block_view::BlockAgentEvidence> {
         match self {
-            Self::Vte(_) => None,
             Self::Block(controller) => controller
                 .model()
                 .selected_block_agent_evidence(max_output_lines),
+            _ => None,
         }
     }
 
     pub(crate) fn insert_inline_notice(&self, widget: &gtk::Widget) -> bool {
         match self {
-            Self::Vte(_) => false,
             Self::Block(controller) => controller.model().insert_inline_notice(widget),
+            _ => false,
         }
     }
 
     pub(crate) fn supports_inline_notices(&self) -> bool {
         match self {
-            Self::Vte(_) => false,
             Self::Block(controller) => controller.model().supports_inline_notices(),
+            _ => false,
         }
     }
 
@@ -149,23 +155,28 @@ impl TermCtl {
 
     pub(crate) fn try_insert_agent_command(&self, command: &str) -> bool {
         match self {
-            Self::Vte(_) => false,
             Self::Block(controller) => controller.model().try_insert_agent_command(command),
+            _ => false,
         }
     }
 
     pub(crate) fn try_run_review_command(&self, command: &str) -> bool {
         match self {
-            Self::Vte(_) => false,
             Self::Block(controller) => controller.model().try_run_review_command(command),
+            _ => false,
         }
     }
 
     pub(crate) fn block_debug_info(&self) -> Option<crate::block_view::DebugInfo> {
         match self {
-            Self::Vte(_) => None,
             Self::Block(controller) => Some(controller.model().debug_info()),
+            _ => None,
         }
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    pub(crate) fn is_shared(&self) -> bool {
+        matches!(self, Self::Shared(_))
     }
 
     /// Grid size (cols, rows) of this pane's live VTE. `(0, 0)` means unknown
@@ -184,6 +195,8 @@ impl TermCtl {
                 .grid_size()
                 .map(|(cols, rows)| (clamp(cols), clamp(rows)))
                 .unwrap_or((0, 0)),
+            #[cfg(anvil_shared_terminal)]
+            Self::Shared(view) => view.grid_size(),
         }
     }
 }
@@ -259,6 +272,8 @@ impl Pane {
             TermCtl::Vte(controller) => {
                 crate::gtk_process::vte_cleanup(controller.model().terminal())
             }
+            #[cfg(anvil_shared_terminal)]
+            TermCtl::Shared(view) => Some(view.child_cleanup()),
         }
     }
 
@@ -274,6 +289,8 @@ impl Pane {
             TermCtl::Vte(controller) => {
                 crate::gtk_process::vte_blocker(controller.model().terminal(), foreground)
             }
+            #[cfg(anvil_shared_terminal)]
+            TermCtl::Shared(view) => view.close_blocker(),
         }
     }
 
@@ -286,6 +303,8 @@ impl Pane {
             TermCtl::Vte(controller) => {
                 crate::gtk_process::vte_withdrawal_work_probe(controller.model().terminal())
             }
+            #[cfg(anvil_shared_terminal)]
+            TermCtl::Shared(view) => view.withdrawal_work_probe(),
         }
     }
 

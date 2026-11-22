@@ -11,6 +11,8 @@ mod imp {
     pub struct CommandRow {
         pub content: gtk::Box,
         pub terminal: glib::WeakRef<Terminal>,
+        #[cfg(anvil_shared_terminal)]
+        pub document: RefCell<Option<jterm_gtk_view::FinishedTextView>>,
         pub columns: Cell<i64>,
         pub command: RefCell<String>,
         pub allocated_width: Cell<i32>,
@@ -56,6 +58,17 @@ mod imp {
         fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
             let measured = self.content.measure(orientation, for_size);
             let Some(terminal) = self.terminal.upgrade() else {
+                #[cfg(anvil_shared_terminal)]
+                if orientation == gtk::Orientation::Horizontal {
+                    if let Some(document) = self.document.borrow().as_ref() {
+                        return (
+                            measured.0,
+                            measured.1.max(document.natural_width()),
+                            measured.2,
+                            measured.3,
+                        );
+                    }
+                }
                 return measured;
             };
             if self.columns.get() == 0 {
@@ -181,5 +194,14 @@ pub(super) fn fit(row: &CommandRow, terminal: &Terminal, columns: i64, command: 
             row.queue_resize();
         }
     });
+    row.queue_resize();
+}
+
+#[cfg(anvil_shared_terminal)]
+pub(super) fn fit_document(row: &CommandRow, document: &jterm_gtk_view::FinishedTextView) {
+    *row.imp().document.borrow_mut() = Some(document.clone());
+    row.set_halign(gtk::Align::Start);
+    row.set_hexpand(false);
+    row.set_overflow(gtk::Overflow::Hidden);
     row.queue_resize();
 }

@@ -939,7 +939,7 @@ mod tests {
             None,
             80,
         );
-        let output_vte = block.output_vte.downgrade();
+        let output_vte = block.output_vte_for_test().downgrade();
         let outer = block.widget().clone();
         block.connect_scroll_forwarding(
             &gtk::ScrolledWindow::new(),

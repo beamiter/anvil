@@ -312,7 +312,7 @@ impl Fixture {
                 "not a virtual placeholder"
             );
             assert!(
-                !card.output_vte.is_mapped(),
+                !card.output_vte_for_test().is_mapped(),
                 "collapsed output must really be hidden"
             );
         }
@@ -381,9 +381,9 @@ impl Fixture {
         self.assert_ownership();
         let cards = self.view.finished_blocks.borrow();
         let card = cards.iter().find(|card| card.id == id).unwrap();
-        assert!(card.output_vte.is_mapped());
+        assert!(card.output_vte_for_test().is_mapped());
         assert!(
-            card.output_vte
+            card.output_vte_for_test()
                 .text_selected(vte4::Format::Text)
                 .as_deref()
                 .unwrap_or_default()
@@ -396,7 +396,7 @@ impl Fixture {
         self.assert_ownership();
         let cards = self.view.finished_blocks.borrow();
         let card = cards.iter().find(|card| card.id == id).unwrap();
-        let terminal = &card.output_vte;
+        let terminal = card.output_vte_for_test();
         assert!(terminal.is_mapped());
         assert!(
             (1..=256).contains(&terminal.row_count()),
@@ -447,9 +447,9 @@ impl Fixture {
         let cards = self.view.finished_blocks.borrow();
         let card = cards.iter().find(|card| card.id == id).unwrap();
         let terminal = if output {
-            &card.output_vte
+            card.output_vte_for_test()
         } else {
-            &card.command_vte
+            card.command_vte_for_test()
         };
         let adjustment = terminal.vadjustment().map(|adjustment| {
             (
@@ -480,9 +480,9 @@ impl Fixture {
         let cards = self.view.finished_blocks.borrow();
         let card = cards.iter().find(|card| card.id == id).unwrap();
         let terminal = if output {
-            &card.output_vte
+            card.output_vte_for_test()
         } else {
-            &card.command_vte
+            card.command_vte_for_test()
         };
         assert!(
             terminal.is_mapped(),
@@ -611,7 +611,9 @@ fn navigation_reveals_exact_occurrence(mode: crate::config::TerminalMode) {
         fixture.search("needle-A", false),
         find::FindSearchResult::Matches(progress(1, 1)),
     );
-    let command = fixture.view.finished_blocks.borrow()[0].command_vte.clone();
+    let command = fixture.view.finished_blocks.borrow()[0]
+        .command_vte_for_test()
+        .clone();
     for next in [true, false] {
         command.unselect_all();
         assert!(!command.has_selection());
@@ -660,7 +662,7 @@ fn filtered_single_hit_reopens(mode: crate::config::TerminalMode) {
     for next in [true, false] {
         assert!(card.set_collapsed(true));
         settle();
-        assert!(!card.output_vte.is_mapped());
+        assert!(!card.output_vte_for_test().is_mapped());
         fixture.step(next, 1, 1, 2, true, "needle-C");
         fixture.assert_open_outputs(&[2]);
         assert_eq!(filter.text().as_str(), "keep");
@@ -689,7 +691,7 @@ fn resized_reveal_preserves_last_filtered_occurrence(mode: crate::config::Termin
     filter.set_text("keep");
     wait_until(
         || {
-            card.output_vte.is_mapped()
+            card.output_vte_for_test().is_mapped()
                 && fixture.searchable_output(2).contains("needle-C")
                 && !fixture.searchable_output(2).contains("needle-D")
         },
@@ -713,7 +715,7 @@ fn resized_reveal_preserves_last_filtered_occurrence(mode: crate::config::Termin
     wait_until(
         || {
             assert!(
-                !card.output_vte.is_mapped(),
+                !card.output_vte_for_test().is_mapped(),
                 "resize must leave output folded"
             );
             fixture.view.block_scroll.height() > old_height + 100
@@ -738,7 +740,7 @@ fn resized_reveal_preserves_last_filtered_occurrence(mode: crate::config::Termin
     );
     fixture.assert_match(1, false, "needle-A");
     assert_eq!(card.render_stamp(), before_resize);
-    assert!(!card.output_vte.is_mapped());
+    assert!(!card.output_vte_for_test().is_mapped());
     fixture.focus_query();
     let result = fixture.view.find_prev();
     let during_reveal = card.render_stamp();
@@ -828,7 +830,7 @@ fn pending_replay_tracks_latest_navigation(mode: crate::config::TerminalMode) {
     let later = fixture.view.finished_blocks.borrow()[2].clone();
     assert!(later.set_collapsed(false));
     fixture.focus_query();
-    assert!(later.output_vte.is_mapped());
+    assert!(later.output_vte_for_test().is_mapped());
     let later_stamp = later.render_stamp();
     fixture.assert_open_outputs(&[3]);
     assert_eq!(
@@ -845,7 +847,9 @@ fn pending_replay_tracks_latest_navigation(mode: crate::config::TerminalMode) {
     // The earlier output's native selection was reset while needle-E owned
     // the logical cursor. Its old vte_cursor must not yield AlreadySelected.
     fixture.step(false, 4, 5, 2, true, "needle-D");
-    let output = fixture.view.finished_blocks.borrow()[1].output_vte.clone();
+    let output = fixture.view.finished_blocks.borrow()[1]
+        .output_vte_for_test()
+        .clone();
     output.unselect_all();
     assert!(!output.has_selection());
     // Restarting a lost native cursor must reach the requested second hit,
@@ -903,7 +907,7 @@ fn pending_replay_retires_after_interruption(mode: crate::config::TerminalMode) 
             let case = find_toggle_button(card.widget().upcast_ref(), "Aa")
                 .expect("filter case-sensitive control");
             wait_until(
-                || card.output_vte.is_mapped(),
+                || card.output_vte_for_test().is_mapped(),
                 "prepare the original full output before revision-race setup",
             );
             fixture.collapse_all();
@@ -913,7 +917,7 @@ fn pending_replay_retires_after_interruption(mode: crate::config::TerminalMode) 
             fixture.window.queue_resize();
             wait_until(
                 || {
-                    assert!(!card.output_vte.is_mapped());
+                    assert!(!card.output_vte_for_test().is_mapped());
                     fixture.view.block_scroll.height() > old_height + 100
                 },
                 "force a real own-reveal replay before the independent filter revision",
@@ -936,7 +940,9 @@ fn pending_replay_retires_after_interruption(mode: crate::config::TerminalMode) 
             );
         }
         fixture.step_now(true, 2, 3);
-        let output = fixture.view.finished_blocks.borrow()[1].output_vte.clone();
+        let output = fixture.view.finished_blocks.borrow()[1]
+            .output_vte_for_test()
+            .clone();
         eprintln!("FIND_FIXTURE interrupt pending replay: {interruption:?}");
         match interruption {
             ReplayInterruption::ReplaceQuery => {
@@ -1046,7 +1052,7 @@ fn large_replay_preserves_narrowed_native_cursor(mode: crate::config::TerminalMo
     let card = fixture.view.finished_blocks.borrow()[1].clone();
     card.set_collapsed(false);
     wait_until(
-        || card.output_vte.is_mapped(),
+        || card.output_vte_for_test().is_mapped(),
         "the long decorated transcript must first be rendered",
     );
     let wide_stamp = card.render_stamp();
@@ -1069,7 +1075,7 @@ fn large_replay_preserves_narrowed_native_cursor(mode: crate::config::TerminalMo
     fixture.window.queue_resize();
     wait_until(
         || {
-            assert!(!card.output_vte.is_mapped());
+            assert!(!card.output_vte_for_test().is_mapped());
             fixture.view.block_scroll.height() > old_height + 100
         },
         "the larger viewport must settle with the narrowed output still folded",

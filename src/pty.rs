@@ -20,6 +20,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 
+#[cfg(anvil_shared_terminal)]
+use jterm_gtk_view::PtyEvent as PtyMsg;
+
+#[cfg(not(anvil_shared_terminal))]
 enum PtyMsg {
     Data(Vec<u8>),
     Exit(i32),
@@ -70,7 +74,7 @@ pub struct OwnedPty {
     test_foreground_group: std::sync::atomic::AtomicI32,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(test, not(anvil_shared_terminal))))]
 fn move_fd_above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
     if fd.as_raw_fd() > libc::STDERR_FILENO {
         return Ok(fd);
@@ -86,7 +90,13 @@ fn move_fd_above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", anvil_shared_terminal))]
+fn shell_token_channel() -> io::Result<Option<(String, OwnedFd, OwnedFd)>> {
+    Ok(jterm_gtk_view::ShellIdentityChannel::allocate()?
+        .map(jterm_gtk_view::ShellIdentityChannel::into_parts))
+}
+
+#[cfg(all(target_os = "linux", not(anvil_shared_terminal)))]
 fn shell_token_channel() -> io::Result<Option<(String, OwnedFd, OwnedFd)>> {
     let mut random = [0_u8; 16];
     // SAFETY: `random` is writable for the exact supplied length.
@@ -317,6 +327,7 @@ fn request_reader_cancel(cancelled: &AtomicBool, cancel_eventfd: Option<&OwnedFd
 /// Eight 256 KiB chunks used to keep the main thread inside VTE feeding for
 /// long stretches, so mouse clicks appeared to do nothing while keyboard tab
 /// shortcuts occasionally slipped through.
+#[cfg(not(anvil_shared_terminal))]
 const MAX_MESSAGES_PER_DISPATCH: usize = 1;
 /// Bound queued PTY data and let the kernel PTY apply normal backpressure to a
 /// runaway producer. An unbounded channel can otherwise grow indefinitely while
@@ -1036,9 +1047,39 @@ impl OwnedPty {
         };
         let OpenptyResult { master, slave } = openpty_cloexec(Some(&initial_size))?;
 
-        let (exec_read, exec_write) = crate::gtk_process::exec_barrier()?;
+        #[cfg(all(target_os = "linux", anvil_shared_terminal))]
+        let startup_status = token_channel
+            .as_ref()
+            .map(|_| jterm_gtk_view::startup_status::channel())
+            .transpose()?;
+        #[cfg(all(target_os = "linux", anvil_shared_terminal))]
+        let exec_barrier = startup_status
+            .is_none()
+            .then(crate::gtk_process::exec_barrier)
+            .transpose()?;
+        #[cfg(not(all(target_os = "linux", anvil_shared_terminal)))]
+        let exec_barrier = Some(crate::gtk_process::exec_barrier()?);
         match unsafe { unistd::fork() } {
             Ok(ForkResult::Child) => {
+                #[cfg(all(target_os = "linux", anvil_shared_terminal))]
+                if let Some((reader, _)) = &startup_status {
+                    // SAFETY: this is the forked copy of the parent's reader.
+                    unsafe { libc::close(reader.as_raw_fd()) };
+                }
+                macro_rules! child_startup_failed {
+                    ($stage:ident, $code:literal) => {{
+                        #[cfg(all(target_os = "linux", anvil_shared_terminal))]
+                        if let Some((_, writer)) = &startup_status {
+                            writer.report_and_exit(
+                                jterm_gtk_view::startup_status::StartupStage::$stage,
+                                *libc::__errno_location(),
+                                $code,
+                            );
+                        }
+                        libc::_exit($code);
+                    }};
+                }
+
                 drop(master);
                 if token_write_fd >= 0 {
                     // SAFETY: this is the child-side copy of a live pipe end.
@@ -1047,14 +1088,16 @@ impl OwnedPty {
                 let slave_fd = slave.into_raw_fd();
                 unsafe {
                     if libc::setsid() < 0 {
-                        libc::_exit(126);
+                        child_startup_failed!(Session, 126);
                     }
-                    if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0
-                        || libc::dup2(slave_fd, 0) < 0
+                    if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
+                        child_startup_failed!(Terminal, 126);
+                    }
+                    if libc::dup2(slave_fd, 0) < 0
                         || libc::dup2(slave_fd, 1) < 0
                         || libc::dup2(slave_fd, 2) < 0
                     {
-                        libc::_exit(126);
+                        child_startup_failed!(StandardStreams, 126);
                     }
                     // dup2(oldfd, oldfd) is a no-op and therefore does not
                     // clear FD_CLOEXEC. Explicitly keep all three standard
@@ -1065,14 +1108,14 @@ impl OwnedPty {
                         if flags < 0
                             || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
                         {
-                            libc::_exit(126);
+                            child_startup_failed!(StandardStreams, 126);
                         }
                     }
                     if slave_fd > libc::STDERR_FILENO {
                         libc::close(slave_fd);
                     }
                     if token_read_fd >= 0 && libc::fcntl(token_read_fd, libc::F_SETFD, 0) < 0 {
-                        libc::_exit(126);
+                        child_startup_failed!(ShellIdentity, 126);
                     }
                 }
 
@@ -1090,11 +1133,22 @@ impl OwnedPty {
                         c_argv_ptrs.as_ptr(),
                         c_environment_ptrs.as_ptr(),
                     );
-                    libc::_exit(127);
+                    child_startup_failed!(Exec, 127);
                 }
             }
             Ok(ForkResult::Parent { child }) => {
-                if let Err(error) = crate::gtk_process::wait_exec_barrier(exec_read, exec_write) {
+                let mut startup = Ok(());
+                if let Some((reader, writer)) = exec_barrier {
+                    startup = crate::gtk_process::wait_exec_barrier(reader, writer);
+                }
+                #[cfg(all(target_os = "linux", anvil_shared_terminal))]
+                if let Some((reader, writer)) = startup_status {
+                    drop(writer);
+                    startup = reader
+                        .wait(std::time::Duration::from_secs(15))
+                        .map_err(io::Error::from);
+                }
+                if let Err(error) = startup {
                     kill_and_reap_unreferenced_child(child);
                     return Err(error);
                 }
@@ -1372,19 +1426,27 @@ impl OwnedPty {
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
-        if let Ok(guard) = self.master.lock() {
-            if let Some(fd) = guard.as_ref() {
-                let ws = libc::winsize {
-                    ws_row: rows,
-                    ws_col: cols,
-                    ws_xpixel: 0,
-                    ws_ypixel: 0,
-                };
-                unsafe {
-                    libc::ioctl(fd.as_raw_fd(), libc::TIOCSWINSZ, &ws);
-                }
-            }
+        let _ = self.try_resize(cols, rows);
+    }
+
+    pub(crate) fn try_resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+        let guard = self
+            .master
+            .lock()
+            .map_err(|_| io::Error::other("PTY descriptor lock poisoned"))?;
+        let fd = guard
+            .as_ref()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?;
+        let ws = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCSWINSZ, &ws) } == -1 {
+            return Err(io::Error::last_os_error());
         }
+        Ok(())
     }
 
     pub(crate) fn lifecycle(&self) -> Arc<ChildLifecycle> {
@@ -1464,7 +1526,7 @@ impl OwnedPty {
         reader_cancelled: Arc<AtomicBool>,
         tx: mpsc::SyncSender<PtyMsg>,
         rx: mpsc::Receiver<PtyMsg>,
-        mut callback: F,
+        callback: F,
         on_exit: E,
     ) -> io::Result<()>
     where
@@ -1577,102 +1639,138 @@ impl OwnedPty {
 
         #[cfg(target_os = "linux")]
         if let Some(eventfd) = eventfd {
-            let on_exit = std::cell::Cell::new(Some(on_exit));
+            #[cfg(anvil_shared_terminal)]
+            {
+                let mut dispatch = jterm_gtk_view::PtyDispatch::new(rx, callback, on_exit);
+                unix_fd_add_local(eventfd.as_raw_fd(), move || {
+                    dispatch.on_wake(
+                        &wake_pending,
+                        || {
+                            let _ = drain_eventfd(eventfd.as_raw_fd());
+                        },
+                        || rearm_dispatch(&eventfd, &wake_pending),
+                    )
+                });
+            }
+            #[cfg(not(anvil_shared_terminal))]
+            {
+                let mut callback = callback;
+                let on_exit = std::cell::Cell::new(Some(on_exit));
 
-            unix_fd_add_local(eventfd.as_raw_fd(), move || {
-                let _ = drain_eventfd(eventfd.as_raw_fd());
+                unix_fd_add_local(eventfd.as_raw_fd(), move || {
+                    let _ = drain_eventfd(eventfd.as_raw_fd());
 
-                // A producer may enqueue between the first empty read and
-                // clearing `wake_pending`. Recheck after clearing so that
-                // transition cannot lose its only eventfd notification.
-                let message = match rx.try_recv() {
-                    Ok(message) => message,
-                    Err(mpsc::TryRecvError::Empty) => {
-                        wake_pending.store(false, Ordering::Release);
-                        match rx.try_recv() {
-                            Ok(message) => {
-                                wake_pending.store(true, Ordering::Release);
-                                let _ = drain_eventfd(eventfd.as_raw_fd());
-                                message
+                    // A producer may enqueue between the first empty read and
+                    // clearing `wake_pending`. Recheck after clearing so that
+                    // transition cannot lose its only eventfd notification.
+                    let message = match rx.try_recv() {
+                        Ok(message) => message,
+                        Err(mpsc::TryRecvError::Empty) => {
+                            wake_pending.store(false, Ordering::Release);
+                            match rx.try_recv() {
+                                Ok(message) => {
+                                    wake_pending.store(true, Ordering::Release);
+                                    let _ = drain_eventfd(eventfd.as_raw_fd());
+                                    message
+                                }
+                                Err(mpsc::TryRecvError::Empty) => return true,
+                                Err(mpsc::TryRecvError::Disconnected) => return false,
                             }
-                            Err(mpsc::TryRecvError::Empty) => return true,
-                            Err(mpsc::TryRecvError::Disconnected) => return false,
                         }
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => return false,
-                };
+                        Err(mpsc::TryRecvError::Disconnected) => return false,
+                    };
 
-                match message {
-                    PtyMsg::Data(data) => {
-                        callback(data);
-                        // Re-arm at idle priority rather than after a fixed
-                        // sleep. This watch is itself a DEFAULT_IDLE source, so
-                        // GTK's input handling (DEFAULT) and its frame clock
-                        // (HIGH_IDLE + 20) both preempt the loop: the frame
-                        // boundary comes from the priority that is already
-                        // there instead of from a constant that has to guess
-                        // one. The former fixed 8 ms re-arm handed the renderer
-                        // at most one 32 KiB chunk per tick — a ~4 MiB/s
-                        // ceiling that spent ~98% of each interval asleep, and
-                        // it showed: measured over `seq 1 200000` in a 1600x1000
-                        // pane, the screen only reached a new frame every 6th
-                        // capture frame (~200 ms of visibly frozen output at a
-                        // time), and the run took 2478 ms from Enter to the
-                        // last repaint. Idle re-arm: no gap above one capture
-                        // frame, 1830 ms end to end. Responsiveness under a
-                        // 20 MiB stream is unchanged — Ctrl+Shift+P still
-                        // raised the palette within 200 ms in both — and peak
-                        // RSS over a 40 MiB runaway grew by 15 MiB, bounded by
-                        // the same output ring and scrollback caps as before.
-                        rearm_dispatch(&eventfd, &wake_pending);
-                        true
-                    }
-                    PtyMsg::Exit(code) => {
-                        if let Some(f) = on_exit.take() {
-                            f(code);
+                    match message {
+                        PtyMsg::Data(data) => {
+                            callback(data);
+                            // Re-arm at idle priority rather than after a fixed
+                            // sleep. This watch is itself a DEFAULT_IDLE source, so
+                            // GTK's input handling (DEFAULT) and its frame clock
+                            // (HIGH_IDLE + 20) both preempt the loop: the frame
+                            // boundary comes from the priority that is already
+                            // there instead of from a constant that has to guess
+                            // one. The former fixed 8 ms re-arm handed the renderer
+                            // at most one 32 KiB chunk per tick — a ~4 MiB/s
+                            // ceiling that spent ~98% of each interval asleep, and
+                            // it showed: measured over `seq 1 200000` in a 1600x1000
+                            // pane, the screen only reached a new frame every 6th
+                            // capture frame (~200 ms of visibly frozen output at a
+                            // time), and the run took 2478 ms from Enter to the
+                            // last repaint. Idle re-arm: no gap above one capture
+                            // frame, 1830 ms end to end. Responsiveness under a
+                            // 20 MiB stream is unchanged — Ctrl+Shift+P still
+                            // raised the palette within 200 ms in both — and peak
+                            // RSS over a 40 MiB runaway grew by 15 MiB, bounded by
+                            // the same output ring and scrollback caps as before.
+                            rearm_dispatch(&eventfd, &wake_pending);
+                            true
                         }
-                        false
+                        PtyMsg::Exit(code) => {
+                            if let Some(f) = on_exit.take() {
+                                f(code);
+                            }
+                            false
+                        }
                     }
-                }
-            });
+                });
+            }
             return Ok(());
         }
 
         // eventfd is Linux-specific and can also fail under descriptor
         // pressure. Retain the original timer transport as a safe fallback.
-        let on_exit = std::cell::Cell::new(Some(on_exit));
-        let rx = std::cell::RefCell::new(rx);
+        #[cfg(anvil_shared_terminal)]
+        {
+            let mut dispatch = jterm_gtk_view::PtyDispatch::new(rx, callback, on_exit);
+            glib::timeout_add_local_full(
+                PTY_DISPATCH_INTERVAL,
+                glib::Priority::DEFAULT_IDLE,
+                move || {
+                    if dispatch.on_poll() {
+                        glib::ControlFlow::Continue
+                    } else {
+                        glib::ControlFlow::Break
+                    }
+                },
+            );
+        }
+        #[cfg(not(anvil_shared_terminal))]
+        {
+            let mut callback = callback;
+            let on_exit = std::cell::Cell::new(Some(on_exit));
+            let rx = std::cell::RefCell::new(rx);
 
-        glib::timeout_add_local_full(
-            PTY_DISPATCH_INTERVAL,
-            glib::Priority::DEFAULT_IDLE,
-            move || {
-                let mut processed = 0usize;
-                loop {
-                    match rx.borrow().try_recv() {
-                        Ok(PtyMsg::Data(data)) => {
-                            callback(data);
-                            processed += 1;
-                            if processed >= MAX_MESSAGES_PER_DISPATCH {
+            glib::timeout_add_local_full(
+                PTY_DISPATCH_INTERVAL,
+                glib::Priority::DEFAULT_IDLE,
+                move || {
+                    let mut processed = 0usize;
+                    loop {
+                        match rx.borrow().try_recv() {
+                            Ok(PtyMsg::Data(data)) => {
+                                callback(data);
+                                processed += 1;
+                                if processed >= MAX_MESSAGES_PER_DISPATCH {
+                                    return glib::ControlFlow::Continue;
+                                }
+                            }
+                            Ok(PtyMsg::Exit(code)) => {
+                                if let Some(f) = on_exit.take() {
+                                    f(code);
+                                }
+                                return glib::ControlFlow::Break;
+                            }
+                            Err(mpsc::TryRecvError::Empty) => {
                                 return glib::ControlFlow::Continue;
                             }
-                        }
-                        Ok(PtyMsg::Exit(code)) => {
-                            if let Some(f) = on_exit.take() {
-                                f(code);
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                return glib::ControlFlow::Break;
                             }
-                            return glib::ControlFlow::Break;
-                        }
-                        Err(mpsc::TryRecvError::Empty) => {
-                            return glib::ControlFlow::Continue;
-                        }
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            return glib::ControlFlow::Break;
                         }
                     }
-                }
-            },
-        );
+                },
+            );
+        }
         Ok(())
     }
 }

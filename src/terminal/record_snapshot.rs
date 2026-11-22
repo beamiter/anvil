@@ -72,22 +72,28 @@ pub(super) fn present(
         body.append(&note_label);
     }
 
-    let text = gtk::TextView::new();
-    text.buffer().set_text(&snapshot.output);
-    text.set_editable(false);
-    text.set_cursor_visible(false);
-    text.set_monospace(true);
-    text.set_left_margin(8);
-    text.set_right_margin(8);
-    text.set_top_margin(8);
-    text.set_bottom_margin(8);
-    let scrolled = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Automatic)
-        .vscrollbar_policy(gtk::PolicyType::Automatic)
-        .vexpand(true)
-        .child(&text)
-        .build();
-    body.append(&scrolled);
+    #[cfg(anvil_shared_terminal)]
+    body.append(jterm_gtk_view::DocumentView::new(&snapshot.output).widget());
+
+    #[cfg(not(anvil_shared_terminal))]
+    {
+        let text = gtk::TextView::new();
+        text.buffer().set_text(&snapshot.output);
+        text.set_editable(false);
+        text.set_cursor_visible(false);
+        text.set_monospace(true);
+        text.set_left_margin(8);
+        text.set_right_margin(8);
+        text.set_top_margin(8);
+        text.set_bottom_margin(8);
+        let scrolled = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Automatic)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .vexpand(true)
+            .child(&text)
+            .build();
+        body.append(&scrolled);
+    }
 
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header_bar);

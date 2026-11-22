@@ -32,10 +32,11 @@ fn collapsed_output_navigation(mode: crate::config::TerminalMode) {
     // A long document keeps the last card parked even after bulk folding.
     for id in 1..=32 {
         let output = "long command output\r\n".repeat(200);
+        let cmd = if id == 2 { "" } else { "seq 200" };
         let card = FinishedBlock::new(
             id,
             "$ ",
-            "seq 200",
+            cmd,
             None,
             &output,
             Some(0),
@@ -51,7 +52,7 @@ fn collapsed_output_navigation(mode: crate::config::TerminalMode) {
         view.block_data.borrow_mut().push_back(BlockData {
             id,
             prompt: "$ ".into(),
-            cmd: "seq 200".into(),
+            cmd: cmd.into(),
             cmd_markup: None,
             output,
             exit_code: Some(0),
@@ -115,7 +116,9 @@ fn collapsed_output_navigation(mode: crate::config::TerminalMode) {
     assert_eq!(view.set_all_blocks_collapsed(true), 32);
     settle();
     assert!(view.finished_blocks.borrow()[0].widget().is_mapped());
-    assert!(!view.finished_blocks.borrow()[0].output_vte.is_mapped());
+    assert!(!view.finished_blocks.borrow()[0]
+        .output_vte_for_test()
+        .is_mapped());
     assert!(view.scroll_debouncer.user_scrolled_up.get());
     // This is the production path used by a command-only palette hit.
     assert_eq!(
@@ -127,6 +130,15 @@ fn collapsed_output_navigation(mode: crate::config::TerminalMode) {
         .borrow()
         .iter()
         .all(|card| card.is_output_collapsed()));
+    // A commandless card keeps card selection and fold state when navigated
+    // by record ID, even though it has no command terminal.
+    assert!(view.finished_blocks.borrow()[1].command_vte.is_none());
+    assert_eq!(
+        view.navigate_to_record_id(2, false),
+        find::RecordNavigationResult::Navigated
+    );
+    assert_eq!(view.selected_block_id.get(), Some(2));
+    assert!(view.finished_blocks.borrow()[1].is_output_collapsed());
     // The palette passes is_output=true for an output hit, before its
     // exact-occurrence highlighter runs. Only that target may unfold.
     assert_eq!(
@@ -164,7 +176,9 @@ fn collapsed_output_navigation(mode: crate::config::TerminalMode) {
     );
     settle();
     assert!(
-        view.finished_blocks.borrow()[0].output_vte.is_mapped(),
+        view.finished_blocks.borrow()[0]
+            .output_vte_for_test()
+            .is_mapped(),
         "the selected output must be visible after layout"
     );
     assert!(

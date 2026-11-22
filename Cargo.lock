@@ -1092,7 +1092,7 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.2.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=f0107afaf631d29d06358abec3997f1b5712b627#f0107afaf631d29d06358abec3997f1b5712b627"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=dfc87c88acf3f9877680d2dad6a5885eb7209974#dfc87c88acf3f9877680d2dad6a5885eb7209974"
 dependencies = [
  "companion-client",
  "companion-core",
@@ -1102,6 +1102,9 @@ dependencies = [
  "eva-character-atlas",
  "fuzzy-matcher",
  "jagent",
+ "jterm_engine",
+ "jterm_remote_client",
+ "jterm_runtime",
  "libc",
  "log",
  "lru",
@@ -1117,6 +1120,34 @@ dependencies = [
  "unicode-width",
  "uuid",
  "zstd",
+]
+
+[[package]]
+name = "jterm_engine"
+version = "0.1.0"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=dfc87c88acf3f9877680d2dad6a5885eb7209974#dfc87c88acf3f9877680d2dad6a5885eb7209974"
+dependencies = [
+ "smallvec",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
+name = "jterm_remote_client"
+version = "0.1.0"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=dfc87c88acf3f9877680d2dad6a5885eb7209974#dfc87c88acf3f9877680d2dad6a5885eb7209974"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "jterm_runtime"
+version = "0.1.0"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=dfc87c88acf3f9877680d2dad6a5885eb7209974#dfc87c88acf3f9877680d2dad6a5885eb7209974"
+dependencies = [
+ "libc",
+ "log",
 ]
 
 [[package]]
@@ -1983,6 +2014,12 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-segmentation"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "unicode-width"

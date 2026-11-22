@@ -260,6 +260,8 @@ pub(crate) fn vte_closed(terminal: &Terminal) -> bool {
 pub(crate) enum ChildDrain {
     Owned(Arc<ChildLifecycle>),
     Launch(Rc<PendingLaunch>),
+    #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+    SharedRuntime(Rc<jterm_gtk_view::RuntimeShell>),
 }
 
 impl From<Arc<ChildLifecycle>> for ChildDrain {
@@ -273,6 +275,8 @@ impl ChildDrain {
         match self {
             Self::Owned(child) => child.exit_code().is_some(),
             Self::Launch(launch) => launch.ready(),
+            #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+            Self::SharedRuntime(runtime) => runtime.ready_to_discard(),
         }
     }
 
@@ -280,6 +284,8 @@ impl ChildDrain {
         match (self, other) {
             (Self::Owned(a), Self::Owned(b)) => Arc::ptr_eq(a, b),
             (Self::Launch(a), Self::Launch(b)) => Rc::ptr_eq(a, b),
+            #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+            (Self::SharedRuntime(a), Self::SharedRuntime(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -290,6 +296,8 @@ impl ChildDrain {
                 child.terminate(jterm_core::process::EscalationPolicy::SESSION_DRAIN);
             }
             Self::Launch(launch) => launch.close(),
+            #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+            Self::SharedRuntime(runtime) => runtime.close(),
         }
     }
 }

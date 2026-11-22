@@ -18,7 +18,7 @@ fn trace_first_card(view: &TermView, window: &gtk::Window, stage: &str, collapse
     let card = &cards[0];
     let widget = card.widget();
     let content = widget.first_child();
-    let output = card.output_vte.parent();
+    let output = card.output_vte_for_test().parent();
     let visibility = |widget: &gtk::Widget| {
         (
             widget.get_visible(),

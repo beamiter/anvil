@@ -242,7 +242,7 @@ pub(super) struct FinishedChrome<'a> {
     pub content: &'a gtk::Box,
     pub header: &'a gtk::Box,
     pub command: &'a CommandRow,
-    pub command_vte: &'a Terminal,
+    pub command_vte: Option<&'a Terminal>,
     pub command_text: &'a str,
     pub metadata: &'a gtk::Widget,
     pub status: BlockStatus,
@@ -302,19 +302,20 @@ pub(super) fn decorate_finished(chrome: FinishedChrome<'_>) {
         content.remove(metadata);
     }
     content.remove(command);
-    super::command_row::fit(
-        command,
-        command_vte,
-        command_vte.column_count().max(2),
-        command_text,
-    );
+    if let Some(terminal) = command_vte {
+        super::command_row::fit(
+            command,
+            terminal,
+            terminal.column_count().max(2),
+            command_text,
+        );
+        terminal.add_css_class("block-command-terminal");
+        // Match the dark header surface when GTK composites the snapshot.
+        terminal.set_color_background(&super::alt_screen::command_header_background());
+    }
     command.set_halign(gtk::Align::Fill);
     command.set_hexpand(true);
     command.add_css_class("block-reference-command");
-    command_vte.add_css_class("block-command-terminal");
-    // A fully transparent VTE can clear its snapshot to the toolkit's light
-    // default. Give the read-only command the header's actual dark surface.
-    command_vte.set_color_background(&super::alt_screen::command_header_background());
     let icon = crate::workspace_shell::icon(jterm_core::reference_icons::Icon::Terminal);
     icon.set_size_request(24, 24);
     icon.set_margin_end(8);

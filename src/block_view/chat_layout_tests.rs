@@ -69,7 +69,7 @@ fn chat_bubbles_keep_alignment_through_resize_and_font_changes() {
         settle();
         for (i, card) in cards.iter().enumerate() {
             let command = card
-                .command_vte
+                .command_vte_for_test()
                 .ancestor(super::command_row::CommandRow::static_type())
                 .expect("command capsule");
             let content = command.parent().expect("card content");
@@ -101,7 +101,10 @@ fn chat_bubbles_keep_alignment_through_resize_and_font_changes() {
                 (control.x() + control.width() - card.header_row.width() as f32).abs() <= 1.0,
                 "collapse control must stay at the far right: {control:?}"
             );
-            let rendered = card.command_vte.text_format(vte4::Format::Text).unwrap();
+            let rendered = card
+                .command_vte_for_test()
+                .text_format(vte4::Format::Text)
+                .unwrap();
             let normalize = |text: &str| {
                 text.chars()
                     .filter(|c| !c.is_whitespace())
@@ -114,13 +117,14 @@ fn chat_bubbles_keep_alignment_through_resize_and_font_changes() {
             );
             let rows = super::blocks::output_visual_row_count(
                 if i == 0 { "pwd" } else { &long_command },
-                card.command_vte.column_count(),
+                card.command_vte_for_test().column_count(),
             );
             assert!(
-                card.command_vte.height() >= rows as i32 * card.command_vte.char_height() as i32,
+                card.command_vte_for_test().height()
+                    >= rows as i32 * card.command_vte_for_test().char_height() as i32,
                 "wrapped command cannot clip: rows={rows}, height={}, cell={}",
-                card.command_vte.height(),
-                card.command_vte.char_height()
+                card.command_vte_for_test().height(),
+                card.command_vte_for_test().char_height()
             );
         }
         if let Ok(dir) = std::env::var("CHAT_LAYOUT_SCREENSHOTS") {
@@ -138,19 +142,19 @@ fn chat_bubbles_keep_alignment_through_resize_and_font_changes() {
         }
     }
     let before = cards[0]
-        .command_vte
+        .command_vte_for_test()
         .ancestor(super::command_row::CommandRow::static_type())
         .unwrap()
         .width();
     config.default_font_scale *= 1.25;
     for card in &cards {
-        super::alt_screen::apply_snapshot_theme_to_vte(&card.command_vte, &config);
-        super::alt_screen::apply_snapshot_theme_to_vte(&card.output_vte, &config);
+        super::alt_screen::apply_snapshot_theme_to_vte(card.command_vte_for_test(), &config);
+        super::alt_screen::apply_snapshot_theme_to_vte(card.output_vte_for_test(), &config);
     }
     settle();
     assert!(
         cards[0]
-            .command_vte
+            .command_vte_for_test()
             .ancestor(super::command_row::CommandRow::static_type())
             .unwrap()
             .width()

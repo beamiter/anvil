@@ -766,6 +766,79 @@ impl AppModel {
         );
     }
 
+    #[cfg(anvil_shared_terminal)]
+    pub(crate) fn add_shared_terminal_tab(&mut self, sender: &ComponentSender<AppModel>) {
+        use crate::shared_terminal::SharedTerminal;
+
+        if self.safe_mode || !self.ensure_persisted_tab_capacity(true) {
+            return;
+        }
+        let cwd = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| tab.panes.get(tab.active_pane))
+            .and_then(Pane::local_cwd)
+            .map(str::to_owned);
+        let id = self.next_id;
+        let close = sender.clone();
+        let opened = SharedTerminal::open(
+            &self.config.borrow(),
+            &self.shell_argv,
+            cwd.as_deref(),
+            move |_| {
+                close.input(AppMsg::CloseTab(id));
+            },
+        );
+        let terminal = match opened {
+            Ok(terminal) => TermCtl::Shared(terminal),
+            Err(error) => {
+                self.show_toast(format!("Cannot open shared terminal: {error}"));
+                return;
+            }
+        };
+        self.next_id += 1;
+        let pane_id = self.next_pane_id;
+        self.next_pane_id += 1;
+        let frame = pane_header::PaneFrame::new(&terminal.widget());
+        let pane = Pane {
+            terminal,
+            frame,
+            id: pane_id,
+            title: None,
+            cwd,
+            cwd_external: false,
+            session_id: None,
+            mode: TerminalMode::Vte,
+            probe: Default::default(),
+            last_exit: None,
+            last_duration_ms: None,
+            task_role: None,
+            task_session_id: None,
+            last_bell_toast: None,
+        };
+        let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        holder.set_hexpand(true);
+        holder.set_vexpand(true);
+        holder.append(&pane.widget());
+        self.stack.add_named(&holder, Some(&id.to_string()));
+        self.insert_tab_after_active(Tab {
+            holder,
+            panes: vec![pane],
+            active_pane: 0,
+            title: "Shared terminal".into(),
+            custom_title: true,
+            bell: false,
+            activity: false,
+            marked: false,
+            pinned: false,
+            private_title: false,
+            id,
+            zoom: None,
+            remote: None,
+        });
+        self.select_tab(id, sender);
+    }
+
     pub(crate) fn add_tab_with(
         &mut self,
         initial_commands: InitialCommands,
@@ -1307,7 +1380,15 @@ impl AppModel {
         let tab_is_task: Vec<bool> = self
             .tabs
             .iter()
-            .map(|tab| tab.panes.iter().any(|pane| pane.task_role.is_some()))
+            .map(|tab| {
+                tab.panes.iter().any(|pane| {
+                    #[cfg(anvil_shared_terminal)]
+                    if pane.terminal.is_shared() {
+                        return true;
+                    }
+                    pane.task_role.is_some()
+                })
+            })
             .collect();
         let (kept, active) = session::pruned_snapshot_tabs(&tab_is_task, self.active);
         let tabs = kept
@@ -2257,6 +2338,16 @@ impl AppModel {
         if self.tabs[target_index].id != plan.target_tab_id {
             return;
         }
+        #[cfg(anvil_shared_terminal)]
+        if [source_index, target_index].iter().any(|&index| {
+            self.tabs[index]
+                .panes
+                .iter()
+                .any(|pane| pane.terminal.is_shared())
+        }) {
+            self.show_toast("Shared terminal tabs use a single pane.");
+            return;
+        }
         if self.session_persistence
             && self.tabs[target_index].panes.len() >= session::MAX_RESTORED_PANES_PER_TAB
         {
@@ -2618,6 +2709,11 @@ impl AppModel {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
+        #[cfg(anvil_shared_terminal)]
+        if tab.panes.iter().any(|pane| pane.terminal.is_shared()) {
+            self.show_toast("Shared terminal tabs use a single pane.");
+            return;
+        }
         if self.session_persistence
             && !session::can_add_persisted_pane(tab.panes.len(), self.current_pane_count())
         {

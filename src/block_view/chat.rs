@@ -1225,7 +1225,7 @@ mod tests {
                 80,
                 "the complete output is retained in the record"
             );
-            block.output_vte.clone()
+            block.output_vte_for_test().clone()
         };
         wait_for("long output is scrollable inside its mapped card", || {
             terminal.is_mapped()

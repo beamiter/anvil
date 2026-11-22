@@ -251,6 +251,10 @@ pub(crate) struct FindState {
     /// must deduplicate these handles rather than reconstructing them from the
     /// Block-only finished-widget list.
     highlighted_terminals: Vec<vte4::Terminal>,
+    #[cfg(anvil_shared_terminal)]
+    highlighted_commands: Vec<gtk::TextView>,
+    #[cfg(anvil_shared_terminal)]
+    command_pattern: Option<regex::Regex>,
     /// Highlights installed by the flat cross-block palette do not participate
     /// in incremental navigation, but must still be cleared without walking all
     /// retained blocks on every debounced query.
@@ -764,6 +768,39 @@ fn is_whole_word_match(text: &str, range: std::ops::Range<usize>) -> bool {
     let after = text[range.end..].chars().next();
     before.is_none_or(|character| !is_word_character(character))
         && after.is_none_or(|character| !is_word_character(character))
+}
+
+#[cfg(anvil_shared_terminal)]
+fn paint_completed_command_matches(
+    view: &gtk::TextView,
+    expression: &regex::Regex,
+    whole_word: bool,
+    limit: usize,
+) {
+    let buffer = view.buffer();
+    let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+    let matches = expression
+        .find_iter(&text)
+        .filter(|m| !whole_word || is_whole_word_match(&text, m.range()))
+        .take(limit)
+        .map(|matched| matched.range());
+    jterm_gtk_view::paint_finished_text_matches(view, matches);
+}
+
+#[cfg(anvil_shared_terminal)]
+fn select_completed_command_match(
+    view: &gtk::TextView,
+    expression: &regex::Regex,
+    whole_word: bool,
+    occurrence: usize,
+) -> bool {
+    let buffer = view.buffer();
+    let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+    expression
+        .find_iter(&text)
+        .filter(|m| !whole_word || is_whole_word_match(&text, m.range()))
+        .nth(occurrence)
+        .is_some_and(|matched| jterm_gtk_view::select_finished_text_bytes(view, matched.range()))
 }
 
 fn cross_block_match_count(regex: &regex::Regex, line: &str, whole_word: bool) -> usize {
@@ -1545,6 +1582,8 @@ impl TermView {
         let live_stamp_at_start = self.live_find_stamp();
         let mut surfaces = Vec::new();
         let mut highlighted_terminals = Vec::new();
+        #[cfg(anvil_shared_terminal)]
+        let mut highlighted_commands = Vec::new();
         let mut total = 0usize;
         let mut match_limited = false;
         let mut scan_limited = false;
@@ -1575,18 +1614,20 @@ impl TermView {
             );
             if let Some(plan) = selected {
                 if backend_surface.reset_cursor {
-                    // A shared Unified VTE retains its selection/search anchor
-                    // across queries. Clear it so the first native step begins
-                    // at the current viewport, exactly like window zero.
-                    backend_surface.terminal.unselect_all();
+                    backend_surface.presentation.clear_selection();
                 }
-                backend_surface.terminal.search_set_regex(Some(&vte_re), 0);
-                backend_surface.terminal.search_set_wrap_around(false);
-                if !highlighted_terminals
-                    .iter()
-                    .any(|terminal| terminal == &backend_surface.terminal)
+                if let Some(terminal) = backend_surface.presentation.native() {
+                    terminal.search_set_regex(Some(&vte_re), 0);
+                    terminal.search_set_wrap_around(false);
+                    if !highlighted_terminals.contains(terminal) {
+                        highlighted_terminals.push(terminal.clone());
+                    }
+                }
+                #[cfg(anvil_shared_terminal)]
+                if let super::TerminalTextSurface::Document(command) = &backend_surface.presentation
                 {
-                    highlighted_terminals.push(backend_surface.terminal.clone());
+                    paint_completed_command_matches(command, &re, false, plan.count);
+                    highlighted_commands.push(command.clone());
                 }
                 surfaces.push(FindSurface {
                     block_id: backend_surface.block_id,
@@ -1758,6 +1799,11 @@ impl TermView {
             st.capped = capped;
             st.scan_limited = scan_limited;
             st.highlighted_terminals = highlighted_terminals;
+            #[cfg(anvil_shared_terminal)]
+            {
+                st.highlighted_commands = highlighted_commands;
+                st.command_pattern = Some(re.clone());
+            }
             st.live_anchor = live_anchor;
             st.live_stamp = live_stamp;
         }
@@ -1858,7 +1904,10 @@ impl TermView {
             let Some(revision) = block.pending_render_revision() else {
                 return;
             };
-            (block.output_vte.clone(), revision)
+            let Some(terminal) = block.output_vte.as_ref() else {
+                return;
+            };
+            (terminal.clone(), revision)
         };
         let Some(window) = terminal
             .root()
@@ -1965,7 +2014,7 @@ impl TermView {
                     };
                     if block.render_revision() != revision
                         || block.render_stamp() != surface.render_stamp
-                        || block.output_vte != *terminal
+                        || block.output_vte.as_ref() != Some(terminal)
                         || block.is_output_collapsed()
                         || !terminal.is_mapped()
                     {
@@ -2004,7 +2053,7 @@ impl TermView {
                         block.id == surface.block_id
                             && block.render_revision() == revision
                             && block.render_stamp() == surface.render_stamp
-                            && block.output_vte == *terminal
+                            && block.output_vte.as_ref() == Some(terminal)
                             && !block.is_output_collapsed()
                             && terminal.is_mapped()
                     })
@@ -2226,7 +2275,31 @@ impl TermView {
                     return FindFocusResult::Revealed;
                 }
             }
-            (target.terminal, Some(target.render_stamp))
+            #[cfg(anvil_shared_terminal)]
+            if let super::TerminalTextSurface::Document(command) = &target.presentation {
+                let expression = self.find_state.borrow().command_pattern.clone();
+                let Some(expression) = expression else {
+                    return FindFocusResult::Invalidated;
+                };
+                if occurrence >= surface.count
+                    || !select_completed_command_match(command, &expression, false, occurrence)
+                {
+                    return FindFocusResult::Invalidated;
+                }
+                let mut state = self.find_state.borrow_mut();
+                if state.query != query_at_start
+                    || state.cursor != cursor_at_start
+                    || state.surfaces.get(surface_index) != Some(&surface)
+                {
+                    return FindFocusResult::Invalidated;
+                }
+                state.surfaces[surface_index].vte_cursor = Some(occurrence);
+                return FindFocusResult::Selected;
+            }
+            let Some(terminal) = target.presentation.native() else {
+                return FindFocusResult::Invalidated;
+            };
+            (terminal.clone(), Some(target.render_stamp))
         };
         let pending_replay = if surface.is_output && !surface.is_live {
             let blocks = self.finished_blocks.borrow();
@@ -2536,6 +2609,14 @@ impl TermView {
         let Some(target) = self
             .render_backend
             .record_search_target(block_id, is_output)
+            .or_else(|| {
+                // Commandless cards still have an exact card target. A jump
+                // to the record can use its output surface without unfolding it.
+                if is_output {
+                    return None;
+                }
+                self.render_backend.record_search_target(block_id, true)
+            })
         else {
             // No per-record surface: an exact proven scroll is still allowed,
             // then the retained snapshot, then the honest notice.
@@ -2559,7 +2640,7 @@ impl TermView {
             return result;
         };
         if target.uses_live_surface {
-            target.terminal.grab_focus();
+            target.presentation.widget().grab_focus();
             return RecordNavigationResult::Navigated;
         }
         self.cross_selection.clear_all();
@@ -2651,7 +2732,42 @@ impl TermView {
         else {
             return false;
         };
-        let vte = target.terminal;
+        #[cfg(anvil_shared_terminal)]
+        if let super::TerminalTextSurface::Document(command) = &target.presentation {
+            let Ok(expression) = regex::RegexBuilder::new(&cross_block_pattern(pattern, options))
+                .case_insensitive(!options.case_sensitive)
+                .multi_line(true)
+                .build()
+            else {
+                return false;
+            };
+            if !select_completed_command_match(command, &expression, options.whole_word, occurrence)
+            {
+                return false;
+            }
+            paint_completed_command_matches(
+                command,
+                &expression,
+                options.whole_word,
+                FIND_MATCH_LIMIT,
+            );
+            let mut state = self.find_state.borrow_mut();
+            if !state.highlighted_commands.contains(command) {
+                state.highlighted_commands.push(command.clone());
+            }
+            let highlight = FindHighlight {
+                block_id,
+                block_index,
+                is_output,
+            };
+            if !state.extra_highlights.contains(&highlight) {
+                state.extra_highlights.push(highlight);
+            }
+            return true;
+        }
+        let Some(vte) = target.presentation.native().cloned() else {
+            return false;
+        };
         // Re-establish the cursor from the top of this surface. Reusing VTE's
         // previous selection made repeated activation walk forward and made a
         // row labelled L482 land on an unrelated next hit.
@@ -2728,11 +2844,13 @@ pub(super) fn clear_find_state(
     find_state: &std::cell::RefCell<FindState>,
     active_vte: &vte4::Terminal,
 ) {
-    let highlighted_terminals = {
-        let state = std::mem::take(&mut *find_state.borrow_mut());
-        state.highlighted_terminals
-    };
-    for vte in highlighted_terminals {
+    let state = std::mem::take(&mut *find_state.borrow_mut());
+    #[cfg(anvil_shared_terminal)]
+    for command in state.highlighted_commands {
+        jterm_gtk_view::clear_finished_text_matches(&command);
+        super::TerminalTextSurface::Document(command).clear_selection();
+    }
+    for vte in state.highlighted_terminals {
         vte.search_set_regex(None::<&vte4::Regex>, 0);
         // VTE retains its last match as the next search anchor even after the
         // regex is removed. Clear only terminals highlighted by this pass so a
