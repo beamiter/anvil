@@ -38,7 +38,9 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-check-cfg=cfg(anvil_shared_terminal)");
     println!("cargo:rerun-if-env-changed=JTERM_ANVIL_SHARED_TERMINAL");
-    if env::var("JTERM_ANVIL_SHARED_TERMINAL").as_deref() == Ok("1") {
+    if env::var_os("CARGO_FEATURE_SHARED_TERMINAL").is_some()
+        || env::var("JTERM_ANVIL_SHARED_TERMINAL").as_deref() == Ok("1")
+    {
         println!("cargo:rustc-cfg=anvil_shared_terminal");
     }
     for name in [

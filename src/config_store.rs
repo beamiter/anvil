@@ -2105,23 +2105,32 @@ mod tests {
             );
             let snapshot = read_validated_snapshot(&path).unwrap();
             let (mut config, _, _) = config::load_config_from_table(snapshot.table.as_ref());
-            config.prepare_workspace_startup(false);
+            config.prepare_workspace_startup(false, false);
             assert_eq!(config.sidebar_visible, visible);
             assert_eq!(config.sidebar_width, 312);
             // An unrelated save must not persist a forced-open startup value.
             save_config_to_path(&path, &config, Some(&snapshot.revision)).unwrap();
             let saved = read_validated_snapshot(&path).unwrap();
             let (mut restarted, _, _) = config::load_config_from_table(saved.table.as_ref());
-            restarted.prepare_workspace_startup(false);
+            restarted.prepare_workspace_startup(false, false);
             assert_eq!(restarted.sidebar_visible, visible);
             assert_eq!(restarted.sidebar_width, 312);
             assert_eq!(saved.validation.errors(), 0);
             fs::remove_dir_all(dir).unwrap();
         }
         let mut safe = Config::safe_defaults();
-        safe.prepare_workspace_startup(true);
+        safe.prepare_workspace_startup(true, false);
         assert!(safe.sidebar_visible);
         assert_eq!(safe.terminal_mode, config::TerminalMode::Vte);
+    }
+
+    #[test]
+    fn admitted_shared_shell_preserves_the_plain_workspace_mode() {
+        let mut config = Config::safe_defaults();
+        config.prepare_workspace_startup(false, true);
+        assert_eq!(config.terminal_mode, config::TerminalMode::Vte);
+        config.prepare_workspace_startup(false, false);
+        assert_eq!(config.terminal_mode, config::TerminalMode::Block);
     }
 
     #[test]

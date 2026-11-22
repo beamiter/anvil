@@ -111,12 +111,6 @@ pub(crate) fn trim_link_trail(text: &str) -> &str {
     })
 }
 
-/// Opening wrappers around a whitespace-delimited URL token (`(https://…)`,
-/// `"https://…"`). Closers are handled by [`trim_link_trail`].
-pub(crate) fn strip_link_wrappers(text: &str) -> &str {
-    text.trim_start_matches(['(', '[', '{', '<', '"', '\''])
-}
-
 /// Sentence punctuation is not part of a path, `file:line`, or `key=value`
 /// token. Colon stays: `src/main.rs:12` is one token.
 pub(crate) fn trim_path_trail(text: &str) -> &str {

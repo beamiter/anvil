@@ -11,7 +11,7 @@ use gtk::prelude::*;
 use gtk::TextBuffer;
 use relm4::gtk;
 
-use super::select::{get_semantic_bounds_at_position, strip_link_wrappers, trim_link_trail};
+use super::select::get_semantic_bounds_at_position;
 
 pub(crate) const OSC8_URI_DATA_KEY: &str = "anvil-osc8-uri";
 
@@ -34,12 +34,8 @@ pub fn is_openable_url(text: &str) -> bool {
 /// Strip wrapping openers and trailing punctuation so `(https://example.com).`
 /// is the same openable URL as the bare form.
 fn clip_plain_url(raw: &str) -> Option<(usize, usize, &str)> {
-    let inner = strip_link_wrappers(raw);
-    let start = raw.len() - inner.len();
-    let trimmed = trim_link_trail(inner);
-    let end = start + trimmed.len();
-    let candidate = &raw[start..end];
-    is_openable_url(candidate).then_some((start, end, candidate))
+    let range = jterm_core::link::plain_url_span(raw)?;
+    Some((range.start, range.end, &raw[range]))
 }
 
 /// Map only typed error codes; backend messages may contain the complete target.

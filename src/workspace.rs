@@ -62,6 +62,8 @@ impl TermCtl {
     pub(crate) fn synchronous_launch_error(&self) -> Option<String> {
         match self {
             Self::Block(controller) => controller.model().launch_error().map(str::to_owned),
+            #[cfg(anvil_shared_terminal)]
+            Self::Shared(view) => view.launch_error().map(str::to_owned),
             _ => None,
         }
     }
@@ -175,8 +177,12 @@ impl TermCtl {
     }
 
     #[cfg(anvil_shared_terminal)]
-    pub(crate) fn is_shared(&self) -> bool {
-        matches!(self, Self::Shared(_))
+    pub(crate) fn is_standalone_shared(&self) -> bool {
+        matches!(self, Self::Shared(view) if view.standalone())
+    }
+
+    pub(crate) fn has_pending_launch(&self) -> bool {
+        matches!(self, Self::Vte(_))
     }
 
     /// Grid size (cols, rows) of this pane's live VTE. `(0, 0)` means unknown
@@ -249,6 +255,23 @@ impl Pane {
             .flatten()
     }
 
+    pub(crate) fn working_directory_for_launch(&self) -> Option<String> {
+        if self.cwd_external {
+            return None;
+        }
+        #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+        if let TermCtl::Shared(view) = &self.terminal {
+            if let Some(cwd) = view
+                .pane()
+                .and_then(|pane| pane.runtime())
+                .and_then(|runtime| runtime.inspect_child(jterm_core::process::process_cwd))
+            {
+                return Some(cwd);
+            }
+        }
+        self.cwd.clone()
+    }
+
     /// A restorable command running in this pane, or `None` when the
     /// foreground process is the pane's normal shell.
     pub(crate) fn restorable_command(&self) -> Option<Vec<String>> {
@@ -273,7 +296,7 @@ impl Pane {
                 crate::gtk_process::vte_cleanup(controller.model().terminal())
             }
             #[cfg(anvil_shared_terminal)]
-            TermCtl::Shared(view) => Some(view.child_cleanup()),
+            TermCtl::Shared(view) => view.child_cleanup(),
         }
     }
 

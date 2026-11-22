@@ -872,8 +872,8 @@ impl Config {
     /// Normalize the workspace presentation without overwriting the user's
     /// saved navigation visibility. A hidden sidebar must stay hidden across
     /// startup and a later unrelated configuration save.
-    pub(crate) fn prepare_workspace_startup(&mut self, safe_mode: bool) {
-        if !safe_mode {
+    pub(crate) fn prepare_workspace_startup(&mut self, safe_mode: bool, shared_shell: bool) {
+        if !safe_mode && !shared_shell {
             self.terminal_mode = self.terminal_mode.workspace_backend();
         }
         self.tab_placement = TabPlacement::Sidebar;

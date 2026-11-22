@@ -21,6 +21,91 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  shared-gtk-terminal:
+    name: Shared GTK terminal and Vim9
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install native display test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            pkg-config libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev libpcre2-dev \
+            at-spi2-core gir1.2-atspi-2.0 python3-gi dbus-x11 xauth xvfb xdotool xclip \
+            imagemagick vim sway wtype wl-clipboard libwayland-dev libwayland-bin \
+            fonts-dejavu-core fonts-noto-color-emoji
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - name: Build the opt-in GTK backend from the production lock
+        run: cargo build --locked --release --features shared-terminal --bin anvil
+      - name: Verify ordinary tabs, shell exit, caret, input and scrollback under X11
+        run: |
+          core=$(python3 scripts/shared-core-path.py)
+          dbus-run-session -- xvfb-run -a --server-args='-screen 0 1440x1100x24 -nolisten tcp' \
+            /usr/bin/python3 -B "$core/crates/jterm_gtk_view/tests/native.py" \
+            anvil target/release/anvil --ordinary-panes --tui --streamed-paste --scrollback-policy \
+            --keyboard-disambiguation --resize-history --history-search --hidden-output-seconds 8
+          dbus-run-session -- xvfb-run -a --server-args='-screen 0 1440x1100x24 -nolisten tcp' \
+            /usr/bin/python3 -B "$core/crates/jterm_gtk_view/tests/native.py" \
+            anvil target/release/anvil --ordinary-panes --shell bash
+          dbus-run-session -- xvfb-run -a --server-args='-screen 0 1440x1100x24 -nolisten tcp' \
+            /usr/bin/python3 -B "$core/crates/jterm_gtk_view/tests/native.py" \
+            anvil target/release/anvil --shared-runtime --underline-colors --osc8-links
+      - name: Verify native and compatibility Vim9 editing and the embedded shell return
+        run: |
+          core=$(python3 scripts/shared-core-path.py)
+          dbus-run-session -- xvfb-run -a --server-args='-screen 0 1440x1100x24 -nolisten tcp' \
+            /usr/bin/python3 -B "$core/crates/jterm_gtk_view/tests/native_vim9.py" \
+            anvil target/release/anvil
+      - name: Verify Wayland terminal and Vim9 composition
+        run: |
+          set -euo pipefail
+          core=$(python3 scripts/shared-core-path.py)
+          fixture_dir=$(mktemp -d "$RUNNER_TEMP/gtk-wayland.XXXXXX")
+          curl --fail --silent --show-error --location --retry 2 --max-time 60 \
+            https://archive.ubuntu.com/ubuntu/pool/universe/w/wlroots/wlroots_0.17.1.orig.tar.gz \
+            --output "$fixture_dir/wlroots.tar.gz"
+          printf '%s  %s\n' b4b1b08daf0728cd2648fb57660493e5b3eafe4fcc081c138de864895181cdfe \
+            "$fixture_dir/wlroots.tar.gz" | sha256sum --check
+          tar -xzf "$fixture_dir/wlroots.tar.gz" -C "$fixture_dir" \
+            wlroots-0.17.1/protocol/input-method-unstable-v2.xml \
+            wlroots-0.17.1/protocol/wlr-virtual-pointer-unstable-v1.xml
+          bash "$core/crates/jterm_gtk_view/tests/build-wayland-fixtures.sh" \
+            "$fixture_dir/wlroots-0.17.1/protocol" "$fixture_dir/clients"
+          dbus-run-session -- /usr/bin/python3 -B "$core/crates/jterm_gtk_view/tests/native_wayland.py" \
+            anvil target/release/anvil --ordinary-pane --keyboard-disambiguation \
+            --output "$RUNNER_TEMP/shared-terminal-wayland" \
+            --ime-client "$fixture_dir/clients/native-ime-client" \
+            --pointer-client "$fixture_dir/clients/native-pointer"
+          dbus-run-session -- /usr/bin/python3 -B "$core/crates/jterm_gtk_view/tests/native_wayland.py" \
+            anvil target/release/anvil --ordinary-pane --keyboard-disambiguation --scale 2 \
+            --output "$RUNNER_TEMP/shared-terminal-wayland/hidpi" \
+            --ime-client "$fixture_dir/clients/native-ime-client" \
+            --pointer-client "$fixture_dir/clients/native-pointer"
+          for display in native compatibility; do
+            dbus-run-session -- /usr/bin/python3 -B "$core/crates/jterm_gtk_view/tests/native_wayland.py" \
+              anvil target/release/anvil --vim9 "$display" \
+              --output "$RUNNER_TEMP/shared-terminal-wayland/vim9-$display" \
+              --ime-client "$fixture_dir/clients/native-ime-client"
+          done
+      - name: Verify shared live output and completed Block and Chat cards
+        run: |
+          core=$(python3 scripts/shared-core-path.py)
+          bash "$core/crates/jterm_gtk_view/tests/test-native-cards.sh" \
+            anvil "$RUNNER_TEMP/shared-terminal-wayland/cards"
+      - name: Preserve native protocol and fixture logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: shared-terminal-native-${{ github.sha }}
+          path: ${{ runner.temp }}/shared-terminal-wayland/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
   interaction-contracts:
     name: Pure interaction evidence contracts (no native acceptance)
     runs-on: ubuntu-24.04

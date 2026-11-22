@@ -1,10 +1,13 @@
 #[cfg(target_os = "linux")]
 use jterm_gtk_view::RuntimeShell;
 use jterm_gtk_view::{LinkActions, Pty, TerminalPane, Theme};
-use relm4::gtk;
-use std::rc::Rc;
+use relm4::gtk::{self, prelude::*};
+use std::{cell::RefCell, rc::Rc};
 
 use crate::{config::Config, pty::OwnedPty, terminal::VteInput};
+
+#[cfg(target_os = "linux")]
+const PANE_DATA: &str = "anvil-shared-panes-vim-source";
 
 impl Pty for OwnedPty {
     fn write(&self, bytes: &[u8]) -> Result<(), String> {
@@ -32,31 +35,23 @@ impl Pty for OwnedPty {
 
 pub(crate) struct SharedTerminal {
     pub(crate) widget: gtk::Widget,
-    pane: Rc<TerminalPane<OwnedPty>>,
+    pane: Option<Rc<TerminalPane<OwnedPty>>>,
+    config: Rc<RefCell<Config>>,
+    standalone: bool,
+    launch_error: Option<String>,
     #[cfg(target_os = "linux")]
     runtime_guard: Option<std::sync::Arc<crate::gtk_process::Guard>>,
 }
 
 impl SharedTerminal {
     pub(crate) fn open(
-        config: &Config,
+        config: Rc<RefCell<Config>>,
         argv: &[String],
         cwd: Option<&str>,
         close: impl Fn(&gtk::Widget) + 'static,
     ) -> Result<Self, String> {
-        let theme = Theme {
-            font: gtk::pango::FontDescription::from_string(&config.font_desc),
-            foreground: config.foreground,
-            background: config.background,
-            palette: config.palette,
-        };
-        let links = LinkActions {
-            admit: |_, uri| jterm_core::link::is_openable_url(uri),
-            attach_opener: |widget| {
-                let opener = crate::terminal::url::LinkOpener::new(widget);
-                Box::new(move |uri| opener.open(uri))
-            },
-        };
+        let theme = Self::theme(&config.borrow());
+        let links = Self::links();
         #[cfg(target_os = "linux")]
         let mut runtime_guard = None;
         let status = jterm_core::review_input::safe_inline_display;
@@ -76,7 +71,13 @@ impl SharedTerminal {
                     host_bridge,
                     crate::host::working_directory_available,
                     include_bytes!("../scripts/shell-integration/anvil.bash"),
-                    Self::runtime_environment,
+                    || {
+                        Self::runtime_environment(
+                            argv,
+                            config.borrow().vim9.auto_gui,
+                            &jterm_gtk_view::CHILD_ENV,
+                        )
+                    },
                 )? {
                     Some(runtime) => Some(runtime),
                     None => RuntimeShell::spawn_candidate(
@@ -84,7 +85,13 @@ impl SharedTerminal {
                         cwd,
                         host_bridge,
                         crate::host::working_directory_available,
-                        Self::runtime_environment,
+                        || {
+                            Self::runtime_environment(
+                                argv,
+                                config.borrow().vim9.auto_gui,
+                                &jterm_gtk_view::CHILD_ENV,
+                            )
+                        },
                     )?,
                 };
                 if let Some(runtime) = runtime {
@@ -103,21 +110,137 @@ impl SharedTerminal {
             #[cfg(not(target_os = "linux"))]
             legacy(theme, links, close)?
         };
+        #[cfg(target_os = "linux")]
+        if pane.runtime().is_some() {
+            pane.set_history_row_limit(config.borrow().terminal_scrollback_lines as usize);
+            Self::register_vim_source(&widget, &pane);
+        }
         Ok(Self {
             widget,
-            pane,
+            pane: Some(pane),
+            config,
+            standalone: true,
+            launch_error: None,
             #[cfg(target_os = "linux")]
             runtime_guard,
         })
     }
 
     #[cfg(target_os = "linux")]
-    fn runtime_environment() -> Result<Vec<std::ffi::CString>, String> {
+    pub(crate) fn open_for_pane(
+        config: Rc<RefCell<Config>>,
+        argv: &[String],
+        cwd: Option<&str>,
+    ) -> Option<Self> {
+        let home = std::env::var("HOME").ok();
+        let cwd = cwd.or(home.as_deref());
+        let result = RuntimeShell::spawn_candidate(
+            argv,
+            cwd,
+            crate::host::is_flatpak(),
+            crate::host::working_directory_available,
+            || {
+                Self::runtime_environment(
+                    argv,
+                    config.borrow().vim9.auto_gui,
+                    &jterm_gtk_view::INTERACTIVE_CHILD_ENV,
+                )
+            },
+        );
+        let build = |runtime: Rc<RuntimeShell>| {
+            let pid = runtime
+                .child_pid()
+                .ok_or("shared shell has no live process id")?;
+            let guard =
+                crate::gtk_process::Guard::capture(pid, Some(std::path::Path::new(&argv[0])));
+            let (widget, pane) = TerminalPane::with_runtime_embedded(
+                runtime,
+                Self::theme(&config.borrow()),
+                jterm_core::review_input::safe_inline_display,
+                Self::links(),
+            )?;
+            pane.set_history_row_limit(config.borrow().terminal_scrollback_lines as usize);
+            Self::register_vim_source(&widget, &pane);
+            Ok::<_, String>((widget, pane, guard))
+        };
+        match result.and_then(|runtime| runtime.map(build).transpose()) {
+            Ok(None) => None,
+            Ok(Some((widget, pane, guard))) => Some(Self {
+                widget,
+                pane: Some(pane),
+                config,
+                standalone: false,
+                launch_error: None,
+                runtime_guard: Some(guard),
+            }),
+            Err(error) => {
+                let safe = jterm_core::review_input::safe_inline_display(&error, 768);
+                let message = format!("Cannot start terminal: {safe}");
+                let label = gtk::Label::new(Some(&message));
+                label.set_wrap(true);
+                label.set_focusable(true);
+                Some(Self {
+                    widget: label.upcast(),
+                    pane: None,
+                    config,
+                    standalone: false,
+                    launch_error: Some(message),
+                    runtime_guard: None,
+                })
+            }
+        }
+    }
+
+    pub(crate) fn links() -> LinkActions {
+        LinkActions {
+            admit: jterm_core::link::is_openable_osc8,
+            find_plain: Some(jterm_core::link::plain_url_at),
+            attach_opener: |widget| {
+                let opener = crate::terminal::url::LinkOpener::new(widget);
+                Box::new(move |uri| opener.open(uri))
+            },
+        }
+    }
+
+    fn theme(config: &Config) -> Theme {
+        let mut font = crate::font::terminal_font_description(&config.font_desc, config);
+        let scale = config.default_font_scale;
+        if font.size() > 0 && scale.is_finite() && scale > 0.0 {
+            let size = (f64::from(font.size()) * scale).round();
+            if font.is_size_absolute() {
+                font.set_absolute_size(size);
+            } else {
+                font.set_size(size as i32);
+            }
+        }
+        Theme {
+            font,
+            foreground: config.foreground,
+            background: config.background,
+            palette: config.palette,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn runtime_environment(
+        argv: &[String],
+        auto_gui: bool,
+        terminal_env: &[(&str, &str)],
+    ) -> Result<Vec<std::ffi::CString>, String> {
         let policy = jterm_core::child_env::ChildEnv {
             less_default: Some("R"),
             ..jterm_core::child_env::ChildEnv::from_identity()
         };
-        let env = jterm_core::child_env::envp_from_captured(&policy, &jterm_gtk_view::CHILD_ENV)
+        let vim = crate::vim9_ide::shell_environment(argv, auto_gui);
+        let extra = terminal_env
+            .iter()
+            .copied()
+            .chain(
+                vim.iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            )
+            .collect::<Vec<_>>();
+        let env = jterm_core::child_env::envp_from_captured(&policy, &extra)
             .map_err(|error| error.to_string())?;
         let mut env = crate::agent_cli::environment(env);
         env.retain(|item| {
@@ -128,53 +251,133 @@ impl SharedTerminal {
         Ok(env)
     }
 
-    pub(crate) fn emit(&self, action: VteInput) {
-        match action {
-            VteInput::GrabFocus => self.pane.focus(),
-            VteInput::Copy | VteInput::CopyOutputOnly => self.pane.copy(),
-            VteInput::Paste => self.pane.paste(),
-            VteInput::Kill => self.pane.stop(),
-            _ => {}
+    #[cfg(target_os = "linux")]
+    fn register_vim_source(widget: &gtk::Widget, pane: &Rc<TerminalPane<OwnedPty>>) {
+        // SAFETY: the matching reader below uses this key with the same
+        // weak pane type. The widget never retains the runtime itself.
+        unsafe {
+            widget.set_data(PANE_DATA, Rc::downgrade(pane));
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn vim_source(
+        widget: &gtk::Widget,
+        invocation: &jterm_core::vim9::Vim9ShellInvocation,
+    ) -> Option<(gtk::Box, gtk::Widget)> {
+        let pane = unsafe {
+            widget
+                .data::<std::rc::Weak<TerminalPane<OwnedPty>>>(PANE_DATA)?
+                .as_ref()
+                .upgrade()?
+        };
+        pane.runtime()?
+            .inspect_child(|pid| invocation.matches_pid(pid).then_some(()))?;
+        Some((
+            widget.clone().downcast().ok()?,
+            pane.screen().clone().upcast(),
+        ))
+    }
+
+    pub(crate) fn toggle_history_search(&self) {
+        if let Some(pane) = &self.pane {
+            pane.toggle_history_search();
+        }
+    }
+
+    pub(crate) fn emit(&self, action: VteInput) {
+        let Some(pane) = &self.pane else {
+            if matches!(action, VteInput::GrabFocus) {
+                self.widget.grab_focus();
+            }
+            return;
+        };
+        let result = match action {
+            VteInput::WriteInput(data) => pane.write_input(data),
+            VteInput::InsertReviewText(data) => {
+                crate::enter_ownership::claim_held();
+                pane.write_input(data)
+            }
+            VteInput::PasteText(text) => {
+                crate::enter_ownership::claim_held();
+                pane.write_text(&text)
+            }
+            action => {
+                match action {
+                    VteInput::GrabFocus => pane.focus(),
+                    VteInput::Copy | VteInput::CopyOutputOnly => pane.copy(),
+                    VteInput::Paste => pane.paste(),
+                    VteInput::ScrollLines(lines) => pane.scroll(i64::from(lines)),
+                    VteInput::ReturnToLive => pane.follow_output(),
+                    VteInput::SetScrollback(lines) => {
+                        pane.set_history_row_limit(usize::try_from(lines).unwrap_or(usize::MAX));
+                    }
+                    VteInput::ApplyTheme | VteInput::SetFont(_) | VteInput::SetFontScale(_) => {
+                        pane.set_theme(Self::theme(&self.config.borrow()));
+                    }
+                    VteInput::Kill => pane.stop(),
+                    _ => {}
+                }
+                Ok(())
+            }
+        };
+        if let Err(error) = result {
+            log::warn!("Shared terminal input rejected: {error}");
+        }
+    }
+
+    pub(crate) fn standalone(&self) -> bool {
+        self.standalone
+    }
+
+    pub(crate) fn launch_error(&self) -> Option<&str> {
+        self.launch_error.as_deref()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn pane(&self) -> Option<&Rc<TerminalPane<OwnedPty>>> {
+        self.pane.as_ref()
+    }
+
     pub(crate) fn grid_size(&self) -> (u16, u16) {
-        self.pane.grid_size()
+        self.pane.as_ref().map_or((0, 0), |pane| pane.grid_size())
     }
 
     pub(crate) fn close_blocker(&self) -> Option<String> {
+        let pane = self.pane.as_ref()?;
         #[cfg(target_os = "linux")]
-        if let (Some(runtime), Some(guard)) = (self.pane.runtime(), &self.runtime_guard) {
+        if let (Some(runtime), Some(guard)) = (pane.runtime(), &self.runtime_guard) {
             return runtime
                 .exit_code()
                 .is_none()
                 .then(|| guard.blocker(true, None))
                 .flatten();
         }
-        self.pane.pty().and_then(|pty| pty.close_blocker(true))
+        pane.pty().and_then(|pty| pty.close_blocker(true))
     }
 
-    pub(crate) fn child_cleanup(&self) -> crate::gtk_process::ChildDrain {
+    pub(crate) fn child_cleanup(&self) -> Option<crate::gtk_process::ChildDrain> {
+        let pane = self.pane.as_ref()?;
         #[cfg(target_os = "linux")]
-        if let Some(runtime) = self.pane.runtime() {
-            return crate::gtk_process::ChildDrain::SharedRuntime(Rc::clone(runtime));
+        if let Some(runtime) = pane.runtime() {
+            return Some(crate::gtk_process::ChildDrain::SharedRuntime(Rc::clone(
+                runtime,
+            )));
         }
-        self.pane
-            .pty()
-            .expect("legacy pane owns a PTY")
-            .lifecycle()
-            .into()
+        pane.pty().map(|pty| pty.lifecycle().into())
     }
 
     pub(crate) fn withdrawal_work_probe(&self) -> Box<dyn Fn() -> bool> {
+        let Some(pane) = &self.pane else {
+            return Box::new(|| false);
+        };
         #[cfg(target_os = "linux")]
-        if let (Some(runtime), Some(guard)) = (self.pane.runtime(), &self.runtime_guard) {
+        if let (Some(runtime), Some(guard)) = (pane.runtime(), &self.runtime_guard) {
             let runtime = Rc::clone(runtime);
             let probe = guard.withdrawal_work_probe();
             return Box::new(move || runtime.exit_code().is_none() && probe());
         }
-        self.pane
-            .pty()
+        pane.pty()
             .expect("legacy pane owns a PTY")
             .withdrawal_work_probe()
     }

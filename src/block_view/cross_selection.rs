@@ -788,7 +788,7 @@ mod tests {
     #[cfg(anvil_shared_terminal)]
     #[test]
     #[ignore = "requires an isolated native GTK display and candidate environment"]
-    fn shared_live_block_and_chat_keep_the_owned_shell() {
+    fn shared_live_output_keeps_the_owned_shell_through_alternate_screen() {
         use super::super::find::FindSearchResult;
         use crate::config::{Config, TerminalMode};
         use gtk::prelude::*;
@@ -805,7 +805,7 @@ mod tests {
             stty -echo
             printf '\033]133;A\007$ \033]133;B\007'
             IFS= read -r start
-            printf '\r\n\033]133;C;cmdline_url=live-witness\007shared live row\n'
+            printf '\r\n\033]133;C;cmdline_url=live-witness\007shared live row\nsecond captured row\nwide 界 é\n'
             IFS= read -r fullscreen
             printf '\033[?1049hfull screen witness\n'
             IFS= read -r finish
@@ -828,7 +828,11 @@ mod tests {
             eprintln!("timed out while waiting for {what}");
             false
         };
-        for mode in [TerminalMode::Block, TerminalMode::Chat] {
+        for mode in [
+            TerminalMode::Block,
+            TerminalMode::Chat,
+            TerminalMode::Unified,
+        ] {
             let mut config = Config::safe_defaults();
             config.terminal_mode = mode.clone();
             config.preserve_live_scrollback = false;
@@ -872,8 +876,26 @@ mod tests {
                 view.active_vte.cursor_position(),
                 view.active_vte.text_format(vte4::Format::Text)
             );
-            assert_eq!(label.text(), "shared live row");
-            assert!(label.width() > 0 && label.height() > 0);
+            let first = label
+                .first_child()
+                .unwrap()
+                .downcast::<gtk::Label>()
+                .unwrap();
+            let second = first
+                .next_sibling()
+                .unwrap()
+                .downcast::<gtk::Label>()
+                .unwrap();
+            assert_eq!(first.text(), "shared live row");
+            assert_eq!(second.text(), "second captured row");
+            assert!(second.is_mapped() && second.width() > first.width());
+            let unicode = second
+                .next_sibling()
+                .unwrap()
+                .downcast::<gtk::Label>()
+                .unwrap();
+            assert_eq!(unicode.text(), "wide 界 e\u{301}");
+            assert!(unicode.is_mapped() && unicode.width() > 0);
             assert!(matches!(
                 view.find_in_blocks("shared live row", false, false),
                 FindSearchResult::Matches(_)
@@ -893,23 +915,27 @@ mod tests {
             view.pty
                 .try_write_bytes(b"finish\r")
                 .expect("same shell exits alternate screen");
-            assert!(wait_for("first completed card", &|| view
-                .finished_blocks
-                .borrow()
+            assert!(wait_for("first completed command", &|| view
+                .render_backend
+                .records()
                 .len()
                 == 1));
             assert!(!label.is_mapped());
             view.pty
                 .try_write_bytes(b"continued\r")
                 .expect("send next command to same shell");
-            assert!(wait_for("same shell's next card", &|| view
-                .finished_blocks
-                .borrow()
+            assert!(wait_for("same shell's next command", &|| view
+                .render_backend
+                .records()
                 .len()
                 == 2));
-            assert!(view.block_data.borrow()[1]
-                .output
-                .contains("same shell continued"));
+            let records = view.render_backend.records();
+            assert!(records
+                .iter()
+                .next_back()
+                .and_then(|record| record.output())
+                .is_some_and(|output| output.contains("same shell continued")));
+            drop(records);
             view.pty.kill();
             window.close();
         }
@@ -964,7 +990,7 @@ mod tests {
         settle();
         view.pty.emit_test_output(b"\x1b]133;A\x07$ \x1b]133;B\x07");
         settle();
-        view.pty.emit_test_output(b"echo needle needle\r\n\x1b]133;C;cmdline_url=echo%20needle%20needle\x07\x1b[1;31mdocument-body\x1b[0m\r\nrow two\r\nrow three\r\nrow four\r\nrow five\r\n\x1b[38;2;33;77;121mfindbody marker\x1b[0m\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        view.pty.emit_test_output("echo needle needle\r\n\x1b]133;C;cmdline_url=echo%20needle%20needle\x07\x1b]8;;https://example.test/completed\x07\x1b[1;31mdocument-body\x1b[0m\x1b]8;;\x07\r\nrow two e\u{301} 👩‍💻\r\nrow three\r\nrow four\r\nrow five\r\n\x1b[38;2;33;77;121mfindbody marker\x1b[0m\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07".as_bytes());
         settle();
         view.pty.emit_test_output(b"echo link\r\n\x1b]133;C;cmdline_url=echo%20link\x07https://example.test\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
         settle();
@@ -987,8 +1013,17 @@ mod tests {
                 finished[2].output_vte.is_some(),
                 "unsupported blinking output stays on VTE"
             );
-            assert!(finished[1].output_vte.is_some(), "URL output stays on VTE");
+            assert_eq!(finished[1].output_vte.is_none(), document_output);
             let first = &finished[0];
+            if document_output {
+                let capture = first.full_output.borrow();
+                let archived = jterm_core::screen_replay::project_bounded_archive(&capture)
+                    .expect("completed output retains its styled document projection");
+                assert_eq!(archived.links.len(), 1);
+                let link = &archived.links[0];
+                assert_eq!(link.target, "https://example.test/completed");
+                assert_eq!(&archived.text[link.bytes.clone()], "document-body");
+            }
             assert!(first.command_vte.is_none());
             assert_eq!(first.output_vte.is_none(), document_output);
             let command = first
@@ -997,11 +1032,7 @@ mod tests {
                 .expect("shared command view")
                 .widget()
                 .clone();
-            let second = finished[1]
-                .output_vte
-                .as_ref()
-                .expect("link remains native")
-                .clone();
+            let second = finished[1].output_surface();
             (first.id, command, first.output_surface(), second)
         };
         assert!(command.is_mapped());
@@ -1011,7 +1042,13 @@ mod tests {
             assert!(output.widget().width() > command.width());
         }
         assert_eq!(output.native().is_none(), document_output);
-        assert!(second.is_mapped());
+        assert!(second.widget().is_mapped());
+        if document_output {
+            assert_eq!(
+                second.document_text().as_deref(),
+                Some("https://example.test")
+            );
+        }
         assert!(!command.is_editable());
         let buffer = command.buffer();
         assert_eq!(
@@ -1053,7 +1090,7 @@ mod tests {
                 TerminalTextSurface::Document(output.clone())
                     .document_text()
                     .as_deref(),
-                Some("document-body\nrow two\nrow three\nrow four\nrow five\nfindbody marker")
+                Some("document-body\nrow two e\u{301} 👩‍💻\nrow three\nrow four\nrow five\nfindbody marker")
             );
             assert!(!output.is_editable());
             assert!(view.set_block_collapsed(card_id, true));
@@ -1134,25 +1171,41 @@ mod tests {
                 output
                     .buffer()
                     .text(&capture.start_iter(), &capture.end_iter(), true),
-                "document-body\nrow two\nrow three\nrow four\nrow five\nfindbody marker"
+                "document-body\nrow two e\u{301} 👩‍💻\nrow three\nrow four\nrow five\nfindbody marker"
             );
         }
 
         let cross = &view.cross_selection;
         let surfaces = cross.ordered_vtes();
         let first = TerminalTextSurface::Document(command);
-        let last = TerminalTextSurface::Native(second);
-        let (start, end) = drag_surface_indices(&surfaces, &first, &last).unwrap();
+        let (start, end) = drag_surface_indices(&surfaces, &first, &second).unwrap();
         cross.paint_range(&surfaces, start, end);
         let copied = cross.copy_text().unwrap().unwrap();
         assert!(copied.starts_with("echo needle needle\n"), "{copied:?}");
         let body = copied
             .find("document-body")
-            .expect("selected native output");
+            .expect("selected first card output");
         let following = copied
             .find("https://example.test")
-            .expect("selected native command");
+            .expect("selected next card output");
         assert!(body < following, "{copied:?}");
+        if document_output {
+            assert_eq!(view.clear_blocks(), 4);
+            assert_eq!(view.undo_clear_blocks(), 4);
+            settle();
+            let finished = view.finished_blocks.borrow();
+            assert!(finished[0].command_document.is_some());
+            assert_eq!(
+                finished[1].output_surface().document_text().as_deref(),
+                Some("https://example.test")
+            );
+            assert!(finished[3].command_vte.is_some());
+            drop(finished);
+            assert!(matches!(
+                view.find_in_blocks("findbody marker", false, true),
+                FindSearchResult::Matches(progress) if progress.total == 1
+            ));
+        }
         window.close();
     }
 

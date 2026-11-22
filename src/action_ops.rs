@@ -78,6 +78,11 @@ impl AppModel {
     }
 
     pub(crate) fn toggle_search(&mut self) {
+        #[cfg(anvil_shared_terminal)]
+        if let Some(TermCtl::Shared(view)) = self.active_terminal() {
+            view.toggle_history_search();
+            return;
+        }
         self.search.emit(search::SearchMsg::Toggle);
     }
 

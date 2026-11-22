@@ -585,6 +585,7 @@ fn create_pane(
     session_id: Option<String>,
     cwd_external: bool,
     env_extra: Vec<(String, String)>,
+    ordinary_local: bool,
     sender: &ComponentSender<AppModel>,
 ) -> Pane {
     // New Block panes use the existing native retained command-card backend.
@@ -669,7 +670,16 @@ fn create_pane(
         VteOutput::AskAiAboutBlock(context, intent) => AppMsg::AskAiAboutBlock(context, intent),
         VteOutput::FixBlockWithAgent => AppMsg::FixBlockWithAgent(pane_id),
     };
-    let terminal = match mode {
+    #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+    let shared = ordinary_local
+        .then(|| setup_shared_pane(&init, tab_id, pane_id, sender))
+        .flatten();
+    #[cfg(not(all(anvil_shared_terminal, target_os = "linux")))]
+    let shared: Option<TermCtl> = {
+        let _ = ordinary_local;
+        None
+    };
+    let terminal = shared.unwrap_or_else(|| match mode {
         TerminalMode::Block | TerminalMode::Unified | TerminalMode::Chat => {
             let controller = BlockTerminal::builder()
                 .launch(init)
@@ -685,7 +695,7 @@ fn create_pane(
                 .launch(init)
                 .forward(sender.input_sender(), forward),
         ),
-    };
+    });
     let frame = pane_header::PaneFrame::new(&terminal.widget());
     // The header is this pane's drag handle and its frame is a typed workspace
     // drop zone. Ids, not indices, cross the drag boundary: pane and tab
@@ -755,6 +765,77 @@ fn create_pane(
         task_session_id: None,
         last_bell_toast: None,
     }
+}
+
+#[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+fn setup_shared_pane(
+    init: &VteInit,
+    tab_id: u64,
+    pane_id: u64,
+    sender: &ComponentSender<AppModel>,
+) -> Option<TermCtl> {
+    if !matches!(init.mode, TerminalMode::Vte)
+        || init.working_directory_external
+        || !init.initial_commands.as_slice().is_empty()
+        || !init.env_extra.is_empty()
+    {
+        return None;
+    }
+    let view = shared_terminal::SharedTerminal::open_for_pane(
+        init.config.clone(),
+        &init.shell_argv,
+        init.working_directory.as_deref(),
+    )?;
+    if let Some(pane) = view.pane() {
+        let runtime = Rc::downgrade(
+            pane.runtime()
+                .expect("embedded shared pane owns its runtime"),
+        );
+        let sender_for_events = sender.clone();
+        let last_cwd = Rc::new(std::cell::RefCell::new(init.working_directory.clone()));
+        let cwd_pending = Rc::new(std::cell::Cell::new(false));
+        pane.set_event_handler(move |event| match event {
+            jterm_gtk_view::PaneEvent::Output => {
+                sender_for_events.input(AppMsg::Activity(pane_id));
+                if cwd_pending.replace(true) {
+                    return;
+                }
+                let runtime = runtime.clone();
+                let pending = cwd_pending.clone();
+                let last_cwd = last_cwd.clone();
+                let sender = sender_for_events.clone();
+                gtk::glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(70),
+                    move || {
+                        pending.set(false);
+                        let Some(cwd) = runtime.upgrade().and_then(|runtime| {
+                            runtime.inspect_child(jterm_core::process::process_cwd)
+                        }) else {
+                            return;
+                        };
+                        if last_cwd.borrow().as_deref() != Some(cwd.as_str()) {
+                            last_cwd.replace(Some(cwd.clone()));
+                            sender.input(AppMsg::PaneCwdChanged(tab_id, pane_id, cwd, false));
+                        }
+                    },
+                );
+            }
+            jterm_gtk_view::PaneEvent::Exited(code) => {
+                sender_for_events.input(AppMsg::PaneExited(tab_id, pane_id, code));
+            }
+            jterm_gtk_view::PaneEvent::TitleChanged(title) => {
+                sender_for_events.input(AppMsg::TitleChanged(pane_id, title));
+            }
+            jterm_gtk_view::PaneEvent::Bell => sender_for_events.input(AppMsg::Bell(pane_id)),
+        });
+        let sender = sender.clone();
+        pane.screen().connect_has_focus_notify(move |screen| {
+            if screen.has_focus() {
+                sender.input(AppMsg::PaneFocused(tab_id, pane_id));
+            }
+        });
+    }
+    Some(TermCtl::Shared(view))
 }
 
 impl AppModel {
@@ -909,12 +990,17 @@ impl SimpleComponent for AppModel {
                 };
             }
         }
-        config.prepare_workspace_startup(init.safe_mode);
         let shell_argv = if init.safe_mode {
             Rc::new(vec!["sh".to_string()])
         } else {
             Rc::new(choose_shell_argv(config.shell.as_deref()))
         };
+        #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+        let shared_shell = init.execute.is_none()
+            && jterm_gtk_view::RuntimeShell::admits_candidate(&shell_argv, host::is_flatpak());
+        #[cfg(not(all(anvil_shared_terminal, target_os = "linux")))]
+        let shared_shell = false;
+        config.prepare_workspace_startup(init.safe_mode, shared_shell);
         let startup = config.startup_commands.clone();
         let requested_cwd = init.working_directory.as_ref().map(|path| {
             path.to_str()

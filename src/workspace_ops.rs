@@ -756,8 +756,7 @@ impl AppModel {
             .tabs
             .get(self.active)
             .and_then(|t| t.panes.get(t.active_pane))
-            .and_then(Pane::local_cwd)
-            .map(str::to_string);
+            .and_then(Pane::working_directory_for_launch);
         self.add_tab_with(
             InitialCommands::from_config(initial_commands.as_deref()),
             cwd,
@@ -782,7 +781,7 @@ impl AppModel {
         let id = self.next_id;
         let close = sender.clone();
         let opened = SharedTerminal::open(
-            &self.config.borrow(),
+            self.config.clone(),
             &self.shell_argv,
             cwd.as_deref(),
             move |_| {
@@ -1019,6 +1018,7 @@ impl AppModel {
             None,
             false,
             env_extra,
+            command.is_none() && !self.safe_mode,
             sender,
         );
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -1166,6 +1166,7 @@ impl AppModel {
                                 restored_sid.clone(),
                                 true,
                                 Vec::new(),
+                                false,
                                 sender,
                             );
                             if restored_remote.is_none() {
@@ -1249,6 +1250,7 @@ impl AppModel {
                     },
                     external_cwd,
                     Vec::new(),
+                    !self.safe_mode,
                     sender,
                 );
                 let widget = pane.widget();
@@ -1383,7 +1385,7 @@ impl AppModel {
             .map(|tab| {
                 tab.panes.iter().any(|pane| {
                     #[cfg(anvil_shared_terminal)]
-                    if pane.terminal.is_shared() {
+                    if pane.terminal.is_standalone_shared() {
                         return true;
                     }
                     pane.task_role.is_some()
@@ -1805,6 +1807,7 @@ impl AppModel {
             None,
             true,
             Vec::new(),
+            false,
             sender,
         );
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -1974,6 +1977,7 @@ impl AppModel {
             None,
             true,
             Vec::new(),
+            false,
             sender,
         );
         self.tabs[idx].holder.append(&pane.widget());
@@ -2343,7 +2347,7 @@ impl AppModel {
             self.tabs[index]
                 .panes
                 .iter()
-                .any(|pane| pane.terminal.is_shared())
+                .any(|pane| pane.terminal.is_standalone_shared())
         }) {
             self.show_toast("Shared terminal tabs use a single pane.");
             return;
@@ -2523,8 +2527,7 @@ impl AppModel {
         let cwd = src
             .panes
             .get(src.active_pane)
-            .and_then(Pane::local_cwd)
-            .map(str::to_string);
+            .and_then(Pane::working_directory_for_launch);
         let title = src.title.clone();
         let custom_title = src.custom_title;
         let private_title = src.private_title;
@@ -2547,6 +2550,7 @@ impl AppModel {
             None,
             false,
             Vec::new(),
+            !self.safe_mode,
             sender,
         );
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -2710,7 +2714,11 @@ impl AppModel {
             return;
         };
         #[cfg(anvil_shared_terminal)]
-        if tab.panes.iter().any(|pane| pane.terminal.is_shared()) {
+        if tab
+            .panes
+            .iter()
+            .any(|pane| pane.terminal.is_standalone_shared())
+        {
             self.show_toast("Shared terminal tabs use a single pane.");
             return;
         }
@@ -2741,7 +2749,7 @@ impl AppModel {
             return;
         }
         let cur_widget = tab.panes[api].widget();
-        let wd = tab.panes[api].local_cwd().map(str::to_string);
+        let wd = tab.panes[api].working_directory_for_launch();
         let mode = tab.panes[api].terminal.mode();
         // Validate the exact holder ancestry before even launching the new
         // component. A stale/malformed leaf must not create an unattached pane
@@ -2757,6 +2765,7 @@ impl AppModel {
         let keybindings = self.kbmap.clone();
         let organism_hub = self.organism_hub.clone();
         let shell_argv = self.shell_argv.clone();
+        let ordinary_local = !self.safe_mode;
         let split = prepare_then_commit(
             || {
                 let pane = create_pane(
@@ -2772,6 +2781,7 @@ impl AppModel {
                     None,
                     false,
                     Vec::new(),
+                    ordinary_local,
                     sender,
                 );
                 if let Some(error) = pane.terminal.synchronous_launch_error() {
@@ -2793,12 +2803,13 @@ impl AppModel {
 
                 {
                     let tab = &mut self.tabs[ti];
+                    let pending_launch = new_pane.terminal.has_pending_launch();
                     tab.panes.push(new_pane);
                     tab.active_pane = tab.panes.len() - 1;
                     // libvte reports spawn completion asynchronously. Until its
                     // success event arrives, this stable id can roll back exactly
                     // the new leaf without guessing from a shifted pane index.
-                    if matches!(mode, TerminalMode::Vte) {
+                    if pending_launch {
                         self.pending_split_spawns
                             .insert(pane_id, (tab_id, source_pane_id));
                     } else if let Some(root) = tab.holder.first_child() {

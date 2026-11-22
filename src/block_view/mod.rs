@@ -9820,6 +9820,14 @@ impl RenderBackend for BlockBackend {
         // colors onto the theme for this block.
         let block_config =
             finished_block_config(&self.dynamic_colors_rc, &self.config_for_cb.borrow());
+        let mut precomputed = FinishedBlockPrecomputed::documents(
+            &block_config,
+            record.command_source == CommandTextSource::ShellReported,
+            !output_head_dropped,
+        );
+        precomputed.output_rows = Some(output_rows);
+        precomputed.output_preview = Some(fold_preview::from_plain(output_plain));
+        precomputed.retained_bytes = Some(newest_estimated_bytes);
         let finished = FinishedBlock::new_with_pool(
             block_id,
             prompt,
@@ -9835,21 +9843,7 @@ impl RenderBackend for BlockBackend {
             &kitty_images,
             plain_output_bytes,
             recycled,
-            FinishedBlockPrecomputed {
-                #[cfg(anvil_shared_terminal)]
-                document_command: record.command_source == CommandTextSource::ShellReported
-                    && matches!(
-                        block_config.terminal_mode,
-                        crate::config::TerminalMode::Block | crate::config::TerminalMode::Chat
-                    )
-                    && std::env::var("JTERM_SHARED_FINISHED_COMMANDS").as_deref() == Ok("1"),
-                #[cfg(anvil_shared_terminal)]
-                document_output: !output_head_dropped
-                    && std::env::var("JTERM_SHARED_FINISHED_OUTPUT").as_deref() == Ok("1"),
-                output_rows: Some(output_rows),
-                output_preview: Some(fold_preview::from_plain(output_plain)),
-                retained_bytes: Some(newest_estimated_bytes),
-            },
+            precomputed,
         );
         finished.set_lifecycle(
             record.lifecycle_health(),
@@ -15485,19 +15479,7 @@ impl TermView {
                         // virtualized away while it is still visible.
                         block.estimated_height =
                             estimated_finished_block_height_for_text(&config, &block.output, cols);
-                        let finished = FinishedBlock::new(
-                            block.id,
-                            &block.prompt,
-                            &block.cmd,
-                            block.cmd_markup.as_deref(),
-                            &block.output,
-                            block.exit_code,
-                            &config,
-                            block.duration_ms,
-                            block.end_time_ms,
-                            block.cwd.as_deref(),
-                            cols,
-                        );
+                        let finished = FinishedBlock::from_retained(block, &config, cols);
                         finished.set_lifecycle(
                             block.lifecycle_health(),
                             block.lifecycle_notice().as_deref(),
@@ -16928,19 +16910,7 @@ impl TermView {
                 });
                 block.estimated_height =
                     estimated_finished_block_height_for_text(&config, &block.output, cols);
-                let finished = FinishedBlock::new(
-                    block.id,
-                    &block.prompt,
-                    &block.cmd,
-                    block.cmd_markup.as_deref(),
-                    &block.output,
-                    block.exit_code,
-                    &config,
-                    block.duration_ms,
-                    block.end_time_ms,
-                    block.cwd.as_deref(),
-                    cols,
-                );
+                let finished = FinishedBlock::from_retained(block, &config, cols);
                 finished.set_lifecycle(
                     block.lifecycle_health(),
                     block.lifecycle_notice().as_deref(),
@@ -17162,19 +17132,7 @@ impl TermView {
                 });
                 block.estimated_height =
                     estimated_finished_block_height_for_text(&config, &block.output, cols);
-                let finished = FinishedBlock::new(
-                    block.id,
-                    &block.prompt,
-                    &block.cmd,
-                    block.cmd_markup.as_deref(),
-                    &block.output,
-                    block.exit_code,
-                    &config,
-                    block.duration_ms,
-                    block.end_time_ms,
-                    block.cwd.as_deref(),
-                    cols,
-                );
+                let finished = FinishedBlock::from_retained(&block, &config, cols);
                 finished.set_lifecycle(
                     block.lifecycle_health(),
                     block.lifecycle_notice().as_deref(),

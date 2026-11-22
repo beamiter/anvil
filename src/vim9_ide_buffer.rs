@@ -2,8 +2,8 @@
 //! render frames. No terminal cells, ANSI escapes, or VTE palette entries are
 //! consulted here. VTE remains the PTY/input adapter and compatibility view.
 
-use super::gtk;
-use gtk::{gdk, glib, pango, subclass::prelude::*};
+use super::{gtk, EditorTerminal};
+use gtk::{gdk, glib, pango, prelude::*, subclass::prelude::*};
 use jterm_core::vim9::{
     Vim9BufferPosition, Vim9Command, Vim9CursorBlink, Vim9InputSnapshot, Vim9PixelRect,
     Vim9PixelScroll, Vim9PointerPhase, Vim9RenderCursor, Vim9RenderFrame, Vim9RenderMetrics,
@@ -14,7 +14,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
-use vte4::prelude::*;
 
 const DEFAULT_FOREGROUND: u32 = 0xd9e0ee;
 const DEFAULT_BACKGROUND: u32 = 0x121720;
@@ -2294,12 +2293,12 @@ pub(super) struct NativeBuffer {
 impl NativeBuffer {
     pub(super) fn new(
         session: &Vim9Session,
-        terminal: &vte4::Terminal,
+        terminal: &EditorTerminal,
         native_enabled: bool,
         smooth_enabled: bool,
     ) -> Self {
         let widget = gtk::Overlay::new();
-        widget.set_child(Some(terminal));
+        widget.set_child(Some(terminal.root()));
         let surface = BufferSurface::new();
         widget.add_overlay(&surface);
         widget.set_measure_overlay(&surface, false);
@@ -2367,7 +2366,7 @@ impl NativeBuffer {
         spacing.set_digits(2);
         spacing.set_value(1.15);
         spacing.set_tooltip_text(Some("Line height multiplier for this editor"));
-        terminal.set_cell_height_scale(1.15);
+        terminal.set_line_height_scale(1.15);
         spacing_row.append(&spacing);
         settings.append(&spacing_row);
         popover.set_child(Some(&settings));
@@ -2378,7 +2377,7 @@ impl NativeBuffer {
         // keys fall through to VTE. Otherwise VTE would draw preedit beneath
         // the opaque native buffer and hide Chinese/Japanese composition.
         let im = gtk::IMMulticontext::new();
-        im.set_client_widget(Some(terminal));
+        im.set_client_widget(Some(terminal.widget()));
         im.set_use_preedit(true);
         let im_keys = gtk::EventControllerKey::new();
         im_keys.set_name(Some("vim9-native-input-method"));
@@ -2389,7 +2388,7 @@ impl NativeBuffer {
             let weak_surface = surface.downgrade();
             im.connect_commit(move |_, text| {
                 if let Some(terminal) = weak_terminal.upgrade() {
-                    terminal.feed_child(text.as_bytes());
+                    terminal.commit_text(text);
                 }
                 if let Some(surface) = weak_surface.upgrade() {
                     surface.set_preedit(None);
@@ -2422,7 +2421,7 @@ impl NativeBuffer {
             let surface = surface.clone();
             font.connect_font_desc_notify(move |font| {
                 if let Some(font) = font.font_desc() {
-                    terminal.set_font(Some(&font));
+                    terminal.set_font(&font);
                     surface.set_font(&font);
                 }
             });
@@ -2430,7 +2429,7 @@ impl NativeBuffer {
         {
             let terminal = terminal.clone();
             spacing.connect_value_changed(move |spacing| {
-                terminal.set_cell_height_scale(spacing.value())
+                terminal.set_line_height_scale(spacing.value())
             });
         }
         {
@@ -2741,7 +2740,7 @@ impl NativeBuffer {
             // that request with allocation can leave Vim 9.1 on the old grid.
             // Disabling rendering does not need to wait for allocation.
             if *subscribed != Some(wanted)
-                && (!wanted || terminal_grid_is_allocated(&terminal))
+                && (!wanted || terminal.grid_matches_allocation())
                 && session
                     .send(Vim9Command::SetRender { enabled: wanted })
                     .is_ok()
@@ -2750,9 +2749,8 @@ impl NativeBuffer {
             }
             let geometry_matches = frame.as_ref().is_some_and(|frame| {
                 frame.revision > *render_revision_floor
-                    && terminal_grid_is_allocated(&terminal)
-                    && frame.rows == terminal.row_count().max(0) as usize
-                    && frame.columns == terminal.column_count().max(0) as usize
+                    && terminal.grid_matches_allocation()
+                    && (frame.rows, frame.columns) == terminal.grid_size()
             });
             let terminal_selection = terminal.has_selection();
             let active = wanted
@@ -2829,6 +2827,7 @@ impl NativeBuffer {
             }
 
             if im_active.replace(active) != active {
+                terminal.delegate_composition(active);
                 if active {
                     im_keys.set_im_context(Some(&im));
                     if terminal.has_focus() {
@@ -2882,32 +2881,14 @@ impl NativeBuffer {
     }
 }
 
-fn terminal_metrics(terminal: &vte4::Terminal) -> Metrics {
-    let border = gtk::prelude::ScrollableExt::border(terminal);
-    let (x, y) = border.as_ref().map_or((0.0, 0.0), |border| {
-        (border.left() as f32, border.top() as f32)
-    });
+fn terminal_metrics(terminal: &EditorTerminal) -> Metrics {
+    let (origin_x, origin_y, cell_width, line_height) = terminal.cell_metrics();
     Metrics {
-        origin_x: x,
-        origin_y: y,
-        cell_width: terminal.char_width().max(1) as f32,
-        line_height: terminal.char_height().max(1) as f32,
+        origin_x,
+        origin_y,
+        cell_width,
+        line_height,
     }
-}
-
-fn terminal_grid_is_allocated(terminal: &vte4::Terminal) -> bool {
-    let border = gtk::prelude::ScrollableExt::border(terminal);
-    let (horizontal, vertical) = border.as_ref().map_or((0, 0), |border| {
-        (
-            i32::from(border.left()) + i32::from(border.right()),
-            i32::from(border.top()) + i32::from(border.bottom()),
-        )
-    });
-    let columns = (terminal.width() - horizontal).max(0) as i64 / terminal.char_width().max(1);
-    let rows = (terminal.height() - vertical).max(0) as i64 / terminal.char_height().max(1);
-    // set_font changes character metrics before GTK reallocates VTE's PTY.
-    // Geometry is ready only when the published counts fit the current size.
-    rows > 0 && columns > 0 && rows == terminal.row_count() && columns == terminal.column_count()
 }
 
 #[cfg(test)]
@@ -3470,7 +3451,7 @@ mod tests {
             std::env::temp_dir(),
         ))
         .unwrap();
-        let terminal = vte4::Terminal::new();
+        let terminal = EditorTerminal::legacy();
         let native = NativeBuffer::new(&session, &terminal, true, true);
         let field = gtk::Entry::new();
         let layout = gtk::Box::new(gtk::Orientation::Vertical, 0);
