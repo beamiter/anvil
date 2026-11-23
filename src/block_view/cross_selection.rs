@@ -834,7 +834,7 @@ mod tests {
             TerminalMode::Unified,
         ] {
             let mut config = Config::safe_defaults();
-            config.terminal_mode = mode.clone();
+            config.terminal_mode = mode;
             config.preserve_live_scrollback = false;
             let view = super::super::TermView::new_with_spawner(
                 &config,
@@ -957,7 +957,7 @@ mod tests {
             document_output
         );
         let mut config = crate::config::Config::safe_defaults();
-        config.terminal_mode = mode.clone();
+        config.terminal_mode = mode;
         crate::child_env::capture_inherited_environment().expect("test child environment");
         let view = super::super::TermView::new_with_spawner(
             &config,
