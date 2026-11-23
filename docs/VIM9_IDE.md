@@ -52,8 +52,10 @@ The Vim9 workbench gives real Vim 9 a native GTK interface. Vim owns text,
 normal/insert/visual modes, registers, macros, undo, buffers, splits, and your
 existing Vim configuration. The main buffer is rendered by GTK/Pango from
 Vim's buffer text, display positions and **GUI RGB highlight attributes**.
-It does not obtain its colors from ANSI output or VTE palette entries. VTE
-continues to own the real interactive PTY and the compatibility display.
+Linux native packages built with `shared-terminal` use the shared terminal
+runtime for the Vim PTY and the compatibility display. Set
+`JTERM_SHARED_RUNTIME=0` before launching to use VTE. Flatpak and builds
+without `shared-terminal` use VTE.
 Native widgets communicate with a bundled Vim9script bridge through a private,
 authenticated local connection.
 
@@ -254,7 +256,7 @@ project roots; select a local pane or launch a local checkout explicitly.
 | Quick open | Ctrl+Shift+P opens a native fuzzy picker across the project. Type a filename or path, use ↑/↓ to select, and press Enter to open. Indexing runs in the background and reports progress, errors, and truncation. Refresh rebuilds the index. Prefix the query with `>` to find and run IDE commands. |
 | Navigation history | Back/forward buttons and Alt+Left/Alt+Right move through the active Vim window's real jump list, restoring the file and cursor position. Native Go to line records a jump as well. Buttons reflect whether a direction is available. |
 | Open buffers | Shows real Vim buffer names, current-buffer marker and modified marker. Activate a row or use previous/next controls to switch; Close current buffer preserves modified-buffer protection. Split vertically/horizontally creates real Vim windows. |
-| Editor | GTK/Pango draws supported buffer views with Vim GUI RGB styles, native cursor and IME preedit; real Vim owns editing, mappings and undo. VTE remains the PTY/input adapter and compatibility view. With multiple splits, a subtle inner outline identifies the active Vim window and dims when the editor loses focus. |
+| Editor | GTK/Pango draws supported buffer views with Vim GUI RGB styles, native cursor and IME preedit; real Vim owns editing, mappings and undo. The same editor PTY drives the compatibility view and accepts input. With multiple splits, a subtle inner outline identifies the active Vim window and dims when the editor loses focus. |
 | Search project | Press Enter or Search to run a search with the selected case mode, literal/regex, whole-word and file-glob options. Stop cancels an active search. Requires `rg` in Vim's environment. Progress, errors, cancellations, match counts and omitted-result counts are visible below the build controls. |
 | Problems | Displays an E/W/I severity label, project-relative filename when valid, line, column and a wrapping message. Hover a row for the full path and message. It identifies the current quickfix list as Search, Build or Vim. Vim may also supply location-list or language-server diagnostics. Activate a result to open its exact location. F8/Shift+F8 navigate Vim diagnostics. |
 | Build | Edit the visible shell command and press Build/F5. Builds run asynchronously in the project root. Cancel stops the active build. Exit status and a bounded output tail are shown in the native Build output tab; parsed diagnostics populate Problems. |

@@ -57,11 +57,11 @@ jobs:
           fi
 
       - name: Run release tests
-        run: xvfb-run --auto-servernum cargo test --all-targets --locked --no-fail-fast
+        run: xvfb-run --auto-servernum cargo test --all-targets --features shared-terminal --locked --no-fail-fast
 
       - name: Build optimized binary and bundle
         run: |
-          cargo build --release --locked
+          cargo build --release --features shared-terminal --locked
           bash scripts/package-release.sh target/release/anvil
           (cd target/dist && sha256sum --check ./*.sha256)
 

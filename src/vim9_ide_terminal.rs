@@ -24,7 +24,8 @@ enum Backend {
 impl EditorTerminal {
     pub(super) fn start(launch: &jterm_core::vim9::Vim9Launch) -> Result<Self, String> {
         #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
-        if !crate::host::is_flatpak() && std::env::var("JTERM_SHARED_RUNTIME").as_deref() == Ok("1")
+        if !crate::host::is_flatpak()
+            && std::env::var_os("JTERM_SHARED_RUNTIME").is_none_or(|value| value == "1")
         {
             let mut argv = vec![launch.program.clone()];
             argv.extend(launch.args.iter().cloned());
