@@ -19,6 +19,19 @@ pub(crate) struct TaskTerminalIdentity {
     pub(crate) session_id: String,
 }
 
+enum CommandTab {
+    Helper(String),
+    HostedAttachment(String),
+}
+
+impl CommandTab {
+    fn title(&self) -> &str {
+        match self {
+            Self::Helper(title) | Self::HostedAttachment(title) => title,
+        }
+    }
+}
+
 /// Seconds an undo offer stays on screen. The default toast timeout is tuned
 /// for statements; this one is a decision, and the user has to notice the
 /// mistake before they can decide to take it back.
@@ -855,11 +868,7 @@ impl AppModel {
         );
     }
 
-    /// Launch an explicit argv in its own named tab, in conventional VTE mode.
-    ///
-    /// Used for one-shot helpers such as the jsh installer: they emit no
-    /// shell-integration sequences, so Block mode would have nothing to build
-    /// blocks from, and their prompts expect a plain terminal to type into.
+    /// Select an existing CLI attachment or open its approved host relay.
     pub(crate) fn add_agent_session_tab(
         &mut self,
         request: crate::agent_sessions::ResumeRequest,
@@ -894,17 +903,9 @@ impl AppModel {
             ));
             return;
         };
-        let launch = plan.clone();
-        let mut argv = vec![launch.program];
-        argv.extend(launch.args);
-        if let Some((_, pane_id)) = self.add_tab_full_inner(
-            InitialCommands::default(),
-            Some(launch.cwd.to_string_lossy().into_owned()),
-            Rc::new(argv),
-            Some((TerminalMode::Vte, request.title.clone())),
-            Vec::new(),
-            sender,
-        ) {
+        if let Some((_, pane_id)) =
+            self.add_hosted_attachment_tab(request.title.clone(), plan.clone(), sender)
+        {
             if let Some(pane) = self
                 .tabs
                 .iter()
@@ -917,12 +918,48 @@ impl AppModel {
             }
             self.agent_session_tabs.insert(key, pane_id);
             self.agent_session_pending.insert(pane_id, request);
+            self.sync_agent_session_tab_bindings();
             self.rebuild_tab_strip(sender);
         } else {
             let _ = request.completion.send(Err(
                 "The terminal tab limit prevented this session from opening.".into(),
             ));
         }
+    }
+
+    pub(crate) fn add_hosted_attachment_tab(
+        &mut self,
+        title: String,
+        launch: jterm_core::agent_sessions::SessionLaunch,
+        sender: &ComponentSender<AppModel>,
+    ) -> Option<(u64, u64)> {
+        let argv = std::iter::once(launch.program).chain(launch.args).collect();
+        self.add_tab_full_inner(
+            InitialCommands::default(),
+            Some(launch.cwd.to_string_lossy().into_owned()),
+            Rc::new(argv),
+            Some(CommandTab::HostedAttachment(title)),
+            Vec::new(),
+            sender,
+        )
+    }
+
+    pub(super) fn forget_agent_session_pane(&mut self, pane_id: u64) {
+        let count = self.agent_session_tabs.len();
+        self.agent_session_tabs.retain(|_, bound| *bound != pane_id);
+        if self.agent_session_tabs.len() != count {
+            self.sync_agent_session_tab_bindings();
+        }
+        if let Some(request) = self.agent_session_pending.remove(&pane_id) {
+            let _ = request
+                .completion
+                .send(Err("The terminal closed before this session opened.".into()));
+        }
+    }
+
+    pub(super) fn sync_agent_session_tab_bindings(&self) {
+        self.session_sidebar
+            .set_existing(self.agent_session_tabs.keys().cloned().collect());
     }
 
     pub(crate) fn add_command_tab(
@@ -935,7 +972,7 @@ impl AppModel {
             InitialCommands::default(),
             None,
             Rc::new(argv),
-            Some((TerminalMode::Vte, title.to_string())),
+            Some(CommandTab::Helper(title.to_string())),
             Vec::new(),
             sender,
         );
@@ -964,7 +1001,7 @@ impl AppModel {
             InitialCommands::default(),
             working_directory,
             Rc::new(argv),
-            Some((TerminalMode::Vte, title.to_string())),
+            Some(CommandTab::Helper(title.to_string())),
             env_extra,
             sender,
         )?;
@@ -988,7 +1025,7 @@ impl AppModel {
         initial_commands: InitialCommands,
         working_directory: Option<String>,
         shell_argv: Rc<Vec<String>>,
-        command: Option<(TerminalMode, String)>,
+        command: Option<CommandTab>,
         env_extra: Vec<(String, String)>,
         sender: &ComponentSender<AppModel>,
     ) -> Option<(u64, u64)> {
@@ -1000,10 +1037,20 @@ impl AppModel {
         let pane_id = self.next_pane_id;
         self.next_pane_id += 1;
         let number = self.tabs.len() as u32 + 1;
-        let mode = command
-            .as_ref()
-            .map(|(mode, _)| *mode)
-            .unwrap_or_else(|| self.config.borrow().terminal_mode);
+        let mode = if command.is_some() {
+            TerminalMode::Vte
+        } else {
+            self.config.borrow().terminal_mode
+        };
+        let shared_kind = if self.safe_mode {
+            None
+        } else {
+            match &command {
+                None => Some(SharedPaneKind::ConfiguredShell),
+                Some(CommandTab::HostedAttachment(_)) => Some(SharedPaneKind::HostedAttachment),
+                Some(CommandTab::Helper(_)) => None,
+            }
+        };
         let title_cwd = working_directory.clone();
         let pane = create_pane(
             &self.config,
@@ -1018,7 +1065,7 @@ impl AppModel {
             None,
             false,
             env_extra,
-            command.is_none() && !self.safe_mode,
+            shared_kind,
             sender,
         );
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -1032,7 +1079,7 @@ impl AppModel {
             active_pane: 0,
             title: command
                 .as_ref()
-                .map(|(_, title)| title.clone())
+                .map(|command| command.title().to_owned())
                 .unwrap_or_else(|| default_tab_title(number, title_cwd.as_deref())),
             custom_title: command.is_some(),
             bell: false,
@@ -1166,7 +1213,7 @@ impl AppModel {
                                 restored_sid.clone(),
                                 true,
                                 Vec::new(),
-                                false,
+                                None,
                                 sender,
                             );
                             if restored_remote.is_none() {
@@ -1250,7 +1297,7 @@ impl AppModel {
                     },
                     external_cwd,
                     Vec::new(),
-                    !self.safe_mode,
+                    (!self.safe_mode).then_some(SharedPaneKind::ConfiguredShell),
                     sender,
                 );
                 let widget = pane.widget();
@@ -1808,7 +1855,7 @@ impl AppModel {
             None,
             true,
             Vec::new(),
-            false,
+            None,
             sender,
         );
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -1978,7 +2025,7 @@ impl AppModel {
             None,
             true,
             Vec::new(),
-            false,
+            None,
             sender,
         );
         self.tabs[idx].holder.append(&pane.widget());
@@ -2131,6 +2178,7 @@ impl AppModel {
             .map(|pane| pane.id)
             .collect::<Vec<_>>();
         for pane_id in pane_ids {
+            self.forget_agent_session_pane(pane_id);
             self.pending_split_spawns.remove(&pane_id);
             self.close_command_suggestion_for_pane(pane_id);
             self.close_command_correction_for_pane(pane_id);
@@ -2551,7 +2599,7 @@ impl AppModel {
             None,
             false,
             Vec::new(),
-            !self.safe_mode,
+            (!self.safe_mode).then_some(SharedPaneKind::ConfiguredShell),
             sender,
         );
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -2640,6 +2688,7 @@ impl AppModel {
             .flat_map(|tab| tab.panes.iter().map(|pane| pane.id))
             .collect::<Vec<_>>();
         for pane_id in pane_ids {
+            self.forget_agent_session_pane(pane_id);
             self.pending_split_spawns.remove(&pane_id);
             self.close_command_suggestion_for_pane(pane_id);
             self.close_command_correction_for_pane(pane_id);
@@ -2766,7 +2815,7 @@ impl AppModel {
         let keybindings = self.kbmap.clone();
         let organism_hub = self.organism_hub.clone();
         let shell_argv = self.shell_argv.clone();
-        let ordinary_local = !self.safe_mode;
+        let shared_kind = (!self.safe_mode).then_some(SharedPaneKind::ConfiguredShell);
         let split = prepare_then_commit(
             || {
                 let pane = create_pane(
@@ -2782,7 +2831,7 @@ impl AppModel {
                     None,
                     false,
                     Vec::new(),
-                    ordinary_local,
+                    shared_kind,
                     sender,
                 );
                 if let Some(error) = pane.terminal.synchronous_launch_error() {
@@ -2991,6 +3040,7 @@ impl AppModel {
             }
         }
         drop(removed);
+        self.forget_agent_session_pane(pane_id);
         self.finish_search_pane_transition(search_transition);
         // Numbering shifted, and dropping back to one pane hides the headers.
         self.refresh_pane_headers(ti);

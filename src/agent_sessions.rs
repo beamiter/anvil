@@ -2022,7 +2022,9 @@ impl Manager {
             self.activation.borrow_mut().take();
             match result {
                 Ok(()) => {
-                    self.existing.borrow_mut().insert(key);
+                    if !self.embedded {
+                        self.existing.borrow_mut().insert(key);
+                    }
                     self.completed_activation.set(true);
                     set_label(&self.readiness, "Session opened — release Enter to switch");
                     self.close_when_released();

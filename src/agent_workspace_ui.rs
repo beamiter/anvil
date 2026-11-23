@@ -236,8 +236,7 @@ impl AppModel {
     }
 
     pub(crate) fn sync_workspace_navigation(&self) {
-        self.session_sidebar
-            .set_existing(self.agent_session_tabs.keys().cloned().collect());
+        self.sync_agent_session_tab_bindings();
         let surface = self.workspace_stack.visible_child_name();
         self.session_sidebar
             .set_terminal_active(surface.as_deref() == Some("terminal"));

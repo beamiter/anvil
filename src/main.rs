@@ -573,6 +573,12 @@ struct AppModel {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy)]
+enum SharedPaneKind {
+    ConfiguredShell,
+    HostedAttachment,
+}
+
 fn create_pane(
     config: &Rc<RefCell<Config>>,
     keybindings: &Rc<RefCell<KeybindingMap>>,
@@ -586,7 +592,7 @@ fn create_pane(
     session_id: Option<String>,
     cwd_external: bool,
     env_extra: Vec<(String, String)>,
-    ordinary_local: bool,
+    shared_kind: Option<SharedPaneKind>,
     sender: &ComponentSender<AppModel>,
 ) -> Pane {
     // New Block panes use the existing native retained command-card backend.
@@ -672,12 +678,11 @@ fn create_pane(
         VteOutput::FixBlockWithAgent => AppMsg::FixBlockWithAgent(pane_id),
     };
     #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
-    let shared = ordinary_local
-        .then(|| setup_shared_pane(&init, tab_id, pane_id, sender))
-        .flatten();
+    let shared =
+        shared_kind.and_then(|kind| setup_shared_pane(kind, &init, tab_id, pane_id, sender));
     #[cfg(not(all(anvil_shared_terminal, target_os = "linux")))]
     let shared: Option<TermCtl> = {
-        let _ = ordinary_local;
+        let _ = shared_kind;
         None
     };
     let terminal = shared.unwrap_or_else(|| match mode {
@@ -770,6 +775,7 @@ fn create_pane(
 
 #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
 fn setup_shared_pane(
+    kind: SharedPaneKind,
     init: &VteInit,
     tab_id: u64,
     pane_id: u64,
@@ -782,12 +788,29 @@ fn setup_shared_pane(
     {
         return None;
     }
-    let view = shared_terminal::SharedTerminal::open_for_pane(
-        init.config.clone(),
-        &init.shell_argv,
-        init.working_directory.as_deref(),
-        init.session_id.as_deref()?,
-    )?;
+    let view = match kind {
+        SharedPaneKind::ConfiguredShell => shared_terminal::SharedTerminal::open_for_pane(
+            init.config.clone(),
+            &init.shell_argv,
+            init.working_directory.as_deref(),
+            init.session_id.as_deref()?,
+        ),
+        SharedPaneKind::HostedAttachment => {
+            shared_terminal::SharedTerminal::open_hosted_attachment(
+                init.config.clone(),
+                &init.shell_argv,
+                init.working_directory.as_deref()?,
+            )
+        }
+    }?;
+    if matches!(kind, SharedPaneKind::HostedAttachment) {
+        sender.input(
+            view.launch_error()
+                .map_or(AppMsg::PaneLaunched(pane_id), |error| {
+                    AppMsg::PaneLaunchFailed(pane_id, error.to_owned())
+                }),
+        );
+    }
     if let Some(pane) = view.pane() {
         let runtime = Rc::downgrade(
             pane.runtime()
@@ -2398,8 +2421,9 @@ impl SimpleComponent for AppModel {
                 self.note_pane_launched_task_pin(pane_id);
             }
             AppMsg::PaneLaunchFailed(pane_id, message) => {
-                self.agent_session_tabs.retain(|_, bound| *bound != pane_id);
-                if let Some(request) = self.agent_session_pending.remove(&pane_id) {
+                let request = self.agent_session_pending.remove(&pane_id);
+                self.forget_agent_session_pane(pane_id);
+                if let Some(request) = request {
                     self.close_pane(pane_id, &sender);
                     let _ = request.completion.send(Err(message));
                     return;
@@ -2456,7 +2480,7 @@ impl SimpleComponent for AppModel {
                 self.persist_config();
             }
             AppMsg::PaneExited(_, pane_id, code) => {
-                self.agent_session_tabs.retain(|_, bound| *bound != pane_id);
+                self.forget_agent_session_pane(pane_id);
                 // A task terminal's exit is authoritative task evidence; the
                 // task model consumes it before the pane closes. Validation
                 // and agent terminals are never remote-reconnect candidates.

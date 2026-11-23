@@ -1243,22 +1243,20 @@ impl AppModel {
                 return;
             }
         };
-        let argv = std::iter::once(launch.program).chain(launch.args).collect();
-        let Some((_, pane_id)) = self.add_task_terminal_tab(
-            &terminal.label,
-            argv,
-            Some(launch.cwd.to_string_lossy().into_owned()),
-            Vec::new(),
-            crate::workspace_ops::TaskTerminalIdentity {
-                role: TaskTerminalRole::Validation,
-                session_id,
-            },
-            sender,
-        ) else {
+        let Some((tab_id, pane_id)) =
+            self.add_hosted_attachment_tab(terminal.label, launch, sender)
+        else {
             return;
         };
-        if let Some(pane) = self.pane(pane_id) {
+        if let Some(pane) = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.panes.iter_mut().find(|pane| pane.id == pane_id))
+        {
             use relm4::gtk::prelude::*;
+            pane.task_role = Some(TaskTerminalRole::Validation);
+            pane.task_session_id = Some(session_id);
             unsafe {
                 pane.terminal
                     .widget()

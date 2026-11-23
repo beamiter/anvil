@@ -43,6 +43,15 @@ pub(crate) struct SharedTerminal {
     runtime_guard: Option<std::sync::Arc<crate::gtk_process::Guard>>,
 }
 
+impl Drop for SharedTerminal {
+    fn drop(&mut self) {
+        // The window retains the runtime for reaping after the pane is gone.
+        if let Some(pane) = &self.pane {
+            pane.stop();
+        }
+    }
+}
+
 impl SharedTerminal {
     pub(crate) fn open(
         config: Rc<RefCell<Config>>,
@@ -149,20 +158,58 @@ impl SharedTerminal {
                 )
             },
         );
+        Self::from_runtime(config, argv, result, false)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_hosted_attachment(
+        config: Rc<RefCell<Config>>,
+        argv: &[String],
+        cwd: &str,
+    ) -> Option<Self> {
+        let result = RuntimeShell::spawn_hosted_attachment(
+            argv,
+            std::path::Path::new(cwd),
+            crate::host::is_flatpak(),
+            || {
+                Self::runtime_environment(
+                    argv,
+                    config.borrow().vim9.auto_gui,
+                    &jterm_gtk_view::INTERACTIVE_CHILD_ENV,
+                )
+            },
+        );
+        Self::from_runtime(config, argv, result, true)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn from_runtime(
+        config: Rc<RefCell<Config>>,
+        argv: &[String],
+        result: Result<Option<Rc<RuntimeShell>>, String>,
+        hosted_attachment: bool,
+    ) -> Option<Self> {
         let build = |runtime: Rc<RuntimeShell>| {
             let pid = runtime
                 .child_pid()
                 .ok_or("shared shell has no live process id")?;
             let guard =
                 crate::gtk_process::Guard::capture(pid, RuntimeShell::candidate_program(argv));
-            let (widget, pane) = TerminalPane::with_runtime_embedded(
+            let mount = if hosted_attachment {
+                TerminalPane::with_hosted_attachment
+            } else {
+                TerminalPane::with_runtime_embedded
+            };
+            let (widget, pane) = mount(
                 runtime,
                 Self::theme(&config.borrow()),
                 jterm_core::review_input::safe_inline_display,
                 Self::links(),
             )?;
             pane.set_history_row_limit(config.borrow().terminal_scrollback_lines as usize);
-            Self::register_vim_source(&widget, &pane);
+            if !hosted_attachment {
+                Self::register_vim_source(&widget, &pane);
+            }
             Ok::<_, String>((widget, pane, guard))
         };
         match result.and_then(|runtime| runtime.map(build).transpose()) {
