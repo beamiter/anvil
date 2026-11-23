@@ -789,6 +789,7 @@ mod tests {
     #[test]
     #[ignore = "requires an isolated native GTK display and candidate environment"]
     fn shared_live_output_keeps_the_owned_shell_through_alternate_screen() {
+        use super::super::find::{FindNavigationResult, FindSearchResult};
         use crate::config::{Config, TerminalMode};
         use gtk::prelude::*;
         use std::rc::Rc;
@@ -810,6 +811,7 @@ mod tests {
             printf '\033[?1049l\033]133;D;0\007\033]133;A\007$ \033]133;B\007'
             IFS= read -r next
             printf '\r\n\033]133;C;cmdline_url=next\007same shell %s\n' "$next"
+            IFS= read -r complete_next
             printf '\033]133;D;0\007\033]133;A\007$ \033]133;B\007'
             IFS= read -r history
             printf '\r\n\033]133;C;cmdline_url=history\007'
@@ -899,6 +901,22 @@ mod tests {
             });
             let (cols, rows) = terminal.grid_size();
             assert_eq!(view.grid_size(), (i64::from(cols), i64::from(rows)));
+            assert!(matches!(
+                view.find_in_blocks("shared (?:live) row|second captured row", true, true),
+                FindSearchResult::Matches(p) if p.current == 1 && p.total == 2
+            ));
+            assert_eq!(
+                current_shared_find_text(&screen).as_deref(),
+                Some("shared live row")
+            );
+            assert!(
+                matches!(view.find_next(), FindNavigationResult::Progress(p) if p.current == 2)
+            );
+            assert_eq!(
+                current_shared_find_text(&screen).as_deref(),
+                Some("second captured row")
+            );
+            assert!(!buffer.has_selection(), "Find must leave the PTY running");
             view.pty
                 .try_write_bytes(b"fullscreen\r")
                 .expect("enter alternate screen");
@@ -908,6 +926,19 @@ mod tests {
                     && text().contains("full screen witness")
                     && !chrome.is_visible()
             });
+            assert_eq!(view.find_next(), FindNavigationResult::Invalidated);
+            assert!(matches!(
+                view.find_in_blocks("full screen witness", false, true),
+                FindSearchResult::Matches(p) if p.total == 1
+            ));
+            assert_eq!(
+                current_shared_find_text(&screen).as_deref(),
+                Some("full screen witness")
+            );
+            assert_eq!(
+                view.find_in_blocks("shared live row", false, true),
+                FindSearchResult::NoMatches
+            );
             view.pty
                 .try_write_bytes(b"finish\r")
                 .expect("return to primary screen");
@@ -944,6 +975,23 @@ mod tests {
             view.pty
                 .try_write_bytes(b"continued\r")
                 .expect("send the next command to the same shell");
+            wait_for(
+                mode,
+                "next command output while the same shell waits",
+                &|| same_surface() && text().contains("same shell continued"),
+            );
+            assert!(matches!(
+                view.find_in_blocks("shared live row|same shell continued", true, true),
+                FindSearchResult::Matches(p) if p.total == 2
+            ));
+            assert!(
+                matches!(view.find_next(), FindNavigationResult::Progress(p) if p.current == 2)
+            );
+            assert_eq!(
+                current_shared_find_text(&screen).as_deref(),
+                Some("same shell continued")
+            );
+            view.pty.try_write_bytes(b"complete\r").unwrap();
             wait_for(mode, "same shell's next command", &|| {
                 same_surface()
                     && view.render_backend.records().len() == 2
@@ -962,6 +1010,15 @@ mod tests {
                     view.render_backend.records().len() == 3
                         && text().contains("archived zones ready")
                 });
+                assert!(matches!(
+                    view.find_in_blocks("shared live row", false, true),
+                    FindSearchResult::Matches(p) if p.total == 1
+                ));
+                assert_eq!(
+                    current_shared_find_text(&screen).as_deref(),
+                    Some("shared live row")
+                );
+                view.clear_find();
                 assert!(transcript.reveal_zone(id));
                 wait_for(
                     mode,
@@ -1002,6 +1059,20 @@ mod tests {
             view.pty.kill();
             window.close();
         }
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    fn current_shared_find_text(screen: &gtk::TextView) -> Option<String> {
+        use gtk::prelude::*;
+        let buffer = screen.buffer();
+        let tag = buffer.tag_table().lookup("jterm-screen-find-current")?;
+        let mut start = buffer.start_iter();
+        if !start.has_tag(&tag) && !start.forward_to_tag_toggle(Some(&tag)) {
+            return None;
+        }
+        let mut end = start;
+        end.forward_to_tag_toggle(Some(&tag));
+        Some(buffer.text(&start, &end, true).to_string())
     }
 
     #[cfg(anvil_shared_terminal)]

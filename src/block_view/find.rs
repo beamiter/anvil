@@ -234,6 +234,56 @@ struct LiveFindStamp {
     origin: Option<i64>,
 }
 
+#[cfg(anvil_shared_terminal)]
+#[derive(Clone)]
+struct SharedFind {
+    terminal: Rc<super::SharedActiveTerminal>,
+    frame: jterm_gtk_view::FindFrame,
+    hits: Rc<[jterm_gtk_view::FindMatch]>,
+}
+
+#[cfg(anvil_shared_terminal)]
+impl SharedFind {
+    fn scan(
+        terminal: Rc<super::SharedActiveTerminal>,
+        scope: FindScope,
+        expression: &regex::Regex,
+        budget: &mut FindScanBudget,
+        limit: usize,
+    ) -> Option<(Self, bool)> {
+        let snapshot = terminal.find_snapshot(
+            scope == FindScope::LiveScreen,
+            budget.remaining_bytes(),
+            &mut || budget.time_exhausted(),
+        )?;
+        let mut hits = Vec::new();
+        let mut incomplete = snapshot.incomplete;
+        'windows: for window in snapshot.windows {
+            budget.consume_bytes(window.text().len());
+            for found in expression.find_iter(window.text()) {
+                if let Some(hit) = window.match_at(found.range()) {
+                    hits.push(hit);
+                    if hits.len() == limit {
+                        break 'windows;
+                    }
+                    if hits.len().is_multiple_of(128) && budget.time_exhausted() {
+                        incomplete = true;
+                        break 'windows;
+                    }
+                }
+            }
+        }
+        Some((
+            Self {
+                terminal,
+                frame: snapshot.frame,
+                hits: hits.into(),
+            },
+            incomplete,
+        ))
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct FindState {
     /// An asynchronous exact step failed; the next action must rebuild rather
@@ -241,6 +291,7 @@ pub(crate) struct FindState {
     invalidated: bool,
     replay_repair: Option<Rc<FindReplayRepair>>,
     query: Option<FindQuery>,
+    scope: Option<FindScope>,
     pub(crate) surfaces: Vec<FindSurface>,
     cursor: FindCursor,
     total: usize,
@@ -255,6 +306,8 @@ pub(crate) struct FindState {
     highlighted_commands: Vec<gtk::TextView>,
     #[cfg(anvil_shared_terminal)]
     command_pattern: Option<regex::Regex>,
+    #[cfg(anvil_shared_terminal)]
+    shared: Option<SharedFind>,
     /// Highlights installed by the flat cross-block palette do not participate
     /// in incremental navigation, but must still be cleared without walking all
     /// retained blocks on every debounced query.
@@ -1459,17 +1512,28 @@ fn add_snapshot_jump_fallbacks<'a>(
 #[allow(dead_code)]
 impl TermView {
     fn live_find_stamp(&self) -> LiveFindStamp {
+        let (columns, rows) = self.grid_size();
         LiveFindStamp {
             contents_generation: self.contents_generation.get(),
-            rows: self.active_vte.row_count(),
-            columns: self.active_vte.column_count(),
+            rows,
+            columns,
             origin: self.active.borrow().live_cursor_origin().get(),
         }
     }
 
     fn live_find_is_current(&self) -> bool {
-        let expected = self.find_state.borrow().live_stamp;
-        expected.is_none_or(|stamp| stamp == self.live_find_stamp())
+        let state = self.find_state.borrow();
+        #[cfg(anvil_shared_terminal)]
+        if state
+            .shared
+            .as_ref()
+            .is_some_and(|find| !find.terminal.find_is_current(&find.frame))
+        {
+            return false;
+        }
+        state
+            .live_stamp
+            .is_none_or(|stamp| stamp == self.live_find_stamp())
     }
 
     /// Cheap version probe for an open picker. No command/output text is
@@ -1543,7 +1607,10 @@ impl TermView {
         allow_rebuild: bool,
     ) -> FindSearchResult {
         self.clear_find();
-        if query.is_empty() || find_scope(self.bstate.get()) == FindScope::LiveScreen {
+        let scope = self.find_scope();
+        if query.is_empty()
+            || (scope == FindScope::LiveScreen && !self.uses_shared_active_terminal())
+        {
             return FindSearchResult::NoMatches;
         }
         let pattern = if use_regex {
@@ -1589,7 +1656,13 @@ impl TermView {
         let mut scan_limited = false;
         let mut live_anchor = None;
         let mut scan_budget = FindScanBudget::new();
-        let completed_batch = {
+        let completed_batch = if scope == FindScope::LiveScreen {
+            super::BackendSearchBatch {
+                surfaces: Vec::new(),
+                incomplete: false,
+                native_fallback: None,
+            }
+        } else {
             let mut deadline_exhausted = || scan_budget.time_exhausted();
             self.render_backend
                 .completed_search_surfaces(scan_budget.remaining_bytes(), &mut deadline_exhausted)
@@ -1706,13 +1779,55 @@ impl TermView {
         // place) leaves a raw byte capture that no replay of ours reads the
         // way VTE does, and a count taken from it did not match the steps.
         // The raw capture is only the fallback when the VTE cannot be read.
+        let running = matches!(
+            self.bstate.get(),
+            BlockState::CollectingOutput | BlockState::PostCommand
+        );
+        #[cfg(anvil_shared_terminal)]
+        let shared_find = if !match_limited
+            && !scan_limited
+            && (running || self.is_unified() || scope == FindScope::LiveScreen)
+        {
+            let terminal = self.active.borrow().shared_active.clone();
+            terminal.and_then(|terminal| {
+                live_observed = true;
+                let limit = FIND_MATCH_LIMIT.saturating_sub(total);
+                let Some((find, incomplete)) =
+                    SharedFind::scan(terminal, scope, &re, &mut scan_budget, limit)
+                else {
+                    scan_limited = true;
+                    return None;
+                };
+                let count = find.hits.len();
+                match_limited = count >= limit;
+                scan_limited = !match_limited && incomplete;
+                if count > 0 {
+                    surfaces.push(FindSurface {
+                        block_id: 0,
+                        block_index: 0,
+                        is_output: true,
+                        is_live: true,
+                        count,
+                        vte_cursor: None,
+                        pending_replay: None,
+                        complete: !(match_limited || scan_limited),
+                        initial_wrap: false,
+                        wrap_before: None,
+                        render_stamp: super::blocks::NEUTRAL_RENDER_STAMP,
+                    });
+                    total += count;
+                    find.terminal.highlight_find(&find.frame, find.hits.clone());
+                }
+                Some(find)
+            })
+        } else {
+            None
+        };
         if !match_limited
             && !scan_limited
             && !completed_owns_live_surface
-            && matches!(
-                self.bstate.get(),
-                super::BlockState::CollectingOutput | super::BlockState::PostCommand
-            )
+            && running
+            && !self.uses_shared_active_terminal()
         {
             live_observed = true;
             let live_rows = self.active_vte.vadjustment().map(|adjustment| {
@@ -1794,6 +1909,7 @@ impl TermView {
                 use_regex,
                 case_sensitive,
             });
+            st.scope = Some(scope);
             st.cursor = FindCursor::default();
             st.total = total;
             st.capped = capped;
@@ -1803,6 +1919,7 @@ impl TermView {
             {
                 st.highlighted_commands = highlighted_commands;
                 st.command_pattern = Some(re.clone());
+                st.shared = shared_find;
             }
             st.live_anchor = live_anchor;
             st.live_stamp = live_stamp;
@@ -2145,7 +2262,14 @@ impl TermView {
         }
         // Hits found before an alternate-screen app took the pane are on
         // cards it hid; stepping to them would scroll to nothing.
-        if find_scope(self.bstate.get()) == FindScope::LiveScreen {
+        let scope = self.find_scope();
+        if self
+            .find_state
+            .borrow()
+            .scope
+            .is_some_and(|before| before != scope)
+            || (scope == FindScope::LiveScreen && !self.uses_shared_active_terminal())
+        {
             self.clear_find();
             return FindNavigationResult::Invalidated;
         }
@@ -2242,6 +2366,27 @@ impl TermView {
             };
             (surface.clone(), state.query.clone(), state.cursor)
         };
+        #[cfg(anvil_shared_terminal)]
+        {
+            let shared = self.find_state.borrow().shared.clone();
+            if let Some(find) = shared {
+                if surface.is_live && surface.block_id == 0 {
+                    if !find.terminal.show_find(&find.frame, find.hits, occurrence) {
+                        return FindFocusResult::Invalidated;
+                    }
+                    let state = self.find_state.borrow();
+                    return if state.query == query_at_start
+                        && state.cursor == cursor_at_start
+                        && state.surfaces.get(surface_index) == Some(&surface)
+                    {
+                        FindFocusResult::Selected
+                    } else {
+                        FindFocusResult::Invalidated
+                    };
+                }
+                find.terminal.highlight_find(&find.frame, find.hits);
+            }
+        }
         let (vte, current_render_stamp) = if surface.is_live && surface.block_id == 0 {
             (self.active_vte.clone(), None)
         } else {
@@ -2418,6 +2563,12 @@ impl TermView {
         let Some(surface) = st.surfaces.get(st.cursor.surface) else {
             return;
         };
+        if surface.is_live
+            && self.uses_shared_active_terminal()
+            && (self.is_unified() || self.find_scope() == FindScope::LiveScreen)
+        {
+            return;
+        }
         let widget: gtk::Widget = if surface.is_live && surface.block_id == 0 {
             self.active.borrow().widget().clone().upcast()
         } else {
@@ -2845,6 +2996,10 @@ pub(super) fn clear_find_state(
     active_vte: &vte4::Terminal,
 ) {
     let state = std::mem::take(&mut *find_state.borrow_mut());
+    #[cfg(anvil_shared_terminal)]
+    if let Some(find) = state.shared {
+        find.terminal.clear_find();
+    }
     #[cfg(anvil_shared_terminal)]
     for command in state.highlighted_commands {
         jterm_gtk_view::clear_finished_text_matches(&command);

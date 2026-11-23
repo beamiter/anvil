@@ -2864,9 +2864,7 @@ impl SimpleComponent for AppModel {
                         self.retitle_tab_from_active_pane(ti, &sender);
                         self.refresh_bottom_bar();
                     }
-                    if !self.tabs[ti].panes[pi].terminal.toggle_transcript_search() {
-                        self.search.emit(search::SearchMsg::Open);
-                    }
+                    self.search.emit(search::SearchMsg::Open);
                 }
             }
             AppMsg::SearchChanged {

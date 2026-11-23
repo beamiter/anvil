@@ -97,6 +97,12 @@ jobs:
           core=$(python3 scripts/shared-core-path.py)
           bash "$core/crates/jterm_gtk_view/tests/test-native-cards.sh" \
             anvil "$RUNNER_TEMP/shared-terminal-wayland/cards"
+      - name: Verify the application's shared transcript Find entry points
+        run: |
+          core=$(python3 scripts/shared-core-path.py)
+          dbus-run-session -- xvfb-run -a --server-args='-screen 0 1440x1100x24 -nolisten tcp' \
+            env PYTHONPATH="$core/crates/jterm_gtk_view/tests" \
+            /usr/bin/python3 -B scripts/test-shared-find-native.py target/release/anvil
       - name: Preserve native protocol and fixture logs
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9

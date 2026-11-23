@@ -1,15 +1,22 @@
 use super::{OwnedPty, SelectionFeedHold, SubmissionSurface};
 use crate::{config::Config, shared_terminal::SharedTerminal};
 use gtk::prelude::*;
-use jterm_gtk_view::{EmbeddedTerminal, HistoryAnchor, PaneEvent, Pty, PtyExit, TranscriptView};
+use jterm_gtk_view::{
+    EmbeddedTerminal, FindFrame, FindMatch, FindRegion, FindSnapshot, HistoryAnchor, PaneEvent,
+    Pty, PtyExit, TranscriptAnchor, TranscriptView,
+};
 use relm4::gtk;
-use std::{cell::OnceCell, rc::Rc};
+use std::{
+    cell::{Cell, OnceCell},
+    rc::Rc,
+};
 
 type Input = Box<dyn Fn(&[u8]) -> Result<(), String>>;
 
 pub(super) struct SharedActiveTerminal {
     terminal: Rc<EmbeddedTerminal<Transport>>,
     transcript: Option<TranscriptView<Transport>>,
+    output_start: Cell<Option<TranscriptAnchor>>,
     pub(super) widget: gtk::Widget,
     input: Rc<OnceCell<InputBinding>>,
 }
@@ -81,6 +88,7 @@ impl SharedActiveTerminal {
         terminal
             .pane()
             .set_history_row_limit(config.terminal_scrollback_lines as usize);
+        terminal.enable_transcript_sources();
         terminal
             .pane()
             .screen()
@@ -94,6 +102,7 @@ impl SharedActiveTerminal {
         Ok(Rc::new(Self {
             terminal,
             transcript,
+            output_start: Cell::new(None),
             widget,
             input,
         }))
@@ -103,12 +112,54 @@ impl SharedActiveTerminal {
         self.transcript.as_ref()
     }
 
-    pub(super) fn toggle_transcript_search(&self) -> bool {
-        if self.transcript.is_none() {
-            return false;
-        }
-        self.terminal.pane().toggle_history_search();
-        true
+    pub(super) fn begin_output(&self) {
+        self.output_start.set(
+            self.terminal
+                .inspect(|terminal| terminal.transcript_cursor()),
+        );
+    }
+
+    pub(super) fn reset_output(&self) {
+        self.output_start.set(None);
+    }
+
+    pub(super) fn find_snapshot(
+        &self,
+        screen_only: bool,
+        byte_limit: usize,
+        expired: &mut dyn FnMut() -> bool,
+    ) -> Option<FindSnapshot> {
+        let region = if screen_only {
+            FindRegion::Screen
+        } else if self.transcript.is_some() {
+            FindRegion::Transcript
+        } else {
+            self.output_start
+                .get()
+                .map_or(FindRegion::Screen, FindRegion::CommandOutput)
+        };
+        self.terminal.find_snapshot(region, byte_limit, expired)
+    }
+
+    pub(super) fn find_is_current(&self, frame: &FindFrame) -> bool {
+        self.terminal.find_is_current(frame)
+    }
+
+    pub(super) fn show_find(
+        &self,
+        frame: &FindFrame,
+        hits: Rc<[FindMatch]>,
+        occurrence: usize,
+    ) -> bool {
+        self.terminal.show_find(frame, hits, occurrence)
+    }
+
+    pub(super) fn highlight_find(&self, frame: &FindFrame, hits: Rc<[FindMatch]>) {
+        self.terminal.highlight_find(frame, hits, None);
+    }
+
+    pub(super) fn clear_find(&self) {
+        self.terminal.clear_find();
     }
 
     pub(super) fn bind_input(&self, write: Input, hold: Rc<SelectionFeedHold>) {

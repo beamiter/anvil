@@ -9273,7 +9273,18 @@ impl RenderBackend for BlockBackend {
     }
 
     fn reset_active_surface(&self, preserve_scrollback: bool) {
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            terminal.reset_output();
+        }
         self.active_rc.borrow().reset_active(preserve_scrollback);
+    }
+
+    fn close_prompt_zone(&self, _zone_id: Option<u64>) {
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            terminal.begin_output();
+        }
     }
 
     fn focus_live_deferred(&self) {
@@ -10521,7 +10532,7 @@ impl RenderBackend for UnifiedBackend {
         if self.transcript().is_some() {
             return BackendSearchBatch {
                 surfaces: Vec::new(),
-                incomplete: true,
+                incomplete: false,
                 native_fallback: None,
             };
         }
@@ -16587,15 +16598,15 @@ impl TermView {
         self.pty.master_fd_raw()
     }
 
-    pub(crate) fn toggle_transcript_search(&self) -> bool {
+    pub(crate) fn uses_shared_active_terminal(&self) -> bool {
         #[cfg(anvil_shared_terminal)]
         {
-            let terminal = self.active.borrow().shared_active.clone();
-            if let Some(terminal) = terminal {
-                return terminal.toggle_transcript_search();
-            }
+            self.active.borrow().shared_active.is_some()
         }
-        false
+        #[cfg(not(anvil_shared_terminal))]
+        {
+            false
+        }
     }
 
     pub fn vte(&self) -> &Terminal {

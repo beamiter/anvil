@@ -75,11 +75,6 @@ impl TermCtl {
         }
     }
 
-    pub(crate) fn toggle_transcript_search(&self) -> bool {
-        self.term_view()
-            .is_some_and(|view| view.toggle_transcript_search())
-    }
-
     /// Most-recent-first command snapshot from the active Block backend.
     /// Plain VTE panes have no structured finished-block history.
     pub(crate) fn command_history(&self) -> Vec<String> {

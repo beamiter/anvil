@@ -480,7 +480,7 @@ fn search_in_scope(
     case_sensitive: bool,
 ) -> (SearchStatus, bool) {
     view.clear_unified_navigation_cursor();
-    if view.find_scope() == FindScope::LiveScreen {
+    if view.find_scope() == FindScope::LiveScreen && !view.uses_shared_active_terminal() {
         // Drops any block hits (and the live terminal's regex) first.
         view.clear_find();
         return (
@@ -1199,7 +1199,8 @@ impl Component for BlockTerminal {
                 } else {
                     -1
                 };
-                let live_now = view.find_scope() == FindScope::LiveScreen;
+                let live_now = view.find_scope() == FindScope::LiveScreen
+                    && !view.uses_shared_active_terminal();
                 let active = matches!(
                     self.search_status,
                     SearchStatus::Results { total, .. } if total > 0
