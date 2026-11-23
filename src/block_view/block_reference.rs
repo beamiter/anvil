@@ -22,7 +22,7 @@ pub(super) fn trace_label_font(label: &gtk::Label, role: &'static str) {
     });
 }
 
-fn status_badge(text: &str, class: &str, role: &'static str) -> gtk::Box {
+fn status_badge(text: &str, class: &str, role: &'static str, detail: Option<&str>) -> gtk::Box {
     use jterm_core::reference_icons::Icon;
     let badge = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     badge.set_valign(gtk::Align::Center);
@@ -44,8 +44,11 @@ fn status_badge(text: &str, class: &str, role: &'static str) -> gtk::Box {
     let label = gtk::Label::new(Some(text));
     label.set_wrap(false);
     trace_label_font(&label, role);
+    if let Some(detail) = detail {
+        label.update_property(&[gtk::accessible::Property::Description(detail)]);
+    }
     badge.append(&label);
-    badge.set_tooltip_text(Some(text));
+    badge.set_tooltip_text(Some(detail.unwrap_or(text)));
     badge
 }
 
@@ -79,7 +82,7 @@ impl LiveChrome {
         command.add_css_class("block-reference-live-command");
         trace_label_font(&command, "running-command");
         root.append(&command);
-        let status = status_badge("Running", "running", "running-status");
+        let status = status_badge("Running", "running", "running-status", None);
         root.append(&status);
         let elapsed = gtk::Label::new(None);
         elapsed.add_css_class("block-reference-elapsed");
@@ -327,8 +330,18 @@ pub(super) fn decorate_finished(chrome: FinishedChrome<'_>) {
     if let Some(cwd) = cwd {
         command.set_tooltip_text(Some(cwd));
     }
-    let badge = status_badge(text, class, "completed-status");
-    header.append(&badge);
+    let detail = match status {
+        BlockStatus::Failed(code) | BlockStatus::Interrupted(code) => {
+            Some(format!("{text}. Exit code {code}"))
+        }
+        _ => None,
+    };
+    header.append(&status_badge(
+        text,
+        class,
+        "completed-status",
+        detail.as_deref(),
+    ));
     if let Some(duration) = duration_ms {
         let elapsed = gtk::Label::new(Some(&super::format_block_duration(duration)));
         elapsed.add_css_class("block-reference-elapsed");

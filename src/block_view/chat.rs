@@ -14,6 +14,8 @@ pub(super) const CONTROLS_HEIGHT: i32 = 28;
 /// the native cell height, so the floor follows font zoom instead of relying
 /// on a fixed pixel height in the surrounding chrome.
 pub(super) const BLOCK_INPUT_MIN_ROWS: i64 = 4;
+#[cfg(anvil_shared_terminal)]
+pub(super) const COMPOSER_HORIZONTAL_CHROME: i32 = 20;
 
 /// Keep a blank row below shell-owned input or completion content, bounded by
 /// the real pane budget so a short split can still shrink below the floor.
@@ -235,12 +237,13 @@ pub(super) fn layout(
             return;
         };
         let target = running.presentation_surface(state.get());
-        let (holder, clip, terminal) = {
+        let (holder, clip, terminal, focus_widget) = {
             let active = active.borrow();
             (
                 active.widget().clone(),
                 active.live_clip(),
                 active.active_vte.clone(),
+                active.focus_widget(),
             )
         };
         let in_transcript = target == ChatSurface::Running;
@@ -257,11 +260,11 @@ pub(super) fn layout(
         let Some(canvas) = frame.child().and_downcast::<gtk::Box>() else {
             return;
         };
-        let focus_root = terminal.root();
+        let focus_root = focus_widget.root();
         let focused = focus_root
             .as_ref()
             .and_then(|root| root.focus())
-            .is_some_and(|owner| owner == *terminal.upcast_ref::<gtk::Widget>());
+            .is_some_and(|owner| owner == focus_widget);
         let destination = if in_transcript { &holder } else { &dock };
         let moving_dock = native != (dock.parent().as_ref() == Some(frame.upcast_ref()));
         let moving_clip = clip.parent().as_ref() != Some(destination.upcast_ref());
@@ -337,7 +340,7 @@ pub(super) fn layout(
             holder.add_css_class("chat-empty-anchor");
         }
         block_layout();
-        if native {
+        if native && terminal.parent().is_some() {
             if let Some(scroll) = transcript.child().and_downcast::<gtk::ScrolledWindow>() {
                 if let Some(rows) = super::viewport_rows_for(&terminal, &scroll) {
                     terminal.set_size(terminal.column_count().max(1), rows);
@@ -352,7 +355,7 @@ pub(super) fn layout(
         }
         // Restore only the focus this pane owned, after the new host is visible.
         if moved && focused {
-            terminal.grab_focus();
+            focus_widget.grab_focus();
         }
     })
 }
@@ -592,6 +595,37 @@ pub(super) fn connect_submit(
     generation: &Rc<Cell<u64>>,
     pending: &Rc<Cell<Option<SendIntent>>>,
 ) {
+    let view = terminal.downgrade();
+    let pending = pending.clone();
+    connect_submit_to(
+        button,
+        state,
+        terminal,
+        pty,
+        hold,
+        generation,
+        move |intent| {
+            let Some(terminal) = view.upgrade() else {
+                return;
+            };
+            // The synchronous native commit retains this target through its
+            // transport boundary and the guarded FIFO write.
+            pending.set(Some(intent));
+            terminal.emit_by_name::<()>("commit", &[&"\r", &1_u32]);
+            pending.set(None);
+        },
+    );
+}
+
+pub(super) fn connect_submit_to(
+    button: &gtk::Button,
+    state: &Rc<Cell<BlockState>>,
+    widget: &impl IsA<gtk::Widget>,
+    pty: &Rc<crate::pty::OwnedPty>,
+    hold: &Rc<super::SelectionFeedHold>,
+    generation: &Rc<Cell<u64>>,
+    dispatch: impl Fn(SendIntent) + 'static,
+) {
     let activation = {
         let (state, generation, pty) = (state.clone(), generation.clone(), Rc::downgrade(pty));
         capture_activation(button, move || {
@@ -606,17 +640,15 @@ pub(super) fn connect_submit(
             })
         })
     };
-    let notify = super::paste_feedback::notifier(terminal);
+    let notify = super::paste_feedback::notifier(widget);
     button.set_tooltip_text(Some(
         "Send Enter to the live shell. Finish or cancel text composition before using Send.",
     ));
-    let (state, terminal, pty, hold, generation, pending) = (
+    let (state, pty, hold, generation) = (
         state.clone(),
-        terminal.downgrade(),
         Rc::downgrade(pty),
         hold.clone(),
         generation.clone(),
-        pending.clone(),
     );
     button.connect_clicked(move |button| {
         let intent = activation.native.take(&activation.pointer);
@@ -641,14 +673,7 @@ pub(super) fn connect_submit(
         {
             return;
         }
-        let Some(terminal) = terminal.upgrade() else {
-            return;
-        };
-        // The synchronous native commit retains this target through its actual
-        // transport boundary; it cannot fall back to the unguarded FIFO.
-        pending.set(Some(intent));
-        terminal.emit_by_name::<()>("commit", &[&"\r", &1_u32]);
-        pending.set(None);
+        dispatch(intent);
     });
 }
 

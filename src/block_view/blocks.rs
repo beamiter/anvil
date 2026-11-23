@@ -6552,6 +6552,8 @@ impl FinishedBlock {
 pub(crate) struct ActiveBlock {
     pub(crate) widget: gtk::Box,
     pub(crate) active_vte: Terminal,
+    #[cfg(anvil_shared_terminal)]
+    pub(super) shared_active: Option<Rc<super::shared_active::SharedActiveTerminal>>,
     /// The measured wrapper around the live VTE. It carries the terminal's
     /// requested pixel size — see [`ActiveBlock::set_live_geometry`], which
     /// keeps the grid at the full viewport while the card shows less.
@@ -6841,6 +6843,8 @@ impl ActiveBlock {
             #[cfg(anvil_shared_terminal)]
             shared_live_foreground,
             active_vte,
+            #[cfg(anvil_shared_terminal)]
+            shared_active: None,
             vte_overlay,
             live_spacer,
             live_clip,
@@ -6858,6 +6862,88 @@ impl ActiveBlock {
             live_organism_alt_screen: Cell::new(false),
             raw_output,
         }
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    pub(super) fn mount_shared(
+        &mut self,
+        terminal: Rc<super::shared_active::SharedActiveTerminal>,
+    ) {
+        if let Some(output) = self.shared_live_output.take() {
+            self.vte_overlay.remove_overlay(output.widget());
+        }
+        self.vte_overlay.set_child(Some(&terminal.widget));
+        let adjustment = terminal.scrollback();
+        self.live_scrollbar.set_adjustment(Some(adjustment));
+        let scrollbar = self.live_scrollbar.downgrade();
+        let sync = move |adjustment: &gtk::Adjustment| {
+            if let Some(scrollbar) = scrollbar.upgrade() {
+                scrollbar.set_visible(adjustment.upper() > adjustment.page_size());
+            }
+        };
+        sync(adjustment);
+        adjustment.connect_changed(sync);
+        self.shared_active = Some(terminal);
+    }
+
+    pub(super) fn focus_widget(&self) -> gtk::Widget {
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return terminal.screen().clone().upcast();
+        }
+        self.active_vte.clone().upcast()
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    pub(super) fn layout_shared(
+        &self,
+        terminal: &super::shared_active::SharedActiveTerminal,
+        canvas_width: i32,
+        canvas_height: i32,
+        state: BlockState,
+        force_full: bool,
+    ) -> Option<(u16, u16)> {
+        let inset = self.live_clip.margin_start() + self.live_clip.margin_end();
+        // The inset belongs to the composer. Keep its rail budget during
+        // native takeover so moving the clip cannot reflow the live grid.
+        let width = canvas_width - inset - super::chat::COMPOSER_HORIZONTAL_CHROME;
+        if width <= 1 || canvas_height <= 1 {
+            return None;
+        }
+        let (_, top, _, cell_height) = terminal.cell_metrics();
+        let (cols, rows) = terminal.fit_grid(width, canvas_height);
+        let rows = i64::from(rows);
+        let drawn = terminal.drawn_rows();
+        let visible = if matches!(
+            state,
+            BlockState::Idle | BlockState::RawFallback | BlockState::AltScreen
+        ) || self.preserve_live_scrollback()
+        {
+            rows
+        } else if matches!(
+            state,
+            BlockState::CollectingOutput | BlockState::PostCommand
+        ) {
+            let extent = drawn.max(self.live_extent_rows.get());
+            self.live_extent_rows.set(extent);
+            if force_full {
+                rows
+            } else {
+                extent.clamp(1, rows)
+            }
+        } else {
+            super::chat::composer_rows(1, drawn, rows)
+        };
+        let geometry = (
+            width,
+            live_rows_height_px(cell_height, rows, top * 2),
+            live_rows_height_px(cell_height, visible, top * 2),
+        );
+        if self.live_geometry.replace(geometry) != geometry {
+            self.vte_overlay.set_size_request(geometry.0, geometry.1);
+            self.live_spacer.set_height_request(geometry.2);
+        }
+        Some((cols, rows as u16))
     }
 
     /// Snapshot the engine-owned capture for live-find. The engine replays
@@ -7157,6 +7243,16 @@ impl ActiveBlock {
         // asynchronously.
         self.live_cursor_origin.set(None);
         self.live_cursor_high.set(0);
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            if preserve_scrollback {
+                terminal.feed(b"\x1b[0m");
+                terminal.feed(super::MOUSE_AND_FOCUS_REPORTING_OFF);
+            } else {
+                terminal.feed(b"\x1bc");
+            }
+            return;
+        }
         if preserve_scrollback {
             self.active_vte.feed(b"\x1b[0m");
             // Kept scrollback means no VTE reset, so a program that died

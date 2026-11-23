@@ -72,7 +72,11 @@ use native_transcript_scroll::NativeTranscriptScroll;
 mod scroll_transfer;
 mod selection_folding;
 mod selection_hold;
+#[cfg(anvil_shared_terminal)]
+mod shared_active;
 pub(crate) use selection_folding::FoldSelectionResult;
+#[cfg(anvil_shared_terminal)]
+use shared_active::SharedActiveTerminal;
 mod unified_chrome;
 mod unified_images;
 mod unified_navigation;
@@ -3829,6 +3833,7 @@ type FixBlockWithAgentCallbacks = Rc<RefCell<Vec<Box<dyn Fn()>>>>;
 /// toast that carries Undo is raised around the mutation, not by the view.
 type DeleteSelectedCallbacks = Rc<RefCell<Vec<Box<dyn Fn()>>>>;
 type CwdCallbacks = Rc<RefCell<Vec<Box<dyn Fn(&str, bool)>>>>;
+type DirectoryReport = Rc<dyn Fn(&str)>;
 type AgentExecutionLostCallbacks =
     Rc<RefCell<Vec<Box<dyn Fn(crate::agent::AgentExecutionRef, &'static str)>>>>;
 type CommandStartedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(CommandStartedEvent)>>>>;
@@ -5439,6 +5444,11 @@ trait RenderBackend {
     /// Feed bytes to the live terminal surface (including re-synthesized
     /// `\x1b[?..h/l` alt-screen toggles).
     fn feed_live(&self, bytes: &[u8]);
+    fn directory_report(&self, _bytes: &[u8]) {}
+    fn live_exited(&self, _status: jterm_core::exit_status::PtyExit) {}
+    fn replies_through_commit(&self) -> bool {
+        true
+    }
     /// Open or reassert the prompt zone chosen by the engine at OSC 133 `A`.
     /// Block has no persistent marker surface, so this is a no-op by default.
     fn begin_prompt_zone(&self, _zone_id: u64) {}
@@ -5707,8 +5717,12 @@ struct BlockBackend {
     chat_running: Option<Rc<chat::RunningCommand>>,
     menu_keybindings: shortcut_hints::MenuKeybindings,
     active_rc: Rc<RefCell<ActiveBlock>>,
-    /// The live VTE — every byte is fed here; alt-screen toggles feed it 1049h/l.
+    /// The legacy surface used when no shared view is mounted.
     active_vte: Terminal,
+    #[cfg(anvil_shared_terminal)]
+    shared_active: Option<Rc<SharedActiveTerminal>>,
+    #[cfg(anvil_shared_terminal)]
+    shared_cwd: Option<DirectoryReport>,
     /// Shared construction-time anchor policy; the submission surface receives
     /// this same value so no prompt reader can bypass the backend decision.
     rebase_prompt_anchor_on_row_delta: bool,
@@ -6708,7 +6722,10 @@ impl ReaderCtx {
         match event {
             ParserEvent::RemoteSessionId(id) => self.on_remote_session_id(id),
             ParserEvent::DecsetMode { mode, set } => self.on_decset_mode(*mode, *set),
-            ParserEvent::Bytes(bytes) => self.on_bytes(bytes, state),
+            ParserEvent::Bytes(bytes) => {
+                self.backend.directory_report(bytes);
+                self.on_bytes(bytes, state);
+            }
             ParserEvent::PromptStart => self.on_prompt_start(),
             ParserEvent::PromptEnd => self.on_prompt_end(),
             ParserEvent::CommandStart(meta) => self.on_command_start(meta),
@@ -8078,7 +8095,9 @@ impl ReaderCtx {
             // That answer comes back through the live VTE's `commit`, where a
             // CPR looks exactly like a modified F3. Counting the question lets
             // the commit handler pass the answer on as a report, not typing.
-            if matches!(query, KeyboardProtocolQuery::CursorPosition) {
+            if self.backend.replies_through_commit()
+                && matches!(query, KeyboardProtocolQuery::CursorPosition)
+            {
                 self.cpr_outstanding_rc
                     .set(self.cpr_outstanding_rc.get().saturating_add(1));
                 self.cpr_queries_rc
@@ -9196,6 +9215,11 @@ impl RenderBackend for BlockBackend {
 
     fn feed_live(&self, bytes: &[u8]) {
         #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            terminal.feed(bytes);
+            return;
+        }
+        #[cfg(anvil_shared_terminal)]
         if let Ok(active) = self.active_rc.try_borrow() {
             if let Some(widget) = active.shared_live_widget() {
                 widget.set_visible(false);
@@ -9204,15 +9228,51 @@ impl RenderBackend for BlockBackend {
         self.active_vte.feed(bytes);
     }
 
+    fn directory_report(&self, _bytes: &[u8]) {
+        #[cfg(anvil_shared_terminal)]
+        if let Some(dispatch) = &self.shared_cwd {
+            // The block parser validates and preserves this as an individual
+            // ST-terminated OSC 7 event. The same CWD authority rules apply.
+            let uri = _bytes
+                .strip_prefix(b"\x1b]7;")
+                .and_then(|payload| payload.strip_suffix(b"\x1b\\"))
+                .and_then(|payload| std::str::from_utf8(payload).ok());
+            if let Some(uri) = uri {
+                dispatch(uri);
+            }
+        }
+    }
+
+    fn live_exited(&self, _status: jterm_core::exit_status::PtyExit) {
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            terminal.exited(_status);
+        }
+    }
+
+    fn replies_through_commit(&self) -> bool {
+        #[cfg(anvil_shared_terminal)]
+        if self.shared_active.is_some() {
+            return false;
+        }
+        true
+    }
+
     fn reset_active_surface(&self, preserve_scrollback: bool) {
         self.active_rc.borrow().reset_active(preserve_scrollback);
     }
 
     fn focus_live_deferred(&self) {
-        focus_restore::restore_live_focus_deferred(&self.active_vte);
+        focus_restore::restore_live_focus_deferred(&self.active_rc.borrow().focus_widget());
     }
 
     fn sync_geometry_to_pty(&self) {
+        #[cfg(anvil_shared_terminal)]
+        if self.shared_active.is_some() {
+            self.layout_active_surface();
+            self.pty_winsize.kick_settle();
+            return;
+        }
         sync_active_to_pty(
             &self.layout_active_surface,
             &self.active_vte,
@@ -9610,10 +9670,19 @@ impl RenderBackend for BlockBackend {
     }
 
     fn schedule_anchor_settle(&self, args: AnchorSettleArgs) {
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            args.ready.set(terminal.cursor().is_some());
+            return;
+        }
         schedule_prompt_anchor_settle(args);
     }
 
     fn cursor_and_rows(&self) -> ((i64, i64), i64) {
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return (terminal.cursor_position(), terminal.row_count());
+        }
         (
             self.active_vte.cursor_position(),
             self.active_vte.row_count(),
@@ -9639,10 +9708,18 @@ impl RenderBackend for BlockBackend {
     }
 
     fn live_surface_answers_query(&self, query: KeyboardProtocolQuery) -> bool {
+        #[cfg(anvil_shared_terminal)]
+        if self.shared_active.is_some() {
+            return true;
+        }
         vte_answers_query_natively(query)
     }
 
     fn command_capture_anchor(&self, provisional: (i64, i64), recorded_rows: i64) -> (i64, i64) {
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return terminal.prompt_anchor(provisional, recorded_rows);
+        }
         // Block changes the VTE from compact prompt height to full command
         // height between B and C. Rebase the saved anchor by that row delta;
         // the query-only submission surface carries the exact same policy bit.
@@ -9655,10 +9732,18 @@ impl RenderBackend for BlockBackend {
     }
 
     fn grid_cols(&self) -> i64 {
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return i64::from(terminal.grid_size().0).max(20);
+        }
         self.active_rc.borrow().grid_cols() as i64
     }
 
     fn live_column_count(&self) -> i64 {
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return i64::from(terminal.grid_size().0);
+        }
         self.active_vte.column_count()
     }
 
@@ -9669,6 +9754,10 @@ impl RenderBackend for BlockBackend {
         end_row: i64,
         end_col: i64,
     ) -> Option<String> {
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return terminal.capture((start_col, start_row), (end_col, end_row));
+        }
         self.active_vte
             .text_range_format(vte4::Format::Text, start_row, start_col, end_row, end_col)
             .0
@@ -10709,6 +10798,7 @@ impl ReaderCtx {
                 exit_ctx.selection_feed_hold.flush_then(|| {
                     exit_ctx.watch_reader.source_ended(Instant::now());
                     log::debug!("Shell exited with code {}", status.code);
+                    exit_ctx.backend.live_exited(status);
                     for cb in exit_ctx.exited_cbs.borrow().iter() {
                         cb(status);
                     }
@@ -10755,6 +10845,8 @@ struct PtyWinsize {
     /// `(cols, rows)` last sent; `(0, 0)` until the first publish.
     sent: Rc<Cell<(u16, u16)>>,
     inline_resize: Option<Rc<InlineResize>>,
+    #[cfg(anvil_shared_terminal)]
+    shared: Option<std::rc::Weak<SharedActiveTerminal>>,
     /// Arms the settle tick. Filled once the tick exists, which is after the
     /// render backends that sync through this are built.
     settle: Rc<RefCell<Option<SettleKick>>>,
@@ -10765,6 +10857,10 @@ impl PtyWinsize {
     /// it was sent. An identical TIOCSWINSZ would be dropped by the kernel
     /// anyway; skipping it here keeps the one shared memory truthful.
     fn publish(&self, pty: &OwnedPty, sample: (u16, u16)) -> bool {
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = self.shared.as_ref().and_then(std::rc::Weak::upgrade) {
+            return publish_shared_winsize(&terminal, &self.sent, sample);
+        }
         publish_winsize(&self.sent, pty, sample, self.inline_resize.as_deref())
     }
 
@@ -10801,6 +10897,23 @@ fn publish_winsize(
         }
         None => false,
     }
+}
+
+#[cfg(anvil_shared_terminal)]
+fn publish_shared_winsize(
+    terminal: &SharedActiveTerminal,
+    sent: &Cell<(u16, u16)>,
+    sample: (u16, u16),
+) -> bool {
+    let Some((cols, rows)) = next_winsize_to_publish(sent.get(), sample) else {
+        return false;
+    };
+    if let Err(error) = terminal.resize(cols, rows) {
+        log::debug!("Could not resize the shared active terminal: {error}");
+        return false;
+    }
+    sent.set(sample);
+    true
 }
 
 /// The winsize to publish for `sample` given the one last `sent`: `None` for
@@ -12381,6 +12494,9 @@ impl TermView {
         // existing live clip: the VTE, PTY and submission authority stay owned
         // by this pane throughout prompt, command and native-app transitions.
         let docked_input = chat_mode || block_mode;
+        #[cfg(anvil_shared_terminal)]
+        let shared_active_requested = docked_input
+            && std::env::var_os("JTERM_SHARED_ACTIVE_TERMINAL").is_some_and(|value| value == "1");
 
         ime_gate::install();
         // ── Build widget tree ──────────────────────────────────────────────
@@ -12457,14 +12573,6 @@ impl TermView {
             holder.add_css_class("block-fullscreen");
         }
         let focus_requested = Rc::new(Cell::new(false));
-        {
-            let focus_requested = focus_requested.clone();
-            active_vte.connect_map(move |vte| {
-                if focus_requested.replace(false) {
-                    vte.grab_focus();
-                }
-            });
-        }
 
         block_list.append(active.borrow().widget());
         if chat_mode && jterm_core::reference_conversation::fixture_enabled() {
@@ -12879,7 +12987,30 @@ impl TermView {
             }
         }
 
+        #[cfg(anvil_shared_terminal)]
+        if shared_active_requested {
+            env_extra.extend(jterm_gtk_view::INTERACTIVE_CHILD_ENV);
+        }
+
         let pty = Rc::new(spawn(&argv, cwd, &env_extra, request_shell_token)?);
+        #[cfg(anvil_shared_terminal)]
+        let shared_active = if shared_active_requested {
+            let terminal =
+                SharedActiveTerminal::new(config, pty.clone()).map_err(std::io::Error::other)?;
+            active.borrow_mut().mount_shared(terminal.clone());
+            Some(terminal)
+        } else {
+            None
+        };
+        let live_focus = active.borrow().focus_widget();
+        {
+            let focus_requested = focus_requested.clone();
+            live_focus.connect_map(move |widget| {
+                if focus_requested.replace(false) {
+                    widget.grab_focus();
+                }
+            });
+        }
 
         // Store child PID on the live VTE so kill_all_terminal_children can find it
         unsafe {
@@ -13093,6 +13224,20 @@ impl TermView {
         // exist — while the card's own height comes from the clip built in
         // `ActiveBlock::new`. The PTY never sees either number: `pty_grid_size`
         // reports the viewport in every state.
+        // The pane's one winsize memory, shared by every PTY resize below.
+        let running_cmd = Rc::new(RefCell::new(String::new()));
+        let pty_winsize = PtyWinsize {
+            inline_resize: Some(Rc::new(InlineResize::new(
+                &active.borrow().resize_surface,
+                bstate.clone(),
+                running_cmd.clone(),
+                direct_cli,
+            ))),
+            #[cfg(anvil_shared_terminal)]
+            shared: shared_active.as_ref().map(Rc::downgrade),
+            ..PtyWinsize::default()
+        };
+
         let block_layout_active_surface: Rc<dyn Fn()> = {
             // This callback is retained by adjustment/VTE signals as well as
             // TermView.  Keep every widget edge weak so closing a pane cannot
@@ -13124,6 +13269,13 @@ impl TermView {
             let live_cursor_high_for_layout = live_cursor_high.clone();
             // Weak: ActiveBlock owns the VTE that retains this callback.
             let active_for_layout = Rc::downgrade(&active);
+            #[cfg(anvil_shared_terminal)]
+            let shared_layout = shared_active.as_ref().map(|terminal| {
+                let terminal = Rc::downgrade(terminal);
+                let canvas = chat_canvas.downgrade();
+                let sent = pty_winsize.sent.clone();
+                (terminal, canvas, sent)
+            });
             Rc::new(move || {
                 let (Some(holder), Some(vte), Some(scroll)) =
                     (holder.upgrade(), vte.upgrade(), scroll.upgrade())
@@ -13175,6 +13327,26 @@ impl TermView {
                         },
                     );
                 };
+                #[cfg(anvil_shared_terminal)]
+                if let Some((terminal, canvas, sent)) = &shared_layout {
+                    if let (Some(terminal), Some(canvas), Ok(active)) = (
+                        terminal.upgrade(),
+                        canvas.upgrade(),
+                        active_block.try_borrow(),
+                    ) {
+                        if let Some(grid) = active.layout_shared(
+                            &terminal,
+                            canvas.width(),
+                            chat::canvas_height(&scroll).unwrap_or_default(),
+                            bstate.get(),
+                            live_force_full_for_layout.get(),
+                        ) {
+                            publish_shared_winsize(&terminal, sent, grid);
+                            fit_finished_outputs();
+                        }
+                    }
+                    return;
+                }
                 let cols = vte.column_count().max(1);
                 let state = bstate.get();
                 holder.set_visible(true);
@@ -13500,17 +13672,6 @@ impl TermView {
 
         // True while an alt-screen app owns the viewport (finished blocks hidden).
         let fullscreen: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        // The pane's one winsize memory, shared by every PTY resize below.
-        let running_cmd = Rc::new(RefCell::new(String::new()));
-        let pty_winsize = PtyWinsize {
-            inline_resize: Some(Rc::new(InlineResize::new(
-                &active.borrow().resize_surface,
-                bstate.clone(),
-                running_cmd.clone(),
-                direct_cli,
-            ))),
-            ..PtyWinsize::default()
-        };
         let cwd_callbacks: CwdCallbacks = Rc::new(RefCell::new(vec![]));
         let remote_session_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
         let exited_callbacks: ExitCallbacks = Rc::new(RefCell::new(vec![]));
@@ -13607,7 +13768,7 @@ impl TermView {
         let live_keys: Rc<LiveKeyRecord> = Rc::new(LiveKeyRecord::default());
         let agent_prompt_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         let chat_send_intent: Rc<Cell<Option<chat::SendIntent>>> = Rc::new(Cell::new(None));
-        if docked_input {
+        if docked_input && live_focus == *active_vte.upcast_ref::<gtk::Widget>() {
             chat::connect_submit(
                 &chat_send,
                 &bstate,
@@ -13690,10 +13851,22 @@ impl TermView {
             Rc::new(RefCell::new(None));
         let verified_submission_source_id: Rc<RefCell<Option<glib::SourceId>>> =
             Rc::new(RefCell::new(None));
-        let submission_surface_owner: Rc<dyn SubmissionSurface> = Rc::new(VteSubmissionSurface {
-            vte: active_vte.clone(),
-            rebase_on_row_delta: rebase_prompt_anchor_on_row_delta,
-        });
+        let submission_surface_owner: Rc<dyn SubmissionSurface> = {
+            let vte_surface = || {
+                Rc::new(VteSubmissionSurface {
+                    vte: active_vte.clone(),
+                    rebase_on_row_delta: rebase_prompt_anchor_on_row_delta,
+                }) as Rc<dyn SubmissionSurface>
+            };
+            #[cfg(anvil_shared_terminal)]
+            {
+                shared_active
+                    .clone()
+                    .map_or_else(vte_surface, |terminal| terminal)
+            }
+            #[cfg(not(anvil_shared_terminal))]
+            vte_surface()
+        };
         let verified_submission = VerifiedSubmissionCtx {
             surface: Rc::downgrade(&submission_surface_owner),
             bstate: bstate.clone(),
@@ -13723,38 +13896,39 @@ impl TermView {
         let menu_keybindings = shortcut_hints::MenuKeybindings::default();
         let current_cwd_external = Rc::new(Cell::new(cwd_external));
 
-        // CWD updates come from VTE's native OSC 7 signal (the parser passes
-        // OSC 7 through unchanged, see parser.rs). Title updates likewise come
-        // from VTE's window-title-changed (OSC 0/2).
+        let cwd_from_uri: DirectoryReport = {
+            let callbacks = cwd_callbacks.clone();
+            let current = current_cwd.clone();
+            let external = current_cwd_external.clone();
+            let pty = pty.clone();
+            let token = cwd_token.to_owned();
+            Rc::new(move |uri| {
+                let Ok((path, host)) = glib::filename_from_uri(uri) else {
+                    return;
+                };
+                let path = path.to_string_lossy().into_owned();
+                if path.is_empty() {
+                    return;
+                }
+                let authority = crate::terminal::classify_cwd_authority(host.as_deref(), &token);
+                let foreground_external = crate::process::foreground_uses_external_cwd(
+                    pty.master_fd_raw(),
+                    pty.pid_i32(),
+                );
+                let is_external =
+                    crate::terminal::resolve_cwd_external(authority, foreground_external);
+                external.set(is_external);
+                *current.borrow_mut() = path.clone();
+                for callback in callbacks.borrow().iter() {
+                    callback(&path, is_external);
+                }
+            })
+        };
         {
-            let cwd_cbs = cwd_callbacks.clone();
-            let current_cwd_for_signal = current_cwd.clone();
-            let current_cwd_external_for_signal = current_cwd_external.clone();
-            let pty_for_cwd = pty.clone();
-            let cwd_token_for_signal = cwd_token.to_string();
+            let dispatch = cwd_from_uri.clone();
             active_vte.connect_current_directory_uri_notify(move |vte| {
                 if let Some(uri) = vte.current_directory_uri() {
-                    if let Ok((path, host)) = glib::filename_from_uri(uri.as_str()) {
-                        let path = path.to_string_lossy().to_string();
-                        if path.is_empty() {
-                            return;
-                        }
-                        let authority = crate::terminal::classify_cwd_authority(
-                            host.as_deref(),
-                            &cwd_token_for_signal,
-                        );
-                        let foreground_external = crate::process::foreground_uses_external_cwd(
-                            pty_for_cwd.master_fd_raw(),
-                            pty_for_cwd.pid_i32(),
-                        );
-                        let external =
-                            crate::terminal::resolve_cwd_external(authority, foreground_external);
-                        current_cwd_external_for_signal.set(external);
-                        *current_cwd_for_signal.borrow_mut() = path.clone();
-                        for cb in cwd_cbs.borrow().iter() {
-                            cb(&path, external);
-                        }
-                    }
+                    dispatch(uri.as_str());
                 }
             });
         }
@@ -13771,6 +13945,55 @@ impl TermView {
                     for cb in title_cbs.borrow().iter() {
                         cb(&title_str);
                     }
+                }
+            });
+        }
+
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &shared_active {
+            let bell = bell_callbacks.clone();
+            let title = title_callbacks.clone();
+            let generation = contents_generation.clone();
+            let focus = live_focus.downgrade();
+            let layout = layout_active_surface.clone();
+            let pending = Rc::new(Cell::new(false));
+            let scroll = block_scroll.downgrade();
+            let debouncer = scroll_debouncer.clone();
+            terminal.on_event(move |event| {
+                use jterm_gtk_view::PaneEvent;
+                match event {
+                    PaneEvent::Output => {
+                        generation.set(generation.get().wrapping_add(1));
+                        let Some(focus) = focus.upgrade() else {
+                            return;
+                        };
+                        if pending.replace(true) {
+                            return;
+                        }
+                        let pending = pending.clone();
+                        let layout = layout.clone();
+                        let scroll = scroll.clone();
+                        let debouncer = debouncer.clone();
+                        focus.add_tick_callback(move |_, _| {
+                            pending.set(false);
+                            layout();
+                            if let Some(scroll) = scroll.upgrade() {
+                                debouncer.pin_to_bottom_deferred(&scroll);
+                            }
+                            glib::ControlFlow::Break
+                        });
+                    }
+                    PaneEvent::TitleChanged(text) => {
+                        for callback in title.borrow().iter() {
+                            callback(&text);
+                        }
+                    }
+                    PaneEvent::Bell => {
+                        for callback in bell.borrow().iter() {
+                            callback();
+                        }
+                    }
+                    PaneEvent::Exited(_) => {}
                 }
             });
         }
@@ -13901,6 +14124,10 @@ impl TermView {
                     chat_running: docked_input.then(|| chat_running.clone()),
                     active_rc,
                     active_vte: active_vte_rc,
+                    #[cfg(anvil_shared_terminal)]
+                    shared_active: shared_active.clone(),
+                    #[cfg(anvil_shared_terminal)]
+                    shared_cwd: shared_active.as_ref().map(|_| cwd_from_uri.clone()),
                     // Same construction-time policy passed to the submission
                     // surface above, so every prompt-anchor reader agrees.
                     rebase_prompt_anchor_on_row_delta,
@@ -14621,6 +14848,139 @@ impl TermView {
             let unread_for_commit = unread_count.clone();
             let chat_send_for_commit = chat_send_intent.clone();
             let prompt_generation_for_commit = agent_prompt_generation.clone();
+            let state_after_write = bstate_for_commit.clone();
+            let human_after_write = human_input_for_commit.clone();
+            // Update the prompt and document only after the PTY accepts input.
+            let accepted = Rc::new(move |bytes: &[u8]| {
+                // Typing is a statement about where the user is. Leaving the
+                // viewport parked in history means watching your own keystrokes
+                // land somewhere off screen — the scroll-on-keystroke rule every
+                // other terminal applies, expressed against the history canvas
+                // because that is what scrolls here. The flag is read first so
+                // the ordinary at-the-bottom keystroke costs one `Cell` read.
+                // Unified is excluded: there `user_scrolled_up` belongs to the
+                // VTE adjustment detector, and releasing the lock would hide the
+                // FAB while its scrollback is still parked above the prompt.
+                if user_scrolled_up_for_commit.get()
+                    && !unified_for_commit
+                    && state_after_write.get() != BlockState::AltScreen
+                {
+                    if let (Some(scroll), Some(fab)) =
+                        (scroll_for_commit.upgrade(), fab_for_commit.upgrade())
+                    {
+                        return_to_live_prompt(
+                            &debouncer_for_commit,
+                            &scroll,
+                            &fab,
+                            &unread_for_commit,
+                        );
+                    }
+                }
+
+                // Real terminal input exits historical block selection. Without
+                // this, Enter can recall an old selection after the user has
+                // already begun editing a new command at the live prompt.
+                if selected_block_id_for_commit.get().is_some() {
+                    let finished = finished_blocks_for_commit.borrow();
+                    clear_finished_block_selection(
+                        &finished,
+                        &selected_block_ids_for_commit,
+                        &selected_block_id_for_commit,
+                        &selection_anchor_id_for_commit,
+                    );
+                }
+
+                emit_human_input(&human_after_write, HumanInputKind::Keyboard);
+                // The finished-block command text comes from a live-VTE
+                // text_range read at CommandStart (see PromptEnd / CommandStart
+                // handlers), so this shadow buffer is only used to size the
+                // input cell while idle (line count). We do not need to track
+                // escape sequences or replay deletes — newline count is what
+                // drives `update_input_height`.
+                if state_after_write.get() == BlockState::AwaitingCommand {
+                    idle_input_dirty_for_commit.set(true);
+                    if bytes.iter().any(|&byte| byte != b'\r' && byte != b'\n') {
+                        // A later history recall must replace this readline
+                        // buffer, not append to it.
+                        pty_synced_for_commit.set(true);
+                    }
+                    // The commit, with a joined Alt ESC in front: still UTF-8.
+                    let typed = String::from_utf8_lossy(bytes);
+                    let mut cmd = typed_cmd_for_commit.borrow_mut();
+                    for ch in typed.chars() {
+                        if ch == '\r' || ch == '\n' {
+                            // Submitted — leave whatever is in the buffer; it
+                            // is cleared at PromptEnd for the next prompt.
+                        } else if ch == '\x7f' || ch == '\x08' {
+                            pop_typed_command_shadow(&mut cmd);
+                        } else if (ch as u32) < 0x20 {
+                            // Control bytes: ignore.
+                        } else {
+                            let mut encoded = [0; 4];
+                            append_typed_command_shadow(&mut cmd, ch.encode_utf8(&mut encoded));
+                        }
+                    }
+                }
+            });
+
+            #[cfg(anvil_shared_terminal)]
+            if let Some(terminal) = &shared_active {
+                let accepted_input = accepted.clone();
+                let pty = pty_for_commit.clone();
+                let armed = armed_agent_execution_for_commit.clone();
+                let submission = reviewed_submission_for_commit.clone();
+                terminal.bind_input(
+                    Box::new(move |bytes| {
+                        if armed.borrow().is_some() || submission.borrow().is_some() {
+                            return Err("verified submission owns shell input".into());
+                        }
+                        pty.try_write_bytes(bytes)
+                            .map_err(|error| error.to_string())?;
+                        accepted_input(bytes);
+                        Ok(())
+                    }),
+                    selection_feed_hold.clone(),
+                );
+                selection_feed_hold.install_text_view_hooks(terminal.screen());
+
+                let accepted = accepted.clone();
+                let pty = Rc::downgrade(&pty_for_commit);
+                let focus = terminal.screen().downgrade();
+                let state = bstate_for_commit.clone();
+                let generation = prompt_generation_for_commit.clone();
+                let kitty_flags = kitty_flags_for_commit.clone();
+                let armed = armed_agent_execution_for_commit.clone();
+                let submission = reviewed_submission_for_commit.clone();
+                chat::connect_submit_to(
+                    &chat_send,
+                    &bstate,
+                    terminal.screen(),
+                    &pty_for_commit,
+                    &selection_feed_hold,
+                    &agent_prompt_generation,
+                    move |intent| {
+                        let (Some(pty), Some(focus)) = (pty.upgrade(), focus.upgrade()) else {
+                            return;
+                        };
+                        // The shared surface encodes normal keyboard input itself.
+                        // Send is a guarded plain Enter targeted to the same prompt.
+                        if pty
+                            .try_dispatch_chat_byte(b'\r', intent.foreground, true, || {
+                                state.get() == BlockState::AwaitingCommand
+                                    && generation.get() == intent.generation
+                                    && kitty_flags.get() == 0
+                                    && armed.borrow().is_none()
+                                    && submission.borrow().is_none()
+                            })
+                            .is_ok()
+                        {
+                            focus.grab_focus();
+                            accepted(b"\r");
+                        }
+                    },
+                );
+            }
+
             active_vte.connect_commit(move |terminal, text, _size| {
                 let submission_pending = armed_agent_execution_for_commit.borrow().is_some()
                     || reviewed_submission_for_commit.borrow().is_some();
@@ -14690,80 +15050,6 @@ impl TermView {
                     }
                     LiveCommit::Typed(bytes) => bytes,
                 };
-                // One write, so an Alt chord's ESC and key arrive together.
-                // Refusal must not claim typing, move the viewport, clear the
-                // historical selection, or change the shell editor shadow.
-                let accepted = || {
-                    // Typing is a statement about where the user is. Leaving the
-                    // viewport parked in history means watching your own keystrokes
-                    // land somewhere off screen — the scroll-on-keystroke rule every
-                    // other terminal applies, expressed against the history canvas
-                    // because that is what scrolls here. The flag is read first so
-                    // the ordinary at-the-bottom keystroke costs one `Cell` read.
-                    // Unified is excluded: there `user_scrolled_up` belongs to the
-                    // VTE adjustment detector, and releasing the lock would hide the
-                    // FAB while its scrollback is still parked above the prompt.
-                    if user_scrolled_up_for_commit.get()
-                        && !unified_for_commit
-                        && bstate_for_commit.get() != BlockState::AltScreen
-                    {
-                        if let (Some(scroll), Some(fab)) =
-                            (scroll_for_commit.upgrade(), fab_for_commit.upgrade())
-                        {
-                            return_to_live_prompt(
-                                &debouncer_for_commit,
-                                &scroll,
-                                &fab,
-                                &unread_for_commit,
-                            );
-                        }
-                    }
-
-                    // Real terminal input exits historical block selection. Without
-                    // this, Enter can recall an old selection after the user has
-                    // already begun editing a new command at the live prompt.
-                    if selected_block_id_for_commit.get().is_some() {
-                        let finished = finished_blocks_for_commit.borrow();
-                        clear_finished_block_selection(
-                            &finished,
-                            &selected_block_ids_for_commit,
-                            &selected_block_id_for_commit,
-                            &selection_anchor_id_for_commit,
-                        );
-                    }
-
-                    emit_human_input(&human_input_for_commit, HumanInputKind::Keyboard);
-                    // The finished-block command text comes from a live-VTE
-                    // text_range read at CommandStart (see PromptEnd / CommandStart
-                    // handlers), so this shadow buffer is only used to size the
-                    // input cell while idle (line count). We do not need to track
-                    // escape sequences or replay deletes — newline count is what
-                    // drives `update_input_height`.
-                    if bstate_for_commit.get() == BlockState::AwaitingCommand {
-                        idle_input_dirty_for_commit.set(true);
-                        if bytes.iter().any(|&byte| byte != b'\r' && byte != b'\n') {
-                            // A later history recall must replace this readline
-                            // buffer, not append to it.
-                            pty_synced_for_commit.set(true);
-                        }
-                        // The commit, with a joined Alt ESC in front: still UTF-8.
-                        let typed = String::from_utf8_lossy(&bytes);
-                        let mut cmd = typed_cmd_for_commit.borrow_mut();
-                        for ch in typed.chars() {
-                            if ch == '\r' || ch == '\n' {
-                                // Submitted — leave whatever is in the buffer; it
-                                // is cleared at PromptEnd for the next prompt.
-                            } else if ch == '\x7f' || ch == '\x08' {
-                                pop_typed_command_shadow(&mut cmd);
-                            } else if (ch as u32) < 0x20 {
-                                // Control bytes: ignore.
-                            } else {
-                                let mut encoded = [0; 4];
-                                append_typed_command_shadow(&mut cmd, ch.encode_utf8(&mut encoded));
-                            }
-                        }
-                    }
-                };
                 if let Some(intent) = chat_send {
                     if bytes.as_ref() == b"\r"
                         && pty_for_commit
@@ -14778,10 +15064,10 @@ impl TermView {
                             .is_ok()
                     {
                         terminal.grab_focus();
-                        accepted();
+                        accepted(&bytes);
                     }
                 } else {
-                    with_accepted_pty_input(&pty_for_commit, &bytes, accepted);
+                    with_accepted_pty_input(&pty_for_commit, &bytes, || accepted(&bytes));
                 }
             });
         }
@@ -14864,7 +15150,7 @@ impl TermView {
         // chords never get here — the window-level dispatcher captures first
         // and swallows them.
         {
-            let active_vte_for_refocus = active_vte.downgrade();
+            let live_for_refocus = live_focus.downgrade();
             let scroll_for_refocus = block_scroll.downgrade();
             let debouncer_for_refocus = scroll_debouncer.clone();
             let unread_for_refocus = unread_count.clone();
@@ -14874,18 +15160,23 @@ impl TermView {
             let refocus_key = gtk::EventControllerKey::new();
             refocus_key.set_propagation_phase(gtk::PropagationPhase::Capture);
             refocus_key.connect_key_pressed(move |controller, keyval, _keycode, modifiers| {
-                let (Some(active_vte_for_refocus), Some(scroll_for_refocus), Some(fab_for_refocus)) =
-                    (active_vte_for_refocus.upgrade(), scroll_for_refocus.upgrade(), fab_for_refocus.upgrade())
-                else {
+                let (Some(live_for_refocus), Some(scroll_for_refocus), Some(fab_for_refocus)) = (
+                    live_for_refocus.upgrade(),
+                    scroll_for_refocus.upgrade(),
+                    fab_for_refocus.upgrade(),
+                ) else {
                     return glib::Propagation::Proceed;
                 };
-                if active_vte_for_refocus.has_focus()
+                if live_for_refocus.has_focus()
                     || selection_owns_key(selected_for_refocus.get().is_some(), keyval)
                     || !stranded_focus_key_recovers(keyval, modifiers)
                 {
                     return glib::Propagation::Proceed;
                 }
-                let Some(focused) = controller.widget().and_then(|root| root.root()).and_then(|window| window.focus())
+                let Some(focused) = controller
+                    .widget()
+                    .and_then(|root| root.root())
+                    .and_then(|window| window.focus())
                 else {
                     return glib::Propagation::Proceed;
                 };
@@ -14897,7 +15188,7 @@ impl TermView {
                 ) {
                     return glib::Propagation::Proceed;
                 }
-                active_vte_for_refocus.grab_focus();
+                live_for_refocus.grab_focus();
                 // Focusing the live VTE makes the ScrolledWindow scroll to
                 // reveal the holder's *top* (see the palette-dismissal note in
                 // palette.rs); `return_to_live_prompt` pins the bottom back.
@@ -14908,7 +15199,7 @@ impl TermView {
                     &unread_for_refocus,
                 );
                 if stranded_key_reaches_running_app(bstate_for_refocus.get()) {
-                    controller.forward(&active_vte_for_refocus);
+                    controller.forward(&live_for_refocus);
                 }
                 glib::Propagation::Stop
             });
@@ -15255,7 +15546,7 @@ impl TermView {
         // mid-settle cannot form signal -> callback -> widget cycles; Drop
         // removes an installed tick via `resize_tick_id`.
         let resize_tick_id: Rc<RefCell<Option<gtk::TickCallbackId>>> = Rc::new(RefCell::new(None));
-        let resize_kick: Rc<dyn Fn()> = {
+        let resize_legacy: Rc<dyn Fn()> = {
             let pty_for_resize = pty.clone();
             let scroll_for_resize = block_scroll.downgrade();
             let vte_for_resize = active_vte.downgrade();
@@ -15344,6 +15635,31 @@ impl TermView {
                 *tick_id.borrow_mut() = Some(id);
             })
         };
+        #[cfg(anvil_shared_terminal)]
+        let resize_kick: Rc<dyn Fn()> = if shared_active.is_some() {
+            let focus = live_focus.downgrade();
+            let layout = layout_active_surface.clone();
+            let pending = Rc::new(Cell::new(false));
+            Rc::new(move || {
+                let Some(focus) = focus.upgrade() else {
+                    return;
+                };
+                if pending.replace(true) {
+                    return;
+                }
+                let pending = pending.clone();
+                let layout = layout.clone();
+                focus.add_tick_callback(move |_, _| {
+                    pending.set(false);
+                    layout();
+                    glib::ControlFlow::Break
+                });
+            })
+        } else {
+            resize_legacy
+        };
+        #[cfg(not(anvil_shared_terminal))]
+        let resize_kick = resize_legacy;
         // The backends were built before the tick existed; hand it to them now
         // so every `sync_geometry_to_pty` can arm it.
         *pty_winsize.settle.borrow_mut() = Some(resize_kick.clone());
@@ -16043,17 +16359,20 @@ impl TermView {
 
     pub fn grab_focus(&self) {
         self.focus_requested.set(true);
-        self.active_vte.grab_focus();
-        if self.active_vte.has_focus() {
+        let widget = self.active.borrow().focus_widget();
+        widget.grab_focus();
+        if widget.has_focus() {
             self.focus_requested.set(false);
         }
-        let active_vte = self.active_vte.clone();
+        let widget = widget.downgrade();
         let focus_requested = self.focus_requested.clone();
         glib::idle_add_local_once(move || {
             if focus_requested.get() {
-                active_vte.grab_focus();
-                if active_vte.has_focus() {
-                    focus_requested.set(false);
+                if let Some(widget) = widget.upgrade() {
+                    widget.grab_focus();
+                    if widget.has_focus() {
+                        focus_requested.set(false);
+                    }
                 }
             }
         });
@@ -16072,6 +16391,16 @@ impl TermView {
     /// [`Self::copy_to_clipboard_with_modifier`], so a greyed-out Copy and a
     /// Copy that does nothing cannot disagree.
     pub(crate) fn has_copyable_selection(&self) -> bool {
+        #[cfg(anvil_shared_terminal)]
+        if self
+            .active
+            .borrow()
+            .shared_active
+            .as_ref()
+            .is_some_and(|terminal| terminal.screen().buffer().has_selection())
+        {
+            return true;
+        }
         if self.cross_selection.has_text_selection() {
             return true;
         }
@@ -16335,8 +16664,9 @@ impl TermView {
             // way back. It stays on `Ctrl+Shift+K` and in the palette.
 
             popover.set_child(Some(&vbox));
+            let focus_widget = view.active.borrow().focus_widget();
             let restore = RefCell::new(focus_restore::FocusRestore::popover(
-                &view.active_vte,
+                &focus_widget,
                 &popover,
             ));
             popover.connect_closed(move |popover| {
@@ -16356,6 +16686,14 @@ impl TermView {
     /// only" modifier (Alt+Ctrl+Shift+C) when a whole block is selected.
     pub fn copy_to_clipboard_with_modifier(&self, alt_held: bool) -> bool {
         log::debug!(">>> TermView::copy_to_clipboard called (alt={})", alt_held);
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &self.active.borrow().shared_active {
+            if terminal.screen().buffer().has_selection() {
+                terminal.copy();
+                self.selection_feed_hold.flush_now();
+                return true;
+            }
+        }
 
         // A visible native or cross-widget text selection is more specific
         // than card selection and therefore wins. The aggregator reads every
@@ -16427,9 +16765,10 @@ impl TermView {
     /// payload as one buffer, so there is no longer a body write to attack.
     pub fn paste_from_clipboard(&self) {
         let selection_feed_hold = self.selection_feed_hold.clone();
-        let clipboard = self.active_vte.clipboard();
+        let widget = self.active.borrow().focus_widget();
+        let clipboard = widget.clipboard();
         let sink = self.paste_sink();
-        let notify = paste_feedback::notifier(&self.active_vte);
+        let notify = paste_feedback::notifier(&widget);
         clipboard.read_text_async(None::<&gtk::gio::Cancellable>, move |result| {
             let Some(text) =
                 paste_feedback::read_text_before_paste(result, notify.as_ref(), || {
@@ -17530,6 +17869,10 @@ impl TermView {
         clear_dynamic_colors(&self.dynamic_colors);
         let config = self.config.borrow();
         apply_theme_to_vte(&self.active_vte, &config);
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &self.active.borrow().shared_active {
+            terminal.update_theme(&config, config.default_font_scale);
+        }
         for block in self.finished_blocks.borrow().iter() {
             if let Some(terminal) = &block.command_vte {
                 apply_snapshot_theme_to_vte(terminal, &config);
@@ -17575,6 +17918,11 @@ impl TermView {
         }
         // Update config and regenerate CSS with new font
         self.config.borrow_mut().font_desc = desc.to_string();
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &self.active.borrow().shared_active {
+            let config = self.config.borrow();
+            terminal.update_theme(&config, config.default_font_scale);
+        }
         install_block_css(&self.config.borrow());
         (self.layout_active_surface)();
         let refit = self.layout_active_surface.clone();
@@ -17605,6 +17953,11 @@ impl TermView {
             }
         }
         self.config.borrow_mut().default_font_scale = scale;
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &self.active.borrow().shared_active {
+            let config = self.config.borrow();
+            terminal.update_theme(&config, config.default_font_scale);
+        }
         // Regenerate CSS with updated font scale
         install_block_css(&self.config.borrow());
         (self.layout_active_surface)();

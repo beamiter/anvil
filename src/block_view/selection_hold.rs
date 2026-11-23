@@ -12,6 +12,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use jterm_core::terminal_report::classify_terminal_report;
+#[cfg(anvil_shared_terminal)]
+use relm4::gtk;
 use vte4::TerminalExt;
 
 use super::{BlockState, MouseReporting};
@@ -123,6 +125,22 @@ impl SelectionFeedHold {
         vte.connect_commit(move |_, text, _| {
             if let Some(hold) = weak.upgrade() {
                 hold.on_live_commit(text.as_bytes(), cpr_outstanding.get() > 0);
+            }
+        });
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    pub(super) fn install_text_view_hooks(self: &Rc<Self>, view: &gtk::TextView) {
+        use gtk::prelude::{TextBufferExt, TextViewExt};
+        let weak = Rc::downgrade(self);
+        view.buffer().connect_has_selection_notify(move |buffer| {
+            if let Some(hold) = weak.upgrade() {
+                if buffer.has_selection() {
+                    hold.begin_drag();
+                    hold.end_drag(true);
+                } else {
+                    hold.selection_cleared();
+                }
             }
         });
     }

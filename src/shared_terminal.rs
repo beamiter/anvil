@@ -251,9 +251,12 @@ impl SharedTerminal {
         }
     }
 
-    fn theme(config: &Config) -> Theme {
+    pub(crate) fn theme(config: &Config) -> Theme {
+        Self::theme_at_scale(config, config.default_font_scale)
+    }
+
+    pub(crate) fn theme_at_scale(config: &Config, scale: f64) -> Theme {
         let mut font = crate::font::terminal_font_description(&config.font_desc, config);
-        let scale = config.default_font_scale;
         if font.size() > 0 && scale.is_finite() && scale > 0.0 {
             let size = (f64::from(font.size()) * scale).round();
             if font.is_size_absolute() {
