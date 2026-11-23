@@ -1552,7 +1552,7 @@ impl AppModel {
     }
 
     pub(crate) fn request_quit(&self, sender: &ComponentSender<AppModel>) {
-        if crate::vim9_ide::request_embedded_close(&self.window) {
+        if self.quit_draining.get() || crate::vim9_ide::request_embedded_close(&self.window) {
             return;
         }
         if let Some(running) = self.running_process_summary() {
@@ -1596,6 +1596,7 @@ impl AppModel {
             return;
         }
 
+        self.quit_draining.set(true);
         let ready_sender = sender.clone();
         let children = self
             .tabs

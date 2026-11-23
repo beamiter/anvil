@@ -808,7 +808,7 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
     );
     table.insert(
         "terminal_mode".into(),
-        toml::Value::String(config.terminal_mode.as_str().to_string()),
+        toml::Value::String(config.terminal_mode_for_save().as_str().to_string()),
     );
     table.insert(
         "tab_placement".into(),
@@ -2244,6 +2244,23 @@ mod tests {
         assert!(!reload.contains("load_config()"));
         assert!(!reload.contains("current_revision()"));
         assert!(!reload.contains("validate_current_config()"));
+    }
+
+    #[test]
+    fn runtime_fallback_keeps_the_configured_terminal_preference() {
+        use config::TerminalMode;
+
+        let mut config = config::load_safe_config().0;
+        config.set_terminal_mode(TerminalMode::Vte);
+        config.prepare_workspace_startup(false, false);
+        assert_eq!(config.terminal_mode, TerminalMode::Block);
+        let mut table = toml::Table::new();
+        apply_config_to_table(&config, &mut table);
+        assert_eq!(table["terminal_mode"].as_str(), Some("vte"));
+
+        config.set_terminal_mode(TerminalMode::Block);
+        apply_config_to_table(&config, &mut table);
+        assert_eq!(table["terminal_mode"].as_str(), Some("block"));
     }
 
     #[test]

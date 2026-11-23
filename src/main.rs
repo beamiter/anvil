@@ -421,6 +421,7 @@ struct AppModel {
     opacity_toast: Rc<RefCell<Option<adw::Toast>>>,
     /// Same in-place slot for Ctrl+=/-/0 and Ctrl+wheel font steps.
     font_toast: Rc<RefCell<Option<adw::Toast>>>,
+    quit_draining: std::cell::Cell<bool>,
     quit_allowed: Rc<std::cell::Cell<bool>>,
     session_persistence: bool,
     /// Last user-visible background-save warning per operation. Worker errors
@@ -983,12 +984,12 @@ impl SimpleComponent for AppModel {
         };
         if !init.safe_mode {
             if let Some(mode) = init.mode {
-                config.terminal_mode = match mode {
+                config.set_terminal_mode(match mode {
                     cli::Mode::Block => TerminalMode::Block,
                     cli::Mode::Vte => TerminalMode::Vte,
                     cli::Mode::Unified => TerminalMode::Unified,
                     cli::Mode::Chat => TerminalMode::Chat,
-                };
+                });
             }
         }
         let shell_argv = if init.safe_mode {
@@ -1643,6 +1644,7 @@ impl SimpleComponent for AppModel {
             task_feedback,
             opacity_toast: Rc::new(RefCell::new(None)),
             font_toast: Rc::new(RefCell::new(None)),
+            quit_draining: std::cell::Cell::new(false),
             quit_allowed: quit_allowed.clone(),
             session_persistence,
             persistence_failure_notices: std::collections::HashMap::new(),
@@ -2458,7 +2460,13 @@ impl SimpleComponent for AppModel {
                 // A task terminal's exit is authoritative task evidence; the
                 // task model consumes it before the pane closes. Validation
                 // and agent terminals are never remote-reconnect candidates.
-                if self.note_task_terminal_exited(pane_id, code) {
+                let task_finished = self.note_task_terminal_exited(pane_id, code);
+                // The window's shutdown owns these children. Preserve the pane
+                // layout and session IDs until its final persistence checkpoint.
+                if self.quit_draining.get() {
+                    return;
+                }
+                if task_finished {
                     self.close_pane(pane_id, &sender);
                     return;
                 }

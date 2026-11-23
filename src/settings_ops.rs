@@ -164,10 +164,10 @@ impl AppModel {
             self.show_toast("Terminal mode is fixed to VTE in safe mode.");
             return;
         }
-        self.config.borrow_mut().terminal_mode = match mode {
+        self.config.borrow_mut().set_terminal_mode(match mode {
             1 => TerminalMode::Chat,
             _ => TerminalMode::Block,
-        };
+        });
         self.persist_config();
         self.show_toast("Terminal backend will apply to new and restored local panes.");
     }

@@ -757,6 +757,7 @@ pub struct Config {
     /// Commands to feed to new shells on startup (comma-separated).
     pub(crate) startup_commands: Option<String>,
     pub(crate) terminal_mode: TerminalMode,
+    pub(crate) terminal_mode_preference: Option<TerminalMode>,
     /// Where the tab strip is shown (left sidebar vs top bar).
     pub(crate) tab_placement: TabPlacement,
     /// Which single view the sidebar shows (tab list vs file tree).
@@ -873,11 +874,24 @@ impl Config {
     /// saved navigation visibility. A hidden sidebar must stay hidden across
     /// startup and a later unrelated configuration save.
     pub(crate) fn prepare_workspace_startup(&mut self, safe_mode: bool, shared_shell: bool) {
-        if !safe_mode && !shared_shell {
-            self.terminal_mode = self.terminal_mode.workspace_backend();
-        }
+        let preference = self.terminal_mode_for_save();
+        self.terminal_mode = if !safe_mode && !shared_shell {
+            preference.workspace_backend()
+        } else {
+            preference
+        };
+        self.terminal_mode_preference = (preference != self.terminal_mode).then_some(preference);
         self.tab_placement = TabPlacement::Sidebar;
         self.bottom_bar = false;
+    }
+
+    pub(crate) fn terminal_mode_for_save(&self) -> TerminalMode {
+        self.terminal_mode_preference.unwrap_or(self.terminal_mode)
+    }
+
+    pub(crate) fn set_terminal_mode(&mut self, mode: TerminalMode) {
+        self.terminal_mode = mode;
+        self.terminal_mode_preference = None;
     }
 
     /// Replace the complete configuration with an isolated, built-in VTE
@@ -910,6 +924,7 @@ impl Config {
             shell: None,
             startup_commands: None,
             terminal_mode: TerminalMode::Vte,
+            terminal_mode_preference: None,
             tab_placement: TabPlacement::Sidebar,
             sidebar_view: SidebarView::Tabs,
             // Recovery mode must not initiate network or shared-cache work.
@@ -2271,6 +2286,7 @@ fn resolve_file_config(fc: FileConfig) -> (Config, Vec<Theme>, KeybindingMap) {
         shell,
         startup_commands,
         terminal_mode,
+        terminal_mode_preference: None,
         tab_placement,
         sidebar_view,
         jsh_update_check,
