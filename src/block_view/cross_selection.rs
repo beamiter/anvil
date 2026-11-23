@@ -25,6 +25,8 @@ use gtk::prelude::*;
 use vte4::TerminalExt;
 
 use super::selection_hold::{feed_hold_eligible, SelectionFeedHold};
+#[cfg(anvil_shared_terminal)]
+use super::shared_active::SharedActiveTerminal;
 use super::text_surface::TerminalTextSurface;
 use super::{
     clear_finished_block_selection, BlockState, FinishedBlock, MouseReporting, SelectedBlockIds,
@@ -63,6 +65,30 @@ struct SelectionWriter {
     failure: Option<SelectionCopyError>,
 }
 
+impl SelectionWriter {
+    fn new(limit: usize, deadline: std::time::Instant) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+            deadline,
+            failure: None,
+        }
+    }
+
+    fn into_text(self, captured: bool) -> Result<String, SelectionCopyError> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if !captured {
+            return Err(SelectionCopyError::CaptureFailed);
+        }
+        if std::time::Instant::now() >= self.deadline {
+            return Err(SelectionCopyError::TimedOut);
+        }
+        String::from_utf8(self.bytes).map_err(|_| SelectionCopyError::CaptureFailed)
+    }
+}
+
 impl std::io::Write for SelectionWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         let next = self.bytes.len().saturating_add(bytes.len());
@@ -93,12 +119,7 @@ fn capture_surface_text(
     max_bytes: usize,
     deadline: std::time::Instant,
 ) -> Result<String, SelectionCopyError> {
-    let stream = gtk::gio::WriteOutputStream::new(SelectionWriter {
-        bytes: Vec::new(),
-        limit: max_bytes,
-        deadline,
-        failure: None,
-    });
+    let stream = gtk::gio::WriteOutputStream::new(SelectionWriter::new(max_bytes, deadline));
     let result = vte.write_contents_sync(
         &stream,
         vte4::WriteFlags::Default,
@@ -108,15 +129,13 @@ fn capture_surface_text(
         .close_and_take()
         .downcast::<SelectionWriter>()
         .map_err(|_| SelectionCopyError::CaptureFailed)?;
-    if let Some(error) = writer.failure {
-        return Err(error);
-    }
-    result.map_err(|_| SelectionCopyError::CaptureFailed)?;
-    String::from_utf8(writer.bytes).map_err(|_| SelectionCopyError::CaptureFailed)
+    writer.into_text(result.is_ok())
 }
 
 struct SelectedSurface {
     widget: gtk::glib::WeakRef<gtk::Widget>,
+    #[cfg(anvil_shared_terminal)]
+    retained_text: Option<jterm_gtk_view::RetainedTextSource>,
     handlers: Vec<(
         gtk::glib::WeakRef<gtk::glib::Object>,
         gtk::glib::SignalHandlerId,
@@ -162,7 +181,9 @@ fn append_selected_text(
 
 pub(crate) struct CrossSelection {
     finished_blocks: Rc<RefCell<Vec<FinishedBlock>>>,
-    active_vte: vte4::Terminal,
+    active_surface: TerminalTextSurface,
+    #[cfg(anvil_shared_terminal)]
+    shared_active: Option<Rc<SharedActiveTerminal>>,
     selected_block_ids: SelectedBlockIds,
     selected_block_id: Rc<Cell<Option<u64>>>,
     selection_anchor_id: Rc<Cell<Option<u64>>>,
@@ -186,7 +207,7 @@ pub(crate) struct CrossSelection {
 
 impl CrossSelection {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn install(
+    pub(super) fn install(
         block_scroll: &impl IsA<gtk::Widget>,
         finished_blocks: Rc<RefCell<Vec<FinishedBlock>>>,
         active_vte: vte4::Terminal,
@@ -196,14 +217,23 @@ impl CrossSelection {
         feed_hold: Rc<SelectionFeedHold>,
         bstate: Rc<Cell<BlockState>>,
         mouse_reporting: Rc<Cell<MouseReporting>>,
+        #[cfg(anvil_shared_terminal)] shared_active: Option<Rc<SharedActiveTerminal>>,
     ) -> Rc<Self> {
         // Chat's live terminal is outside its history scroller. Mount the same
         // native pick-based owner on their common canvas; Block still passes
         // its original scroller. No synthetic chrome acquires a text origin.
         let block_scroll = block_scroll.upcast_ref::<gtk::Widget>();
+        let active_surface = TerminalTextSurface::Native(active_vte);
+        #[cfg(anvil_shared_terminal)]
+        let active_surface = match &shared_active {
+            Some(terminal) => TerminalTextSurface::Document(terminal.screen().clone()),
+            None => active_surface,
+        };
         let this = Rc::new(Self {
             finished_blocks,
-            active_vte,
+            active_surface,
+            #[cfg(anvil_shared_terminal)]
+            shared_active,
             selected_block_ids,
             selected_block_id,
             selection_anchor_id,
@@ -219,7 +249,7 @@ impl CrossSelection {
         let weak = Rc::downgrade(&this);
         this.feed_hold.set_release_listener(move || {
             if let Some(this) = weak.upgrade() {
-                if this.surface_selected(&this.active_vte) {
+                if this.surface_selected(this.active_surface.widget()) {
                     this.clear_cross_selection();
                 }
             }
@@ -273,7 +303,7 @@ impl CrossSelection {
                 return;
             }
             let start = this.vte_at(&scroll, x, y);
-            if start.as_ref().and_then(TerminalTextSurface::native) == Some(&this.active_vte)
+            if start.as_ref() == Some(&this.active_surface)
                 && this.mouse_reporting.get().is_tracking()
                 && !shift_held(gesture)
             {
@@ -287,7 +317,7 @@ impl CrossSelection {
             if let Some(start) = start {
                 this.clear_block_selection();
                 this.clear_other_selections(Some(&start));
-                this.maybe_hold_active_feed(start.native(), shift_held(gesture));
+                this.maybe_hold_active_feed(Some(&start), shift_held(gesture));
             }
         });
 
@@ -331,11 +361,7 @@ impl CrossSelection {
             gesture.set_state(gtk::EventSequenceState::Claimed);
             this.claimed.set(true);
             this.paint_range(&vtes, start, cur_idx);
-            this.maybe_hold_active_feed(
-                vtes.get(start.max(cur_idx))
-                    .and_then(TerminalTextSurface::native),
-                shift_held(gesture),
-            );
+            this.maybe_hold_active_feed(vtes.get(start.max(cur_idx)), shift_held(gesture));
         });
 
         let this_for_end = Rc::downgrade(&this);
@@ -378,9 +404,10 @@ impl CrossSelection {
                 return;
             }
             let selection_alive = weak.upgrade().is_some_and(|this| {
-                this.active_vte.is_mapped()
-                    && this.active_vte.is_visible()
-                    && (this.active_vte.has_selection() || this.surface_selected(&this.active_vte))
+                this.active_surface.widget().is_mapped()
+                    && this.active_surface.widget().is_visible()
+                    && (this.active_surface.has_selection()
+                        || this.surface_selected(this.active_surface.widget()))
             });
             hold.end_drag(selection_alive);
             // Cancellation also happens after drag-end, when end_drag(false)
@@ -392,8 +419,8 @@ impl CrossSelection {
         });
     }
 
-    fn maybe_hold_active_feed(&self, vte: Option<&vte4::Terminal>, shift_held: bool) {
-        if vte == Some(&self.active_vte)
+    fn maybe_hold_active_feed(&self, surface: Option<&TerminalTextSurface>, shift_held: bool) {
+        if surface == Some(&self.active_surface)
             && feed_hold_eligible(self.bstate.get(), self.mouse_reporting.get(), shift_held)
         {
             self.feed_hold.begin_drag();
@@ -417,7 +444,8 @@ impl CrossSelection {
                 return;
             }
             hold.end_drag(weak.upgrade().is_some_and(|this| {
-                this.active_vte.has_selection() || this.surface_selected(&this.active_vte)
+                this.active_surface.has_selection()
+                    || this.surface_selected(this.active_surface.widget())
             }));
         });
     }
@@ -444,7 +472,7 @@ impl CrossSelection {
             vtes.extend(block.command_surface());
             vtes.push(block.output_surface());
         }
-        vtes.push(TerminalTextSurface::Native(self.active_vte.clone()));
+        vtes.push(self.active_surface.clone());
         vtes
     }
 
@@ -578,6 +606,10 @@ impl CrossSelection {
             }
             selected.push(SelectedSurface {
                 widget: widget.downgrade(),
+                #[cfg(anvil_shared_terminal)]
+                retained_text: self
+                    .shared_active_for(surface)
+                    .and_then(|terminal| terminal.embedded().retained_text_source()),
                 handlers,
             });
         }
@@ -655,7 +687,7 @@ impl CrossSelection {
                 if !vte.has_selection() {
                     continue;
                 }
-                vte.selected_text()
+                self.selected_text(&vte)
             };
             if let Some(text) = text.filter(|text| !text.is_empty()) {
                 append_selected_text(&mut output, &text, MAX_CROSS_SELECTION_BYTES)?;
@@ -673,12 +705,39 @@ impl CrossSelection {
         }
     }
 
+    fn selected_text(&self, surface: &TerminalTextSurface) -> Option<String> {
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = self.shared_active_for(surface) {
+            return terminal.embedded().pane().selected_text();
+        }
+        surface.selected_text()
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    fn shared_active_for(&self, surface: &TerminalTextSurface) -> Option<&SharedActiveTerminal> {
+        self.shared_active
+            .as_deref()
+            .filter(|_| surface == &self.active_surface)
+    }
+
     fn capture_whole_surface(
         &self,
         surface: &TerminalTextSurface,
         max_bytes: usize,
         deadline: std::time::Instant,
     ) -> Result<String, SelectionCopyError> {
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = self.shared_active_for(surface) {
+            let selections = self.selected_surfaces.borrow();
+            let source = selections
+                .iter()
+                .find(|selected| selected.widget.upgrade().as_ref() == Some(surface.widget()))
+                .and_then(|selected| selected.retained_text.as_ref())
+                .ok_or(SelectionCopyError::CaptureFailed)?;
+            let mut writer = SelectionWriter::new(max_bytes, deadline);
+            let result = terminal.embedded().write_retained_text(source, &mut writer);
+            return writer.into_text(result.is_ok());
+        }
         match surface {
             TerminalTextSurface::Native(terminal) => {
                 capture_surface_text(terminal, max_bytes, deadline)
@@ -1517,6 +1576,8 @@ mod tests {
             SelectionFeedHold::new(),
             Rc::new(Cell::new(BlockState::CollectingOutput)),
             Rc::new(Cell::new(MouseReporting::OFF)),
+            #[cfg(anvil_shared_terminal)]
+            None,
         );
 
         cross

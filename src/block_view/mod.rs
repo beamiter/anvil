@@ -15777,6 +15777,8 @@ impl TermView {
             selection_feed_hold.clone(),
             bstate.clone(),
             mouse_reporting_mode.clone(),
+            #[cfg(anvil_shared_terminal)]
+            shared_active.clone(),
         );
         *cross_selection_slot.borrow_mut() = Some(cross_selection.clone());
 
@@ -16651,16 +16653,6 @@ impl TermView {
     /// [`Self::copy_to_clipboard_with_modifier`], so a greyed-out Copy and a
     /// Copy that does nothing cannot disagree.
     pub(crate) fn has_copyable_selection(&self) -> bool {
-        #[cfg(anvil_shared_terminal)]
-        if self
-            .active
-            .borrow()
-            .shared_active
-            .as_ref()
-            .is_some_and(|terminal| terminal.screen().buffer().has_selection())
-        {
-            return true;
-        }
         if self.cross_selection.has_text_selection() {
             return true;
         }
@@ -16946,31 +16938,20 @@ impl TermView {
     /// only" modifier (Alt+Ctrl+Shift+C) when a whole block is selected.
     pub fn copy_to_clipboard_with_modifier(&self, alt_held: bool) -> bool {
         log::debug!(">>> TermView::copy_to_clipboard called (alt={})", alt_held);
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.active.borrow().shared_active {
-            if terminal.screen().buffer().has_selection() {
-                terminal.copy();
-                self.selection_feed_hold.flush_now();
-                return true;
-            }
-        }
-
-        // A visible native or cross-widget text selection is more specific
-        // than card selection and therefore wins. The aggregator reads every
-        // tracked VTE in document order, including a single ordinary drag.
+        // A visible text selection takes precedence over a whole-card selection.
         match self.cross_selection.copy_text() {
             Ok(Some(text)) => {
                 log::debug!(
                     ">>> TermView copy: got {} chars from visible text selection",
                     text.len()
                 );
-                self.active_vte.clipboard().set_text(&text);
+                self.root.clipboard().set_text(&text);
                 self.selection_feed_hold.flush_now();
                 return true;
             }
             Err(error) => {
-                log::warn!("refused VTE selection copy: {error}");
-                show_clipboard_failure(&self.active_vte, &format!("{error}. Nothing was copied."));
+                log::warn!("could not copy selected terminal text: {error}");
+                show_clipboard_failure(&self.root, &format!("{error}. Nothing was copied."));
                 self.selection_feed_hold.flush_now();
                 return true;
             }
