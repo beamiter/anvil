@@ -98,6 +98,7 @@ jobs:
           bash "$core/crates/jterm_gtk_view/tests/test-native-cards.sh" \
             anvil "$RUNNER_TEMP/shared-terminal-wayland/cards"
       - name: Verify the application's shared transcript Find entry points
+        if: ${{ !cancelled() }}
         run: |
           core=$(python3 scripts/shared-core-path.py)
           dbus-run-session -- xvfb-run -a --server-args='-screen 0 1440x1100x24 -nolisten tcp' \
@@ -109,6 +110,13 @@ jobs:
           core=$(python3 scripts/shared-core-path.py)
           dbus-run-session -- xvfb-run -a --server-args='-screen 0 1440x1100x24 -nolisten tcp' \
             /usr/bin/python3 -B "$core/crates/jterm_gtk_view/tests/native_selection.py" \
+            anvil target/release/anvil
+      - name: Verify shared color replies and rendered palette in Block, Chat and Unified
+        if: ${{ !cancelled() }}
+        run: |
+          core=$(python3 scripts/shared-core-path.py)
+          dbus-run-session -- xvfb-run -a --server-args='-screen 0 1440x1100x24 -nolisten tcp' \
+            /usr/bin/python3 -B "$core/crates/jterm_gtk_view/tests/native_colors.py" \
             anvil target/release/anvil
       - name: Preserve native protocol and fixture logs
         if: ${{ always() }}

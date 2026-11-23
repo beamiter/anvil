@@ -6749,6 +6749,7 @@ impl ReaderCtx {
             ParserEvent::ClipboardSet(text) => self.on_clipboard_set(text),
             ParserEvent::ClipboardQuery => self.on_clipboard_query(),
             ParserEvent::ColorQuery(kind) => self.on_color_query(*kind),
+            ParserEvent::LiveColorQuery(bytes) => self.backend.feed_live(bytes),
             ParserEvent::ColorSet { kind, spec } => self.on_color_set(*kind, spec),
             ParserEvent::ColorReset(kind) => self.on_color_reset(*kind),
             ParserEvent::KeyboardProtocolQuery(query) => self.on_keyboard_protocol_query(*query),
@@ -6907,7 +6908,7 @@ impl ReaderCtx {
         self.mouse_reporting_rc.set(MouseReporting::OFF);
         self.dynamic_colors_rc.set(DynamicColors::default());
         let config = self.config_for_cb.borrow();
-        *self.parser.borrow_mut() = Parser::with_config(ParserConfig {
+        self.parser.borrow_mut().reset_with_config(ParserConfig {
             mouse_reporting: config.mouse_reporting_enabled,
             focus_reporting: config.focus_reporting_enabled,
         });
@@ -14274,10 +14275,13 @@ impl TermView {
             let bracketed_paste_rc = bracketed_paste.clone();
             let dynamic_colors_rc = dynamic_colors.clone();
             let config_for_cb = config_shared.clone();
-            let parser = Rc::new(RefCell::new(Parser::with_config(ParserConfig {
+            let parser = Parser::with_config(ParserConfig {
                 mouse_reporting: config.mouse_reporting_enabled,
                 focus_reporting: config.focus_reporting_enabled,
-            })));
+            });
+            #[cfg(anvil_shared_terminal)]
+            let parser = parser.with_live_terminal_colors(shared_active.is_some());
+            let parser = Rc::new(RefCell::new(parser));
             let block_data_for_cb = block_data_rc.clone();
             let finished_blocks_for_cb = finished_blocks_rc.clone();
             let scroll_debouncer = scroll_debouncer.clone();

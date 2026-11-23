@@ -1,6 +1,6 @@
 #[cfg(target_os = "linux")]
 use jterm_gtk_view::RuntimeShell;
-use jterm_gtk_view::{LinkActions, Pty, TerminalPane, Theme};
+use jterm_gtk_view::{CursorColors, LinkActions, Pty, TerminalPane, Theme};
 use relm4::gtk::{self, prelude::*};
 use std::{cell::RefCell, rc::Rc};
 
@@ -270,6 +270,10 @@ impl SharedTerminal {
             foreground: config.foreground,
             background: config.background,
             palette: config.palette,
+            cursor: Some(CursorColors {
+                foreground: config.cursor_foreground,
+                background: config.cursor,
+            }),
         }
     }
 

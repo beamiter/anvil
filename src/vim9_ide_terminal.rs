@@ -46,6 +46,7 @@ impl EditorTerminal {
                 foreground: foreground(),
                 background: background(),
                 palette: jterm_gtk_view::default_ansi_palette(),
+                cursor: None,
             };
             let (root, pane) = jterm_gtk_view::TerminalPane::with_runtime_embedded(
                 runtime,
