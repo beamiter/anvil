@@ -1038,7 +1038,7 @@ impl Component for BlockTerminal {
             VteInput::Paste => view.paste_from_clipboard(),
             VteInput::SetFontScale(scale) => view.set_font_scale(scale),
             VteInput::SetFont(desc) => view.set_font(&desc),
-            VteInput::SetScrollback(lines) => view.vte().set_scrollback_lines(lines),
+            VteInput::SetScrollback(lines) => view.set_scrollback_lines(lines),
             VteInput::ScrollLines(lines) => view.scroll_lines(lines),
             VteInput::ApplyTheme => view.apply_theme(),
             VteInput::SyncConfig => view.reload_config(&self.config.borrow()),

@@ -18110,6 +18110,14 @@ impl TermView {
         self.render_backend.sync_geometry_to_pty();
     }
 
+    pub(crate) fn set_scrollback_lines(&self, lines: i64) {
+        self.active_vte.set_scrollback_lines(lines);
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = self.active.borrow().shared_active.as_ref() {
+            terminal.set_history_row_limit(usize::try_from(lines).unwrap_or(usize::MAX));
+        }
+    }
+
     pub fn apply_theme(&self) {
         clear_dynamic_colors(&self.dynamic_colors);
         let config = self.config.borrow();

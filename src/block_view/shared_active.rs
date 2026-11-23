@@ -212,9 +212,11 @@ impl SharedActiveTerminal {
         self.terminal
             .pane()
             .set_theme(SharedTerminal::theme_at_scale(config, scale));
-        self.terminal
-            .pane()
-            .set_history_row_limit(config.terminal_scrollback_lines as usize);
+        self.set_history_row_limit(config.terminal_scrollback_lines as usize);
+    }
+
+    pub(super) fn set_history_row_limit(&self, rows: usize) {
+        self.terminal.pane().set_history_row_limit(rows);
     }
 
     pub(super) fn drawn_rows(&self) -> i64 {
