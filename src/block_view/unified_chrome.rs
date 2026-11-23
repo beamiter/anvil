@@ -1052,6 +1052,79 @@ fn projection_drift_after_contents(
     }
 }
 
+#[derive(Clone, Copy)]
+struct BadgeLayout {
+    width: i32,
+    content_x: f64,
+    cell_width: f64,
+    cell_height: f64,
+    columns: i64,
+}
+
+fn paint_badge(
+    cr: &gtk::cairo::Context,
+    geometry: BadgeLayout,
+    y: f64,
+    colors: &ChromeColors,
+    record: &ZoneChromeRecord,
+    blank_from: impl FnOnce(i64) -> bool,
+) {
+    let BadgeLayout {
+        width,
+        content_x,
+        cell_width,
+        cell_height,
+        columns,
+    } = geometry;
+    let badge = record.badge();
+    cr.select_font_face(
+        "sans-serif",
+        gtk::cairo::FontSlant::Normal,
+        gtk::cairo::FontWeight::Bold,
+    );
+    cr.set_font_size((cell_height * 0.62).clamp(8.0, 13.0));
+    let Ok(extents) = cr.text_extents(&badge) else {
+        return;
+    };
+    let badge_width = extents.width() + BADGE_PAD_X * 2.0;
+    let badge_height = (extents.height() + BADGE_PAD_Y * 2.0).min(cell_height - 1.0);
+    let badge_x = (f64::from(width) - badge_width - 6.0).max(content_x + cell_width);
+    let start_col = (((badge_x - content_x) / cell_width).floor() as i64).clamp(0, columns);
+    if !blank_from(badge_probe_start_col(start_col)) {
+        return;
+    }
+    let y = y + (cell_height - badge_height) / 2.0;
+    let color = if record.is_background {
+        colors.info
+    } else {
+        match record.exit_code {
+            Some(0) => colors.success,
+            Some(code) if super::interrupt_signal(code).is_some() => colors.muted,
+            Some(_) => colors.error,
+            None => colors.warning,
+        }
+    };
+    cr.set_source_rgba(
+        f64::from(color.red()),
+        f64::from(color.green()),
+        f64::from(color.blue()),
+        0.20,
+    );
+    cr.rectangle(badge_x, y, badge_width, badge_height);
+    let _ = cr.fill();
+    cr.set_source_rgba(
+        f64::from(color.red()),
+        f64::from(color.green()),
+        f64::from(color.blue()),
+        1.0,
+    );
+    cr.move_to(
+        badge_x + BADGE_PAD_X - extents.x_bearing(),
+        y + (badge_height - extents.height()) / 2.0 - extents.y_bearing(),
+    );
+    let _ = cr.show_text(&badge);
+}
+
 #[derive(Clone)]
 pub(super) struct UnifiedChrome {
     surface: gtk::DrawingArea,
@@ -1081,11 +1154,26 @@ impl UnifiedChrome {
         authority: Rc<RefCell<ZoneChromeAuthority>>,
         config: Rc<RefCell<super::Config>>,
         retained_floor_observer: RetainedFloorObserver,
+        #[cfg(anvil_shared_terminal)] shared: Option<&Rc<super::SharedActiveTerminal>>,
     ) -> Self {
         let cache = Rc::new(RefCell::new(KnownHeadCache::default()));
         let projection: Rc<Cell<Option<ViewportProjection>>> = Rc::new(Cell::new(None));
         let calibration_anchor: Rc<Cell<Option<CalibrationAnchor>>> = Rc::new(Cell::new(None));
         let row_epoch = Rc::new(Cell::new(1_u64));
+        let chrome = Self {
+            surface: surface.clone(),
+            authority: authority.clone(),
+            projection: projection.clone(),
+            calibration_anchor: calibration_anchor.clone(),
+            row_epoch: row_epoch.clone(),
+            cache: cache.clone(),
+            retained_floor_observer: retained_floor_observer.clone(),
+        };
+        #[cfg(anvil_shared_terminal)]
+        if let Some(shared) = shared {
+            chrome.connect_shared(shared, config);
+            return chrome;
+        }
         let terminal_for_draw = terminal.clone();
         let authority_for_draw = authority.clone();
         let config_for_draw = config;
@@ -1272,70 +1360,31 @@ impl UnifiedChrome {
                     continue;
                 }
 
-                let badge = record.badge();
-                cr.select_font_face(
-                    "sans-serif",
-                    gtk::cairo::FontSlant::Normal,
-                    gtk::cairo::FontWeight::Bold,
-                );
-                cr.set_font_size((cell_height * 0.62).clamp(8.0, 13.0));
-                let Ok(extents) = cr.text_extents(&badge) else {
-                    continue;
-                };
-                let badge_width = extents.width() + BADGE_PAD_X * 2.0;
-                let badge_height = (extents.height() + BADGE_PAD_Y * 2.0).min(cell_height - 1.0);
-                let badge_x = (f64::from(width) - badge_width - 6.0).max(content_x + cell_width);
-                let start_col =
-                    (((badge_x - content_x) / cell_width).floor() as i64).clamp(0, columns);
-                let probe_start_col = badge_probe_start_col(start_col);
-                let row_tail = terminal_for_draw
-                    .text_range_format(
-                        vte4::Format::Text,
-                        line.absolute_row,
-                        probe_start_col,
-                        line.absolute_row,
+                paint_badge(
+                    cr,
+                    BadgeLayout {
+                        width,
+                        content_x,
+                        cell_width,
+                        cell_height,
                         columns,
-                    )
-                    .0;
-                let Some(row_tail) = row_tail else {
-                    // An unavailable range (including a wide-cell boundary
-                    // VTE cannot represent) is unknown, never blank.
-                    continue;
-                };
-                if !badge_lands_on_blank_cells(row_tail.as_str()) {
-                    continue;
-                }
-
-                let badge_y = y + (cell_height - badge_height) / 2.0;
-                let color = if record.is_background {
-                    colors.info
-                } else {
-                    match record.exit_code {
-                        Some(0) => colors.success,
-                        Some(code) if super::interrupt_signal(code).is_some() => colors.muted,
-                        Some(_) => colors.error,
-                        None => colors.warning,
-                    }
-                };
-                cr.set_source_rgba(
-                    f64::from(color.red()),
-                    f64::from(color.green()),
-                    f64::from(color.blue()),
-                    0.20,
+                    },
+                    y,
+                    &colors,
+                    record,
+                    |start_col| {
+                        terminal_for_draw
+                            .text_range_format(
+                                vte4::Format::Text,
+                                line.absolute_row,
+                                start_col,
+                                line.absolute_row,
+                                columns,
+                            )
+                            .0
+                            .is_some_and(|tail| badge_lands_on_blank_cells(tail.as_str()))
+                    },
                 );
-                cr.rectangle(badge_x, badge_y, badge_width, badge_height);
-                let _ = cr.fill();
-                cr.set_source_rgba(
-                    f64::from(color.red()),
-                    f64::from(color.green()),
-                    f64::from(color.blue()),
-                    1.0,
-                );
-                cr.move_to(
-                    badge_x + BADGE_PAD_X - extents.x_bearing(),
-                    badge_y + (badge_height - extents.height()) / 2.0 - extents.y_bearing(),
-                );
-                let _ = cr.show_text(&badge);
             }
         });
 
@@ -1521,15 +1570,97 @@ impl UnifiedChrome {
             }
         });
 
-        Self {
-            surface: surface.clone(),
-            authority,
-            projection,
-            calibration_anchor,
-            row_epoch,
-            cache,
-            retained_floor_observer,
-        }
+        chrome
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    fn connect_shared(
+        &self,
+        terminal: &Rc<super::SharedActiveTerminal>,
+        config: Rc<RefCell<super::Config>>,
+    ) {
+        let surface = self.surface.downgrade();
+        let transcript = terminal
+            .transcript()
+            .expect("Unified terminal owns the transcript");
+        assert!(transcript.on_painted(move || {
+            if let Some(surface) = surface.upgrade() {
+                surface.queue_draw();
+            }
+        }));
+        let terminal = Rc::downgrade(terminal);
+        let records = self.authority.clone();
+        self.surface
+            .set_draw_func(move |surface, cr, width, height| {
+                let Some(terminal) = terminal.upgrade() else {
+                    return;
+                };
+                let Some(origin) = terminal
+                    .screen()
+                    .compute_point(surface, &gtk::graphene::Point::new(0.0, 0.0))
+                else {
+                    return;
+                };
+                let (left, top, cw, ch) = terminal.cell_metrics();
+                let x = f64::from(origin.x()) + f64::from(left);
+                let y = f64::from(origin.y()) + f64::from(top);
+                let ch = f64::from(ch.max(1));
+                let x_gutter = x - GUTTER_WIDTH - 1.0;
+                let colors = ChromeColors::from_config(&config.borrow());
+                let accent = colors.accent;
+                let records = records.borrow();
+                let geometry = BadgeLayout {
+                    width,
+                    content_x: x,
+                    cell_width: f64::from(cw.max(1)),
+                    cell_height: ch,
+                    columns: i64::from(terminal.grid_size().0),
+                };
+                let Some(transcript) = terminal.transcript() else {
+                    return;
+                };
+                for row in transcript.painted_zone_rows() {
+                    let row_y = y + row.row as f64 * ch;
+                    if row_y >= f64::from(height) || row_y + ch <= 0.0 {
+                        continue;
+                    }
+                    let Some(record) = records.record(row.id) else {
+                        continue;
+                    };
+                    cr.set_source_rgba(
+                        f64::from(accent.red()),
+                        f64::from(accent.green()),
+                        f64::from(accent.blue()),
+                        0.72,
+                    );
+                    cr.rectangle(x_gutter, row_y, GUTTER_WIDTH, ch + 0.5);
+                    let _ = cr.fill();
+                    if !row.heading {
+                        continue;
+                    }
+                    cr.set_source_rgba(
+                        f64::from(accent.red()),
+                        f64::from(accent.green()),
+                        f64::from(accent.blue()),
+                        0.45,
+                    );
+                    cr.rectangle(x_gutter, row_y, (f64::from(width) - x_gutter).max(0.0), 1.0);
+                    let _ = cr.fill();
+                    if row.completed && records.is_completed(row.id) {
+                        paint_badge(cr, geometry, row_y, &colors, record, |start| {
+                            row.blank_tail.is_some_and(|clear| clear as i64 <= start)
+                        });
+                    }
+                }
+            });
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    pub(super) fn begin_shared_zone(&self, id: u64, limit: usize) {
+        let mut authority = self.authority.borrow_mut();
+        authority.begin_zone(id);
+        authority.enforce_limit(limit);
+        self.surface.queue_draw();
     }
 
     pub(super) fn record_completed(&self, record: ZoneChromeRecord) {

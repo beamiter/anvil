@@ -789,17 +789,15 @@ mod tests {
     #[test]
     #[ignore = "requires an isolated native GTK display and candidate environment"]
     fn shared_live_output_keeps_the_owned_shell_through_alternate_screen() {
-        use super::super::find::FindSearchResult;
         use crate::config::{Config, TerminalMode};
         use gtk::prelude::*;
+        use std::rc::Rc;
         use std::time::{Duration, Instant};
-        use vte4::TerminalExt;
 
         gtk::init().expect("GTK display");
-        assert_eq!(
-            std::env::var("JTERM_SHARED_LIVE_OUTPUT").as_deref(),
-            Ok("1")
-        );
+        for name in ["JTERM_SHARED_ACTIVE_TERMINAL", "JTERM_SHARED_TRANSCRIPT"] {
+            assert_eq!(std::env::var(name).as_deref(), Ok("1"));
+        }
         crate::child_env::capture_inherited_environment().expect("test child environment");
         let shell = r#"
             stty -echo
@@ -813,20 +811,23 @@ mod tests {
             IFS= read -r next
             printf '\r\n\033]133;C;cmdline_url=next\007same shell %s\n' "$next"
             printf '\033]133;D;0\007\033]133;A\007$ \033]133;B\007'
+            IFS= read -r history
+            printf '\r\n\033]133;C;cmdline_url=history\007'
+            seq 1 90
+            printf '\r\narchived zones ready\r\n\033]133;D;0\007\033]133;A\007$ \033]133;B\007'
             IFS= read -r shutdown
         "#;
-        let wait_for = |what: &str, condition: &dyn Fn() -> bool| {
+        let wait_for = |mode: TerminalMode, what: &str, condition: &dyn Fn() -> bool| {
             let context = gtk::glib::MainContext::default();
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(6);
             while Instant::now() < deadline {
                 while context.iteration(false) {}
                 if condition() {
-                    return true;
+                    return;
                 }
                 std::thread::sleep(Duration::from_millis(2));
             }
-            eprintln!("timed out while waiting for {what}");
-            false
+            panic!("{mode:?}: timed out while waiting for {what}");
         };
         for mode in [
             TerminalMode::Block,
@@ -849,96 +850,203 @@ mod tests {
                 |_, _, _, _| crate::pty::OwnedPty::spawn(&["/bin/sh", "-c", shell], None, &[]),
             )
             .expect("spawn real PTY shell");
+            let terminal = view
+                .active
+                .borrow()
+                .shared_active
+                .clone()
+                .expect("shared active renderer");
+            let screen = terminal.screen().clone();
+            let chrome = view.active.borrow().unified_chrome_surface.clone();
             let window = gtk::Window::builder()
                 .default_width(920)
                 .default_height(680)
                 .child(&view.widget())
                 .build();
+            let buffer = screen.buffer();
+            let text = || buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
+            let pid = view.pid_i32();
+            let fd = view.pty_fd_i32();
+            assert!(pid > 0 && fd >= 0);
+            let same_surface = || {
+                screen.is_mapped()
+                    && screen.buffer() == buffer
+                    && !view.active_vte.is_mapped()
+                    && view
+                        .active
+                        .borrow()
+                        .shared_active
+                        .as_ref()
+                        .is_some_and(|current| Rc::ptr_eq(current, &terminal))
+                    && view.pid_i32() == pid
+                    && view.pty_fd_i32() == fd
+            };
             window.present();
-            assert!(wait_for("live shell prompt", &|| view
-                .active_vte
-                .is_mapped()
-                && view.bstate.get()
-                    == super::super::BlockState::AwaitingCommand));
-            let label = view
-                .active
-                .borrow()
-                .shared_live_widget()
-                .expect("live output widget");
-            assert!(!label.is_mapped());
+            wait_for(mode, "shared prompt over the real PTY", &|| {
+                same_surface()
+                    && text().contains("$ ")
+                    && view.bstate.get() == super::super::BlockState::AwaitingCommand
+            });
             view.pty
                 .try_write_bytes(b"start\r")
                 .expect("send held command");
-            assert!(
-                wait_for("shared active row", &|| label.is_mapped()),
-                "{mode:?}: capture {:?}, cursor {:?}, native {:?}",
-                view.active.borrow().output_text_prefix(128),
-                view.active_vte.cursor_position(),
-                view.active_vte.text_format(vte4::Format::Text)
-            );
-            let first = label
-                .first_child()
-                .unwrap()
-                .downcast::<gtk::Label>()
-                .unwrap();
-            let second = first
-                .next_sibling()
-                .unwrap()
-                .downcast::<gtk::Label>()
-                .unwrap();
-            assert_eq!(first.text(), "shared live row");
-            assert_eq!(second.text(), "second captured row");
-            assert!(second.is_mapped() && second.width() > first.width());
-            let unicode = second
-                .next_sibling()
-                .unwrap()
-                .downcast::<gtk::Label>()
-                .unwrap();
-            assert_eq!(unicode.text(), "wide 界 e\u{301}");
-            assert!(unicode.is_mapped() && unicode.width() > 0);
-            assert!(matches!(
-                view.find_in_blocks("shared live row", false, false),
-                FindSearchResult::Matches(_)
-            ));
-            assert!(wait_for("existing active find renderer", &|| !label.is_mapped()));
-            view.clear_find();
-
+            wait_for(mode, "all live output rows", &|| {
+                let output = text();
+                same_surface()
+                    && output.contains("shared live row")
+                    && output.contains("second captured row")
+                    && output.contains("wide 界 e\u{301}")
+            });
+            let (cols, rows) = terminal.grid_size();
+            assert_eq!(view.grid_size(), (i64::from(cols), i64::from(rows)));
             view.pty
                 .try_write_bytes(b"fullscreen\r")
-                .expect("same shell enters alternate screen");
-            assert!(wait_for("mapped alternate screen", &|| !label.is_mapped()
-                && view.bstate.get() == super::super::BlockState::AltScreen
-                && view
-                    .active_vte
-                    .text_format(vte4::Format::Text)
-                    .is_some_and(|text| text.contains("full screen witness"))));
+                .expect("enter alternate screen");
+            wait_for(mode, "same shared surface in alternate screen", &|| {
+                same_surface()
+                    && view.bstate.get() == super::super::BlockState::AltScreen
+                    && text().contains("full screen witness")
+                    && !chrome.is_visible()
+            });
             view.pty
                 .try_write_bytes(b"finish\r")
-                .expect("same shell exits alternate screen");
-            assert!(wait_for("first completed command", &|| view
-                .render_backend
-                .records()
-                .len()
-                == 1));
-            assert!(!label.is_mapped());
+                .expect("return to primary screen");
+            wait_for(mode, "same PTY after the first command", &|| {
+                same_surface()
+                    && view.render_backend.records().len() == 1
+                    && view.bstate.get() == super::super::BlockState::AwaitingCommand
+            });
+            let id = view.render_backend.records().iter().next().unwrap().id();
+            if let Some(transcript) = terminal.transcript() {
+                wait_for(mode, "completed live zone and native chrome", &|| {
+                    chrome.is_mapped()
+                        && transcript
+                            .painted_zone_rows()
+                            .iter()
+                            .any(|row| row.id == id && row.heading && row.completed)
+                });
+                wait_for(mode, "native exit badge pixels", &|| {
+                    transcript
+                        .painted_zone_rows()
+                        .iter()
+                        .find(|row| row.id == id && row.heading)
+                        .is_some_and(|row| {
+                            chrome_exit_badge_has_pixels(
+                                &window,
+                                &screen,
+                                &chrome,
+                                terminal.cell_metrics(),
+                                row.row,
+                            )
+                        })
+                });
+            }
             view.pty
                 .try_write_bytes(b"continued\r")
-                .expect("send next command to same shell");
-            assert!(wait_for("same shell's next command", &|| view
+                .expect("send the next command to the same shell");
+            wait_for(mode, "same shell's next command", &|| {
+                same_surface()
+                    && view.render_backend.records().len() == 2
+                    && view.bstate.get() == super::super::BlockState::AwaitingCommand
+            });
+            assert!(view
                 .render_backend
                 .records()
-                .len()
-                == 2));
-            let records = view.render_backend.records();
-            assert!(records
                 .iter()
                 .next_back()
                 .and_then(|record| record.output())
                 .is_some_and(|output| output.contains("same shell continued")));
-            drop(records);
+            if let Some(transcript) = terminal.transcript() {
+                view.pty.try_write_bytes(b"archive\r").unwrap();
+                wait_for(mode, "the first zone rolls into retained history", &|| {
+                    view.render_backend.records().len() == 3
+                        && text().contains("archived zones ready")
+                });
+                assert!(transcript.reveal_zone(id));
+                wait_for(
+                    mode,
+                    "archive chrome remains tied to the same zone",
+                    &|| {
+                        transcript
+                            .painted_zone_rows()
+                            .iter()
+                            .any(|row| row.id == id && row.heading && row.completed)
+                    },
+                );
+                let before = terminal.grid_size().0;
+                window.set_default_size(610, 450);
+                wait_for(mode, "a distinct terminal column layout", &|| {
+                    terminal.grid_size().0 < before
+                });
+                assert!(transcript.reveal_zone(id));
+                wait_for(
+                    mode,
+                    "the original zone and exit badge survive reflow",
+                    &|| {
+                        transcript
+                            .painted_zone_rows()
+                            .iter()
+                            .find(|row| row.id == id && row.heading)
+                            .is_some_and(|row| {
+                                chrome_exit_badge_has_pixels(
+                                    &window,
+                                    &screen,
+                                    &chrome,
+                                    terminal.cell_metrics(),
+                                    row.row,
+                                )
+                            })
+                    },
+                );
+            }
             view.pty.kill();
             window.close();
         }
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    fn chrome_exit_badge_has_pixels(
+        window: &gtk::Window,
+        screen: &gtk::TextView,
+        chrome: &gtk::DrawingArea,
+        (_, top, _, cell_height): (i32, i32, i32, i32),
+        row: usize,
+    ) -> bool {
+        use gtk::prelude::*;
+        let (width, height) = (chrome.width(), chrome.height());
+        if width < 60 || height < 24 || cell_height < 5 {
+            return false;
+        }
+        let Some(origin) = screen.compute_point(chrome, &gtk::graphene::Point::new(0.0, 0.0))
+        else {
+            return false;
+        };
+        let y = origin.y().round() as i32 + top + row as i32 * cell_height;
+        if y < 0 || y + cell_height > height {
+            return false;
+        }
+        let snapshot = gtk::Snapshot::new();
+        gtk::WidgetPaintable::new(Some(chrome)).snapshot(
+            &snapshot,
+            f64::from(width),
+            f64::from(height),
+        );
+        let Some(node) = snapshot.to_node() else {
+            return false;
+        };
+        let Some(renderer) = gtk::prelude::NativeExt::renderer(window) else {
+            return false;
+        };
+        let viewport = gtk::graphene::Rect::new(0.0, 0.0, width as f32, height as f32);
+        let texture = renderer.render_texture(&node, Some(&viewport));
+        let stride = width as usize * 4;
+        let mut pixels = vec![0; stride * height as usize];
+        texture.download(&mut pixels, stride);
+        // The gutter and the single-pixel separator cannot light this band.
+        ((y + 2)..(y + cell_height - 1)).any(|line| {
+            let start = line as usize * stride + (width as usize - 58) * 4;
+            pixels[start..start + 50 * 4].iter().any(|&byte| byte != 0)
+        })
     }
 
     #[cfg(anvil_shared_terminal)]

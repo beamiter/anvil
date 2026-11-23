@@ -6557,10 +6557,6 @@ pub(crate) struct ActiveBlock {
     /// The measured wrapper around the live VTE. It carries the terminal's
     /// requested pixel size — see [`ActiveBlock::set_live_geometry`], which
     /// keeps the grid at the full viewport while the card shows less.
-    #[cfg(anvil_shared_terminal)]
-    shared_live_output: Option<jterm_gtk_view::LiveOutputView>,
-    #[cfg(anvil_shared_terminal)]
-    shared_live_foreground: Cell<gtk::gdk::RGBA>,
     vte_overlay: gtk::Overlay,
     /// Sole measured child of the clip: its height IS the live card's height.
     live_spacer: gtk::Box,
@@ -6707,28 +6703,7 @@ impl ActiveBlock {
         vte_overlay.set_hexpand(true);
         vte_overlay.set_vexpand(false);
 
-        #[cfg(anvil_shared_terminal)]
-        let shared_live_output = (matches!(
-            config.terminal_mode,
-            crate::config::TerminalMode::Block
-                | crate::config::TerminalMode::Chat
-                | crate::config::TerminalMode::Unified
-        ) && std::env::var_os("JTERM_SHARED_LIVE_OUTPUT")
-            .is_some_and(|value| value == "1"))
-        .then(|| {
-            let view = jterm_gtk_view::LiveOutputView::new(&active_vte);
-            vte_overlay.add_overlay(view.widget());
-            vte_overlay.set_measure_overlay(view.widget(), false);
-            vte_overlay.set_clip_overlay(view.widget(), true);
-            view
-        });
-
-        let native_surface = active_vte.upcast_ref::<gtk::Widget>();
-        #[cfg(anvil_shared_terminal)]
-        let native_surface = shared_live_output
-            .as_ref()
-            .map_or(native_surface, |view| view.native_surface());
-        vte_overlay.set_child(Some(native_surface));
+        vte_overlay.set_child(Some(&active_vte));
 
         let live_organism_surface = gtk::Fixed::new();
         live_organism_surface.set_hexpand(true);
@@ -6836,14 +6811,8 @@ impl ActiveBlock {
             adjustment.connect_changed(sync_visibility);
         }
 
-        #[cfg(anvil_shared_terminal)]
-        let shared_live_foreground = Cell::new(config.foreground);
         ActiveBlock {
             widget,
-            #[cfg(anvil_shared_terminal)]
-            shared_live_output,
-            #[cfg(anvil_shared_terminal)]
-            shared_live_foreground,
             active_vte,
             #[cfg(anvil_shared_terminal)]
             shared_active: None,
@@ -6871,9 +6840,6 @@ impl ActiveBlock {
         &mut self,
         terminal: Rc<super::shared_active::SharedActiveTerminal>,
     ) {
-        if let Some(output) = self.shared_live_output.take() {
-            self.vte_overlay.remove_overlay(output.widget());
-        }
         self.vte_overlay.set_child(Some(&terminal.widget));
         let adjustment = terminal.scrollback();
         self.live_scrollbar.set_adjustment(Some(adjustment));
@@ -6997,164 +6963,6 @@ impl ActiveBlock {
     /// the same ring into the finished card at finalize.
     pub(crate) fn output_text(&self) -> String {
         super::live_output_text(&self.raw_output)
-    }
-
-    #[cfg(anvil_shared_terminal)]
-    pub(super) fn connect_shared_live_output(
-        active: &Rc<RefCell<Self>>,
-        state: Rc<Cell<BlockState>>,
-        contents_generation: Rc<Cell<u64>>,
-    ) {
-        let clip = {
-            let active = active.borrow();
-            if active.shared_live_output.is_none() {
-                return;
-            }
-            active.live_clip()
-        };
-        let weak = Rc::downgrade(active);
-        let last_snapshot = Cell::new(None);
-        clip.add_tick_callback(move |clip, _| {
-            let Some(active) = weak.upgrade() else {
-                return gtk::glib::ControlFlow::Break;
-            };
-            let Ok(active) = active.try_borrow() else {
-                return gtk::glib::ControlFlow::Continue;
-            };
-            let terminal = &active.active_vte;
-            let capture_size = active.raw_output.borrow().len();
-            let follows_output = terminal.vadjustment().is_none_or(|adjustment| {
-                adjustment.value() + adjustment.page_size() + 0.5 >= adjustment.upper()
-            });
-            let can_present = state.get() == BlockState::CollectingOutput
-                && !active.preserve_live_scrollback()
-                && !active.live_organism_visible.get()
-                && !terminal.has_selection()
-                && terminal.search_get_regex().is_none()
-                && follows_output
-                && capture_size <= jterm_gtk_view::MAX_LIVE_OUTPUT_BYTES;
-            let geometry = (
-                terminal.width(),
-                terminal.height(),
-                clip.width(),
-                clip.height(),
-                terminal.char_width(),
-                terminal.char_height(),
-            );
-            let stamp = (
-                can_present,
-                contents_generation.get(),
-                capture_size,
-                geometry,
-                active.shared_live_foreground.get(),
-                terminal.color_background_for_draw(),
-            );
-            if last_snapshot.replace(Some(stamp)) != Some(stamp) {
-                active.present_shared_live_output(can_present);
-            }
-            gtk::glib::ControlFlow::Continue
-        });
-
-        let active = active.borrow();
-        let label = active
-            .shared_live_widget()
-            .expect("enabled live output")
-            .downgrade();
-        active
-            .active_vte
-            .connect_selection_changed(move |terminal| {
-                if terminal.has_selection() {
-                    if let Some(label) = label.upgrade() {
-                        label.set_visible(false);
-                    }
-                }
-            });
-    }
-
-    #[cfg(anvil_shared_terminal)]
-    pub(super) fn shared_live_widget(&self) -> Option<gtk::Fixed> {
-        self.shared_live_output
-            .as_ref()
-            .map(|view| view.widget().clone())
-    }
-
-    #[cfg(anvil_shared_terminal)]
-    pub(super) fn set_shared_live_foreground(&self, foreground: gtk::gdk::RGBA) {
-        self.shared_live_foreground.set(foreground);
-    }
-
-    #[cfg(anvil_shared_terminal)]
-    fn present_shared_live_output(&self, can_present: bool) {
-        let Some(view) = &self.shared_live_output else {
-            return;
-        };
-        view.clear();
-        if !can_present {
-            return;
-        }
-        let (capture, truncated) = self.output_text_prefix(jterm_gtk_view::MAX_LIVE_OUTPUT_BYTES);
-        let terminal = &self.active_vte;
-        let (column, cursor) = terminal.cursor_position();
-        let columns = terminal.column_count();
-        let Some(text_rows) = jterm_gtk_view::captured_live_rows(&capture, columns.max(0) as usize)
-            .filter(|_| !truncated && column == 0)
-        else {
-            return;
-        };
-        let Some(origin) = super::displayed_live_origin(terminal) else {
-            return;
-        };
-        let first = cursor.saturating_sub(text_rows.len() as i64);
-        let Some(font) = terminal.font().filter(|_| terminal.font_scale() == 1.0) else {
-            return;
-        };
-        #[allow(deprecated)] // Match the native terminal content origin.
-        let (padding, border) = {
-            let style = terminal.style_context();
-            (style.padding(), style.border())
-        };
-        let x = i32::from(padding.left()) + i32::from(border.left()) + terminal.margin_start();
-        let top = i32::from(padding.top()) + i32::from(border.top()) + terminal.margin_top();
-        let height = terminal.char_height() as i32;
-        let mut rows = Vec::with_capacity(text_rows.len());
-        for (offset, captured) in text_rows.into_iter().enumerate() {
-            let row = first + offset as i64;
-            let screen_row = row.saturating_sub(origin);
-            if screen_row < 0 || screen_row >= terminal.row_count() {
-                return;
-            }
-            let (native, _) =
-                terminal.text_range_format(vte4::Format::Html, row, 0, row, columns - 1);
-            let Some(native) = native
-                .as_deref()
-                .and_then(|html| html.trim().strip_prefix("<pre>")?.strip_suffix("</pre>"))
-            else {
-                return;
-            };
-            if native.trim_end_matches([' ', '\n']) != gtk::glib::markup_escape_text(captured.text)
-            {
-                return;
-            }
-            let width = (terminal.char_width() as i32) * captured.columns as i32;
-            let y = top + screen_row as i32 * height;
-            if width <= 0
-                || height <= 0
-                || x + width > self.live_clip.width()
-                || y + height > self.live_visible_height_px()
-            {
-                return;
-            }
-            rows.push(jterm_gtk_view::LiveOutputRow {
-                text: captured.text,
-                area: gtk::gdk::Rectangle::new(x, y, width, height),
-            });
-        }
-        view.present(
-            &rows,
-            &font,
-            self.shared_live_foreground.get(),
-            terminal.color_background_for_draw(),
-        );
     }
 
     /// Return at most `max_bytes` from the live capture for bounded find.

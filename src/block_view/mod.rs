@@ -9242,12 +9242,6 @@ impl RenderBackend for BlockBackend {
             terminal.feed(bytes);
             return;
         }
-        #[cfg(anvil_shared_terminal)]
-        if let Ok(active) = self.active_rc.try_borrow() {
-            if let Some(widget) = active.shared_live_widget() {
-                widget.set_visible(false);
-            }
-        }
         self.active_vte.feed(bytes);
     }
 
@@ -9269,10 +9263,13 @@ impl RenderBackend for BlockBackend {
 
     fn replies_through_commit(&self) -> bool {
         #[cfg(anvil_shared_terminal)]
-        if self.shared_active.is_some() {
-            return false;
+        {
+            self.shared_active.is_none()
         }
-        true
+        #[cfg(not(anvil_shared_terminal))]
+        {
+            true
+        }
     }
 
     fn reset_active_surface(&self, preserve_scrollback: bool) {
@@ -10305,6 +10302,7 @@ impl UnifiedBackend {
         if let Some(transcript) = self.transcript() {
             let [prompt, input, output] = zone_history::replay_sections(record, text, truncated);
             transcript.begin_restored_prompt(record.id);
+            self.chrome.begin_shared_zone(record.id, _max_zones);
             self.feed_live(&prompt);
             transcript.end_prompt();
             self.feed_live(&input);
@@ -10352,6 +10350,10 @@ impl RenderBackend for UnifiedBackend {
         #[cfg(anvil_shared_terminal)]
         if let Some(transcript) = self.transcript() {
             transcript.begin_prompt(zone_id);
+            self.chrome.begin_shared_zone(
+                zone_id,
+                self.config_for_cb.borrow().max_visible_blocks as usize,
+            );
             return;
         }
         self.chrome.begin_zone(zone_id, &self.vte);
@@ -10901,10 +10903,13 @@ impl RenderBackend for UnifiedBackend {
 
     fn replies_through_commit(&self) -> bool {
         #[cfg(anvil_shared_terminal)]
-        if self.shared_active.is_some() {
-            return false;
+        {
+            self.shared_active.is_none()
         }
-        true
+        #[cfg(not(anvil_shared_terminal))]
+        {
+            true
+        }
     }
 
     fn live_surface_answers_query(&self, query: KeyboardProtocolQuery) -> bool {
@@ -12644,10 +12649,6 @@ impl TermView {
         self.active
             .borrow()
             .set_preserve_live_scrollback(config.preserve_live_scrollback);
-        #[cfg(anvil_shared_terminal)]
-        self.active
-            .borrow()
-            .set_shared_live_foreground(config.foreground);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -13893,13 +13894,6 @@ impl TermView {
             });
         }
 
-        #[cfg(anvil_shared_terminal)]
-        blocks::ActiveBlock::connect_shared_live_output(
-            &active,
-            bstate.clone(),
-            contents_generation.clone(),
-        );
-
         // True while an alt-screen app owns the viewport (finished blocks hidden).
         let fullscreen: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let cwd_callbacks: CwdCallbacks = Rc::new(RefCell::new(vec![]));
@@ -14314,6 +14308,8 @@ impl TermView {
                             }
                         }
                     }),
+                    #[cfg(anvil_shared_terminal)]
+                    shared_active.as_ref(),
                 );
                 let image_layer = unified_images::UnifiedImageLayer::new(
                     &active_vte_rc,
@@ -14322,10 +14318,7 @@ impl TermView {
                     chrome.image_row_projection(),
                 );
                 *image_layer_slot.borrow_mut() = Some(image_layer.clone());
-                active_rc
-                    .borrow()
-                    .unified_chrome_surface
-                    .set_visible(active_vte_rc.parent().is_some());
+                active_rc.borrow().unified_chrome_surface.set_visible(true);
                 Rc::new(UnifiedBackend {
                     #[cfg(anvil_shared_terminal)]
                     shared_active: shared_active.clone(),
@@ -18280,17 +18273,25 @@ impl TermView {
         (self.failure_marker_redraw)();
     }
 
-    /// Grid size (cols, rows) of the live VTE, for the bottom bar's grid
-    /// segment.
+    /// The rendered pane's current PTY geometry, for the status bar.
     pub fn grid_size(&self) -> (i64, i64) {
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = self
+            .pty_winsize
+            .shared
+            .as_ref()
+            .and_then(std::rc::Weak::upgrade)
+        {
+            let (cols, rows) = terminal.grid_size();
+            return (i64::from(cols), i64::from(rows));
+        }
         (self.active_vte.column_count(), self.active_vte.row_count())
     }
 
     /// Collect a snapshot of internal runtime state for the debug dashboard.
     /// Returns labelled sections, each a list of (key, value) rows.
     pub fn debug_info(&self) -> DebugInfo {
-        let out_cols = self.active_vte.column_count();
-        let out_rows = self.active_vte.row_count();
+        let (out_cols, out_rows) = self.grid_size();
 
         let finished_len = self.finished_blocks.borrow().len();
         let block_data_len = self.block_data.borrow().len();
