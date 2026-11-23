@@ -118,6 +118,13 @@ jobs:
           dbus-run-session -- xvfb-run -a --server-args='-screen 0 1440x1100x24 -nolisten tcp' \
             /usr/bin/python3 -B "$core/crates/jterm_gtk_view/tests/native_colors.py" \
             anvil target/release/anvil
+      - name: Verify shared PTY ownership, device replies and child cleanup
+        if: ${{ !cancelled() }}
+        run: |
+          core=$(python3 scripts/shared-core-path.py)
+          dbus-run-session -- xvfb-run -a --server-args='-screen 0 1440x1100x24 -nolisten tcp' \
+            /usr/bin/python3 -B "$core/crates/jterm_gtk_view/tests/native_prepared_pty.py" \
+            anvil target/release/anvil
       - name: Preserve native protocol and fixture logs
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9

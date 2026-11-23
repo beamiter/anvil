@@ -11008,12 +11008,12 @@ impl ReaderCtx {
             }
         });
         let exit_ctx = ctx.clone();
-        pty.start_reader(
-            move |data: Vec<u8>| {
+        pty.start_stamped_reader(
+            move |data, read_at| {
                 if data.is_empty() {
                     return;
                 }
-                let origin = ctx.watch_reader.fresh_origin(Instant::now());
+                let origin = read_at.and_then(|at| ctx.watch_reader.fresh_origin(at));
                 if ctx.selection_feed_hold.try_buffer(&data) {
                     return;
                 }
@@ -12685,8 +12685,24 @@ impl TermView {
             cwd_token,
             initial_commands,
             env_overrides,
-            OwnedPty::spawn_with_shell_token,
+            |argv, cwd, env, token| {
+                #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+                if Self::shared_active_requested(mode) {
+                    return OwnedPty::spawn_shared(argv, cwd, env, token);
+                }
+                OwnedPty::spawn_with_shell_token(argv, cwd, env, token)
+            },
         )
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    fn shared_active_requested(mode: &crate::config::TerminalMode) -> bool {
+        (matches!(
+            mode,
+            crate::config::TerminalMode::Block | crate::config::TerminalMode::Chat
+        ) && std::env::var_os("JTERM_SHARED_ACTIVE_TERMINAL").is_some_and(|value| value == "1"))
+            || (mode.is_unified()
+                && std::env::var_os("JTERM_SHARED_TRANSCRIPT").is_some_and(|value| value == "1"))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -12716,10 +12732,7 @@ impl TermView {
         // by this pane throughout prompt, command and native-app transitions.
         let docked_input = chat_mode || block_mode;
         #[cfg(anvil_shared_terminal)]
-        let shared_active_requested = (docked_input
-            && std::env::var_os("JTERM_SHARED_ACTIVE_TERMINAL").is_some_and(|value| value == "1"))
-            || (mode.is_unified()
-                && std::env::var_os("JTERM_SHARED_TRANSCRIPT").is_some_and(|value| value == "1"));
+        let shared_active_requested = Self::shared_active_requested(mode);
 
         ime_gate::install();
         // ── Build widget tree ──────────────────────────────────────────────

@@ -31,10 +31,12 @@ enum PtyMsg {
 }
 
 pub struct OwnedPty {
+    #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+    shared_session: Option<jterm_gtk_view::PreparedPtySession>,
     master: Arc<std::sync::Mutex<Option<OwnedFd>>>,
     /// A bounded, non-blocking userspace queue keeps kernel PTY backpressure
     /// away from GTK without letting a query storm grow memory indefinitely.
-    input_tx: FdWriter,
+    input_tx: Option<FdWriter>,
     child_lifecycle: Arc<ChildLifecycle>,
     guard: Arc<crate::gtk_process::Guard>,
     /// Host-bridged shells live in another PID namespace, so their foreground
@@ -419,6 +421,17 @@ impl std::fmt::Display for FdWriterSendError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{} ({} bytes)", self.reason, self.len)
     }
+}
+
+#[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+fn shared_write_error(error: jterm_gtk_view::WriteError, len: usize) -> FdWriterSendError {
+    use jterm_gtk_view::WriteError;
+    let reason = match error {
+        WriteError::Full { .. } => "PTY writer queue safety limit reached",
+        WriteError::TooLarge { .. } => "PTY write exceeds the per-message safety limit",
+        WriteError::Closed => "PTY writer is closed",
+    };
+    FdWriterSendError { len, reason }
 }
 
 impl Clone for FdWriter {
@@ -821,6 +834,16 @@ fn filter_and_admit_input_with<T>(
     modes: pty_input::PasteModes,
     observe: impl FnOnce(&[u8], bool) -> T,
 ) -> Result<T, FdWriterSendError> {
+    filter_and_queue_input(guard, data, modes, observe, |bytes| writer.send(bytes))
+}
+
+fn filter_and_queue_input<T>(
+    guard: &mut pty_input::InputGuard,
+    data: &[u8],
+    modes: pty_input::PasteModes,
+    observe: impl FnOnce(&[u8], bool) -> T,
+    enqueue: impl FnOnce(Vec<u8>) -> Result<(), FdWriterSendError>,
+) -> Result<T, FdWriterSendError> {
     // Core's `InputGuard` exposes its frame state but no setter, so a rollback
     // reconstructs an equivalent guard from the one-bit state.
     let before_in_frame = guard.in_frame();
@@ -831,7 +854,7 @@ fn filter_and_admit_input_with<T>(
         return Ok(observe(&[], before_in_frame));
     }
     let observed = observe(&safe_data, before_in_frame);
-    let result = writer.send(safe_data);
+    let result = enqueue(safe_data);
     if result.is_err() {
         *guard = input_guard_with_frame(before_in_frame);
     }
@@ -880,7 +903,7 @@ impl OwnedPty {
     }
 
     pub fn spawn(argv: &[&str], cwd: Option<&str>, env_extra: &[(&str, &str)]) -> io::Result<Self> {
-        Self::spawn_inner(argv, cwd, env_extra, false)
+        Self::spawn_inner(argv, cwd, env_extra, false, false)
     }
 
     /// Spawn a shell with an optional private shell-integration token channel.
@@ -893,7 +916,17 @@ impl OwnedPty {
         env_extra: &[(&str, &str)],
         enable_shell_token: bool,
     ) -> io::Result<Self> {
-        Self::spawn_inner(argv, cwd, env_extra, enable_shell_token)
+        Self::spawn_inner(argv, cwd, env_extra, enable_shell_token, false)
+    }
+
+    #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+    pub(crate) fn spawn_shared(
+        argv: &[&str],
+        cwd: Option<&str>,
+        env_extra: &[(&str, &str)],
+        enable_shell_token: bool,
+    ) -> io::Result<Self> {
+        Self::spawn_inner(argv, cwd, env_extra, enable_shell_token, true)
     }
 
     fn spawn_inner(
@@ -901,7 +934,10 @@ impl OwnedPty {
         cwd: Option<&str>,
         env_extra: &[(&str, &str)],
         enable_shell_token: bool,
+        use_shared_session: bool,
     ) -> io::Result<Self> {
+        #[cfg(not(all(anvil_shared_terminal, target_os = "linux")))]
+        let _ = use_shared_session;
         let argv_owned: Vec<String> = argv.iter().map(|value| (*value).to_string()).collect();
         let argv_owned = crate::agent_cli::inline_argv(&argv_owned);
         let host_bridge = crate::host::is_flatpak();
@@ -1186,34 +1222,55 @@ impl OwnedPty {
                         return Err(error);
                     }
                 };
-                let writer_fd = match master.try_clone() {
-                    Ok(fd) => fd,
-                    Err(error) => {
-                        drop(master);
-                        child_lifecycle.force_kill_and_reap();
-                        return Err(error);
-                    }
+                let guard = crate::gtk_process::Guard::capture(
+                    child.as_raw(),
+                    Some(executable_path.as_path()),
+                );
+                #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+                let (master, shared_session) = if use_shared_session {
+                    let reap = Arc::clone(&guard);
+                    let session = jterm_gtk_view::PreparedPtySession::start(
+                        master,
+                        Arc::clone(&child_lifecycle),
+                        EscalationPolicy::SESSION_DRAIN,
+                        move |child| reap.poll_reap(child),
+                        FD_WRITER_MAX_QUEUED_BYTES,
+                        FD_WRITER_MAX_MESSAGES,
+                    )?;
+                    (None, Some(session))
+                } else {
+                    (Some(master), None)
                 };
-                let input_tx = match spawn_cancellable_fd_writer(writer_fd, "anvil-pty-writer") {
-                    Ok(tx) => tx,
-                    Err(error) => {
-                        drop(master);
-                        child_lifecycle.force_kill_and_reap();
-                        return Err(error);
+                #[cfg(not(all(anvil_shared_terminal, target_os = "linux")))]
+                let master = Some(master);
+                let input_tx = if let Some(fd) = &master {
+                    match fd
+                        .try_clone()
+                        .and_then(|fd| spawn_cancellable_fd_writer(fd, "anvil-pty-writer"))
+                    {
+                        Ok(tx) => Some(tx),
+                        Err(error) => {
+                            drop(master);
+                            child_lifecycle.force_kill_and_reap();
+                            return Err(error);
+                        }
                     }
+                } else {
+                    None
                 };
+                let reader_cancel_eventfd =
+                    master.as_ref().and_then(|_| create_reader_cancel_eventfd());
                 Ok(OwnedPty {
-                    master: Arc::new(std::sync::Mutex::new(Some(master))),
+                    #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+                    shared_session,
+                    master: Arc::new(std::sync::Mutex::new(master)),
                     input_tx,
-                    guard: crate::gtk_process::Guard::capture(
-                        child.as_raw(),
-                        Some(executable_path.as_path()),
-                    ),
+                    guard,
                     child_lifecycle,
                     foreground_identity_available: !host_bridge,
                     agent_launch_limitation,
                     reader_cancelled: Arc::new(AtomicBool::new(false)),
-                    reader_cancel_eventfd: create_reader_cancel_eventfd(),
+                    reader_cancel_eventfd,
                     input_guard: std::sync::Mutex::new(pty_input::InputGuard::new()),
                     shell_bracketed_paste: Arc::new(AtomicBool::new(false)),
                     shell_integration_token,
@@ -1240,6 +1297,10 @@ impl OwnedPty {
     /// Raw master-side fd, or -1 if already closed. Borrowed for the lifetime of
     /// the PTY; used only for `tcgetpgrp`-style foreground-process probing.
     pub fn master_fd_raw(&self) -> i32 {
+        #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+        if let Some(session) = &self.shared_session {
+            return session.inspect_fd(|fd| fd).unwrap_or(-1);
+        }
         self.master
             .lock()
             .ok()
@@ -1266,16 +1327,9 @@ impl OwnedPty {
         if self.test_slave.is_some() {
             return self.test_foreground;
         }
-        if !self.foreground_identity_available {
-            return None;
-        }
-        let fd = self.master_fd_raw();
-        if fd < 0 {
-            return None;
-        }
-        let foreground = unsafe { libc::tcgetpgrp(fd) };
+        let foreground = self.foreground_group()?;
         let shell_group = unsafe { libc::getpgid(self.child_lifecycle.pid()) };
-        (foreground > 0 && shell_group > 0).then_some(foreground == shell_group)
+        (shell_group > 0).then_some(foreground == shell_group)
     }
 
     /// The PTY's foreground process group, whoever it is. `None` when the
@@ -1288,6 +1342,11 @@ impl OwnedPty {
         }
         if !self.foreground_identity_available {
             return None;
+        }
+        #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+        if let Some(session) = &self.shared_session {
+            let group = session.inspect_fd(|fd| unsafe { libc::tcgetpgrp(fd) })?;
+            return (group > 0).then_some(group);
         }
         let fd = self.master_fd_raw();
         if fd < 0 {
@@ -1348,7 +1407,37 @@ impl OwnedPty {
                 guard
             }
         };
-        filter_and_admit_input(&mut guard, &self.input_tx, data, modes)
+        #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+        if let Some(session) = &self.shared_session {
+            return filter_and_queue_input(
+                &mut guard,
+                data,
+                modes,
+                |_, _| (),
+                |bytes| {
+                    let len = bytes.len();
+                    session
+                        .write_input(bytes)
+                        .map_err(|error| shared_write_error(error, len))
+                },
+            );
+        }
+        let writer = self.input_tx.as_ref().ok_or(FdWriterSendError {
+            len: data.len(),
+            reason: "PTY writer is closed",
+        })?;
+        filter_and_admit_input(&mut guard, writer, data, modes)
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    pub(crate) fn write_protocol_reply(&self, data: &[u8]) -> Result<(), FdWriterSendError> {
+        #[cfg(target_os = "linux")]
+        if let Some(session) = &self.shared_session {
+            return session
+                .write_reply(data)
+                .map_err(|error| shared_write_error(error, data.len()));
+        }
+        self.try_write_bytes(data)
     }
 
     /// Observe accepted transport input for a future native display-origin
@@ -1364,7 +1453,11 @@ impl OwnedPty {
         if guard.in_frame() {
             return None;
         }
-        self.input_tx.display_idle_input_stamp()
+        #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+        if let Some(session) = &self.shared_session {
+            return session.input_stamp();
+        }
+        self.input_tx.as_ref()?.display_idle_input_stamp()
     }
 
     /// Fail-closed, immediate dispatch for Chat's optional Send/Stop only.
@@ -1388,6 +1481,22 @@ impl OwnedPty {
         if guard.in_frame() {
             return Err(refused("PTY paste frame is still open"));
         }
+        #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+        if let Some(session) = &self.shared_session {
+            return if self.foreground_identity_available
+                && session.try_write_control(byte, |actual| {
+                    actual == foreground
+                        && (!require_shell
+                            || unsafe { libc::getpgid(self.child_lifecycle.pid()) } == actual)
+                        && target_is_current()
+                }) {
+                Ok(())
+            } else {
+                Err(refused(
+                    "PTY writer or optional action target is unavailable",
+                ))
+            };
+        }
         // These two plain bytes cannot open a paste frame and do not mutate
         // InputGuard. Holding it prevents ordinary input from opening one
         // between this check and the single-byte syscall.
@@ -1399,7 +1508,11 @@ impl OwnedPty {
             .as_ref()
             .ok_or_else(|| refused("PTY is closed"))?
             .as_raw_fd();
-        self.input_tx.try_dispatch_byte(fd, byte, || {
+        let writer = self
+            .input_tx
+            .as_ref()
+            .ok_or_else(|| refused("PTY writer is closed"))?;
+        writer.try_dispatch_byte(fd, byte, || {
             if self.reader_cancelled.load(Ordering::Acquire) || !target_is_current() {
                 return false;
             }
@@ -1431,6 +1544,10 @@ impl OwnedPty {
     }
 
     pub(crate) fn try_resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+        #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+        if let Some(session) = &self.shared_session {
+            return session.resize(cols, rows);
+        }
         let guard = self
             .master
             .lock()
@@ -1469,7 +1586,14 @@ impl OwnedPty {
     }
 
     pub fn kill(&self) {
-        self.input_tx.cancel();
+        #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+        if let Some(session) = &self.shared_session {
+            session.stop();
+            return;
+        }
+        if let Some(writer) = &self.input_tx {
+            writer.cancel();
+        }
         request_reader_cancel(
             &self.reader_cancelled,
             self.reader_cancel_eventfd.as_deref(),
@@ -1477,6 +1601,21 @@ impl OwnedPty {
         self.close_master_fd();
         self.child_lifecycle
             .terminate(EscalationPolicy::SESSION_DRAIN);
+    }
+
+    pub(crate) fn start_stamped_reader(
+        &self,
+        mut callback: impl FnMut(Vec<u8>, Option<std::time::Instant>) + 'static,
+        on_exit: impl FnOnce(PtyExit) + 'static,
+    ) -> io::Result<()> {
+        #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+        if let Some(session) = &self.shared_session {
+            return session.attach(callback, on_exit);
+        }
+        self.start_reader(
+            move |bytes| callback(bytes, Some(std::time::Instant::now())),
+            on_exit,
+        )
     }
 
     /// Spawn a background reader thread; deliver bounded data through a
@@ -2021,8 +2160,10 @@ impl OwnedPty {
             }
         };
         Ok(Self {
+            #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+            shared_session: None,
             master: Arc::new(Mutex::new(Some(master))),
-            input_tx,
+            input_tx: Some(input_tx),
             guard: crate::gtk_process::Guard::capture(child.as_raw(), None),
             child_lifecycle,
             foreground_identity_available: true,
@@ -2040,6 +2181,10 @@ impl OwnedPty {
 
     /// Observe the real kernel PTY size, rather than repeating the UI's size
     /// formula in a geometry test. This helper exists only in test builds.
+    fn test_writer(&self) -> &FdWriter {
+        self.input_tx.as_ref().expect("legacy test PTY writer")
+    }
+
     pub(crate) fn test_slave_winsize(&self) -> (u16, u16) {
         let slave = self.test_slave.as_ref().expect("test PTY slave");
         let mut size = libc::winsize {
@@ -2069,7 +2214,7 @@ impl OwnedPty {
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            let queue = self.input_tx.shared.queue.lock().unwrap();
+            let queue = self.test_writer().shared.queue.lock().unwrap();
             if queue.in_flight && queue.messages.is_empty() {
                 break;
             }
@@ -2156,14 +2301,7 @@ fn prepare_test_slave(slave: &OwnedFd) {
 
 impl Drop for OwnedPty {
     fn drop(&mut self) {
-        self.input_tx.cancel();
-        request_reader_cancel(
-            &self.reader_cancelled,
-            self.reader_cancel_eventfd.as_deref(),
-        );
-        self.close_master_fd();
-        self.child_lifecycle
-            .terminate(EscalationPolicy::SESSION_DRAIN);
+        self.kill();
     }
 }
 
@@ -2194,7 +2332,7 @@ mod tests {
         pty.set_test_foreground_group(Some(101));
         let earlier = pty.test_start_inflight_input();
         {
-            let queue = pty.input_tx.shared.queue.lock().unwrap();
+            let queue = pty.test_writer().shared.queue.lock().unwrap();
             assert!(queue.in_flight && queue.messages.is_empty() && queue.bytes == 0);
         }
         for byte in [3, b'\r'] {
@@ -2206,7 +2344,7 @@ mod tests {
         // raw queue even though its full capacity is now available.
         std::thread::sleep(Duration::from_millis(100));
         assert!(pty
-            .input_tx
+            .test_writer()
             .shared
             .queue
             .lock()
@@ -2219,7 +2357,7 @@ mod tests {
         assert!(bytes[..earlier].iter().all(|byte| *byte == b'x'));
         assert_eq!(&bytes[earlier..], b"ordinary FIFO tail");
         let deadline = Instant::now() + Duration::from_secs(2);
-        while pty.input_tx.shared.queue.lock().unwrap().in_flight {
+        while pty.test_writer().shared.queue.lock().unwrap().in_flight {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -2234,7 +2372,7 @@ mod tests {
         let pty = OwnedPty::from_openpty(Some(true)).unwrap();
         pty.set_test_foreground_group(Some(101));
         // Same real mutex that admission, dequeue and completion use.
-        let queue = pty.input_tx.shared.queue.lock().unwrap();
+        let queue = pty.test_writer().shared.queue.lock().unwrap();
         assert!(pty
             .try_dispatch_chat_byte(3, 101, false, || true)
             .unwrap_err()
@@ -2251,7 +2389,7 @@ mod tests {
         pty.try_write_bytes(&vec![b'y'; FD_WRITER_MAX_MESSAGE_BYTES])
             .unwrap();
         assert!(!pty
-            .input_tx
+            .test_writer()
             .shared
             .queue
             .lock()
@@ -2291,7 +2429,7 @@ mod tests {
             accepted += 1;
         }
         {
-            let queue = pty.input_tx.shared.queue.lock().unwrap();
+            let queue = pty.test_writer().shared.queue.lock().unwrap();
             assert!(!queue.in_flight && queue.messages.is_empty());
         }
         pty.set_test_foreground_group(Some(202));
@@ -3203,7 +3341,12 @@ mod tests {
         assert_eq!(pty.display_idle_input_stamp(), None);
         assert!(pty.try_write_bytes(b"late input").is_err());
         assert_eq!(
-            pty.input_tx.shared.queue.lock().unwrap().admission_sequence,
+            pty.test_writer()
+                .shared
+                .queue
+                .lock()
+                .unwrap()
+                .admission_sequence,
             6
         );
         assert!(pty.drain_test_slave(Duration::from_millis(10)).is_empty());
@@ -3216,7 +3359,12 @@ mod tests {
         let earlier = pty.test_start_inflight_input();
         assert_eq!(pty.display_idle_input_stamp(), None);
         assert_eq!(
-            pty.input_tx.shared.queue.lock().unwrap().admission_sequence,
+            pty.test_writer()
+                .shared
+                .queue
+                .lock()
+                .unwrap()
+                .admission_sequence,
             1
         );
         for byte in [3, b'\r'] {
@@ -3225,7 +3373,12 @@ mod tests {
                 .is_err());
         }
         assert_eq!(
-            pty.input_tx.shared.queue.lock().unwrap().admission_sequence,
+            pty.test_writer()
+                .shared
+                .queue
+                .lock()
+                .unwrap()
+                .admission_sequence,
             1
         );
         let data = pty.drain_test_slave_exact(earlier);

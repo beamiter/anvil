@@ -48,7 +48,7 @@ impl Pty for Transport {
 
     fn write_reply(&self, bytes: &[u8]) -> Result<(), String> {
         self.pty
-            .try_write_bytes(bytes)
+            .write_protocol_reply(bytes)
             .map_err(|error| error.to_string())
     }
 
