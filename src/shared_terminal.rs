@@ -27,7 +27,7 @@ impl Pty for OwnedPty {
     fn start_reader(
         &self,
         output: impl FnMut(Vec<u8>) + 'static,
-        exited: impl FnOnce(i32) + 'static,
+        exited: impl FnOnce(jterm_core::exit_status::PtyExit) + 'static,
     ) -> Result<(), String> {
         OwnedPty::start_reader(self, output, exited).map_err(|error| error.to_string())
     }

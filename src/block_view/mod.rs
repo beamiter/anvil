@@ -4657,7 +4657,7 @@ pub struct TermView {
     pty_synced: Rc<Cell<bool>>,
     cwd_callbacks: CwdCallbacks,
     remote_session_callbacks: StrCallbacks,
-    exited_callbacks: IntCallbacks,
+    exited_callbacks: ExitCallbacks,
     workspace_action_callbacks: WorkspaceActionCallbacks,
     bell_callbacks: VoidCallbacks,
     title_callbacks: StrCallbacks,
@@ -6588,7 +6588,7 @@ struct ReaderCtx {
     prompt_anchor_rows_rc: Rc<Cell<i64>>,
     prompt_anchor_ready_rc: Rc<Cell<bool>>,
     remote_session_cbs: StrCallbacks,
-    exited_cbs: IntCallbacks,
+    exited_cbs: ExitCallbacks,
     activity_cbs: VoidCallbacks,
     alt_screen_cbs: AltScreenCallbacks,
     command_started_cbs: CommandStartedCallbacks,
@@ -10705,12 +10705,12 @@ impl ReaderCtx {
                 }
                 ctx.process_watch_input(&data, origin);
             },
-            move |exit_code| {
+            move |status| {
                 exit_ctx.selection_feed_hold.flush_then(|| {
                     exit_ctx.watch_reader.source_ended(Instant::now());
-                    log::debug!("Shell exited with code {}", exit_code);
+                    log::debug!("Shell exited with code {}", status.code);
                     for cb in exit_ctx.exited_cbs.borrow().iter() {
-                        cb(exit_code);
+                        cb(status);
                     }
                 });
             },
@@ -13513,7 +13513,7 @@ impl TermView {
         };
         let cwd_callbacks: CwdCallbacks = Rc::new(RefCell::new(vec![]));
         let remote_session_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
-        let exited_callbacks: IntCallbacks = Rc::new(RefCell::new(vec![]));
+        let exited_callbacks: ExitCallbacks = Rc::new(RefCell::new(vec![]));
         let bell_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
         // Bell signal is delivered natively by VTE — no need to scan the byte
         // stream for BEL ourselves (and disambiguate it from OSC string
@@ -16480,7 +16480,7 @@ impl TermView {
         self.remote_session_callbacks.borrow_mut().push(Box::new(f));
     }
 
-    pub fn connect_exited<F: Fn(i32) + 'static>(&self, f: F) {
+    pub fn connect_exited<F: Fn(jterm_core::exit_status::PtyExit) + 'static>(&self, f: F) {
         self.exited_callbacks.borrow_mut().push(Box::new(f));
     }
 

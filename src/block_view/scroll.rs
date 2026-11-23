@@ -820,7 +820,7 @@ impl WidgetPool {
 
 /// Shared lists of observer callbacks, keyed by the payload they receive.
 pub(crate) type StrCallbacks = Rc<RefCell<Vec<Box<dyn Fn(&str)>>>>;
-pub(crate) type IntCallbacks = Rc<RefCell<Vec<Box<dyn Fn(i32)>>>>;
+pub(crate) type ExitCallbacks = Rc<RefCell<Vec<Box<dyn Fn(jterm_core::exit_status::PtyExit)>>>>;
 pub(crate) type VoidCallbacks = Rc<RefCell<Vec<Box<dyn Fn()>>>>;
 
 #[cfg(test)]

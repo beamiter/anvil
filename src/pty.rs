@@ -8,6 +8,7 @@ use crate::process::{ChildLifecycle, EscalationPolicy, ReapOwner};
 use crate::pty_input;
 use crate::pty_pair::openpty_cloexec;
 use gtk::glib;
+use jterm_core::exit_status::{ExitTail, PtyExit};
 use nix::libc;
 use nix::pty::OpenptyResult;
 use nix::unistd::{self, ForkResult, Pid};
@@ -15,7 +16,7 @@ use relm4::gtk;
 use std::collections::VecDeque;
 use std::ffi::{CString, OsStr};
 use std::io::{self, Read as _, Write as _};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
@@ -26,7 +27,7 @@ use jterm_gtk_view::PtyEvent as PtyMsg;
 #[cfg(not(anvil_shared_terminal))]
 enum PtyMsg {
     Data(Vec<u8>),
-    Exit(i32),
+    Exit(PtyExit),
 }
 
 pub struct OwnedPty {
@@ -1483,7 +1484,7 @@ impl OwnedPty {
     pub fn start_reader<F, E>(&self, callback: F, on_exit: E) -> io::Result<()>
     where
         F: FnMut(Vec<u8>) + 'static,
-        E: FnOnce(i32) + 'static,
+        E: FnOnce(PtyExit) + 'static,
     {
         let reader_fd = match self
             .master
@@ -1531,7 +1532,7 @@ impl OwnedPty {
     ) -> io::Result<()>
     where
         F: FnMut(Vec<u8>) + 'static,
-        E: FnOnce(i32) + 'static,
+        E: FnOnce(PtyExit) + 'static,
     {
         let reader_cancel_eventfd = self.reader_cancel_eventfd.as_ref().map(Arc::clone);
         let guard = Arc::clone(&self.guard);
@@ -1564,16 +1565,23 @@ impl OwnedPty {
                 let mut file = std::fs::File::from(reader_fd);
                 let fd = file.as_raw_fd();
                 let mut buf = [0u8; PTY_READ_CHUNK_BYTES];
+                let mut tail = ExitTail::Complete;
                 loop {
                     if reader_cancelled.load(Ordering::Acquire) {
                         break;
                     }
                     if guard.ready_to_reap(&child_lifecycle) {
-                        crate::gtk_process::drain_tail(&mut file, |data| {
-                            let sent = tx.send(PtyMsg::Data(data)).is_ok();
-                            if sent { notify(); }
-                            sent
-                        });
+                        tail = jterm_core::pty_reader::drain_ready_exit_tail(
+                            file.as_fd(),
+                            |data| {
+                                let sent = tx.send(PtyMsg::Data(data)).is_ok();
+                                if sent {
+                                    notify();
+                                }
+                                sent
+                            },
+                            || reader_cancelled.load(Ordering::Acquire),
+                        ).unwrap_or_default();
                         break;
                     }
                     match poll_pty_or_reader_cancel(
@@ -1628,7 +1636,7 @@ impl OwnedPty {
                     notify();
                     return;
                 }
-                reap_child(&child_lifecycle, &guard, &tx);
+                reap_child(&child_lifecycle, &guard, &tx, tail);
                 notify();
             });
         if let Err(error) = reader {
@@ -1779,12 +1787,13 @@ fn reap_child(
     child_lifecycle: &Arc<ChildLifecycle>,
     guard: &crate::gtk_process::Guard,
     tx: &mpsc::SyncSender<PtyMsg>,
+    tail: ExitTail,
 ) {
     let started = std::time::Instant::now();
     let mut termination_requested = false;
     loop {
         if let Some(code) = guard.poll_reap(child_lifecycle) {
-            let _ = tx.send(PtyMsg::Exit(code));
+            let _ = tx.send(PtyMsg::Exit(PtyExit { code, tail }));
             return;
         }
         // EOF normally precedes shell exit by only a few milliseconds. If an

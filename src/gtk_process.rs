@@ -55,34 +55,6 @@ pub(crate) fn wait_exec_barrier(
     }
 }
 
-/// Preserve a bounded amount of already-readable final output. A background
-/// writer cannot prevent exit forever by keeping the PTY readable.
-pub(crate) fn drain_tail(file: &mut std::fs::File, mut emit: impl FnMut(Vec<u8>) -> bool) {
-    use std::{io::Read, os::fd::AsRawFd};
-    let mut remaining = 1024 * 1024;
-    let mut buf = [0u8; 32 * 1024];
-    while remaining > 0 {
-        let mut fd = libc::pollfd {
-            fd: file.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one initialized pollfd, zero wait; read only when readable.
-        if unsafe { libc::poll(&mut fd, 1, 0) } <= 0 || fd.revents & libc::POLLIN == 0 {
-            break;
-        }
-        match file.read(&mut buf[..remaining.min(32 * 1024)]) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                remaining -= n;
-                if !emit(buf[..n].to_vec()) {
-                    break;
-                }
-            }
-        }
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct Guard {
     pid: i32,

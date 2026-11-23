@@ -761,9 +761,12 @@ fn connect_view_outputs(
     view.connect_exited({
         let sender = sender.clone();
         let terminal_done = terminal_done.clone();
-        move |code| {
+        move |status| {
             terminal_done.set(true);
-            let _ = sender.output(VteOutput::Exited(code));
+            if let Some(notice) = status.tail.notice() {
+                let _ = sender.output(VteOutput::Notice(notice.to_owned()));
+            }
+            let _ = sender.output(VteOutput::Exited(status.code));
         }
     });
     view.connect_bell({

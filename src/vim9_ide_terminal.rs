@@ -120,8 +120,8 @@ impl EditorTerminal {
             #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
             Backend::Shared { pane, .. } => {
                 pane.set_event_handler(move |event| {
-                    if let jterm_gtk_view::PaneEvent::Exited(code) = event {
-                        on_exit(code);
+                    if let jterm_gtk_view::PaneEvent::Exited(status) = event {
+                        on_exit(status.code);
                     }
                 });
             }

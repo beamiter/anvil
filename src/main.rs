@@ -845,8 +845,11 @@ fn setup_shared_pane(
                     },
                 );
             }
-            jterm_gtk_view::PaneEvent::Exited(code) => {
-                sender_for_events.input(AppMsg::PaneExited(tab_id, pane_id, code));
+            jterm_gtk_view::PaneEvent::Exited(status) => {
+                if let Some(notice) = status.tail.notice() {
+                    sender_for_events.input(AppMsg::Toast(notice.to_owned()));
+                }
+                sender_for_events.input(AppMsg::PaneExited(tab_id, pane_id, status.code));
             }
             jterm_gtk_view::PaneEvent::TitleChanged(title) => {
                 sender_for_events.input(AppMsg::TitleChanged(pane_id, title));
