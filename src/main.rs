@@ -785,6 +785,7 @@ fn setup_shared_pane(
         init.config.clone(),
         &init.shell_argv,
         init.working_directory.as_deref(),
+        init.session_id.as_deref()?,
     )?;
     if let Some(pane) = view.pane() {
         let runtime = Rc::downgrade(

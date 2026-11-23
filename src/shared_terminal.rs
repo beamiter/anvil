@@ -100,7 +100,7 @@ impl SharedTerminal {
                         .ok_or("shared runtime child has no process id")?;
                     runtime_guard = Some(crate::gtk_process::Guard::capture(
                         pid,
-                        Some(std::path::Path::new(&argv[0])),
+                        RuntimeShell::candidate_program(argv),
                     ));
                     TerminalPane::with_runtime(runtime, theme, status, links, close)?
                 } else {
@@ -131,12 +131,14 @@ impl SharedTerminal {
         config: Rc<RefCell<Config>>,
         argv: &[String],
         cwd: Option<&str>,
+        session_id: &str,
     ) -> Option<Self> {
         let home = std::env::var("HOME").ok();
         let cwd = cwd.or(home.as_deref());
-        let result = RuntimeShell::spawn_candidate(
+        let result = RuntimeShell::spawn_session_candidate(
             argv,
             cwd,
+            session_id,
             crate::host::is_flatpak(),
             crate::host::working_directory_available,
             || {
@@ -152,7 +154,7 @@ impl SharedTerminal {
                 .child_pid()
                 .ok_or("shared shell has no live process id")?;
             let guard =
-                crate::gtk_process::Guard::capture(pid, Some(std::path::Path::new(&argv[0])));
+                crate::gtk_process::Guard::capture(pid, RuntimeShell::candidate_program(argv));
             let (widget, pane) = TerminalPane::with_runtime_embedded(
                 runtime,
                 Self::theme(&config.borrow()),
@@ -347,11 +349,9 @@ impl SharedTerminal {
         let pane = self.pane.as_ref()?;
         #[cfg(target_os = "linux")]
         if let (Some(runtime), Some(guard)) = (pane.runtime(), &self.runtime_guard) {
-            return runtime
-                .exit_code()
-                .is_none()
-                .then(|| guard.blocker(true, None))
-                .flatten();
+            // Shutdown stops the runtime before its reader can publish an exit code.
+            runtime.child_pid()?;
+            return guard.blocker(true, None);
         }
         pane.pty().and_then(|pty| pty.close_blocker(true))
     }
@@ -375,7 +375,7 @@ impl SharedTerminal {
         if let (Some(runtime), Some(guard)) = (pane.runtime(), &self.runtime_guard) {
             let runtime = Rc::clone(runtime);
             let probe = guard.withdrawal_work_probe();
-            return Box::new(move || runtime.exit_code().is_none() && probe());
+            return Box::new(move || runtime.child_pid().is_some() && probe());
         }
         pane.pty()
             .expect("legacy pane owns a PTY")
