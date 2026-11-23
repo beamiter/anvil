@@ -210,6 +210,8 @@ impl AppModel {
     fn finish_organism_focus_transfer(&self, _: bool) {}
     fn refresh_active_pane_headers(&self) {}
     fn refresh_pane_headers(&self, _: usize) {}
+    // Session bindings belong to the Agent controller, which this search fixture stubs.
+    fn forget_agent_session_pane(&mut self, _: u64) {}
     fn close_command_suggestion_for_pane(&self, _: u64) {}
     fn close_command_correction_for_pane(&self, _: u64) {}
     fn agent_close(&self) {}

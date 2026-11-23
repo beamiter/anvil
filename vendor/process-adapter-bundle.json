@@ -1,9 +1,9 @@
 {
   "adapter_source_core_base": "10120c3aa690ff5e1a66ae15f2418b753e2053f1",
   "bundle": "pty-process-v1",
-  "core_pin_verification": "The application's locked Cargo graph uses published jterm_core 82795a0. The bundled adapter files have separately recorded source identities and checksums.",
+  "core_pin_verification": "The application's locked Cargo graph uses published jterm_core 6a3cb04. The bundled adapter files have separately recorded source identities and checksums.",
   "files_sha256": {
-    "src/gtk_process.rs": "4987e8d4bf9ff638766cea3df7e923f6836eb4b7b2ce5a4ee122c0e79dd3a52a",
+    "src/gtk_process.rs": "97e92c22cb081e9d3986c46328c63a3d68db2cbc8898565c916e75070d334165",
     "src/gtk_spawn.rs": "2e4668330a6b8510713944ccc4d07a381531d029233a84bf0ba857ac5d36c2cb",
     "tools/check-process-bundle.py": "72e4641349af09b2ac91ad92a80aedc0c4599c9cce11082f9f4d9aa823ccff19",
     "vendor/companion-process/Cargo.toml": "46cfd243bd73a0b8d0c94e10a4c456e719123d153008b02f043ad122ee7c66e2",
@@ -12,7 +12,7 @@
     "vendor/companion-process/src/pty_session.rs": "34ef861a92c1afe27059f491664802f932b996306f09d5a04e91db94b8661a2f",
     "vendor/companion-process/src/shell_identity.rs": "cff15f40ec159f8c099a74335d51bc236d524e4166088f9d1bf785ebff28435f"
   },
-  "public_core_base": "c9fe92c27b3269fb2e0dc3b2797a43bf05a13775",
+  "public_core_base": "6a3cb048e89934c99b3bc35c6817a2e2f3c4b4dc",
   "schema": 1,
   "scope": "Versioned process observer and GTK launch ownership. The GTK adapter also tracks child drain in the opt-in shared runtime. The file hashes identify these exact adapter sources.",
   "version": "0.1.0"

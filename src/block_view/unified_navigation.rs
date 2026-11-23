@@ -1,5 +1,5 @@
-//! Navigation for the persistent Unified surface. Geometry comes exclusively
-//! from VTE and the existing authenticated zone proof, never from text guesses.
+//! Navigation for the persistent Unified surface. The active renderer owns
+//! scroll geometry and authenticated command locations.
 
 use super::{BackendRecords, BlockState, RecordNavigationResult, TermView};
 use crate::keybindings::Action;
@@ -26,8 +26,7 @@ pub(super) fn position(lower: f64, upper: f64, page: f64, value: f64) -> Option<
     })
 }
 
-pub(super) fn terminal_position(terminal: &vte4::Terminal) -> Option<Position> {
-    let adjustment = terminal.vadjustment()?;
+fn terminal_position(adjustment: &gtk::Adjustment) -> Option<Position> {
     position(
         adjustment.lower(),
         adjustment.upper(),
@@ -313,7 +312,7 @@ impl NavigationBar {
         if hidden {
             return;
         }
-        let position = terminal_position(&view.active_vte);
+        let position = view.unified_position();
         let reading = position.is_some_and(|position| position.reading);
         let compact = self.width.get() < 640;
         for label in &self.text_labels {
@@ -457,7 +456,7 @@ impl TermView {
             });
         });
         *bar.refresh.borrow_mut() = Some(refresh.clone());
-        if let Some(adjustment) = view.active_vte.vadjustment() {
+        if let Some(adjustment) = view.unified_adjustment() {
             let weak = Rc::downgrade(view);
             let last_value = Cell::new(adjustment.value());
             adjustment.connect_value_changed(move |adjustment| {
@@ -514,10 +513,22 @@ impl TermView {
         refresh();
     }
 
+    fn unified_adjustment(&self) -> Option<gtk::Adjustment> {
+        self.active.borrow().surface_adjustment()
+    }
+
+    fn unified_position(&self) -> Option<Position> {
+        self.unified_adjustment()
+            .as_ref()
+            .and_then(terminal_position)
+    }
+
     fn sync_unified_scroll_state(&self) {
         let reading = self.bstate.get() != BlockState::AltScreen
             && !self.fullscreen.get()
-            && terminal_position(&self.active_vte).is_some_and(|position| position.reading);
+            && self
+                .unified_position()
+                .is_some_and(|position| position.reading);
         self.user_scrolled_up.set(reading);
         if !reading {
             self.unread_count.set(0);
@@ -539,7 +550,7 @@ impl TermView {
         }
         let _guard = bar.guard();
         self.selection_feed_hold.flush_now();
-        if let Some(adjustment) = self.active_vte.vadjustment() {
+        if let Some(adjustment) = self.unified_adjustment() {
             adjustment
                 .set_value((adjustment.upper() - adjustment.page_size()).max(adjustment.lower()));
         }
@@ -547,7 +558,7 @@ impl TermView {
         self.user_scrolled_up.set(false);
         self.unread_count.set(0);
         self.jump_fab.set_visible(false);
-        self.active_vte.grab_focus();
+        self.grab_focus();
         bar.request_refresh();
         Ok(())
     }
@@ -563,11 +574,9 @@ impl TermView {
             return Err("The full-screen application owns this terminal.");
         }
         let selected = self.navigated_record_id.get();
-        let position = terminal_position(&self.active_vte);
-        let viewport = self
-            .active_vte
-            .vadjustment()
-            .map_or(f64::NAN, |adjustment| adjustment.value());
+        let adjustment = self.unified_adjustment();
+        let position = adjustment.as_ref().and_then(terminal_position);
+        let viewport = adjustment.map_or(f64::NAN, |adjustment| adjustment.value());
         let ids = {
             let BackendRecords::Metadata(zones) = self.render_backend.records() else {
                 unreachable!();

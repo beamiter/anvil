@@ -83,6 +83,12 @@ impl AppModel {
             view.toggle_history_search();
             return;
         }
+        if self
+            .active_terminal()
+            .is_some_and(TermCtl::toggle_transcript_search)
+        {
+            return;
+        }
         self.search.emit(search::SearchMsg::Toggle);
     }
 

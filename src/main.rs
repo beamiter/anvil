@@ -572,13 +572,13 @@ struct AppModel {
     agent_panel: Controller<agent::AgentPanelModel>,
 }
 
-#[allow(clippy::too_many_arguments)]
 #[derive(Clone, Copy)]
 enum SharedPaneKind {
     ConfiguredShell,
     HostedAttachment,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_pane(
     config: &Rc<RefCell<Config>>,
     keybindings: &Rc<RefCell<KeybindingMap>>,
@@ -2864,7 +2864,9 @@ impl SimpleComponent for AppModel {
                         self.retitle_tab_from_active_pane(ti, &sender);
                         self.refresh_bottom_bar();
                     }
-                    self.search.emit(search::SearchMsg::Open);
+                    if !self.tabs[ti].panes[pi].terminal.toggle_transcript_search() {
+                        self.search.emit(search::SearchMsg::Open);
+                    }
                 }
             }
             AppMsg::SearchChanged {

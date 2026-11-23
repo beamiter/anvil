@@ -6828,7 +6828,9 @@ impl ActiveBlock {
                 };
                 let overflows =
                     adjustment.upper() - adjustment.lower() > adjustment.page_size() + f64::EPSILON;
-                scrollbar.set_visible(overflows);
+                if scrollbar.adjustment() == *adjustment {
+                    scrollbar.set_visible(overflows);
+                }
             };
             sync_visibility(&adjustment);
             adjustment.connect_changed(sync_visibility);
@@ -6876,9 +6878,17 @@ impl ActiveBlock {
         let adjustment = terminal.scrollback();
         self.live_scrollbar.set_adjustment(Some(adjustment));
         let scrollbar = self.live_scrollbar.downgrade();
+        let unified = terminal.transcript().is_some();
         let sync = move |adjustment: &gtk::Adjustment| {
             if let Some(scrollbar) = scrollbar.upgrade() {
-                scrollbar.set_visible(adjustment.upper() > adjustment.page_size());
+                let scrollable = adjustment.upper() - adjustment.lower() > adjustment.page_size();
+                scrollbar.set_visible(unified || scrollable);
+                if unified {
+                    scrollbar.set_opacity(if scrollable { 1.0 } else { 0.0 });
+                    scrollbar.set_can_target(scrollable);
+                    scrollbar.set_can_focus(scrollable);
+                    scrollbar.update_state(&[gtk::accessible::State::Hidden(!scrollable)]);
+                }
             }
         };
         sync(adjustment);
@@ -6892,6 +6902,38 @@ impl ActiveBlock {
             return terminal.screen().clone().upcast();
         }
         self.active_vte.clone().upcast()
+    }
+
+    pub(super) fn surface_adjustment(&self) -> Option<gtk::Adjustment> {
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return Some(terminal.scrollback().clone());
+        }
+        self.active_vte.vadjustment()
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    pub(super) fn layout_shared_unified(
+        &self,
+        terminal: &super::shared_active::SharedActiveTerminal,
+        viewport_width: i32,
+        viewport_height: i32,
+    ) -> Option<(u16, u16)> {
+        if !self.widget.is_mapped() || viewport_height <= 1 {
+            return None;
+        }
+        // Keep the same grid when the first archived row makes the scrollbar
+        // interactive. Its reserved width does not depend on scroll position.
+        let gutter = self.live_scrollbar.measure(Orientation::Horizontal, -1).1;
+        let width = self.widget.width().min(viewport_width) - gutter;
+        if width <= 1 {
+            return None;
+        }
+        let (_, top, _, cell_height) = terminal.cell_metrics();
+        let grid = terminal.fit_grid(width, viewport_height);
+        let height = live_rows_height_px(cell_height, i64::from(grid.1), top * 2);
+        self.set_shared_geometry((width, height, height));
+        Some(grid)
     }
 
     #[cfg(anvil_shared_terminal)]
@@ -6939,11 +6981,16 @@ impl ActiveBlock {
             live_rows_height_px(cell_height, rows, top * 2),
             live_rows_height_px(cell_height, visible, top * 2),
         );
+        self.set_shared_geometry(geometry);
+        Some((cols, rows as u16))
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    fn set_shared_geometry(&self, geometry: (i32, i32, i32)) {
         if self.live_geometry.replace(geometry) != geometry {
             self.vte_overlay.set_size_request(geometry.0, geometry.1);
             self.live_spacer.set_height_request(geometry.2);
         }
-        Some((cols, rows as u16))
     }
 
     /// Snapshot the engine-owned capture for live-find. The engine replays

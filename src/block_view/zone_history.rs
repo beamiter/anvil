@@ -645,18 +645,28 @@ pub(super) fn replay_bytes(
     snapshot: Option<&str>,
     truncated: bool,
 ) -> Vec<u8> {
-    let mut out = Vec::new();
+    replay_sections(record, snapshot, truncated).concat()
+}
+
+pub(super) fn replay_sections(
+    record: &CompletedCommandRecord,
+    snapshot: Option<&str>,
+    truncated: bool,
+) -> [Vec<u8>; 3] {
+    let mut prompt = Vec::new();
     let cwd = record.cwd.as_deref().unwrap_or("");
     if !cwd.is_empty() {
-        out.extend_from_slice(b"\x1b[2m");
-        out.extend_from_slice(sanitize_line(cwd).as_bytes());
-        out.extend_from_slice(b"\x1b[0m\r\n");
+        prompt.extend_from_slice(b"\x1b[2m");
+        prompt.extend_from_slice(sanitize_line(cwd).as_bytes());
+        prompt.extend_from_slice(b"\x1b[0m\r\n");
     }
+    let mut command = Vec::new();
     if !record.cmd.is_empty() {
-        out.extend_from_slice(b"\x1b[2m>\x1b[0m ");
-        out.extend_from_slice(sanitize_line(&record.cmd).as_bytes());
-        out.extend_from_slice(b"\r\n");
+        command.extend_from_slice(b"\x1b[2m>\x1b[0m ");
+        command.extend_from_slice(sanitize_line(&record.cmd).as_bytes());
+        command.extend_from_slice(b"\r\n");
     }
+    let mut out = Vec::new();
     if let Some(snapshot) = snapshot {
         for line in snapshot.split('\n') {
             out.extend_from_slice(sanitize_line(line).as_bytes());
@@ -668,7 +678,7 @@ pub(super) fn replay_bytes(
         out.extend_from_slice(b"[output truncated]");
         out.extend_from_slice(b"\x1b[0m\r\n");
     }
-    out
+    [prompt, command, out]
 }
 
 /// One dim line introducing the replay, so restored rows are never mistaken

@@ -1,7 +1,7 @@
 use super::{OwnedPty, SelectionFeedHold, SubmissionSurface};
 use crate::{config::Config, shared_terminal::SharedTerminal};
 use gtk::prelude::*;
-use jterm_gtk_view::{EmbeddedTerminal, HistoryAnchor, PaneEvent, Pty, PtyExit};
+use jterm_gtk_view::{EmbeddedTerminal, HistoryAnchor, PaneEvent, Pty, PtyExit, TranscriptView};
 use relm4::gtk;
 use std::{cell::OnceCell, rc::Rc};
 
@@ -9,11 +9,12 @@ type Input = Box<dyn Fn(&[u8]) -> Result<(), String>>;
 
 pub(super) struct SharedActiveTerminal {
     terminal: Rc<EmbeddedTerminal<Transport>>,
+    transcript: Option<TranscriptView<Transport>>,
     pub(super) widget: gtk::Widget,
     input: Rc<OnceCell<InputBinding>>,
 }
 
-struct Transport {
+pub(super) struct Transport {
     pty: Rc<OwnedPty>,
     input: Rc<OnceCell<InputBinding>>,
 }
@@ -86,11 +87,28 @@ impl SharedActiveTerminal {
             .update_property(&[gtk::accessible::Property::Description(
                 "Shared active terminal",
             )]);
+        let transcript = config
+            .terminal_mode
+            .is_unified()
+            .then(|| TranscriptView::new(terminal.clone()));
         Ok(Rc::new(Self {
             terminal,
+            transcript,
             widget,
             input,
         }))
+    }
+
+    pub(super) fn transcript(&self) -> Option<&TranscriptView<Transport>> {
+        self.transcript.as_ref()
+    }
+
+    pub(super) fn toggle_transcript_search(&self) -> bool {
+        if self.transcript.is_none() {
+            return false;
+        }
+        self.terminal.pane().toggle_history_search();
+        true
     }
 
     pub(super) fn bind_input(&self, write: Input, hold: Rc<SelectionFeedHold>) {
@@ -202,4 +220,11 @@ impl SubmissionSurface for SharedActiveTerminal {
         self.terminal
             .inspect(|terminal| terminal.primary_suffix_is_empty())
     }
+}
+
+/// The block parser admits OSC 7 as a single ST-terminated packet. Its
+/// boundary remains intact during coalescing.
+pub(super) fn directory_uri(bytes: &[u8]) -> Option<&str> {
+    let payload = bytes.strip_prefix(b"\x1b]7;")?.strip_suffix(b"\x1b\\")?;
+    std::str::from_utf8(payload).ok()
 }
