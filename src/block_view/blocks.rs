@@ -3766,11 +3766,11 @@ impl FinishedBlockPrecomputed {
                     crate::config::TerminalMode::Block | crate::config::TerminalMode::Chat
                 )
                 && std::env::var_os("JTERM_SHARED_FINISHED_COMMANDS")
-                    .is_some_and(|value| value == "1"),
+                    .is_none_or(|value| value == "1"),
             #[cfg(anvil_shared_terminal)]
             document_output: complete_output
                 && std::env::var_os("JTERM_SHARED_FINISHED_OUTPUT")
-                    .is_some_and(|value| value == "1"),
+                    .is_none_or(|value| value == "1"),
             ..Self::default()
         }
     }

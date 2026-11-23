@@ -948,12 +948,9 @@ mod tests {
         use std::time::{Duration, Instant};
 
         gtk::init().expect("GTK display");
+        assert!(std::env::var_os("JTERM_SHARED_FINISHED_COMMANDS").is_none_or(|value| value == "1"));
         assert_eq!(
-            std::env::var("JTERM_SHARED_FINISHED_COMMANDS").as_deref(),
-            Ok("1")
-        );
-        assert_eq!(
-            std::env::var("JTERM_SHARED_FINISHED_OUTPUT").as_deref() == Ok("1"),
+            std::env::var_os("JTERM_SHARED_FINISHED_OUTPUT").is_none_or(|value| value == "1"),
             document_output
         );
         let mut config = crate::config::Config::safe_defaults();
