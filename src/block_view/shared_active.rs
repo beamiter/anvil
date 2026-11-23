@@ -191,6 +191,33 @@ impl SharedActiveTerminal {
             .inspect(|terminal| terminal.primary_text_range(start, end).ok())
     }
 
+    pub(super) fn kitty_cursor(&self) -> Option<(i64, i64)> {
+        self.terminal.inline_image_cursor()
+    }
+
+    pub(super) fn prepare_inline_image(
+        &self,
+        texture: gtk::gdk::Texture,
+        encoded_source_bytes: usize,
+        requested: super::kitty_graphics::DisplayPlacement,
+    ) -> Option<jterm_gtk_view::PendingInlineImage> {
+        requested.geometry_valid.then_some(())?;
+        self.terminal.prepare_inline_image(
+            texture,
+            encoded_source_bytes,
+            jterm_gtk_view::InlineImageRequest {
+                columns: requested.columns,
+                rows: requested.rows?,
+                move_cursor: requested.cursor_moves?,
+                cursor: (requested.cursor_col, requested.cursor_row),
+            },
+        )
+    }
+
+    pub(super) fn admit_inline_image(&self, pending: jterm_gtk_view::PendingInlineImage) -> bool {
+        self.terminal.admit_inline_image(pending)
+    }
+
     pub(super) fn cursor(&self) -> Option<(i64, i64)> {
         self.terminal.inspect(|terminal| {
             let anchor = terminal.primary_cursor_anchor()?;
