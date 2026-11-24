@@ -1179,12 +1179,16 @@ impl OwnedPty {
                     }
                 }
                 unsafe {
+                    #[cfg(all(target_os = "linux", anvil_shared_terminal))]
+                    if let Some((_, writer)) = &startup_status {
+                        writer.execve(&c_executable, &c_argv_ptrs, &c_environment_ptrs);
+                    }
                     libc::execve(
                         c_executable.as_ptr(),
                         c_argv_ptrs.as_ptr(),
                         c_environment_ptrs.as_ptr(),
                     );
-                    child_startup_failed!(Exec, 127);
+                    libc::_exit(127);
                 }
             }
             Ok(ForkResult::Parent { child }) => {
