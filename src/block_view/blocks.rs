@@ -1432,6 +1432,78 @@ fn scroll_target(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(anvil_shared_terminal)]
+    #[test]
+    #[ignore = "requires an isolated native GTK display"]
+    fn completed_image_cards_share_the_caption_and_keep_the_picture() {
+        use gtk::prelude::*;
+        use gtk::{gdk, glib};
+
+        gtk::init().expect("GTK display");
+        let mut config = crate::config::Config::safe_defaults();
+        config.terminal_mode = crate::config::TerminalMode::Block;
+        let texture: gdk::Texture = gdk::MemoryTexture::new(
+            1,
+            1,
+            gdk::MemoryFormat::R8g8b8a8,
+            &glib::Bytes::from_static(&[0, 255, 0, 255]),
+            4,
+        )
+        .upcast();
+
+        for (caption, expected) in [
+            ("caption for plot\r\n", Some("caption for plot")),
+            ("", Some("")),
+            ("\x1b[5mblinking caption\x1b[0m\r\n", None),
+        ] {
+            let card = super::FinishedBlock::new_with_pool(
+                1,
+                "$ ",
+                "draw plot",
+                None,
+                caption,
+                Some(0),
+                &config,
+                None,
+                None,
+                None,
+                80,
+                std::slice::from_ref(&texture),
+                caption.len(),
+                None,
+                super::FinishedBlockPrecomputed::documents(&config, true, true),
+            );
+            let output = card.output_surface();
+            assert_eq!(output.document_text().as_deref(), expected);
+            assert_eq!(card.output_vte.is_none(), expected.is_some());
+            let pictures =
+                std::iter::successors(card.content.first_child(), |widget| widget.next_sibling())
+                    .find(|widget| widget.has_css_class("block-images"))
+                    .expect("finished card image box");
+            let picture = pictures
+                .first_child()
+                .and_downcast::<gtk::Picture>()
+                .expect("the original image is mounted below the caption");
+            assert_eq!(
+                picture.paintable(),
+                Some(texture.clone().upcast::<gdk::Paintable>())
+            );
+
+            let window = gtk::Window::builder().child(card.widget()).build();
+            window.present();
+            while glib::MainContext::default().iteration(false) {}
+            assert!(picture.is_mapped());
+            assert_eq!(output.widget().is_mapped(), !caption.is_empty());
+            assert!(card.set_collapsed(true));
+            assert!(!picture.is_mapped());
+            assert!(!output.widget().is_mapped());
+            assert!(card.set_collapsed(false));
+            assert!(picture.is_mapped());
+            assert_eq!(output.widget().is_mapped(), !caption.is_empty());
+            window.close();
+        }
+    }
+
     #[test]
     fn live_clip_pixels_include_insets_without_adding_a_terminal_row() {
         for insets in [0, 2, 14, 60] {
@@ -4922,7 +4994,6 @@ impl FinishedBlock {
         #[cfg(anvil_shared_terminal)]
         let output_document = if precomputed.document_output
             && (command_document.is_some() || is_background)
-            && images.is_empty()
         {
             jterm_core::screen_replay::project_bounded_archive(output).map(|document| {
                 let output = jterm_gtk_view::FinishedTextView::output(

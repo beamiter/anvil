@@ -101,9 +101,17 @@ jobs:
           done
       - name: Verify shared live output and completed Block and Chat cards
         run: |
+          set -o pipefail
           core=$(python3 scripts/shared-core-path.py)
           bash "$core/crates/jterm_gtk_view/tests/test-native-cards.sh" \
             anvil "$RUNNER_TEMP/shared-terminal-wayland/cards"
+          log="$RUNNER_TEMP/shared-terminal-wayland/cards/completed-image-cards.log"
+          dbus-run-session -- xvfb-run -a env -u JTERM_SHARED_FINISHED_COMMANDS \
+            -u JTERM_SHARED_FINISHED_OUTPUT GSK_RENDERER=cairo \
+            cargo test --locked --release --features shared-terminal --bin anvil \
+            block_view::blocks::tests::completed_image_cards_share_the_caption_and_keep_the_picture \
+            -- --exact --ignored --test-threads=1 | tee "$log"
+          grep -F 'test result: ok. 1 passed; 0 failed;' "$log"
       - name: Verify the application's shared transcript Find entry points
         if: ${{ !cancelled() }}
         run: |
