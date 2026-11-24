@@ -449,7 +449,7 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.2.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=714ff70e05ef842025fbed1b5ca626381740698b#714ff70e05ef842025fbed1b5ca626381740698b"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=9d9d4fd28e1e60fc4c22f996c7d7b3f709d71bff#9d9d4fd28e1e60fc4c22f996c7d7b3f709d71bff"
 dependencies = [
  "companion-client",
  "companion-core",
@@ -482,7 +482,7 @@ dependencies = [
 [[package]]
 name = "jterm_engine"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=714ff70e05ef842025fbed1b5ca626381740698b#714ff70e05ef842025fbed1b5ca626381740698b"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=9d9d4fd28e1e60fc4c22f996c7d7b3f709d71bff#9d9d4fd28e1e60fc4c22f996c7d7b3f709d71bff"
 dependencies = [
  "smallvec",
  "unicode-segmentation",
@@ -492,7 +492,7 @@ dependencies = [
 [[package]]
 name = "jterm_remote_client"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=714ff70e05ef842025fbed1b5ca626381740698b#714ff70e05ef842025fbed1b5ca626381740698b"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=9d9d4fd28e1e60fc4c22f996c7d7b3f709d71bff#9d9d4fd28e1e60fc4c22f996c7d7b3f709d71bff"
 dependencies = [
  "serde",
  "serde_json",
@@ -501,7 +501,7 @@ dependencies = [
 [[package]]
 name = "jterm_runtime"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=714ff70e05ef842025fbed1b5ca626381740698b#714ff70e05ef842025fbed1b5ca626381740698b"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=9d9d4fd28e1e60fc4c22f996c7d7b3f709d71bff#9d9d4fd28e1e60fc4c22f996c7d7b3f709d71bff"
 dependencies = [
  "libc",
  "log",
