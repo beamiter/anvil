@@ -7100,12 +7100,7 @@ impl ActiveBlock {
         self.live_cursor_high.set(0);
         #[cfg(anvil_shared_terminal)]
         if let Some(terminal) = &self.shared_active {
-            if preserve_scrollback {
-                terminal.feed(b"\x1b[0m");
-                terminal.feed(super::MOUSE_AND_FOCUS_REPORTING_OFF);
-            } else {
-                terminal.feed(b"\x1bc");
-            }
+            terminal.output().reset_prompt(preserve_scrollback);
             return;
         }
         if preserve_scrollback {

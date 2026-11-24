@@ -5443,9 +5443,8 @@ trait RenderBackend {
     // ── live surface ──
     /// Feed bytes to the live terminal surface (including re-synthesized
     /// `\x1b[?..h/l` alt-screen toggles).
-    fn feed_live(&self, bytes: &[u8]);
+    fn feed_legacy(&self, bytes: &[u8]);
     fn directory_report(&self, _bytes: &[u8]) {}
-    fn live_exited(&self, _status: jterm_core::exit_status::PtyExit) {}
     fn replies_through_commit(&self) -> bool {
         true
     }
@@ -6577,6 +6576,8 @@ struct UnifiedBackend {
 struct ReaderCtx {
     /// Every widget/surface effect and query goes through this seam.
     backend: Rc<dyn RenderBackend>,
+    #[cfg(anvil_shared_terminal)]
+    terminal_output: Option<Rc<shared_active::ActiveTerminalOutput>>,
     bstate_rc: Rc<Cell<BlockState>>,
     engine: RefCell<EngineState>,
     /// Bounded raw-output ring for the running command — engine-owned shared
@@ -6691,6 +6692,15 @@ struct ReaderCtx {
 /// order the events arrive. Bodies moved verbatim from the former
 /// `process_chunk` match closure (arm-level `continue` became `return`).
 impl ReaderCtx {
+    fn apply_live_output(&self, bytes: &[u8]) {
+        #[cfg(anvil_shared_terminal)]
+        if let Some(output) = &self.terminal_output {
+            output.apply(bytes);
+            return;
+        }
+        self.backend.feed_legacy(bytes);
+    }
+
     /// Drop the engine-owned raw-output ring together with the marker that
     /// describes it. The two are only meaningful as a pair: retained bytes
     /// under a stale marker would report the next command's output as
@@ -6749,7 +6759,7 @@ impl ReaderCtx {
             ParserEvent::ClipboardSet(text) => self.on_clipboard_set(text),
             ParserEvent::ClipboardQuery => self.on_clipboard_query(),
             ParserEvent::ColorQuery(kind) => self.on_color_query(*kind),
-            ParserEvent::LiveColorQuery(bytes) => self.backend.feed_live(bytes),
+            ParserEvent::LiveColorQuery(bytes) => self.apply_live_output(bytes),
             ParserEvent::ColorSet { kind, spec } => self.on_color_set(*kind, spec),
             ParserEvent::ColorReset(kind) => self.on_color_reset(*kind),
             ParserEvent::KeyboardProtocolQuery(query) => self.on_keyboard_protocol_query(*query),
@@ -7080,7 +7090,7 @@ impl ReaderCtx {
         };
 
         if feed_active_vte {
-            self.backend.feed_live(bytes);
+            self.apply_live_output(bytes);
         }
     }
 
@@ -7113,7 +7123,7 @@ impl ReaderCtx {
                         engine.pending_zone,
                     )
                 };
-                self.backend.feed_live(format!("\x1b[?{mode}l").as_bytes());
+                self.apply_live_output(format!("\x1b[?{mode}l").as_bytes());
                 if let Some(id) = prompt_zone_to_reopen_after_alt(restored_state, pending_zone) {
                     self.backend.restore_prompt_zone(id);
                 }
@@ -7921,7 +7931,7 @@ impl ReaderCtx {
             let mode = self.engine.borrow_mut().active_alt_screen_mode.take();
             let mode = mode.unwrap_or(1049);
             let leave = format!("\x1b[?{mode}l");
-            self.backend.feed_live(leave.as_bytes());
+            self.apply_live_output(leave.as_bytes());
             // libvte's mouse and focus modes are global, not per screen, so
             // leaving the alternate screen does not switch them off.
             self.backend.release_live_reporting();
@@ -8016,7 +8026,7 @@ impl ReaderCtx {
         // app draws (see sync_active_to_pty doc).
         self.backend.sync_geometry_to_pty();
         let enter = format!("\x1b[?{mode}h");
-        self.backend.feed_live(enter.as_bytes());
+        self.apply_live_output(enter.as_bytes());
     }
 
     fn on_alt_screen_leave(&self, mode: u32) {
@@ -8033,7 +8043,7 @@ impl ReaderCtx {
         self.watch_reader.set_alt(false, Instant::now());
         emit_alt_screen_transition(&self.alt_screen_cbs, AltScreenTransition::Left);
         let leave = format!("\x1b[?{mode}l");
-        self.backend.feed_live(leave.as_bytes());
+        self.apply_live_output(leave.as_bytes());
         self.engine.borrow_mut().osc133_depth = 0;
         let prev_state = self.engine.borrow().prev_state;
         self.bstate_rc.set(prev_state);
@@ -9237,12 +9247,7 @@ impl RenderBackend for BlockBackend {
         more_button.set_action_name(Some("block.show-menu"));
     }
 
-    fn feed_live(&self, bytes: &[u8]) {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            terminal.feed(bytes);
-            return;
-        }
+    fn feed_legacy(&self, bytes: &[u8]) {
         self.active_vte.feed(bytes);
     }
 
@@ -9252,13 +9257,6 @@ impl RenderBackend for BlockBackend {
             (&self.shared_cwd, shared_active::directory_uri(_bytes))
         {
             dispatch(uri);
-        }
-    }
-
-    fn live_exited(&self, _status: jterm_core::exit_status::PtyExit) {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            terminal.exited(_status);
         }
     }
 
@@ -10302,6 +10300,15 @@ impl UnifiedBackend {
         self.shared_active.as_ref()?.transcript()
     }
 
+    fn apply_terminal_effect(&self, bytes: &[u8]) {
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            terminal.output().apply(bytes);
+            return;
+        }
+        self.feed_legacy(bytes);
+    }
+
     fn replay_zone_contents(
         &self,
         record: &CompletedCommandRecord,
@@ -10315,17 +10322,17 @@ impl UnifiedBackend {
             let [prompt, input, output] = zone_history::replay_sections(record, text, truncated);
             transcript.begin_restored_prompt(record.id);
             self.chrome.begin_shared_zone(record.id, _max_zones);
-            self.feed_live(&prompt);
+            self.apply_terminal_effect(&prompt);
             transcript.end_prompt();
-            self.feed_live(&input);
+            self.apply_terminal_effect(&input);
             transcript.begin_output(Some(record.id));
-            self.feed_live(&output);
+            self.apply_terminal_effect(&output);
             transcript.end_output(Some(record.id), _max_zones);
             return;
         }
         self.chrome.begin_zone(record.id, &self.vte);
         self.zone_marker.borrow_mut().begin_zone(record.id);
-        self.feed_live(&zone_history::replay_bytes(record, text, truncated));
+        self.feed_legacy(&zone_history::replay_bytes(record, text, truncated));
         close_zone_marker(&self.zone_marker, Some(record.id), |bytes| {
             self.vte.feed(bytes)
         });
@@ -10333,12 +10340,7 @@ impl UnifiedBackend {
 }
 
 impl RenderBackend for UnifiedBackend {
-    fn feed_live(&self, bytes: &[u8]) {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            terminal.feed(bytes);
-            return;
-        }
+    fn feed_legacy(&self, bytes: &[u8]) {
         feed_vte_with_zone_marker(&self.vte, &self.zone_marker, bytes);
     }
 
@@ -10348,13 +10350,6 @@ impl RenderBackend for UnifiedBackend {
             (&self.shared_cwd, shared_active::directory_uri(_bytes))
         {
             dispatch(uri);
-        }
-    }
-
-    fn live_exited(&self, _status: jterm_core::exit_status::PtyExit) {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            terminal.exited(_status);
         }
     }
 
@@ -10439,7 +10434,7 @@ impl RenderBackend for UnifiedBackend {
     /// Preserve the continuous surface between prompts. A bare SGR reset keeps
     /// an interrupted command's attributes from tinting the next prompt.
     fn reset_active_surface(&self, _preserve_scrollback: bool) {
-        self.feed_live(b"\x1b[0m");
+        self.apply_terminal_effect(b"\x1b[0m");
         self.release_live_reporting();
     }
 
@@ -10447,7 +10442,7 @@ impl RenderBackend for UnifiedBackend {
     /// focus reporting a killed program left on; the engine's shadow of
     /// those modes was just cleared with the prompt.
     fn release_live_reporting(&self) {
-        self.feed_live(MOUSE_AND_FOCUS_REPORTING_OFF);
+        self.apply_terminal_effect(MOUSE_AND_FOCUS_REPORTING_OFF);
     }
 
     fn focus_live_deferred(&self) {
@@ -10646,7 +10641,7 @@ impl RenderBackend for UnifiedBackend {
             return 0;
         }
         // The surface paints the stored projection outside the PTY lifecycle.
-        self.feed_live(&zone_history::replay_banner(zones.len()));
+        self.apply_terminal_effect(&zone_history::replay_banner(zones.len()));
         let max_zones = self.config_for_cb.borrow().max_visible_blocks as usize;
         let mut restored = 0;
         for zone in zones {
@@ -11023,7 +11018,10 @@ impl ReaderCtx {
                 exit_ctx.selection_feed_hold.flush_then(|| {
                     exit_ctx.watch_reader.source_ended(Instant::now());
                     log::debug!("Shell exited with code {}", status.code);
-                    exit_ctx.backend.live_exited(status);
+                    #[cfg(anvil_shared_terminal)]
+                    if let Some(output) = &exit_ctx.terminal_output {
+                        output.finish(status);
+                    }
                     for cb in exit_ctx.exited_cbs.borrow().iter() {
                         cb(status);
                     }
@@ -14433,6 +14431,10 @@ impl TermView {
             *render_backend_slot.borrow_mut() = Some(backend.clone());
             ReaderCtx {
                 backend,
+                #[cfg(anvil_shared_terminal)]
+                terminal_output: shared_active
+                    .as_ref()
+                    .map(|terminal| Rc::clone(terminal.output())),
                 bstate_rc,
                 kitty_keyboard_rc: kitty_keyboard.clone(),
                 kitty_flags_rc: kitty_flags.clone(),
@@ -21063,7 +21065,7 @@ mod tests {
     }
 
     impl RenderBackend for RecordingBackend {
-        fn feed_live(&self, bytes: &[u8]) {
+        fn feed_legacy(&self, bytes: &[u8]) {
             self.marker_trace
                 .borrow_mut()
                 .push(MarkerTrace::Feed(bytes.to_vec()));
@@ -21645,6 +21647,8 @@ mod tests {
 
             let ctx = ReaderCtx {
                 backend: backend.clone(),
+                #[cfg(anvil_shared_terminal)]
+                terminal_output: None,
                 bstate_rc: bstate.clone(),
                 engine: RefCell::new(EngineState {
                     prev_state: BlockState::Idle,

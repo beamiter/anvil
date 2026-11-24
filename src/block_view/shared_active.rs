@@ -3,7 +3,7 @@ use crate::{config::Config, shared_terminal::SharedTerminal};
 use gtk::prelude::*;
 use jterm_gtk_view::{
     EmbeddedTerminal, FindFrame, FindMatch, FindRegion, FindSnapshot, HistoryAnchor, PaneEvent,
-    Pty, PtyExit, TranscriptAnchor, TranscriptView,
+    Pty, PtyExit, TerminalOutput, TerminalProfile, TranscriptAnchor, TranscriptView,
 };
 use relm4::gtk;
 use std::{
@@ -15,10 +15,34 @@ type Input = Box<dyn Fn(&[u8]) -> Result<(), String>>;
 
 pub(super) struct SharedActiveTerminal {
     terminal: Rc<EmbeddedTerminal<Transport>>,
+    output: Rc<ActiveTerminalOutput>,
     transcript: Option<TranscriptView<Transport>>,
     output_start: Cell<Option<TranscriptAnchor>>,
     pub(super) widget: gtk::Widget,
     input: Rc<OnceCell<InputBinding>>,
+}
+
+pub(super) struct ActiveTerminalOutput(TerminalOutput<Transport>);
+
+impl ActiveTerminalOutput {
+    pub(super) fn apply(&self, bytes: &[u8]) {
+        if let Err(error) = self.0.apply(bytes) {
+            log::warn!("Could not process active terminal output: {error}");
+        }
+    }
+
+    pub(super) fn finish(&self, status: PtyExit) {
+        self.0.finish(status);
+    }
+
+    pub(super) fn reset_prompt(&self, preserve_scrollback: bool) {
+        if preserve_scrollback {
+            self.apply(b"\x1b[0m");
+            self.apply(super::MOUSE_AND_FOCUS_REPORTING_OFF);
+        } else {
+            self.apply(b"\x1bc");
+        }
+    }
 }
 
 pub(super) struct Transport {
@@ -74,16 +98,22 @@ impl Pty for Transport {
 impl SharedActiveTerminal {
     pub(super) fn new(config: &Config, pty: Rc<OwnedPty>) -> Result<Rc<Self>, String> {
         let input = Rc::new(OnceCell::new());
-        let (widget, terminal) = EmbeddedTerminal::new(
+        let links = SharedTerminal::links();
+        let runtime = TerminalOutput::new(
             Transport {
                 pty,
                 input: input.clone(),
             },
             80,
             24,
+            TerminalProfile::Embedded,
+            links.admit,
+        )?;
+        let (widget, terminal) = EmbeddedTerminal::attach(
+            runtime.handle(),
             SharedTerminal::theme(config),
             |message, _| message.to_owned(),
-            SharedTerminal::links(),
+            links,
         )?;
         terminal
             .pane()
@@ -101,6 +131,7 @@ impl SharedActiveTerminal {
             .then(|| TranscriptView::new(terminal.clone()));
         Ok(Rc::new(Self {
             terminal,
+            output: Rc::new(ActiveTerminalOutput(runtime)),
             transcript,
             output_start: Cell::new(None),
             widget,
@@ -178,14 +209,13 @@ impl SharedActiveTerminal {
         &self.terminal
     }
 
-    pub(super) fn feed(&self, bytes: &[u8]) {
-        if let Err(error) = self.terminal.ingest(bytes) {
-            log::warn!("Could not process active terminal output: {error}");
-        }
+    pub(super) fn output(&self) -> &Rc<ActiveTerminalOutput> {
+        &self.output
     }
 
-    pub(super) fn exited(&self, status: PtyExit) {
-        self.terminal.exited(status);
+    #[cfg(test)]
+    pub(super) fn feed(&self, bytes: &[u8]) {
+        self.output.apply(bytes);
     }
 
     pub(super) fn on_event(&self, handler: impl Fn(PaneEvent) + 'static) {

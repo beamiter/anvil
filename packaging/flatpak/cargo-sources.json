@@ -14,8 +14,8 @@
     {
         "type": "git",
         "url": "https://github.com/beamiter/jterm_core",
-        "commit": "4c2d40d8f84265564354e4938d105a7c11fdb2e1",
-        "dest": "flatpak-cargo/git/jterm_core-4c2d40d"
+        "commit": "c701f34b5165c72651995c67301977cae461158e",
+        "dest": "flatpak-cargo/git/jterm_core-c701f34"
     },
     {
         "type": "archive",
@@ -1413,7 +1413,7 @@
     {
         "type": "shell",
         "commands": [
-            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-4c2d40d/.\" \"cargo/vendor/jterm_core\""
+            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-c701f34/.\" \"cargo/vendor/jterm_core\""
         ]
     },
     {
@@ -1431,7 +1431,7 @@
     {
         "type": "shell",
         "commands": [
-            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-4c2d40d/crates/jterm_engine\" \"cargo/vendor/jterm_engine\""
+            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-c701f34/crates/jterm_engine\" \"cargo/vendor/jterm_engine\""
         ]
     },
     {
@@ -1449,12 +1449,12 @@
     {
         "type": "shell",
         "commands": [
-            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-4c2d40d/crates/jterm_gtk_view\" \"cargo/vendor/jterm_gtk_view\""
+            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-c701f34/crates/jterm_gtk_view\" \"cargo/vendor/jterm_gtk_view\""
         ]
     },
     {
         "type": "inline",
-        "contents": "[package]\nname = \"jterm_gtk_view\"\nversion = \"0.1.0\"\nedition = \"2021\"\nrust-version = \"1.93\"\ndescription = \"GTK4 presentation and input for shared terminal sessions\"\nlicense = \"MIT\"\npublish = false\n\n[dependencies.gtk4]\nversion = \"0.11.4\"\nfeatures = [\"v4_12\"]\n\n[dependencies.jterm_engine]\nversion = \"0.1.0\"\npath = \"../jterm_engine\"\n\n[target.\"cfg(target_os = \\\"linux\\\")\".dependencies]\nfutures-channel = \"0.3\"\n\n[target.\"cfg(target_os = \\\"linux\\\")\".dependencies.futures-util]\nversion = \"0.3\"\ndefault-features = false\n\n[target.\"cfg(target_os = \\\"linux\\\")\".dependencies.jterm_runtime]\nversion = \"0.1.0\"\npath = \"../jterm_runtime\"\nfeatures = [\"linux-pty\"]\n\n[workspace]\n",
+        "contents": "[package]\nname = \"jterm_gtk_view\"\nversion = \"0.1.0\"\nedition = \"2021\"\nrust-version = \"1.93\"\ndescription = \"GTK4 presentation and input for shared terminal sessions\"\nlicense = \"MIT\"\npublish = false\n\n[dependencies.gtk4]\nversion = \"0.11.4\"\nfeatures = [\"v4_12\"]\n\n[dependencies.jterm_engine]\nversion = \"0.1.0\"\npath = \"../jterm_engine\"\n\n[dependencies.jterm_runtime]\nversion = \"0.1.0\"\npath = \"../jterm_runtime\"\nfeatures = [\"terminal\"]\n\n[target.\"cfg(target_os = \\\"linux\\\")\".dependencies]\nfutures-channel = \"0.3\"\n\n[target.\"cfg(target_os = \\\"linux\\\")\".dependencies.futures-util]\nversion = \"0.3\"\ndefault-features = false\n\n[target.\"cfg(target_os = \\\"linux\\\")\".dependencies.jterm_runtime]\nversion = \"0.1.0\"\npath = \"../jterm_runtime\"\nfeatures = [\"linux-pty\"]\n\n[workspace]\n",
         "dest": "cargo/vendor/jterm_gtk_view",
         "dest-filename": "Cargo.toml"
     },
@@ -1467,7 +1467,7 @@
     {
         "type": "shell",
         "commands": [
-            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-4c2d40d/crates/jterm_remote_client\" \"cargo/vendor/jterm_remote_client\""
+            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-c701f34/crates/jterm_remote_client\" \"cargo/vendor/jterm_remote_client\""
         ]
     },
     {
@@ -1485,12 +1485,12 @@
     {
         "type": "shell",
         "commands": [
-            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-4c2d40d/crates/jterm_runtime\" \"cargo/vendor/jterm_runtime\""
+            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-c701f34/crates/jterm_runtime\" \"cargo/vendor/jterm_runtime\""
         ]
     },
     {
         "type": "inline",
-        "contents": "[package]\nname = \"jterm_runtime\"\nversion = \"0.1.0\"\nedition = \"2021\"\nrust-version = \"1.89\"\ndescription = \"UI-independent terminal runtime and process helpers\"\nlicense = \"MIT\"\npublish = false\n\n[dependencies]\nlog = \"0.4\"\n\n[features]\nlinux-pty = [\"dep:jterm_engine\", \"dep:portable-pty\", \"session-actor\"]\nsession-actor = [\"dep:crossbeam-channel\", \"dep:parking_lot\"]\nsession-actor-test-hooks = [\"session-actor\"]\n\n[target.\"cfg(unix)\".dependencies]\nlibc = \"0.2.189\"\n\n[target.\"cfg(unix)\".dependencies.crossbeam-channel]\nversion = \"0.5\"\noptional = true\n\n[target.\"cfg(unix)\".dependencies.parking_lot]\nversion = \"0.12\"\noptional = true\n\n[target.\"cfg(target_os = \\\"linux\\\")\".dependencies.jterm_engine]\nversion = \"0.1.0\"\npath = \"../jterm_engine\"\noptional = true\n\n[target.\"cfg(target_os = \\\"linux\\\")\".dependencies.portable-pty]\nversion = \"0.9\"\noptional = true\n\n[workspace]\n",
+        "contents": "[package]\nname = \"jterm_runtime\"\nversion = \"0.1.0\"\nedition = \"2021\"\nrust-version = \"1.89\"\ndescription = \"UI-independent terminal runtime and process helpers\"\nlicense = \"MIT\"\npublish = false\n\n[dependencies]\nlog = \"0.4\"\n\n[dependencies.jterm_engine]\nversion = \"0.1.0\"\npath = \"../jterm_engine\"\noptional = true\n\n[features]\nlinux-pty = [\"terminal\", \"dep:portable-pty\", \"session-actor\"]\nsession-actor = [\"dep:crossbeam-channel\", \"dep:parking_lot\"]\nsession-actor-test-hooks = [\"session-actor\"]\nterminal = [\"dep:jterm_engine\"]\n\n[target.\"cfg(unix)\".dependencies]\nlibc = \"0.2.189\"\n\n[target.\"cfg(unix)\".dependencies.crossbeam-channel]\nversion = \"0.5\"\noptional = true\n\n[target.\"cfg(unix)\".dependencies.parking_lot]\nversion = \"0.12\"\noptional = true\n\n[target.\"cfg(target_os = \\\"linux\\\")\".dependencies.portable-pty]\nversion = \"0.9\"\noptional = true\n\n[workspace]\n",
         "dest": "cargo/vendor/jterm_runtime",
         "dest-filename": "Cargo.toml"
     },
@@ -3192,7 +3192,7 @@
     },
     {
         "type": "inline",
-        "contents": "[source.vendored-sources]\ndirectory = \"cargo/vendor\"\n\n[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.\"https://github.com/beamiter/jcompanion\"]\ngit = \"https://github.com/beamiter/jcompanion\"\nreplace-with = \"vendored-sources\"\nrev = \"9aa569540091524d637a7115b64c587b9177a55b\"\n\n[source.\"https://github.com/beamiter/jagent\"]\ngit = \"https://github.com/beamiter/jagent\"\nreplace-with = \"vendored-sources\"\nrev = \"f269c3c6afafcf9b6d60b3cccd741649fdb74576\"\n\n[source.\"https://github.com/beamiter/jterm_core\"]\ngit = \"https://github.com/beamiter/jterm_core\"\nreplace-with = \"vendored-sources\"\nrev = \"4c2d40d8f84265564354e4938d105a7c11fdb2e1\"\n",
+        "contents": "[source.vendored-sources]\ndirectory = \"cargo/vendor\"\n\n[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.\"https://github.com/beamiter/jcompanion\"]\ngit = \"https://github.com/beamiter/jcompanion\"\nreplace-with = \"vendored-sources\"\nrev = \"9aa569540091524d637a7115b64c587b9177a55b\"\n\n[source.\"https://github.com/beamiter/jagent\"]\ngit = \"https://github.com/beamiter/jagent\"\nreplace-with = \"vendored-sources\"\nrev = \"f269c3c6afafcf9b6d60b3cccd741649fdb74576\"\n\n[source.\"https://github.com/beamiter/jterm_core\"]\ngit = \"https://github.com/beamiter/jterm_core\"\nreplace-with = \"vendored-sources\"\nrev = \"c701f34b5165c72651995c67301977cae461158e\"\n",
         "dest": "cargo",
         "dest-filename": "config"
     }
