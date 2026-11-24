@@ -2024,8 +2024,8 @@ type DynamicColorsRc = Rc<Cell<DynamicColors>>;
 /// live OSC 10/11/12 overrides substituted. Shared by the reader's
 /// block-finished path and `undo_clear_blocks`, so restored blocks cannot end
 /// up theme-colored next to correctly recolored neighbors.
-fn finished_block_config(dynamic: &DynamicColorsRc, config: &Config) -> Config {
-    dynamic.get().overlay(config)
+fn finished_block_config(dynamic: DynamicColors, config: &Config) -> Config {
+    dynamic.overlay(config)
 }
 
 /// Drop every tracked dynamic override. An explicit user theme change repaints
@@ -9931,12 +9931,17 @@ impl RenderBackend for BlockBackend {
         // Snapshot VTEs must match what the live view
         // showed: overlay any dynamic OSC 10/11/12
         // colors onto the theme for this block.
-        let block_config =
-            finished_block_config(&self.dynamic_colors_rc, &self.config_for_cb.borrow());
+        let colors = self.dynamic_colors_rc.get();
+        #[cfg(anvil_shared_terminal)]
+        let colors = self
+            .shared_active
+            .as_ref()
+            .map_or(colors, |terminal| terminal.output_colors());
+        let block_config = finished_block_config(colors, &self.config_for_cb.borrow());
         let mut precomputed = FinishedBlockPrecomputed::documents(
             &block_config,
-            record.command_source == CommandTextSource::ShellReported,
             !output_head_dropped,
+            colors.background,
         );
         precomputed.output_rows = Some(output_rows);
         precomputed.output_preview = Some(fold_preview::from_plain(output_plain));
@@ -16060,7 +16065,7 @@ impl TermView {
                         // virtualized away while it is still visible.
                         block.estimated_height =
                             estimated_finished_block_height_for_text(&config, &block.output, cols);
-                        let finished = FinishedBlock::from_retained(block, &config, cols);
+                        let finished = FinishedBlock::from_retained(block, &config, cols, None);
                         finished.set_lifecycle(
                             block.lifecycle_health(),
                             block.lifecycle_notice().as_deref(),
@@ -17514,7 +17519,8 @@ impl TermView {
             // Rebuild with the same overlay the reader uses for new blocks: if a
             // dynamic OSC 10/11/12 color is active, restored blocks must match
             // the recolored live view instead of reverting to theme colors.
-            let config = finished_block_config(&self.dynamic_colors, &self.config.borrow());
+            let colors = self.finished_snapshot_colors();
+            let config = finished_block_config(colors, &self.config.borrow());
             let fallback_cols =
                 bounded_finished_vte_columns(self.active.borrow().grid_cols() as i64);
             // Everything restored predates the current finished blocks, so the
@@ -17534,7 +17540,8 @@ impl TermView {
                 });
                 block.estimated_height =
                     estimated_finished_block_height_for_text(&config, &block.output, cols);
-                let finished = FinishedBlock::from_retained(block, &config, cols);
+                let finished =
+                    FinishedBlock::from_retained(block, &config, cols, colors.background);
                 finished.set_lifecycle(
                     block.lifecycle_health(),
                     block.lifecycle_notice().as_deref(),
@@ -17742,7 +17749,8 @@ impl TermView {
         let restored_count = plan.restored_positions.len();
         let mut stash: Vec<_> = stash.into_iter().map(|(_, block)| Some(block)).collect();
         {
-            let config = finished_block_config(&self.dynamic_colors, &self.config.borrow());
+            let colors = self.finished_snapshot_colors();
+            let config = finished_block_config(colors, &self.config.borrow());
             let fallback_cols =
                 bounded_finished_vte_columns(self.active.borrow().grid_cols() as i64);
             for (stash_index, at) in plan.restored_positions {
@@ -17756,7 +17764,8 @@ impl TermView {
                 });
                 block.estimated_height =
                     estimated_finished_block_height_for_text(&config, &block.output, cols);
-                let finished = FinishedBlock::from_retained(&block, &config, cols);
+                let finished =
+                    FinishedBlock::from_retained(&block, &config, cols, colors.background);
                 finished.set_lifecycle(
                     block.lifecycle_health(),
                     block.lifecycle_notice().as_deref(),
@@ -18158,6 +18167,14 @@ impl TermView {
         }
     }
 
+    fn finished_snapshot_colors(&self) -> DynamicColors {
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &self.active.borrow().shared_active {
+            return terminal.output_colors();
+        }
+        self.dynamic_colors.get()
+    }
+
     pub fn apply_theme(&self) {
         clear_dynamic_colors(&self.dynamic_colors);
         let config = self.config.borrow();
@@ -18173,6 +18190,7 @@ impl TermView {
             #[cfg(anvil_shared_terminal)]
             if let Some(command) = &block.command_document {
                 command.set_colors(config.foreground, &config.palette);
+                command.set_background(None);
             }
             if let Some(terminal) = &block.output_vte {
                 apply_snapshot_theme_to_vte(terminal, &config);
@@ -18180,6 +18198,7 @@ impl TermView {
             #[cfg(anvil_shared_terminal)]
             if let Some(output) = &block.output_document {
                 output.text().set_colors(config.foreground, &config.palette);
+                output.text().set_background(None);
             }
         }
         install_block_css(&config);
@@ -27092,14 +27111,14 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             (ColorKind::Background, "#102030"),
             (ColorKind::Cursor, "rgb:ff/80/00"),
         ]);
-        let rebuilt = finished_block_config(&dynamic, &config);
+        let rebuilt = finished_block_config(dynamic.get(), &config);
         assert_eq!(rebuilt.background, parse_color_spec("#102030").unwrap());
         assert_eq!(rebuilt.cursor, parse_color_spec("rgb:ff/80/00").unwrap());
         // Untouched slots stay on the theme.
         assert_eq!(rebuilt.foreground, config.foreground);
 
         // With nothing tracked the rebuild is the plain theme again.
-        let plain = finished_block_config(&Rc::new(Cell::new(DynamicColors::default())), &config);
+        let plain = finished_block_config(DynamicColors::default(), &config);
         assert_eq!(plain.background, config.background);
         assert_eq!(plain.cursor, config.cursor);
     }
@@ -27132,7 +27151,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
                 build_color_query_reply(&config, DynamicColors::default(), kind)
             );
         }
-        let rebuilt = finished_block_config(&dynamic, &config);
+        let rebuilt = finished_block_config(dynamic.get(), &config);
         assert_eq!(rebuilt.background, config.background);
         assert_eq!(rebuilt.foreground, config.foreground);
         assert_eq!(rebuilt.cursor, config.cursor);

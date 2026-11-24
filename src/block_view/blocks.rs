@@ -1471,7 +1471,7 @@ mod tests {
                 std::slice::from_ref(&texture),
                 caption.len(),
                 None,
-                super::FinishedBlockPrecomputed::documents(&config, true, true),
+                super::FinishedBlockPrecomputed::documents(&config, true, None),
             );
             let output = card.output_surface();
             assert_eq!(output.document_text().as_deref(), expected);
@@ -3822,16 +3822,20 @@ pub(crate) struct FinishedBlockPrecomputed {
     #[cfg(anvil_shared_terminal)]
     pub(crate) document_output: bool,
     #[cfg(anvil_shared_terminal)]
-    document_output_with_native_command: bool,
+    document_background: Option<RGBA>,
     pub(crate) output_preview: Option<String>,
     pub(crate) output_rows: Option<i64>,
     pub(crate) retained_bytes: Option<usize>,
 }
 
 impl FinishedBlockPrecomputed {
-    pub(super) fn documents(config: &Config, exact_command: bool, complete_output: bool) -> Self {
+    pub(super) fn documents(
+        config: &Config,
+        complete_output: bool,
+        background: Option<RGBA>,
+    ) -> Self {
         #[cfg(not(anvil_shared_terminal))]
-        let _ = (config, exact_command, complete_output);
+        let _ = (config, complete_output, background);
         #[cfg(anvil_shared_terminal)]
         let foreground_documents = matches!(
             config.terminal_mode,
@@ -3840,13 +3844,13 @@ impl FinishedBlockPrecomputed {
             .is_none_or(|value| value == "1");
         Self {
             #[cfg(anvil_shared_terminal)]
-            document_command: exact_command && foreground_documents,
+            document_command: foreground_documents,
             #[cfg(anvil_shared_terminal)]
             document_output: complete_output
                 && std::env::var_os("JTERM_SHARED_FINISHED_OUTPUT")
                     .is_none_or(|value| value == "1"),
             #[cfg(anvil_shared_terminal)]
-            document_output_with_native_command: foreground_documents,
+            document_background: background,
             ..Self::default()
         }
     }
@@ -4386,7 +4390,12 @@ impl FinishedBlock {
         }
     }
 
-    pub(super) fn from_retained(block: &BlockData, config: &Config, cols: i64) -> Self {
+    pub(super) fn from_retained(
+        block: &BlockData,
+        config: &Config,
+        cols: i64,
+        background: Option<RGBA>,
+    ) -> Self {
         Self::new_with_pool(
             block.id,
             &block.prompt,
@@ -4402,11 +4411,7 @@ impl FinishedBlock {
             &[],
             block.output.len(),
             None,
-            FinishedBlockPrecomputed::documents(
-                config,
-                block.command_exact && !block.command_truncated,
-                !block.output_head_dropped,
-            ),
+            FinishedBlockPrecomputed::documents(config, !block.output_head_dropped, background),
         )
     }
 
@@ -4914,21 +4919,39 @@ impl FinishedBlock {
         // after the wrapped feed and discard its prefix before the command's
         // own settling pass expands it again (notably with the 12px default).
         #[cfg(anvil_shared_terminal)]
-        let command_document = if precomputed.document_command && cmd_ansi.is_none() {
-            jterm_gtk_view::FinishedTextView::command(
-                cmd,
-                cmd_bytes.as_slice(),
-                crate::font::terminal_font_description(&config.font_desc, config),
-                config.default_font_scale,
-                config.foreground,
-                &config.palette,
-            )
-            .inspect(|command| {
-                command.install_links(crate::shared_terminal::SharedTerminal::links())
-            })
-        } else {
-            None
-        };
+        let command_document =
+            if precomputed.document_command && jterm_gtk_view::supports_finished_command(cmd) {
+                let font = crate::font::terminal_font_description(&config.font_desc, config);
+                let command = match cmd_ansi.filter(|markup| !markup.is_empty()) {
+                    Some(markup) => {
+                        jterm_core::screen_replay::project_bounded_command_archive(markup, cmd)
+                            .and_then(|archive| {
+                                jterm_gtk_view::FinishedTextView::archived_command(
+                                    cmd,
+                                    &archive,
+                                    font,
+                                    config.default_font_scale,
+                                    config.foreground,
+                                    &config.palette,
+                                )
+                            })
+                    }
+                    None => jterm_gtk_view::FinishedTextView::command(
+                        cmd,
+                        cmd_bytes.as_slice(),
+                        font,
+                        config.default_font_scale,
+                        config.foreground,
+                        &config.palette,
+                    ),
+                };
+                command.inspect(|command| {
+                    command.set_background(precomputed.document_background.filter(|_| !chat));
+                    command.install_links(crate::shared_terminal::SharedTerminal::links());
+                })
+            } else {
+                None
+            };
         #[cfg(anvil_shared_terminal)]
         let uses_command_vte = !is_background && command_document.is_none();
         #[cfg(not(anvil_shared_terminal))]
@@ -4997,9 +5020,7 @@ impl FinishedBlock {
         let initial_visible_rows = output_rows.min(viewport_cap).clamp(1, 32);
         #[cfg(anvil_shared_terminal)]
         let output_document = if precomputed.document_output
-            && (command_document.is_some()
-                || is_background
-                || precomputed.document_output_with_native_command)
+            && (precomputed.document_command || is_background)
         {
             jterm_core::screen_replay::project_bounded_archive(output).map(|document| {
                 let output = jterm_gtk_view::FinishedTextView::output(
@@ -5014,6 +5035,7 @@ impl FinishedBlock {
                         .widget()
                         .update_property(&[gtk::accessible::Property::Label("Background output")]);
                 }
+                output.set_background(precomputed.document_background.filter(|_| !chat));
                 output.install_links(crate::shared_terminal::SharedTerminal::links());
                 jterm_gtk_view::FinishedOutputView::new(output, viewport_cap, max_expanded_cap)
             })
