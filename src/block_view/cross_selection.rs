@@ -1248,12 +1248,31 @@ mod tests {
         let (card_id, command, output, second) = {
             let finished = view.finished_blocks.borrow();
             assert_eq!(finished.len(), 4);
-            assert!(
-                finished[1].command_vte.is_some() && finished[1].command_document.is_none(),
-                "the command captured from the screen still uses VTE"
-            );
+            assert!(finished[1].command_vte.is_none());
             let captured = finished[1].cmd_text.as_str();
             assert_eq!(captured.strip_prefix("$ ").unwrap_or(captured), "echo link");
+            assert_eq!(
+                finished[1]
+                    .command_surface()
+                    .unwrap()
+                    .document_text()
+                    .as_deref(),
+                Some(captured)
+            );
+            let records = view.block_data.borrow();
+            let record = &records[1];
+            assert_eq!(
+                super::super::failed_block_retry_disabled_reason(
+                    false,
+                    &record.cmd,
+                    record.command_exact,
+                    record.command_truncated,
+                    None,
+                    None,
+                    None,
+                ),
+                Some("The shell did not provide exact command metadata")
+            );
             assert!(finished[3].command_vte.is_none());
             let multiline = finished[3]
                 .command_document
@@ -1445,6 +1464,19 @@ mod tests {
             assert_eq!(copied, "mixed-output");
             view.clear_find();
         }
+        assert!(matches!(
+            view.find_in_blocks("echo link", false, true),
+            FindSearchResult::Matches(progress) if progress.total == 1
+        ));
+        settle();
+        view.copy_to_clipboard();
+        let copied = gtk::glib::MainContext::default()
+            .block_on(window.clipboard().read_text_future())
+            .unwrap()
+            .unwrap();
+        assert_eq!(copied, "echo link");
+        view.clear_find();
+
         let cross = &view.cross_selection;
         let surfaces = cross.ordered_vtes();
         let first = TerminalTextSurface::Document(command);
@@ -1457,7 +1489,7 @@ mod tests {
             .expect("selected first card output");
         let inferred_command = copied
             .find("echo link")
-            .unwrap_or_else(|| panic!("native command missing from {copied:?}"));
+            .unwrap_or_else(|| panic!("captured command missing from {copied:?}"));
         let following = copied
             .find("https://example.test/mixed-output")
             .expect("selected next card output");
@@ -1471,7 +1503,8 @@ mod tests {
             settle();
             let finished = view.finished_blocks.borrow();
             assert!(finished[0].command_document.is_some());
-            assert!(finished[1].command_vte.is_some());
+            assert!(finished[1].command_document.is_some());
+            assert!(!view.block_data.borrow()[1].command_exact);
             assert_eq!(
                 finished[1].output_surface().document_text().as_deref(),
                 Some("https://example.test/mixed-output")
@@ -1560,6 +1593,33 @@ mod tests {
             settle();
             assert!(adjustment.page_size() > height);
         }
+        let mut retained = view.block_data.borrow()[1].clone();
+        retained.command_truncated = true;
+        retained.cmd_markup = Some(format!("\x1b[38;2;33;77;121m{}\x1b[0m", retained.cmd));
+        let config = view.config.borrow().clone();
+        let restored = super::super::FinishedBlock::from_retained(&retained, &config, 80, None);
+        assert!(restored.command_vte.is_none());
+        let document = restored
+            .command_document
+            .as_ref()
+            .expect("matching archived command");
+        let buffer = document.widget().buffer();
+        assert_eq!(
+            buffer.text(&buffer.start_iter(), &buffer.end_iter(), true),
+            retained.cmd
+        );
+        assert!(!document.widget().is_editable());
+        let color = gtk::gdk::RGBA::new(33.0 / 255.0, 77.0 / 255.0, 121.0 / 255.0, 1.0);
+        assert!(buffer
+            .start_iter()
+            .tags()
+            .iter()
+            .any(|tag| tag.foreground_rgba() == Some(color)));
+
+        retained.cmd_markup = Some("\x1b[32ma different title\x1b[0m".into());
+        let fallback = super::super::FinishedBlock::from_retained(&retained, &config, 80, None);
+        assert!(fallback.command_vte.is_some());
+        assert_eq!(fallback.output_vte.is_none(), document_output);
         window.close();
     }
 

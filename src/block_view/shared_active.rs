@@ -1,4 +1,4 @@
-use super::{OwnedPty, SelectionFeedHold, SubmissionSurface};
+use super::{DynamicColors, OwnedPty, SelectionFeedHold, SubmissionSurface};
 use crate::{config::Config, shared_terminal::SharedTerminal};
 use gtk::prelude::*;
 use jterm_gtk_view::{
@@ -207,6 +207,27 @@ impl SharedActiveTerminal {
 
     pub(super) fn embedded(&self) -> &EmbeddedTerminal<Transport> {
         &self.terminal
+    }
+
+    pub(super) fn output_colors(&self) -> DynamicColors {
+        let rgba = |(red, green, blue)| {
+            gtk::gdk::RGBA::new(
+                f32::from(red) / 255.0,
+                f32::from(green) / 255.0,
+                f32::from(blue) / 255.0,
+                1.0,
+            )
+        };
+        self.terminal.inspect(|terminal| {
+            let Some((_, colors)) = terminal.paint_colors() else {
+                return DynamicColors::default();
+            };
+            DynamicColors {
+                foreground: colors.foreground_override().map(rgba),
+                background: colors.background_override().map(rgba),
+                cursor: None,
+            }
+        })
     }
 
     pub(super) fn output(&self) -> &Rc<ActiveTerminalOutput> {
