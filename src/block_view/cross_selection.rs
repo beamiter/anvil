@@ -12,9 +12,8 @@
 //! PRIMARY; repeated native `select_all()` calls would clear earlier owners.
 //!
 //! Single-block drags are untouched: the controller installs in the Capture
-//! phase but only claims the gesture once the pointer leaves the block where
-//! the drag started, so VTE's native per-cell selection still owns the common
-//! case.
+//! phase and consumes motion after the pointer crosses a surface boundary.
+//! The underlying widget owns per-cell selection within one surface.
 
 use relm4::gtk;
 
@@ -255,135 +254,119 @@ impl CrossSelection {
             }
         });
 
-        // A native selection starts a new selection model. Clear stale text
-        // selections on other surfaces and any whole-card selection first.
-        let click = gtk::GestureClick::new();
-        click.set_button(gtk::gdk::BUTTON_PRIMARY);
-        click.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let scroll_for_click = block_scroll.downgrade();
-        let this_for_click = Rc::downgrade(&this);
-        click.connect_pressed(move |gesture, _n_press, x, y| {
-            let (Some(this), Some(scroll)) = (this_for_click.upgrade(), scroll_for_click.upgrade())
-            else {
-                return;
-            };
-            // A Chat command button must capture the displayed/pressed command
-            // before releasing a selected live feed. Ancestor capture runs first;
-            // clearing selection here could replay old-D/new-A/B/new-C and make
-            // the button accidentally target the new foreground command.
-            if chat_command_control_at(&scroll, x, y) {
-                gesture.set_state(gtk::EventSequenceState::Denied);
-                return;
-            }
-            let target = this.vte_at(&scroll, x, y);
-            if target.is_some() {
-                this.clear_block_selection();
-            }
-            this.clear_other_selections(target.as_ref());
-            // Preserve VTE ownership of cell/word/line selection.
-            gesture.set_state(gtk::EventSequenceState::Denied);
-        });
-        block_scroll.add_controller(click);
-
-        let drag = gtk::GestureDrag::new();
-        drag.set_button(gtk::gdk::BUTTON_PRIMARY);
+        // Native terminals and GtkTextView claim their own drag gestures.
+        // Observe the pointer in capture so a claimed child gesture can
+        // still cross into another surface.
+        let drag = gtk::EventControllerLegacy::new();
         drag.set_propagation_phase(gtk::PropagationPhase::Capture);
-
-        let scroll_for_begin = block_scroll.downgrade();
-        let this_for_begin = Rc::downgrade(&this);
-        drag.connect_drag_begin(move |gesture, x, y| {
-            let (Some(this), Some(scroll)) = (this_for_begin.upgrade(), scroll_for_begin.upgrade())
-            else {
-                return;
+        let root = block_scroll.downgrade();
+        let owner = Rc::downgrade(&this);
+        drag.connect_event(move |_, event| {
+            let (Some(owner), Some(root)) = (owner.upgrade(), root.upgrade()) else {
+                return gtk::glib::Propagation::Proceed;
             };
-            this.drag_generation
-                .set(this.drag_generation.get().wrapping_add(1));
-            if chat_command_control_at(&scroll, x, y) {
-                gesture.set_state(gtk::EventSequenceState::Denied);
-                return;
-            }
-            let start = this.vte_at(&scroll, x, y);
-            if start.as_ref() == Some(&this.active_surface)
-                && this.mouse_reporting.get().is_tracking()
-                && !shift_held(gesture)
-            {
-                this.start_vte.borrow_mut().take();
-                gesture.set_state(gtk::EventSequenceState::Denied);
-                return;
-            }
-            *this.start_vte.borrow_mut() =
-                start.as_ref().map(|surface| surface.widget().downgrade());
-            this.claimed.set(false);
-            if let Some(start) = start {
-                this.clear_block_selection();
-                this.clear_other_selections(Some(&start));
-                this.maybe_hold_active_feed(Some(&start), shift_held(gesture));
-            }
+            owner.track_drag(&root, event).into()
         });
-
-        let scroll_for_update = block_scroll.downgrade();
-        let this_for_update = Rc::downgrade(&this);
-        drag.connect_drag_update(move |gesture, dx, dy| {
-            let (Some(this), Some(scroll)) =
-                (this_for_update.upgrade(), scroll_for_update.upgrade())
-            else {
-                return;
-            };
-            let Some(origin) = this.start_vte.borrow().clone() else {
-                return;
-            };
-            let Some(start_vte) = origin.upgrade().and_then(TerminalTextSurface::from_widget)
-            else {
-                this.cancel_drag_selection();
-                return;
-            };
-            let Some((sx, sy)) = gesture.start_point() else {
-                return;
-            };
-            let Some(current_vte) = this.vte_at(&scroll, sx + dx, sy + dy) else {
-                return;
-            };
-            let vtes = this.ordered_vtes();
-            let Some((start, cur_idx)) = drag_surface_indices(&vtes, &start_vte, &current_vte)
-            else {
-                // The origin was folded, virtualized or evicted. Never apply
-                // its old index to an unrelated surface.
-                this.cancel_drag_selection();
-                return;
-            };
-            if cur_idx == start && !this.claimed.get() {
-                // Still within the original widget — let VTE's native gesture
-                // own the per-cell selection.
-                return;
-            }
-            // Crossed a boundary: one owner marks the covered surfaces without
-            // competing for VTE's shared PRIMARY selection.
-            gesture.set_state(gtk::EventSequenceState::Claimed);
-            this.claimed.set(true);
-            this.paint_range(&vtes, start, cur_idx);
-            this.maybe_hold_active_feed(vtes.get(start.max(cur_idx)), shift_held(gesture));
-        });
-
-        let this_for_end = Rc::downgrade(&this);
-        drag.connect_drag_end(move |_, _, _| {
-            if let Some(this) = this_for_end.upgrade() {
-                this.start_vte.borrow_mut().take();
-                this.end_active_feed_hold();
-            }
-            // Leave `claimed` and the painted selections in place so the user
-            // can copy with Ctrl+Shift+C after releasing.
-        });
-
-        let this_for_cancel = Rc::downgrade(&this);
-        drag.connect_cancel(move |_, _| {
-            if let Some(this) = this_for_cancel.upgrade() {
-                this.start_vte.borrow_mut().take();
-                this.end_active_feed_hold();
-            }
-        });
-
         block_scroll.add_controller(drag);
         this
+    }
+
+    fn track_drag(self: &Rc<Self>, root: &gtk::Widget, event: &gtk::gdk::Event) -> bool {
+        use gtk::gdk::{ButtonEvent, EventType, ModifierType, TouchEvent, BUTTON_PRIMARY};
+
+        let state = event.modifier_state();
+        let shift_held = state.contains(ModifierType::SHIFT_MASK);
+        let primary = || {
+            event
+                .downcast_ref::<ButtonEvent>()
+                .is_some_and(|event| event.button() == BUTTON_PRIMARY)
+        };
+        let pointer_touch = || {
+            event
+                .downcast_ref::<TouchEvent>()
+                .is_some_and(TouchEvent::is_emulating_pointer)
+        };
+        let point = || event_point(root, event);
+        match event.event_type() {
+            EventType::ButtonPress if primary() => {
+                if let Some((x, y)) = point() {
+                    self.begin_drag(root, x, y, shift_held);
+                }
+            }
+            EventType::TouchBegin if pointer_touch() => {
+                if let Some((x, y)) = point() {
+                    self.begin_drag(root, x, y, shift_held);
+                }
+            }
+            EventType::MotionNotify if state.contains(ModifierType::BUTTON1_MASK) => {
+                return point().is_some_and(|(x, y)| self.drag_to(root, x, y, shift_held));
+            }
+            EventType::TouchUpdate if pointer_touch() => {
+                return point().is_some_and(|(x, y)| self.drag_to(root, x, y, shift_held));
+            }
+            EventType::ButtonRelease if primary() => self.finish_drag(),
+            EventType::TouchEnd if pointer_touch() => self.finish_drag(),
+            EventType::GrabBroken => self.finish_drag(),
+            EventType::TouchCancel if pointer_touch() => self.finish_drag(),
+            _ => {}
+        }
+        false
+    }
+
+    fn begin_drag(&self, root: &gtk::Widget, x: f64, y: f64, shift_held: bool) {
+        self.drag_generation
+            .set(self.drag_generation.get().wrapping_add(1));
+        self.start_vte.borrow_mut().take();
+        self.claimed.set(false);
+        // A Chat command control captures the pressed command before
+        // releasing any held output.
+        if chat_command_control_at(root, x, y) {
+            return;
+        }
+        let target = self.vte_at(root, x, y);
+        if target.is_some() {
+            self.clear_block_selection();
+        }
+        self.clear_other_selections(target.as_ref());
+        let Some(start) = target else { return };
+        if start == self.active_surface && self.mouse_reporting.get().is_tracking() && !shift_held {
+            return;
+        }
+        self.start_vte.replace(Some(start.widget().downgrade()));
+        self.maybe_hold_active_feed(Some(&start), shift_held);
+    }
+
+    fn drag_to(self: &Rc<Self>, root: &gtk::Widget, x: f64, y: f64, shift_held: bool) -> bool {
+        let Some(origin) = self.start_vte.borrow().clone() else {
+            return false;
+        };
+        let Some(start_vte) = origin.upgrade().and_then(TerminalTextSurface::from_widget) else {
+            self.cancel_drag_selection();
+            return false;
+        };
+        let Some(current_vte) = self.vte_at(root, x, y) else {
+            return self.claimed.get();
+        };
+        let vtes = self.ordered_vtes();
+        let Some((start, current)) = drag_surface_indices(&vtes, &start_vte, &current_vte) else {
+            self.cancel_drag_selection();
+            return false;
+        };
+        if current == start && !self.claimed.get() {
+            return false;
+        }
+        self.claimed.set(true);
+        self.paint_range(&vtes, start, current);
+        self.maybe_hold_active_feed(vtes.get(start.max(current)), shift_held);
+        true
+    }
+
+    fn finish_drag(self: &Rc<Self>) {
+        if self.start_vte.borrow_mut().take().is_some() {
+            // Let GTK finalize any native selection on release before
+            // deciding whether to resume the held output.
+            self.end_active_feed_hold();
+        }
     }
 
     fn cancel_drag_selection(self: &Rc<Self>) {
@@ -779,10 +762,21 @@ fn drag_surface_indices<T: PartialEq>(
     ))
 }
 
-fn shift_held(gesture: &gtk::GestureDrag) -> bool {
-    gesture
-        .current_event_state()
-        .contains(gtk::gdk::ModifierType::SHIFT_MASK)
+fn event_point(widget: &gtk::Widget, event: &gtk::gdk::Event) -> Option<(f64, f64)> {
+    let (x, y) = event.position()?;
+    let native = widget.native()?;
+    if event.surface() != native.surface() {
+        return None;
+    }
+    let (dx, dy) = native.surface_transform();
+    native
+        .dynamic_cast::<gtk::Widget>()
+        .ok()?
+        .compute_point(
+            widget,
+            &gtk::graphene::Point::new((x - dx) as f32, (y - dy) as f32),
+        )
+        .map(|point| (f64::from(point.x()), f64::from(point.y())))
 }
 
 // The command control captures its identity before its own feed release.
@@ -856,7 +850,7 @@ mod tests {
 
         gtk::init().expect("GTK display");
         for name in ["JTERM_SHARED_ACTIVE_TERMINAL", "JTERM_SHARED_TRANSCRIPT"] {
-            assert_eq!(std::env::var(name).as_deref(), Ok("1"));
+            assert!(std::env::var_os(name).is_none(), "test the default route");
         }
         crate::child_env::capture_inherited_environment().expect("test child environment");
         let shell = r#"
@@ -1247,7 +1241,7 @@ mod tests {
         settle();
         view.pty.emit_test_output(b"echo color\r\n\x1b]133;C;cmdline_url=echo%20color\x07\x1b[5mblinking text\x1b[0m\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
         settle();
-        view.pty.emit_test_output(b"echo https://example.test\r\n\x1b]133;C;cmdline_url=echo%20https%3A%2F%2Fexample.test\x07ordinary text\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        view.pty.emit_test_output(b"echo https://example.test\r\n./src/file.rs\r\n\x1b]133;C;cmdline_url=echo%20https%3A%2F%2Fexample.test%0A.%2Fsrc%2Ffile.rs\x07ordinary text\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
         settle();
         let (card_id, command, output, second) = {
             let finished = view.finished_blocks.borrow();
@@ -1256,9 +1250,16 @@ mod tests {
                 finished[1].command_document.is_some(),
                 "URL checks the output gate"
             );
-            assert!(
-                finished[3].command_vte.is_some(),
-                "URL in a command stays on VTE"
+            assert!(finished[3].command_vte.is_none());
+            let multiline = finished[3]
+                .command_document
+                .as_ref()
+                .expect("shared command with a URL and a path")
+                .widget()
+                .buffer();
+            assert_eq!(
+                multiline.text(&multiline.start_iter(), &multiline.end_iter(), false),
+                "echo https://example.test\n./src/file.rs"
             );
             assert!(
                 finished[2].output_vte.is_some(),
@@ -1450,7 +1451,7 @@ mod tests {
                 finished[1].output_surface().document_text().as_deref(),
                 Some("https://example.test")
             );
-            assert!(finished[3].command_vte.is_some());
+            assert!(finished[3].command_document.is_some());
             drop(finished);
             assert!(matches!(
                 view.find_in_blocks("findbody marker", false, true),

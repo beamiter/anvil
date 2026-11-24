@@ -1,10 +1,10 @@
 {
   "repository": "https://github.com/beamiter/jterm_core.git",
-  "revision": "35c5253dcf16fc787e96dcafb9a2a242b04ab51e",
-  "tree": "b2f2f360d41cd6b38ee2ee9e4a1710cc37c70003",
-  "source_nar_sha256": "sha256-m68+1cZPTL4KKx/OR8r5PlyhBwTMdanb7edMOCyN6UU=",
-  "publication_verified_at": "2026-11-24T01:31:53Z",
-  "publication_url": "https://github.com/beamiter/jterm_core/commit/35c5253dcf16fc787e96dcafb9a2a242b04ab51e",
+  "revision": "a9b16e5786c7138e1a5bcf5757c44689a74aa1ed",
+  "tree": "0bd7dcac05e932a46f984136bd3d55fad282d4a9",
+  "source_nar_sha256": "sha256-8q0Fwa/2tZDGghF2JUOJSLN1ceNnIQbLyM5evulHNys=",
+  "publication_verified_at": "2026-11-24T02:39:37Z",
+  "publication_url": "https://github.com/beamiter/jterm_core/commit/a9b16e5786c7138e1a5bcf5757c44689a74aa1ed",
   "source_policy": "Cargo, Nix and Flatpak use this exact published Git source. Older audit archives retain their historical identity and are not production build inputs.",
   "nar_verification": "Canonical Git-tree NAR serialization reproduced the previous production hash before computing this revision. The commit was verified against the public Git master ref."
 }

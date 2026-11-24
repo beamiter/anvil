@@ -873,9 +873,9 @@ impl Config {
     /// Normalize the workspace presentation without overwriting the user's
     /// saved navigation visibility. A hidden sidebar must stay hidden across
     /// startup and a later unrelated configuration save.
-    pub(crate) fn prepare_workspace_startup(&mut self, safe_mode: bool, shared_shell: bool) {
+    pub(crate) fn prepare_workspace_startup(&mut self, safe_mode: bool, ordinary_shell: bool) {
         let preference = self.terminal_mode_for_save();
-        self.terminal_mode = if !safe_mode && !shared_shell {
+        self.terminal_mode = if !safe_mode && !ordinary_shell {
             preference.workspace_backend()
         } else {
             preference

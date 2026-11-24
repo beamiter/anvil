@@ -1024,11 +1024,11 @@ impl SimpleComponent for AppModel {
             Rc::new(choose_shell_argv(config.shell.as_deref()))
         };
         #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
-        let shared_shell = init.execute.is_none()
-            && jterm_gtk_view::RuntimeShell::admits_candidate(&shell_argv, host::is_flatpak());
+        let ordinary_shell = init.execute.is_none()
+            && jterm_gtk_view::RuntimeShell::supports_local_shell(&shell_argv, host::is_flatpak());
         #[cfg(not(all(anvil_shared_terminal, target_os = "linux")))]
-        let shared_shell = false;
-        config.prepare_workspace_startup(init.safe_mode, shared_shell);
+        let ordinary_shell = false;
+        config.prepare_workspace_startup(init.safe_mode, ordinary_shell);
         let startup = config.startup_commands.clone();
         let requested_cwd = init.working_directory.as_ref().map(|path| {
             path.to_str()

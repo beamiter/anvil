@@ -86,6 +86,13 @@ jobs:
             --output "$RUNNER_TEMP/shared-terminal-wayland/hidpi" \
             --ime-client "$fixture_dir/clients/native-ime-client" \
             --pointer-client "$fixture_dir/clients/native-pointer"
+          for mode in block chat unified; do
+            dbus-run-session -- /usr/bin/python3 -B "$core/crates/jterm_gtk_view/tests/native_wayland.py" \
+              anvil target/release/anvil --structured-pane "$mode" --keyboard-disambiguation \
+              --output "$RUNNER_TEMP/shared-terminal-wayland/$mode" \
+              --ime-client "$fixture_dir/clients/native-ime-client" \
+              --pointer-client "$fixture_dir/clients/native-pointer"
+          done
           for display in native compatibility; do
             dbus-run-session -- /usr/bin/python3 -B "$core/crates/jterm_gtk_view/tests/native_wayland.py" \
               anvil target/release/anvil --vim9 "$display" \
@@ -118,13 +125,23 @@ jobs:
           dbus-run-session -- xvfb-run -a --server-args='-screen 0 1440x1100x24 -nolisten tcp' \
             /usr/bin/python3 -B "$core/crates/jterm_gtk_view/tests/native_colors.py" \
             anvil target/release/anvil
-      - name: Verify shared PTY ownership, device replies and child cleanup
+      - name: Verify default and rollback PTY ownership, replies and cleanup
         if: ${{ !cancelled() }}
         run: |
           core=$(python3 scripts/shared-core-path.py)
           dbus-run-session -- xvfb-run -a --server-args='-screen 0 1440x1100x24 -nolisten tcp' \
             /usr/bin/python3 -B "$core/crates/jterm_gtk_view/tests/native_prepared_pty.py" \
             anvil target/release/anvil
+      - name: Verify a default ordinary jsh session and explicit VTE rollback
+        if: ${{ !cancelled() }}
+        run: |
+          core=$(python3 scripts/shared-core-path.py)
+          cargo install --locked --debug --git https://github.com/beamiter/jsh.git \
+            --rev 295fc912ef22da4d864b79a549cd01b0b27c3d84 \
+            --root "$RUNNER_TEMP/shared-terminal-jsh" jsh
+          dbus-run-session -- xvfb-run -a --server-args='-screen 0 1440x1100x24 -nolisten tcp' \
+            /usr/bin/python3 -B "$core/crates/jterm_gtk_view/tests/native_jsh.py" \
+            anvil target/release/anvil --jsh "$RUNNER_TEMP/shared-terminal-jsh/bin/jsh"
       - name: Preserve native protocol and fixture logs
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9

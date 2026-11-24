@@ -12693,14 +12693,17 @@ impl TermView {
         )
     }
 
-    #[cfg(anvil_shared_terminal)]
+    #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
     fn shared_active_requested(mode: &crate::config::TerminalMode) -> bool {
-        (matches!(
-            mode,
-            crate::config::TerminalMode::Block | crate::config::TerminalMode::Chat
-        ) && std::env::var_os("JTERM_SHARED_ACTIVE_TERMINAL").is_some_and(|value| value == "1"))
-            || (mode.is_unified()
-                && std::env::var_os("JTERM_SHARED_TRANSCRIPT").is_some_and(|value| value == "1"))
+        use crate::config::TerminalMode;
+
+        let override_name = match mode {
+            TerminalMode::Block | TerminalMode::Chat => "JTERM_SHARED_ACTIVE_TERMINAL",
+            TerminalMode::Unified => "JTERM_SHARED_TRANSCRIPT",
+            TerminalMode::Vte => return false,
+        };
+        std::env::var_os(override_name)
+            .map_or_else(|| !crate::host::is_flatpak(), |value| value == "1")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -12729,8 +12732,6 @@ impl TermView {
         // existing live clip: the VTE, PTY and submission authority stay owned
         // by this pane throughout prompt, command and native-app transitions.
         let docked_input = chat_mode || block_mode;
-        #[cfg(anvil_shared_terminal)]
-        let shared_active_requested = Self::shared_active_requested(mode);
 
         ime_gate::install();
         // ── Build widget tree ──────────────────────────────────────────────
@@ -12756,12 +12757,6 @@ impl TermView {
         block_scroll.set_hexpand(true);
         block_scroll.set_vexpand(true);
         block_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
-        #[cfg(anvil_shared_terminal)]
-        if shared_active_requested && mode.is_unified() {
-            // The transcript owns scrolling. External keeps the viewport
-            // free to shrink when its toolbar returns after alternate screen.
-            block_scroll.set_policy(gtk::PolicyType::External, gtk::PolicyType::External);
-        }
         block_scroll.set_child(Some(&block_list));
         block_scroll.add_css_class("block-scroll");
         // A focusable ScrolledWindow steals keyboard focus from the live VTE
@@ -13227,14 +13222,14 @@ impl TermView {
             }
         }
 
-        #[cfg(anvil_shared_terminal)]
-        if shared_active_requested {
-            env_extra.extend(jterm_gtk_view::INTERACTIVE_CHILD_ENV);
-        }
-
         let pty = Rc::new(spawn(&argv, cwd, &env_extra, request_shell_token)?);
         #[cfg(anvil_shared_terminal)]
-        let shared_active = if shared_active_requested {
+        let shared_active = if pty.uses_shared_session() {
+            if mode.is_unified() {
+                // The transcript owns scrolling. External keeps the viewport
+                // free to shrink when its toolbar returns after alternate screen.
+                block_scroll.set_policy(gtk::PolicyType::External, gtk::PolicyType::External);
+            }
             let terminal =
                 SharedActiveTerminal::new(config, pty.clone()).map_err(std::io::Error::other)?;
             active.borrow_mut().mount_shared(terminal.clone());

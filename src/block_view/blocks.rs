@@ -4847,6 +4847,9 @@ impl FinishedBlock {
                 config.foreground,
                 &config.palette,
             )
+            .inspect(|command| {
+                command.install_links(crate::shared_terminal::SharedTerminal::links())
+            })
         } else {
             None
         };

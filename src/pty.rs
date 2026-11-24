@@ -926,7 +926,21 @@ impl OwnedPty {
         env_extra: &[(&str, &str)],
         enable_shell_token: bool,
     ) -> io::Result<Self> {
-        Self::spawn_inner(argv, cwd, env_extra, enable_shell_token, true)
+        let mut environment = env_extra.to_vec();
+        environment.extend(jterm_gtk_view::INTERACTIVE_CHILD_ENV);
+        Self::spawn_inner(argv, cwd, &environment, enable_shell_token, true)
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    pub(crate) fn uses_shared_session(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.shared_session.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
     }
 
     fn spawn_inner(

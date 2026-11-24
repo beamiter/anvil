@@ -286,6 +286,14 @@ The command preserves the replaced live file as `config.toml.before-restore`.
 
 ## Terminal modes
 
+Native Linux packages built with `shared-terminal` default to the shared
+terminal for new Block, Chat, and Unified panes. Each pane keeps its PTY,
+renderer, and input method for its lifetime. To start with VTE, quit Anvil and
+set `JTERM_SHARED_ACTIVE_TERMINAL=0` for Block and Chat or
+`JTERM_SHARED_TRANSCRIPT=0` for Unified. Ordinary panes with supported local
+shells use `JTERM_SHARED_RUNTIME=0` to select VTE. Flatpak host shells use the
+compatibility path.
+
 Chat mode is an independent opt-in presentation with right command capsules,
 wide result cards, and a bottom-docked live shell. Select `--mode chat` or
 `terminal_mode = "chat"`; see [Chat mode](docs/chat-mode.md). It applies to
