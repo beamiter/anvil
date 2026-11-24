@@ -156,6 +156,29 @@ impl SharedTerminal {
     }
 
     #[cfg(target_os = "linux")]
+    pub(crate) fn open_explicit(
+        config: Rc<RefCell<Config>>,
+        argv: &[String],
+        cwd: Option<&str>,
+    ) -> Option<Self> {
+        let home = std::env::var("HOME").ok();
+        let launch = crate::agent_cli::inline_argv(argv);
+        let result = RuntimeShell::spawn_explicit_command(
+            &launch,
+            cwd.or(home.as_deref()),
+            crate::host::is_flatpak(),
+            || {
+                Self::runtime_environment(
+                    argv,
+                    config.borrow().vim9.auto_gui,
+                    &jterm_gtk_view::INTERACTIVE_CHILD_ENV,
+                )
+            },
+        );
+        Self::from_runtime(config, &launch, result, false)
+    }
+
+    #[cfg(target_os = "linux")]
     fn from_runtime(
         config: Rc<RefCell<Config>>,
         argv: &[String],

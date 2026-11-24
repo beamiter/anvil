@@ -20,14 +20,17 @@ pub(crate) struct TaskTerminalIdentity {
 }
 
 enum CommandTab {
+    Explicit,
     Helper(String),
     HostedAttachment(String),
+    Task(String),
 }
 
 impl CommandTab {
-    fn title(&self) -> &str {
+    fn title(&self) -> Option<&str> {
         match self {
-            Self::Helper(title) | Self::HostedAttachment(title) => title,
+            Self::Explicit => None,
+            Self::Helper(title) | Self::HostedAttachment(title) | Self::Task(title) => Some(title),
         }
     }
 }
@@ -868,6 +871,22 @@ impl AppModel {
         );
     }
 
+    pub(crate) fn add_explicit_tab(
+        &mut self,
+        working_directory: Option<String>,
+        argv: Rc<Vec<String>>,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        self.add_tab_full_inner(
+            InitialCommands::default(),
+            working_directory,
+            argv,
+            Some(CommandTab::Explicit),
+            Vec::new(),
+            sender,
+        );
+    }
+
     /// Select an existing CLI attachment or open its approved host relay.
     pub(crate) fn add_agent_session_tab(
         &mut self,
@@ -1001,7 +1020,7 @@ impl AppModel {
             InitialCommands::default(),
             working_directory,
             Rc::new(argv),
-            Some(CommandTab::Helper(title.to_string())),
+            Some(CommandTab::Task(title.to_string())),
             env_extra,
             sender,
         )?;
@@ -1017,8 +1036,8 @@ impl AppModel {
         Some((tab_id, pane_id))
     }
 
-    /// Shared body: `command` forces a terminal mode and a fixed tab title,
-    /// which is what one-shot helper tabs need and ordinary tabs must not have.
+    /// Named helper tabs use a fixed title and conventional terminal mode.
+    /// The startup command follows the window's selected terminal mode.
     #[allow(clippy::too_many_arguments)]
     fn add_tab_full_inner(
         &mut self,
@@ -1037,7 +1056,8 @@ impl AppModel {
         let pane_id = self.next_pane_id;
         self.next_pane_id += 1;
         let number = self.tabs.len() as u32 + 1;
-        let mode = if command.is_some() {
+        let command_title = command.as_ref().and_then(CommandTab::title);
+        let mode = if command_title.is_some() {
             TerminalMode::Vte
         } else {
             self.config.borrow().terminal_mode
@@ -1048,7 +1068,10 @@ impl AppModel {
             match &command {
                 None => Some(SharedPaneKind::ConfiguredShell),
                 Some(CommandTab::HostedAttachment(_)) => Some(SharedPaneKind::HostedAttachment),
-                Some(CommandTab::Helper(_)) => None,
+                Some(CommandTab::Explicit | CommandTab::Helper(_)) => {
+                    Some(SharedPaneKind::ExplicitCommand)
+                }
+                Some(CommandTab::Task(_)) => None,
             }
         };
         let title_cwd = working_directory.clone();
@@ -1077,11 +1100,10 @@ impl AppModel {
             holder,
             panes: vec![pane],
             active_pane: 0,
-            title: command
-                .as_ref()
-                .map(|command| command.title().to_owned())
+            title: command_title
+                .map(str::to_owned)
                 .unwrap_or_else(|| default_tab_title(number, title_cwd.as_deref())),
-            custom_title: command.is_some(),
+            custom_title: command_title.is_some(),
             bell: false,
             activity: false,
             marked: false,
