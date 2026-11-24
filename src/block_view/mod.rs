@@ -4729,6 +4729,7 @@ pub struct TermView {
     /// saves refuse so an unreadable file cannot be overwritten; Retry reads
     /// this to choose ReloadFirst vs SaveAgain (pairs forge `history_load`).
     history_load_outcome: RefCell<history::HistoryLoadOutcome>,
+    history_close_started: Cell<bool>,
     zone_persistence: RefCell<zone_history::SessionPersistence>,
     /// Clear Blocks deletion authorities bound to resolved paths and codecs.
     /// Keep each ordered target armed until that exact replacement succeeds.
@@ -4794,10 +4795,7 @@ pub struct TermView {
 
 impl Drop for TermView {
     fn drop(&mut self) {
-        if let Err(err) = self.save_history() {
-            log::warn!("save block history on close: {err}");
-            crate::history_notice::park_sync_block_history_failure(&err);
-        }
+        self.save_history_before_close();
         // Outer gesture controllers capture pane-owned Rc state, while child
         // buttons/VTEs own their signal closures. Explicitly sever both sides
         // before the widget tree disappears so closing a pane cannot leave its
@@ -9952,11 +9950,7 @@ impl RenderBackend for BlockBackend {
             .as_ref()
             .map_or(colors, |terminal| terminal.output_colors());
         let block_config = finished_block_config(colors, &self.config_for_cb.borrow());
-        let mut precomputed = FinishedBlockPrecomputed::documents(
-            &block_config,
-            !output_head_dropped,
-            colors.background,
-        );
+        let mut precomputed = FinishedBlockPrecomputed::documents(&block_config, colors.background);
         precomputed.output_rows = Some(output_rows);
         precomputed.output_preview = Some(fold_preview::from_plain(output_plain));
         precomputed.retained_bytes = Some(newest_estimated_bytes);
@@ -16122,6 +16116,7 @@ impl TermView {
             cleared_head_dropped: RefCell::new(std::collections::HashSet::new()),
             history_baselines: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             history_load_outcome: RefCell::new(history::HistoryLoadOutcome::Idle),
+            history_close_started: Cell::new(false),
             zone_persistence: RefCell::new(zone_history::SessionPersistence::default()),
             history_explicit_replace_pending: std::sync::Arc::new(std::sync::Mutex::new(
                 VecDeque::new(),
@@ -18309,6 +18304,7 @@ impl TermView {
             #[cfg(anvil_shared_terminal)]
             if let Some(command) = &block.command_document {
                 command.set_colors(config.foreground, &config.palette);
+                command.set_terminal_background(config.background);
                 command.set_background(None);
             }
             if let Some(terminal) = &block.output_vte {
@@ -18317,6 +18313,7 @@ impl TermView {
             #[cfg(anvil_shared_terminal)]
             if let Some(output) = &block.output_document {
                 output.text().set_colors(config.foreground, &config.palette);
+                output.text().set_terminal_background(config.background);
                 output.text().set_background(None);
             }
         }

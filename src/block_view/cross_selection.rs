@@ -1229,7 +1229,7 @@ mod tests {
         settle();
         view.pty.emit_test_output(b"\x1b]133;A\x07$ \x1b]133;B\x07");
         settle();
-        view.pty.emit_test_output("echo needle needle\r\n\x1b]133;C;cmdline_url=echo%20needle%20needle\x07\x1b]8;;https://example.test/completed\x07\x1b[1;31mdocument-body\x1b[0m\x1b]8;;\x07\r\nrow two e\u{301} 👩‍💻\r\nrow three\r\nrow four\r\nrow five\r\n\x1b[38;2;33;77;121mfindbody marker\x1b[0m\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07".as_bytes());
+        view.pty.emit_test_output("echo needle needle\r\n\x1b]133;C;cmdline_url=echo%20needle%20needle\x07progress-before-rewrite\r\x1b[2K\x1b]8;;https://example.test/completed\x07\x1b[1;31mdocument-body\x1b[0m\x1b]8;;\x07\r\nrow two e\u{301} 👩‍💻\r\nrow three\r\nrow four\r\nrow five\r\n\x1b[38;2;33;77;121mfindbody marker\x1b[0m\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07".as_bytes());
         settle();
         view.pty.emit_test_output(b"echo link");
         settle();
@@ -1286,12 +1286,13 @@ mod tests {
             let first = &finished[0];
             if document_output {
                 let capture = first.full_output.borrow();
-                let archived = jterm_core::screen_replay::project_bounded_archive(&capture)
+                let archived = jterm_core::screen_replay::project_finished_output(&capture, 80)
                     .expect("completed output retains its styled document projection");
                 assert_eq!(archived.links.len(), 1);
                 let link = &archived.links[0];
                 assert_eq!(link.target, "https://example.test/completed");
                 assert_eq!(&archived.text[link.bytes.clone()], "document-body");
+                assert!(!archived.text.contains("progress-before-rewrite"));
             }
             assert!(first.command_vte.is_none());
             assert_eq!(first.output_vte.is_none(), document_output);
@@ -1614,6 +1615,48 @@ mod tests {
         let fallback = super::super::FinishedBlock::from_retained(&retained, &config, 80, None);
         assert!(fallback.command_vte.is_some());
         assert_eq!(fallback.output_vte.is_none(), document_output);
+        if document_output {
+            let (mut retained, mut record_ids) = {
+                let records = view.block_data.borrow();
+                (
+                    records.front().unwrap().clone(),
+                    records.iter().map(|block| block.id).collect::<Vec<_>>(),
+                )
+            };
+            retained.id = record_ids.iter().max().unwrap() + 1;
+            let restored_id = retained.id;
+            retained.cmd = "printf\tretained".into();
+            retained.cmd_markup = Some("\x1b[7mprintf\x1b[27m\tretained".into());
+            retained.output = "discarded sample\r\x1b[Kretained\tvalue".into();
+            record_ids.push(restored_id);
+            retained.output_head_dropped = true;
+            *view.deleted_order.borrow_mut() = record_ids;
+            view.deleted_stash
+                .borrow_mut()
+                .push((view.block_data.borrow().len(), retained));
+            assert_eq!(view.undo_deleted_blocks(), 1);
+            settle();
+            let finished = view.finished_blocks.borrow();
+            let restored = finished
+                .iter()
+                .find(|block| block.id == restored_id)
+                .unwrap();
+            assert!(restored.command_vte.is_none());
+            assert!(restored.output_vte.is_none());
+            assert_eq!(
+                restored
+                    .command_surface()
+                    .unwrap()
+                    .document_text()
+                    .as_deref(),
+                Some("printf\tretained")
+            );
+            assert_eq!(
+                restored.output_surface().document_text().as_deref(),
+                Some("retained\tvalue")
+            );
+            assert!(restored.output_head_dropped());
+        }
         window.close();
     }
 

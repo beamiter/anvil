@@ -1471,7 +1471,7 @@ mod tests {
                 std::slice::from_ref(&texture),
                 caption.len(),
                 None,
-                super::FinishedBlockPrecomputed::documents(&config, true, None),
+                super::FinishedBlockPrecomputed::documents(&config, None),
             );
             let output = card.output_surface();
             assert_eq!(output.document_text().as_deref(), expected);
@@ -3828,13 +3828,9 @@ pub(crate) struct FinishedBlockPrecomputed {
 }
 
 impl FinishedBlockPrecomputed {
-    pub(super) fn documents(
-        config: &Config,
-        complete_output: bool,
-        background: Option<RGBA>,
-    ) -> Self {
+    pub(super) fn documents(config: &Config, background: Option<RGBA>) -> Self {
         #[cfg(not(anvil_shared_terminal))]
-        let _ = (config, complete_output, background);
+        let _ = (config, background);
         #[cfg(anvil_shared_terminal)]
         let foreground_documents = matches!(
             config.terminal_mode,
@@ -3845,9 +3841,8 @@ impl FinishedBlockPrecomputed {
             #[cfg(anvil_shared_terminal)]
             document_command: foreground_documents,
             #[cfg(anvil_shared_terminal)]
-            document_output: complete_output
-                && std::env::var_os("JTERM_SHARED_FINISHED_OUTPUT")
-                    .is_none_or(|value| value == "1"),
+            document_output: std::env::var_os("JTERM_SHARED_FINISHED_OUTPUT")
+                .is_none_or(|value| value == "1"),
             #[cfg(anvil_shared_terminal)]
             document_background: background,
             ..Self::default()
@@ -4410,7 +4405,7 @@ impl FinishedBlock {
             &[],
             block.output.len(),
             None,
-            FinishedBlockPrecomputed::documents(config, !block.output_head_dropped, background),
+            FinishedBlockPrecomputed::documents(config, background),
         )
     }
 
@@ -4945,6 +4940,7 @@ impl FinishedBlock {
                     ),
                 };
                 command.inspect(|command| {
+                    command.set_terminal_background(config.background);
                     command.set_background(precomputed.document_background.filter(|_| !chat));
                     command.install_links(crate::shared_terminal::SharedTerminal::document_links());
                 })
@@ -5018,29 +5014,32 @@ impl FinishedBlock {
         let output_scrollable = output_rows > viewport_cap;
         let initial_visible_rows = output_rows.min(viewport_cap).clamp(1, 32);
         #[cfg(anvil_shared_terminal)]
-        let output_document = if precomputed.document_output
-            && (precomputed.document_command || is_background)
-        {
-            jterm_core::screen_replay::project_bounded_archive(output).map(|document| {
-                let output = jterm_gtk_view::FinishedTextView::output(
-                    &document,
-                    crate::font::terminal_font_description(&config.font_desc, config),
-                    config.default_font_scale,
-                    config.foreground,
-                    &config.palette,
-                );
-                if is_background {
-                    output
-                        .widget()
-                        .update_property(&[gtk::accessible::Property::Label("Background output")]);
-                }
-                output.set_background(precomputed.document_background.filter(|_| !chat));
-                output.install_links(crate::shared_terminal::SharedTerminal::document_links());
-                jterm_gtk_view::FinishedOutputView::new(output, viewport_cap, max_expanded_cap)
-            })
-        } else {
-            None
-        };
+        let output_archive =
+            if precomputed.document_output && (precomputed.document_command || is_background) {
+                jterm_core::screen_replay::project_finished_output(output, cols.max(1) as usize)
+                    .map(Rc::new)
+            } else {
+                None
+            };
+        #[cfg(anvil_shared_terminal)]
+        let output_document = output_archive.as_deref().map(|document| {
+            let output = jterm_gtk_view::FinishedTextView::output(
+                document,
+                crate::font::terminal_font_description(&config.font_desc, config),
+                config.default_font_scale,
+                config.foreground,
+                &config.palette,
+            );
+            if is_background {
+                output
+                    .widget()
+                    .update_property(&[gtk::accessible::Property::Label("Background output")]);
+            }
+            output.set_terminal_background(config.background);
+            output.set_background(precomputed.document_background.filter(|_| !chat));
+            output.install_links(crate::shared_terminal::SharedTerminal::document_links());
+            jterm_gtk_view::FinishedOutputView::new(output, viewport_cap, max_expanded_cap)
+        });
         #[cfg(anvil_shared_terminal)]
         let uses_output_vte = output_document.is_none();
         #[cfg(not(anvil_shared_terminal))]
@@ -5563,6 +5562,8 @@ impl FinishedBlock {
             let output_vte = output_vte.as_ref().map(ObjectExt::downgrade);
             #[cfg(anvil_shared_terminal)]
             let output_document = output_document.clone();
+            #[cfg(anvil_shared_terminal)]
+            let output_archive = output_archive.clone();
             let expand_btn = expand_btn.downgrade();
             let output_scrollbar = output_scrollbar.downgrade();
             let collapsed_summary = collapsed_summary.downgrade();
@@ -5618,6 +5619,8 @@ impl FinishedBlock {
                         let output_vte = output_vte.clone();
                         #[cfg(anvil_shared_terminal)]
                         let output_document = output_document.clone();
+                        #[cfg(anvil_shared_terminal)]
+                        let output_archive = output_archive.clone();
                         let full_output = full_output.clone();
                         let displayed_output = displayed_output.clone();
                         let filter_entry = filter_entry.downgrade();
@@ -5663,24 +5666,56 @@ impl FinishedBlock {
                             };
                             let q = filter_entry.text().to_string();
                             let full = full_output.borrow();
-                            let next_display = if filter_enabled.get() {
-                                filter_output_lines(
-                                    full.as_str(),
+                            let full_text = full.as_str();
+                            #[cfg(anvil_shared_terminal)]
+                            let full_text = output_archive
+                                .as_deref()
+                                .map_or(full_text, |document| document.text.as_str());
+                            #[cfg(anvil_shared_terminal)]
+                            let archive_filter = output_archive.as_deref().map(|document| {
+                                if !filter_enabled.get() {
+                                    return Ok(None);
+                                }
+                                jterm_core::screen_replay::filter_archived_output(
+                                    document,
                                     &q,
                                     regex_tg.is_active(),
                                     case_tg.is_active(),
                                     invert_tg.is_active(),
                                     ctx_spin.value() as usize,
                                 )
-                            } else {
-                                None
+                            });
+                            let filter_raw = || {
+                                if filter_enabled.get() {
+                                    filter_output_lines(
+                                        full.as_str(),
+                                        &q,
+                                        regex_tg.is_active(),
+                                        case_tg.is_active(),
+                                        invert_tg.is_active(),
+                                        ctx_spin.value() as usize,
+                                    )
+                                } else {
+                                    None
+                                }
                             };
-                            let shown = next_display.as_deref().unwrap_or(full.as_str());
+                            #[cfg(not(anvil_shared_terminal))]
+                            let next_display = filter_raw();
+                            #[cfg(anvil_shared_terminal)]
+                            let next_display = match &archive_filter {
+                                Some(result) => result
+                                    .as_ref()
+                                    .ok()
+                                    .and_then(Option::as_ref)
+                                    .map(|doc| doc.text.clone()),
+                                None => filter_raw(),
+                            };
+                            let shown = next_display.as_deref().unwrap_or(full_text);
                             let shown_rows = output_row_count(shown);
                             let full_rows = if next_display.is_none() {
                                 shown_rows
                             } else {
-                                output_row_count(&full)
+                                output_row_count(full_text)
                             };
 
                             let display_changed =
@@ -5743,15 +5778,15 @@ impl FinishedBlock {
                             } else {
                                 #[cfg(anvil_shared_terminal)]
                                 if display_changed {
-                                    if let Some(output) = &output_document {
-                                        let Some(document) =
-                                            jterm_core::screen_replay::project_bounded_archive(
-                                                shown,
-                                            )
-                                        else {
-                                            return;
-                                        };
-                                        output.present_output(&document);
+                                    if let (Some(output), Some(original)) =
+                                        (&output_document, output_archive.as_deref())
+                                    {
+                                        let document = archive_filter
+                                            .as_ref()
+                                            .and_then(|result| result.as_ref().ok())
+                                            .and_then(Option::as_ref)
+                                            .unwrap_or(original);
+                                        output.present_output(document);
                                         render_stamp.replace(output_render_stamp(
                                             cols,
                                             shown_rows.max(1),

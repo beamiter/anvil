@@ -1502,20 +1502,25 @@ fn execute_history_saves(
 /// Baselines and pending Clears are `Arc<Mutex<_>>` so the worker can commit
 /// revision / tombstone authority after a successful write without bouncing
 /// back through the GTK thread. One job runs the whole planned batch in order
-/// (Clear-queue stop-on-first-error). Coalescing keys on the last target path
-/// so a newer `save_history` replaces an older pending batch for that file
-/// family.
+/// (Clear-queue stop-on-first-error). Coalesce ordinary saves by their last
+/// target. During window shutdown, every pane's final batch must reach the
+/// writer, including panes using the same history file.
 fn enqueue_history_saves(
     baselines: Arc<Mutex<HashMap<PathBuf, HistoryBaseline>>>,
     pending: Arc<Mutex<VecDeque<HistoryTarget>>>,
     blocks: Vec<BlockData>,
     saves: Vec<PlannedHistorySave>,
+    closing: bool,
 ) -> io::Result<()> {
     if saves.is_empty() {
         return Ok(());
     }
-    let key_path = saves.last().expect("non-empty saves").target.path.clone();
-    let key = PersistenceKey::for_path("block-history", &key_path);
+    let key_path = &saves.last().expect("non-empty saves").target.path;
+    let key = if closing {
+        PersistenceKey::unique_for_path("block-history", key_path)
+    } else {
+        PersistenceKey::for_path("block-history", key_path)
+    };
     let estimated_bytes = estimated_snapshot_retained_bytes(&blocks, blocks.capacity());
     persistence::enqueue_weighted(
         key,
@@ -1741,6 +1746,17 @@ impl TermView {
         Ok(())
     }
 
+    /// Queue the last pane snapshot while the persistence worker still accepts work.
+    pub(crate) fn save_history_before_close(&self) {
+        if self.history_close_started.replace(true) {
+            return;
+        }
+        if let Err(err) = self.save_history() {
+            log::warn!("save block history on close: {err}");
+            crate::history_notice::park_sync_block_history_failure(&err);
+        }
+    }
+
     /// Save block history without risking truncation of the last good snapshot.
     ///
     /// Snapshots live blocks on the GTK thread, then enqueues the write under
@@ -1801,6 +1817,7 @@ impl TermView {
             Arc::clone(&self.history_explicit_replace_pending),
             blocks,
             saves,
+            self.history_close_started.get(),
         )
     }
 
@@ -3796,6 +3813,56 @@ mod tests {
     static LABELED_WORKER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn closing_panes_each_save_to_the_shared_history_file() {
+        let dir = TestDir::new("closing-panes");
+        let path = dir.path().join("history.bin");
+        let (release, wait) = std::sync::mpsc::sync_channel(1);
+        persistence::enqueue(
+            persistence::PersistenceKey::unique_for_path("history-test-gate", &path),
+            "Hold the worker until both saves are queued",
+            move || wait.recv_timeout(Duration::from_secs(5)).map_err(io::Error::other),
+        )
+        .unwrap();
+        let saves = vec![super::PlannedHistorySave {
+            target: HistoryTarget {
+                path: path.clone(),
+                compress: false,
+            },
+            explicit_replace: false,
+        }];
+        for (id, command) in [(1, "first-pane"), (2, "second-pane")] {
+            let baselines = Arc::new(Mutex::new(HashMap::new()));
+            replace_history_baseline(
+                &baselines,
+                path.clone(),
+                Some(HistoryRevision::Missing),
+                None,
+            );
+            enqueue_history_saves(
+                baselines,
+                Arc::new(Mutex::new(VecDeque::new())),
+                vec![sample_block(id, command)],
+                saves.clone(),
+                true,
+            )
+            .unwrap();
+        }
+        let (finished, done) = std::sync::mpsc::sync_channel(1);
+        persistence::enqueue(
+            persistence::PersistenceKey::unique_for_path("history-test-drain", &path),
+            "Wait for both final history saves",
+            move || finished.send(()).map_err(io::Error::other),
+        )
+        .unwrap();
+        release.send(()).unwrap();
+        done.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let reread = read_history_records(&path, false, 10, UndecodablePolicy::Reject).unwrap();
+        let commands: Vec<_> = reread.blocks.iter().map(|block| block.cmd.as_str()).collect();
+        assert_eq!(commands, ["first-pane", "second-pane"]);
+    }
+
+    #[test]
     fn labeled_enqueue_failure_drains_onto_the_sticky_surface() {
         let _worker = LABELED_WORKER_TEST_LOCK.lock().unwrap();
         let dir = TestDir::new("labeled-enqueue-fail");
@@ -3817,6 +3884,7 @@ mod tests {
             Arc::clone(&pending),
             vec![sample_block(1, "blocked")],
             saves,
+            false,
         )
         .expect("admission must succeed; the lock only fails the write");
 
@@ -3868,6 +3936,7 @@ mod tests {
             Arc::clone(&pending),
             vec![sample_block(3, "async-ok")],
             saves,
+            false,
         )
         .unwrap();
 

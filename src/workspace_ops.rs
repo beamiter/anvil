@@ -1706,6 +1706,16 @@ impl AppModel {
         self.agent_close();
         self.close_command_suggestion();
         self.close_all_command_corrections();
+        // The views can outlive this shutdown handler. Queue their final
+        // history snapshots before shutting down the persistence worker.
+        for view in self
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter())
+            .filter_map(|pane| pane.terminal.term_view())
+        {
+            view.save_history_before_close();
+        }
         if let Err(error) = command_history::flush_pending(std::time::Duration::from_secs(3)) {
             log::warn!("flush command history on exit: {error}");
         }

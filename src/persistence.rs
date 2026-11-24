@@ -44,8 +44,7 @@ impl PersistenceKey {
         }
     }
 
-    /// Reads are not coalescible: two panes may intentionally restore from the
-    /// same legacy file and each owns a different completion route.
+    /// Give independently owned operations on the same file distinct slots.
     pub(crate) fn unique_for_path(kind: &str, path: &Path) -> Self {
         static NEXT_UNIQUE_KEY: AtomicU64 = AtomicU64::new(0);
         let sequence = NEXT_UNIQUE_KEY.fetch_add(1, Ordering::Relaxed);

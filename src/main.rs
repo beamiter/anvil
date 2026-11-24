@@ -4006,6 +4006,13 @@ mod startup_wiring_tests {
         let flush_at = body
             .find(flush)
             .expect("force_quit must flush the execution journal");
+        let history_at = body
+            .find("view.save_history_before_close()")
+            .expect("force_quit queues the final block history");
+        let worker_shutdown_at = body
+            .find("crate::persistence::shutdown(")
+            .expect("force_quit shuts down the persistence worker");
+        assert!(history_at < worker_shutdown_at);
         let quit_at = body
             .find("self.quit_allowed.set(true)")
             .expect("force_quit arms quit before closing");
