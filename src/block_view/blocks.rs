@@ -731,7 +731,7 @@ pub(crate) struct FinishedBlock {
     /// full natural height; scrolling belongs to the outer block canvas.
     pub(crate) output_vte: Option<vte4::Terminal>,
     #[cfg(anvil_shared_terminal)]
-    pub(crate) output_document: Option<jterm_gtk_view::FinishedTextView>,
+    pub(crate) output_document: Option<jterm_gtk_view::FinishedOutputView>,
     #[cfg(anvil_shared_terminal)]
     output_document_height: Rc<Cell<i32>>,
     /// Visible per-block scrollbar for long output, bound to `output_vte`'s
@@ -4921,23 +4921,25 @@ impl FinishedBlock {
         let initial_visible_rows = output_rows.min(viewport_cap).clamp(1, 32);
         #[cfg(anvil_shared_terminal)]
         let output_document = if precomputed.document_output
-            && command_document.is_some()
+            && (command_document.is_some() || is_background)
             && images.is_empty()
-            && output_rows <= i64::from(config.finished_block_viewport_rows)
         {
-            jterm_core::screen_replay::project_bounded_archive(output)
-                .filter(|document| !document.text.trim().is_empty())
-                .map(|document| {
-                    let output = jterm_gtk_view::FinishedTextView::output(
-                        &document,
-                        crate::font::terminal_font_description(&config.font_desc, config),
-                        config.default_font_scale,
-                        config.foreground,
-                        &config.palette,
-                    );
-                    output.install_links(crate::shared_terminal::SharedTerminal::links());
+            jterm_core::screen_replay::project_bounded_archive(output).map(|document| {
+                let output = jterm_gtk_view::FinishedTextView::output(
+                    &document,
+                    crate::font::terminal_font_description(&config.font_desc, config),
+                    config.default_font_scale,
+                    config.foreground,
+                    &config.palette,
+                );
+                if is_background {
                     output
-                })
+                        .widget()
+                        .update_property(&[gtk::accessible::Property::Label("Background output")]);
+                }
+                output.install_links(crate::shared_terminal::SharedTerminal::links());
+                jterm_gtk_view::FinishedOutputView::new(output, viewport_cap, max_expanded_cap)
+            })
         } else {
             None
         };
@@ -5229,7 +5231,7 @@ impl FinishedBlock {
                 body.add_css_class("block-reference-output");
                 body.set_margin_start(16);
                 body.set_margin_end(16);
-                body.append(&output.output_gutter());
+                body.append(&output.text().output_gutter());
                 body.append(output.widget());
                 output_box.set_child(Some(&body));
             } else {
@@ -5258,6 +5260,10 @@ impl FinishedBlock {
             };
             sync_visibility(&adjustment);
             adjustment.connect_changed(sync_visibility);
+        }
+        #[cfg(anvil_shared_terminal)]
+        if let Some(output) = &output_document {
+            output.bind_controls(&output_scrollbar, &expand_btn, &jump_bottom_btn);
         }
         output_box.add_overlay(&output_scrollbar);
         output_box.set_measure_overlay(&output_scrollbar, false);
@@ -5677,8 +5683,14 @@ impl FinishedBlock {
                                 filter_status.remove_css_class("block-filter-empty");
                                 filter_status.set_visible(false);
                             }
-                            expand_btn.set_visible(can_expand);
-                            output_scrollbar.set_visible(has_private_scroll);
+                            if output_vte
+                                .as_ref()
+                                .and_then(glib::WeakRef::upgrade)
+                                .is_some()
+                            {
+                                expand_btn.set_visible(can_expand);
+                                output_scrollbar.set_visible(has_private_scroll);
+                            }
                             let preview = display_changed.then(|| {
                                 if next_display.is_none() {
                                     original_preview.as_ref().clone()
@@ -5933,7 +5945,7 @@ impl FinishedBlock {
             expanded,
             expand_btn,
             output_scrollable: uses_output_vte && output_scrollable,
-            long_output: uses_output_vte && long_output,
+            long_output,
             estimated_retained_bytes,
         }
     }
@@ -6136,7 +6148,7 @@ impl FinishedBlock {
         use super::text_surface::TerminalTextSurface;
         #[cfg(anvil_shared_terminal)]
         if let Some(output) = &self.output_document {
-            return TerminalTextSurface::Document(output.widget().clone());
+            return TerminalTextSurface::Document(output.text().widget().clone());
         }
         TerminalTextSurface::Native(
             self.output_vte
@@ -6155,10 +6167,24 @@ impl FinishedBlock {
 
     #[cfg(anvil_shared_terminal)]
     fn refit_output_document_height(&self) -> Option<i32> {
-        if !self.content.is_mapped() {
+        let width = self.widget.width();
+        if !self.content.is_mapped() || width <= 0 {
             return None;
         }
-        let height = self.widget.height();
+        let output = self.output_document.as_ref()?;
+        let page = self
+            .widget
+            .ancestor(gtk::ScrolledWindow::static_type())
+            .and_downcast::<gtk::ScrolledWindow>()
+            .map(|scroll| {
+                super::chat::canvas_height(&scroll)
+                    .map_or_else(|| scroll.vadjustment().page_size(), f64::from)
+            });
+        output.refit(
+            page,
+            super::MIN_INPUT_ROWS as i64 + FINISHED_BLOCK_NON_OUTPUT_ROWS,
+        );
+        let (_, height, ..) = self.widget.measure(Orientation::Vertical, width);
         if height > 0 && self.output_document_height.replace(height) != height {
             Some(height)
         } else {
@@ -6372,11 +6398,27 @@ impl FinishedBlock {
         // weak widget handles keep eviction and pane teardown reclaimable.
         let widget_for_jump = self.widget.downgrade();
         let outer_for_jump = outer.downgrade();
+        #[cfg(anvil_shared_terminal)]
+        let adjustment_for_jump = self
+            .output_document
+            .as_ref()
+            .map(|output| output.adjustment().downgrade());
         self.jump_bottom_btn.connect_clicked(move |_| {
             let (Some(widget), Some(outer)) = (widget_for_jump.upgrade(), outer_for_jump.upgrade())
             else {
                 return;
             };
+            #[cfg(anvil_shared_terminal)]
+            if let Some(adj) = adjustment_for_jump
+                .as_ref()
+                .and_then(glib::WeakRef::upgrade)
+            {
+                let target = (adj.upper() - adj.page_size()).max(adj.lower());
+                if target > adj.lower() + f64::EPSILON {
+                    adj.set_value(target);
+                    return;
+                }
+            }
             FinishedBlock::scroll_finished_widget_to_edge(&widget, &outer, true);
         });
 
@@ -6403,19 +6445,34 @@ impl FinishedBlock {
 
         #[cfg(anvil_shared_terminal)]
         if let Some(output) = &self.output_document {
-            let wheel = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
-            wheel.set_propagation_phase(gtk::PropagationPhase::Capture);
-            debouncer.watch_gesture(&wheel, outer);
-            let outer = outer.downgrade();
-            let debouncer = debouncer.clone();
-            wheel.connect_scroll(move |event, _, dy| {
-                let Some(outer) = outer.upgrade() else {
-                    return glib::Propagation::Proceed;
-                };
-                debouncer.scroll_wheel(&outer, dy, event.unit() == gtk::gdk::ScrollUnit::Surface);
-                glib::Propagation::Stop
-            });
-            output.widget().add_controller(wheel);
+            let page = super::chat::canvas_height(outer)
+                .map_or_else(|| outer.vadjustment().page_size(), f64::from);
+            output.refit(
+                Some(page),
+                super::MIN_INPUT_ROWS as i64 + FINISHED_BLOCK_NON_OUTPUT_ROWS,
+            );
+            let targets = [output.widget(), self.output_scrollbar.upcast_ref()];
+            for target in targets {
+                let wheel =
+                    gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+                wheel.set_propagation_phase(gtk::PropagationPhase::Capture);
+                debouncer.watch_gesture(&wheel, outer);
+                let outer = outer.downgrade();
+                let inner = output.adjustment().downgrade();
+                let debouncer = debouncer.clone();
+                wheel.connect_scroll(move |event, _, dy| {
+                    let (Some(outer), Some(inner)) = (outer.upgrade(), inner.upgrade()) else {
+                        return glib::Propagation::Proceed;
+                    };
+                    let surface = event.unit() == gtk::gdk::ScrollUnit::Surface;
+                    let remaining = jterm_gtk_view::scroll_finished_output(&inner, dy, surface);
+                    if remaining != 0.0 {
+                        debouncer.scroll_wheel(&outer, remaining, surface);
+                    }
+                    glib::Propagation::Stop
+                });
+                target.add_controller(wheel);
+            }
         }
 
         let Some(output_vte) = &self.output_vte else {

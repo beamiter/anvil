@@ -1483,6 +1483,58 @@ mod tests {
         ));
         let (start, end) = buffer.selection_bounds().expect("selected command tail");
         assert_eq!(buffer.text(&start, &end, true), tail);
+        if document_output {
+            let body = "archived output line before the last row\r\n".repeat(96);
+            view.pty
+                .emit_test_output(b"echo archive\r\n\x1b]133;C;cmdline_url=echo%20archive\x07");
+            view.pty.emit_test_output(body.as_bytes());
+            view.pty.emit_test_output(
+                b"\x1b[32marchive-tail-witness\x1b[0m\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07",
+            );
+            settle();
+            let (output, expand, jump, copy) = {
+                let blocks = view.finished_blocks.borrow();
+                assert_eq!(blocks.len(), 6);
+                let block = &blocks[5];
+                assert!(block.output_vte.is_none());
+                let output = block.output_document.clone().expect("shared tall output");
+                (
+                    output,
+                    block.expand_btn.clone(),
+                    block.jump_bottom_btn.clone(),
+                    block.copy_output_btn.clone(),
+                )
+            };
+            let adjustment = output.adjustment();
+            let height = adjustment.page_size();
+            assert!(height > 0.0 && adjustment.upper() > height * 2.0);
+            let buffer = output.text().widget().buffer();
+            assert_eq!(buffer.line_count(), 97);
+            copy.emit_clicked();
+            let copied = gtk::glib::MainContext::default()
+                .block_on(window.clipboard().read_text_future())
+                .expect("read archived output")
+                .expect("copied output text");
+            let expected = format!("{}archive-tail-witness", body.replace("\r\n", "\n"));
+            assert_eq!(
+                copied.lines().collect::<Vec<_>>(),
+                expected.lines().collect::<Vec<_>>()
+            );
+            assert!(matches!(
+                view.find_in_blocks("archive-tail-witness", false, true),
+                FindSearchResult::Matches(p) if p.total == 1
+            ));
+            settle();
+            let (start, end) = buffer.selection_bounds().expect("selected output tail");
+            assert_eq!(buffer.text(&start, &end, true), "archive-tail-witness");
+            assert!(adjustment.value() > 0.0);
+            adjustment.set_value(0.0);
+            jump.emit_clicked();
+            assert_eq!(adjustment.value(), adjustment.upper() - height);
+            expand.emit_clicked();
+            settle();
+            assert!(adjustment.page_size() > height);
+        }
         window.close();
     }
 
