@@ -576,6 +576,18 @@ struct AppModel {
 enum SharedPaneKind {
     ConfiguredShell,
     HostedAttachment,
+    ExplicitCommand,
+}
+
+fn shared_explicit_command_admitted() -> bool {
+    #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+    {
+        jterm_gtk_view::RuntimeShell::admits_explicit_command(host::is_flatpak())
+    }
+    #[cfg(not(all(anvil_shared_terminal, target_os = "linux")))]
+    {
+        false
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -804,8 +816,14 @@ fn setup_shared_pane(
                 init.working_directory.as_deref()?,
             )
         }
+        SharedPaneKind::ExplicitCommand => shared_terminal::SharedTerminal::open_explicit(
+            init.config.clone(),
+            &init.shell_argv,
+            init.working_directory.as_deref(),
+        ),
     }?;
-    if matches!(kind, SharedPaneKind::HostedAttachment) {
+    let configured_shell = matches!(kind, SharedPaneKind::ConfiguredShell);
+    if !configured_shell {
         sender.input(
             view.launch_error()
                 .map_or(AppMsg::PaneLaunched(pane_id), |error| {
@@ -819,7 +837,6 @@ fn setup_shared_pane(
                 .expect("embedded shared pane owns its runtime"),
         );
         let sender_for_events = sender.clone();
-        let configured_shell = matches!(kind, SharedPaneKind::ConfiguredShell);
         let last_cwd = Rc::new(std::cell::RefCell::new(init.working_directory.clone()));
         let cwd_pending = Rc::new(std::cell::Cell::new(false));
         pane.set_event_handler(move |event| match event {
@@ -1034,7 +1051,8 @@ impl SimpleComponent for AppModel {
             && jterm_gtk_view::RuntimeShell::supports_local_shell(&shell_argv, host::is_flatpak());
         #[cfg(not(all(anvil_shared_terminal, target_os = "linux")))]
         let ordinary_shell = false;
-        config.prepare_workspace_startup(init.safe_mode, ordinary_shell);
+        let explicit_command = init.execute.is_some() && shared_explicit_command_admitted();
+        config.prepare_workspace_startup(init.safe_mode, ordinary_shell || explicit_command);
         let startup = config.startup_commands.clone();
         let requested_cwd = init.working_directory.as_ref().map(|path| {
             path.to_str()
@@ -2156,13 +2174,16 @@ impl SimpleComponent for AppModel {
                 model.persist_session();
             }
             None => {
-                let initial_argv = execute_argv.unwrap_or_else(|| model.shell_argv.clone());
-                let initial_commands = if init.execute.is_some() {
-                    InitialCommands::default()
+                if let Some(argv) = execute_argv {
+                    model.add_explicit_tab(requested_cwd, argv, &sender);
                 } else {
-                    InitialCommands::from_config(startup.as_deref())
-                };
-                model.add_tab_with(initial_commands, requested_cwd, initial_argv, &sender);
+                    model.add_tab_with(
+                        InitialCommands::from_config(startup.as_deref()),
+                        requested_cwd,
+                        model.shell_argv.clone(),
+                        &sender,
+                    );
+                }
             }
         }
 
@@ -3445,7 +3466,27 @@ fn validate_launch_options(options: &mut cli::LaunchOptions) -> Result<(), Strin
     if let Some(argv) = &options.execute {
         let executable = argv.first().expect("CLI parser rejects empty commands");
         let path = std::path::Path::new(executable);
-        let found = if path.components().count() > 1 {
+        let found = if shared_explicit_command_admitted() {
+            let cwd = options
+                .working_directory
+                .as_deref()
+                .and_then(std::path::Path::to_str);
+            let home = if cwd.is_none()
+                && options.mode.map_or_else(
+                    || load_config().0.terminal_mode_for_save() == TerminalMode::Vte,
+                    |mode| matches!(mode, cli::Mode::Vte),
+                ) {
+                std::env::var("HOME").ok()
+            } else {
+                None
+            };
+            host::resolve_executable(
+                executable,
+                std::env::var_os("PATH").as_deref(),
+                cwd.or(home.as_deref()),
+            )
+            .is_ok()
+        } else if path.components().count() > 1 {
             path.is_file()
         } else {
             host::find_executable_in_path(executable).is_some()
