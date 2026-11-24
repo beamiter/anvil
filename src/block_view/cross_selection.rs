@@ -890,6 +890,7 @@ mod tests {
             }
             panic!("{mode:?}: timed out while waiting for {what}");
         };
+        let argv = ["/bin/sh".into(), "-c".into(), shell.into()];
         for mode in [
             TerminalMode::Block,
             TerminalMode::Chat,
@@ -898,19 +899,18 @@ mod tests {
             let mut config = Config::safe_defaults();
             config.terminal_mode = mode;
             config.preserve_live_scrollback = false;
-            let view = super::super::TermView::new_with_spawner(
+            let view = super::super::TermView::new(
                 &config,
                 &mode,
-                &["sh".into()],
+                &argv,
                 None,
                 false,
                 None,
                 "live-output-test",
                 &[],
                 &[],
-                |_, _, _, _| crate::pty::OwnedPty::spawn(&["/bin/sh", "-c", shell], None, &[]),
             )
-            .expect("spawn real PTY shell");
+            .expect("spawn the production shared PTY");
             let terminal = view
                 .active
                 .borrow()
@@ -1063,6 +1063,22 @@ mod tests {
                 .next_back()
                 .and_then(|record| record.output())
                 .is_some_and(|output| output.contains("same shell continued")));
+            if !mode.is_unified() {
+                view.select_all_blocks();
+                assert!(view.copy_to_clipboard_with_modifier(true));
+                let clipboard = window.clipboard();
+                let copied = gtk::glib::MainContext::default()
+                    .block_on(clipboard.read_text_future())
+                    .expect("read copied outputs")
+                    .expect("completed outputs on the clipboard");
+                let first = copied
+                    .find("shared live row")
+                    .unwrap_or_else(|| panic!("{mode:?}: first output missing from {copied:?}"));
+                let second = copied
+                    .find("same shell continued")
+                    .unwrap_or_else(|| panic!("{mode:?}: next output missing from {copied:?}"));
+                assert!(first < second, "copied outputs preserve command order");
+            }
             if let Some(transcript) = terminal.transcript() {
                 view.pty.try_write_bytes(b"archive\r").unwrap();
                 wait_for(mode, "the first zone rolls into retained history", &|| {

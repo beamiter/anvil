@@ -125,7 +125,7 @@ fn unified_navigation_preserves_native_ownership_and_follows_live() {
         let id = offset as u64 + 1;
         view.render_backend.begin_prompt_zone(id);
         view.render_backend
-            .feed_live(format!("\x1b[32m~/project\x1b[0m $ {command}\r\n").as_bytes());
+            .feed_legacy(format!("\x1b[32m~/project\x1b[0m $ {command}\r\n").as_bytes());
         settle(); // Let VTE prove the visible authenticated head before output scrolls it away.
         let output = (1..=24)
             .map(|row| {
@@ -134,7 +134,7 @@ fn unified_navigation_preserves_native_ownership_and_follows_live() {
                 )
             })
             .collect::<String>();
-        view.render_backend.feed_live(output.as_bytes());
+        view.render_backend.feed_legacy(output.as_bytes());
         settle();
         view.render_backend.close_prompt_zone(Some(id));
         finalize(&view, &record(id, command, false), &output);
@@ -153,7 +153,7 @@ fn unified_navigation_preserves_native_ownership_and_follows_live() {
     assert!(retained_record_two.output.contains("needle 2.24"));
     assert!(!retained_record_two.output.contains("needle 3.01"));
     view.render_backend
-        .feed_live(b"\x1b[32m~/project\x1b[0m $ unfinished draft");
+        .feed_legacy(b"\x1b[32m~/project\x1b[0m $ unfinished draft");
     settle();
     *view.typed_cmd.borrow_mut() = "unfinished draft".into();
     view.return_to_live().unwrap();
@@ -276,7 +276,7 @@ fn unified_navigation_preserves_native_ownership_and_follows_live() {
     adjustment.set_value(adjustment.lower());
     settle();
     view.render_backend
-        .feed_live(b"\r\nnew-completion-needle\r\n");
+        .feed_legacy(b"\r\nnew-completion-needle\r\n");
     settle();
     finalize(
         &view,
@@ -382,7 +382,7 @@ fn unified_navigation_preserves_native_ownership_and_follows_live() {
     view.render_backend.enter_alt_screen_chrome();
     view.render_backend.enter_fullscreen();
     view.render_backend
-        .feed_live(b"\x1b[?1049h\x1b[Hnative full-screen application");
+        .feed_legacy(b"\x1b[?1049h\x1b[Hnative full-screen application");
     wait_until(|| {
         !bar.root.is_visible() && view.grid_size().1 > rows_with_bar && grid_matches_pty(&view)
     });
@@ -413,7 +413,7 @@ fn unified_navigation_preserves_native_ownership_and_follows_live() {
         view.record_snapshot_view(2),
         Some(retained_record_two.clone())
     );
-    view.render_backend.feed_live(b"\x1b[?1049l");
+    view.render_backend.feed_legacy(b"\x1b[?1049l");
     view.bstate.set(BlockState::AwaitingCommand);
     view.render_backend.exit_fullscreen();
     view.render_backend.exit_alt_screen_chrome();

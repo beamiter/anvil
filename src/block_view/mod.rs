@@ -16996,7 +16996,7 @@ impl TermView {
                         parts.len(),
                         text.len()
                     );
-                    self.active_vte.clipboard().set_text(&text);
+                    self.root.clipboard().set_text(&text);
                     self.selection_feed_hold.flush_now();
                     return true;
                 }
@@ -17052,13 +17052,13 @@ impl TermView {
         self.selection_feed_hold.flush_now();
         if let Err(error) = self.paste_sink().deliver(text) {
             log::warn!("text paste refused: {error}");
-            show_clipboard_failure(&self.active_vte, &format!("{error}. Nothing was pasted."));
+            show_clipboard_failure(&self.root, &format!("{error}. Nothing was pasted."));
         }
     }
 
     fn paste_sink(&self) -> PasteSink {
         PasteSink {
-            notify: paste_feedback::notifier(&self.active_vte),
+            notify: paste_feedback::notifier(&self.root),
             pty: self.pty.clone(),
             bracketed_paste: self.bracketed_paste.clone(),
             bstate: self.bstate.clone(),
@@ -17277,6 +17277,11 @@ impl TermView {
     /// the active edge (strong outline), while the oldest is the fixed anchor
     /// used if the user subsequently contracts the range with Shift+Up.
     pub fn select_all_blocks(&self) {
+        if self.fullscreen.get() {
+            return;
+        }
+        self.cross_selection.clear_all();
+        // Replaying held output can bring an alternate-screen app forward.
         if self.fullscreen.get() {
             return;
         }
