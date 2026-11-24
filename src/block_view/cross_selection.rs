@@ -1458,6 +1458,31 @@ mod tests {
                 FindSearchResult::Matches(progress) if progress.total == 1
             ));
         }
+        let tail = "long-tail-witness";
+        let long_command = format!("echo {} {tail}", "0123456789".repeat(18));
+        let encoded = long_command.replace(' ', "%20");
+        view.pty.emit_test_output(format!(
+            "{long_command}\r\n\x1b]133;C;cmdline_url={encoded}\x07short output\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07"
+        ).as_bytes());
+        settle();
+        let document = {
+            let blocks = view.finished_blocks.borrow();
+            assert_eq!(blocks.len(), 5);
+            let block = &blocks[4];
+            assert!(block.command_vte.is_none());
+            block.command_document.as_ref().unwrap().widget().clone()
+        };
+        assert!(document.is_mapped());
+        let buffer = document.buffer();
+        let (start, end) = buffer.bounds();
+        assert_eq!(buffer.text(&start, &end, true), long_command);
+        assert!(document.iter_location(&end).y() > document.iter_location(&start).y());
+        assert!(matches!(
+            view.find_in_blocks(tail, false, true),
+            FindSearchResult::Matches(p) if p.total == 1
+        ));
+        let (start, end) = buffer.selection_bounds().expect("selected command tail");
+        assert_eq!(buffer.text(&start, &end, true), tail);
         window.close();
     }
 
