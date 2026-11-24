@@ -3821,6 +3821,8 @@ pub(crate) struct FinishedBlockPrecomputed {
     pub(crate) document_command: bool,
     #[cfg(anvil_shared_terminal)]
     pub(crate) document_output: bool,
+    #[cfg(anvil_shared_terminal)]
+    document_output_with_native_command: bool,
     pub(crate) output_preview: Option<String>,
     pub(crate) output_rows: Option<i64>,
     pub(crate) retained_bytes: Option<usize>,
@@ -3830,19 +3832,21 @@ impl FinishedBlockPrecomputed {
     pub(super) fn documents(config: &Config, exact_command: bool, complete_output: bool) -> Self {
         #[cfg(not(anvil_shared_terminal))]
         let _ = (config, exact_command, complete_output);
+        #[cfg(anvil_shared_terminal)]
+        let foreground_documents = matches!(
+            config.terminal_mode,
+            crate::config::TerminalMode::Block | crate::config::TerminalMode::Chat
+        ) && std::env::var_os("JTERM_SHARED_FINISHED_COMMANDS")
+            .is_none_or(|value| value == "1");
         Self {
             #[cfg(anvil_shared_terminal)]
-            document_command: exact_command
-                && matches!(
-                    config.terminal_mode,
-                    crate::config::TerminalMode::Block | crate::config::TerminalMode::Chat
-                )
-                && std::env::var_os("JTERM_SHARED_FINISHED_COMMANDS")
-                    .is_none_or(|value| value == "1"),
+            document_command: exact_command && foreground_documents,
             #[cfg(anvil_shared_terminal)]
             document_output: complete_output
                 && std::env::var_os("JTERM_SHARED_FINISHED_OUTPUT")
                     .is_none_or(|value| value == "1"),
+            #[cfg(anvil_shared_terminal)]
+            document_output_with_native_command: foreground_documents,
             ..Self::default()
         }
     }
@@ -4993,7 +4997,9 @@ impl FinishedBlock {
         let initial_visible_rows = output_rows.min(viewport_cap).clamp(1, 32);
         #[cfg(anvil_shared_terminal)]
         let output_document = if precomputed.document_output
-            && (command_document.is_some() || is_background)
+            && (command_document.is_some()
+                || is_background
+                || precomputed.document_output_with_native_command)
         {
             jterm_core::screen_replay::project_bounded_archive(output).map(|document| {
                 let output = jterm_gtk_view::FinishedTextView::output(
