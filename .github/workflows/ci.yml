@@ -137,7 +137,7 @@ jobs:
         run: |
           core=$(python3 scripts/shared-core-path.py)
           cargo install --locked --debug --git https://github.com/beamiter/jsh.git \
-            --rev 295fc912ef22da4d864b79a549cd01b0b27c3d84 \
+            --rev d9e18fe636d2041fc23dabd7e3d6aa1159cad2e9 \
             --root "$RUNNER_TEMP/shared-terminal-jsh" jsh
           dbus-run-session -- xvfb-run -a --server-args='-screen 0 1440x1100x24 -nolisten tcp' \
             /usr/bin/python3 -B "$core/crates/jterm_gtk_view/tests/native_jsh.py" \
