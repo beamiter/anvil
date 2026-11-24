@@ -143,19 +143,16 @@ impl SharedTerminal {
         argv: &[String],
         cwd: &str,
     ) -> Option<Self> {
-        let result = RuntimeShell::spawn_hosted_attachment(
-            argv,
-            std::path::Path::new(cwd),
-            crate::host::is_flatpak(),
-            || {
-                Self::runtime_environment(
-                    argv,
-                    config.borrow().vim9.auto_gui,
-                    &jterm_gtk_view::INTERACTIVE_CHILD_ENV,
-                )
-            },
-        );
-        Self::from_runtime(config, argv, result, true)
+        let (launch, local_directory) =
+            crate::host::hosted_attachment_pty(argv, cwd, &jterm_gtk_view::INTERACTIVE_CHILD_ENV);
+        let result = RuntimeShell::spawn_hosted_attachment(&launch, local_directory, || {
+            Self::runtime_environment(
+                argv,
+                config.borrow().vim9.auto_gui,
+                &jterm_gtk_view::INTERACTIVE_CHILD_ENV,
+            )
+        });
+        Self::from_runtime(config, &launch, result, true)
     }
 
     #[cfg(target_os = "linux")]

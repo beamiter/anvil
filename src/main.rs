@@ -783,7 +783,6 @@ fn setup_shared_pane(
 ) -> Option<TermCtl> {
     if !matches!(init.mode, TerminalMode::Vte)
         || init.working_directory_external
-        || !init.initial_commands.as_slice().is_empty()
         || !init.env_extra.is_empty()
     {
         return None;
@@ -796,6 +795,9 @@ fn setup_shared_pane(
             init.session_id.as_deref()?,
         ),
         SharedPaneKind::HostedAttachment => {
+            if !init.initial_commands.as_slice().is_empty() {
+                return None;
+            }
             shared_terminal::SharedTerminal::open_hosted_attachment(
                 init.config.clone(),
                 &init.shell_argv,
@@ -817,12 +819,13 @@ fn setup_shared_pane(
                 .expect("embedded shared pane owns its runtime"),
         );
         let sender_for_events = sender.clone();
+        let configured_shell = matches!(kind, SharedPaneKind::ConfiguredShell);
         let last_cwd = Rc::new(std::cell::RefCell::new(init.working_directory.clone()));
         let cwd_pending = Rc::new(std::cell::Cell::new(false));
         pane.set_event_handler(move |event| match event {
             jterm_gtk_view::PaneEvent::Output => {
                 sender_for_events.input(AppMsg::Activity(pane_id));
-                if cwd_pending.replace(true) {
+                if !configured_shell || cwd_pending.replace(true) {
                     return;
                 }
                 let runtime = runtime.clone();
@@ -862,6 +865,9 @@ fn setup_shared_pane(
                 sender.input(AppMsg::PaneFocused(tab_id, pane_id));
             }
         });
+        if configured_shell {
+            pane.schedule_initial_commands(init.initial_commands.as_slice());
+        }
     }
     Some(TermCtl::Shared(view))
 }
