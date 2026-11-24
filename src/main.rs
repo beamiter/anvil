@@ -603,6 +603,7 @@ fn create_pane(
     initial_commands: InitialCommands,
     working_directory: Option<String>,
     session_id: Option<String>,
+    history: block_view::PaneHistoryInit,
     cwd_external: bool,
     env_extra: Vec<(String, String)>,
     shared_kind: Option<SharedPaneKind>,
@@ -620,6 +621,7 @@ fn create_pane(
     // is deliberate — a new pane path added later inherits the identity instead
     // of silently rejoining the set that journals nothing.
     let session_id = Some(config::pane_session_id(session_id, pane_id));
+    let history_id = history.id;
     let probe = terminal::PaneProbe::default();
     // -1 means "no PTY yet"; foreground probing skips it (0 would alias stdin).
     probe.pty_fd.set(-1);
@@ -631,6 +633,7 @@ fn create_pane(
         working_directory: working_directory.clone(),
         working_directory_external: cwd_external,
         session_id: session_id.clone(),
+        history,
         cwd_token,
         initial_commands,
         probe: probe.clone(),
@@ -776,6 +779,7 @@ fn create_pane(
         cwd: working_directory,
         cwd_external,
         session_id,
+        history_id,
         mode,
         probe,
         last_exit: None,

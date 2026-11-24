@@ -400,6 +400,31 @@ fn read_session_text(path: &Path) -> io::Result<Option<String>> {
     }
 }
 
+pub(super) fn legacy_archive_text(path: &Path) -> io::Result<(String, bool)> {
+    let Some(text) = read_session_text(path)? else {
+        return Ok((String::new(), false));
+    };
+    let DecodedSession { zones, limited } = decode_session_for_restore(text.as_bytes())?;
+    let mut preview = String::new();
+    for zone in zones {
+        let (record, snapshot) = zone.into_live(0);
+        let bytes = replay_bytes(
+            &record,
+            snapshot.as_ref().map(|value| value.plain.as_str()),
+            snapshot.as_ref().is_some_and(|value| value.truncated),
+        );
+        // replay_bytes sanitizes user data and only adds its own dim framing.
+        preview.push_str(
+            &String::from_utf8_lossy(&bytes)
+                .replace("\x1b[2m", "")
+                .replace("\x1b[0m", "")
+                .replace("\r\n", "\n"),
+        );
+        preview.push('\n');
+    }
+    Ok((preview, limited))
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum RestoreStatus {
     #[default]

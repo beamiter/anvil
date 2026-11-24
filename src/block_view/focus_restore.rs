@@ -301,6 +301,7 @@ mod tests {
             None,
             false,
             None,
+            Default::default(),
             "focus-restore-test",
             &[],
             &[],

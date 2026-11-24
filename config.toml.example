@@ -82,8 +82,8 @@ finished_block_viewport_rows = 24
 finished_block_max_expanded_rows = 5000
 max_collapsed_output_lines = 25
 virtual_scroll_margin = 1
-# Unlike command history, this binary file can contain terminal output. It is
-# disabled unless an absolute or ~/ path is configured.
+# Set an absolute or ~/ path to save completed output in per-pane files beside it.
+# Earlier shared archives can be opened from the terminal's context menu.
 # block_history_path = "~/.local/state/anvil/block-history.bin"
 block_history_compress = true
 preserve_live_scrollback = false

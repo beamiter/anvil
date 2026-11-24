@@ -889,6 +889,7 @@ impl Component for BlockTerminal {
                 init.working_directory.as_deref(),
                 init.working_directory_external,
                 init.session_id.as_deref(),
+                init.history,
                 &init.cwd_token,
                 init.initial_commands.as_slice(),
                 &init.env_extra,

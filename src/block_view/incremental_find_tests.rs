@@ -166,6 +166,7 @@ impl Fixture {
             None,
             false,
             None,
+            Default::default(),
             "incremental-find-test",
             &[],
             &[],

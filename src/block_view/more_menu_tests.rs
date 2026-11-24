@@ -55,6 +55,7 @@ fn more_opens_complete_menu_preserves_selection_and_retires_stale_cards() {
             None,
             false,
             None,
+            Default::default(),
             "more-menu-test",
             &[],
             &[],

@@ -6,7 +6,7 @@
 use super::zone_history;
 use super::{mutate_block_data_and_redraw, BlockData, TermView};
 use crate::persistence::{self, PersistenceKey};
-use gtk::prelude::*;
+use gtk::{glib, prelude::*};
 use jterm_core::screen_replay::FinishedHistoryFrame;
 use relm4::gtk;
 use std::borrow::Cow;
@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MAX_ENCODED_RECORD_BYTES: usize = 16 * 1024 * 1024;
@@ -168,9 +169,51 @@ struct PlannedHistorySave {
     explicit_replace: bool,
 }
 
-fn configured_history_target(path: Option<&str>, compress: bool) -> Option<HistoryTarget> {
-    path.map(|path| HistoryTarget {
-        path: history_path(path),
+pub(crate) struct PaneHistoryInit {
+    pub(crate) id: Uuid,
+    pub(super) handoff: Option<BlockHistoryHandoff>,
+}
+
+impl PaneHistoryInit {
+    pub(crate) fn new(saved: Option<Uuid>) -> Self {
+        Self {
+            id: saved.unwrap_or_else(Uuid::new_v4),
+            handoff: None,
+        }
+    }
+}
+
+impl Default for PaneHistoryInit {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+pub(super) struct BlockHistoryHandoff {
+    blocks: VecDeque<BlockData>,
+    reserved_ids: HashSet<u64>,
+    baselines: Arc<Mutex<HashMap<PathBuf, HistoryBaseline>>>,
+    outcome: HistoryLoadOutcome,
+    pending_clear: Arc<Mutex<VecDeque<HistoryTarget>>>,
+}
+
+fn scoped_history_path(base: &Path, owner: Uuid, extension: &str) -> Option<PathBuf> {
+    // Keep the configured directory and bound the derived filename even when
+    // the original basename is long or contains non-UTF-8 bytes.
+    let namespace = glib::compute_checksum_for_data(
+        glib::ChecksumType::Sha256,
+        base.file_name()?.as_encoded_bytes(),
+    )?;
+    Some(base.with_file_name(format!(".anvil-history-{namespace}-{owner}.{extension}")))
+}
+
+fn configured_history_target(
+    path: Option<&str>,
+    compress: bool,
+    owner: Uuid,
+) -> Option<HistoryTarget> {
+    Some(HistoryTarget {
+        path: scoped_history_path(&history_path(path?), owner, "blocks")?,
         compress,
     })
 }
@@ -289,6 +332,17 @@ fn expand_home_prefix_with(path: &str, home: Option<&Path>) -> PathBuf {
 fn history_path(path: &str) -> PathBuf {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     expand_home_prefix_with(path, home.as_deref())
+}
+
+fn legacy_zone_path(base: &Path) -> Option<PathBuf> {
+    // This reproduces the names written by the shared-zone history codec.
+    let mut name = base.file_stem()?.to_os_string();
+    name.push("-zones");
+    if let Some(extension) = base.extension() {
+        name.push(".");
+        name.push(extension);
+    }
+    Some(base.with_file_name(name))
 }
 
 fn temp_file_name(target: &Path) -> io::Result<OsString> {
@@ -1560,6 +1614,105 @@ fn enqueue_history_saves(
 
 const ZONE_HISTORY_NOTICE_NAME: &str = "zone-history-recovery-notice";
 
+#[derive(Clone, Copy)]
+pub(super) enum LegacyHistoryKind {
+    Block,
+    Unified,
+}
+
+impl LegacyHistoryKind {
+    pub(super) fn title(self) -> &'static str {
+        match self {
+            Self::Block => "Shared Block History",
+            Self::Unified => "Shared Unified History",
+        }
+    }
+}
+
+enum LegacyHistory {
+    Blocks(LoadedRecords, persistence::EstimatedBytesReservation),
+    Zones(String, bool),
+}
+
+fn clear_archived_card(content: &gtk::Box) {
+    if let Some(card) = content.first_child().and_downcast::<gtk::Box>() {
+        content.remove(&card);
+        super::WidgetPool::teardown(&card);
+    }
+}
+
+fn show_archived_blocks(
+    content: &gtk::Box,
+    status: &gtk::Label,
+    archive: (LoadedRecords, persistence::EstimatedBytesReservation),
+    config: crate::config::Config,
+) {
+    let (loaded, _) = &archive;
+    let incomplete = !loaded.fully_decoded
+        || !loaded.fully_retained
+        || loaded.blocks.len() < loaded.total_loaded;
+    if loaded.blocks.is_empty() {
+        status.set_label(if incomplete {
+            "No readable records within the archive limits."
+        } else {
+            "No archived records."
+        });
+        return;
+    }
+    if incomplete {
+        status.set_label("Showing the most recent readable records within the archive limits.");
+    } else {
+        status.set_visible(false);
+    }
+    let names: Vec<_> = loaded
+        .blocks
+        .iter()
+        .map(|block| {
+            if block.is_background() {
+                "Background output".to_owned()
+            } else {
+                jterm_core::review_input::safe_inline_display(&block.cmd, 120)
+            }
+        })
+        .collect();
+    let labels: Vec<_> = names.iter().map(String::as_str).collect();
+    let picker = gtk::DropDown::from_strings(&labels);
+    picker.update_property(&[gtk::accessible::Property::Label("Archived command")]);
+    picker.set_selected((labels.len() - 1) as u32);
+    content.append(&picker);
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    card.connect_unrealize(clear_archived_card);
+    let scroll = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .child(&card)
+        .build();
+    content.append(&scroll);
+
+    let show = move |index: u32| {
+        clear_archived_card(&card);
+        let (records, _budget) = &archive;
+        let Some(record) = records.blocks.get(index as usize) else {
+            return;
+        };
+        let cols = super::bounded_finished_vte_columns(if record.cols == 0 {
+            80
+        } else {
+            i64::from(record.cols)
+        });
+        let finished = super::FinishedBlock::from_retained(record, &config, cols, None);
+        finished.set_lifecycle(
+            record.lifecycle_health(),
+            record.lifecycle_notice().as_deref(),
+        );
+        finished.set_output_head_dropped(record.output_head_dropped);
+        finished.header_row.set_tooltip_text(None);
+        finished.action_box.set_visible(false);
+        card.append(finished.widget());
+    };
+    show(picker.selected());
+    picker.connect_selected_notify(move |picker| show(picker.selected()));
+}
+
 fn zone_history_notice(message: &str, details: &str) -> gtk::Box {
     let notice = gtk::Box::new(gtk::Orientation::Vertical, 4);
     notice.set_widget_name(ZONE_HISTORY_NOTICE_NAME);
@@ -1582,6 +1735,153 @@ fn zone_history_notice(message: &str, details: &str) -> gtk::Box {
 
 #[allow(dead_code)]
 impl TermView {
+    pub(super) fn legacy_history_archives(&self) -> Vec<(LegacyHistoryKind, PathBuf)> {
+        let config = self.config.borrow();
+        let Some(path) = config.block_history_path.as_deref() else {
+            return Vec::new();
+        };
+        let base = history_path(path);
+        let zones = legacy_zone_path(&base);
+        [
+            (LegacyHistoryKind::Block, Some(base)),
+            (LegacyHistoryKind::Unified, zones),
+        ]
+        .into_iter()
+        .filter_map(|(kind, path)| path.map(|path| (kind, path)))
+        .filter(|(_, path)| path.symlink_metadata().is_ok())
+        .collect()
+    }
+
+    pub(super) fn open_legacy_history(&self, kind: LegacyHistoryKind, path: PathBuf) {
+        let config = self.config.borrow().clone();
+        let read_limit =
+            (config.lazy_load_threshold as usize).min(config.max_visible_blocks as usize);
+        let compressed = config.block_history_compress;
+        let window = gtk::Window::builder()
+            .title(kind.title())
+            .default_width(760)
+            .default_height(520)
+            .modal(true)
+            .destroy_with_parent(true)
+            .build();
+        if let Some(parent) = self.root.root().and_downcast::<gtk::Window>() {
+            window.set_transient_for(Some(&parent));
+        }
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        content.set_margin_start(12);
+        content.set_margin_end(12);
+        content.set_margin_top(12);
+        content.set_margin_bottom(12);
+        let description = gtk::Label::new(Some("Archived records with unknown pane ownership"));
+        description.set_xalign(0.0);
+        content.append(&description);
+        let status = gtk::Label::new(Some("Loading history…"));
+        status.set_xalign(0.0);
+        status.set_wrap(true);
+        content.append(&status);
+        window.set_child(Some(&content));
+
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let key = PersistenceKey::unique_for_path("legacy-history-read", &path);
+        let queued = persistence::enqueue(key, "Read shared history archive", move || {
+            let result = match kind {
+                LegacyHistoryKind::Block => {
+                    read_history_records_reserved(&path, compressed, read_limit)
+                        .map(|(records, budget)| LegacyHistory::Blocks(records, budget))
+                }
+                LegacyHistoryKind::Unified => zone_history::legacy_archive_text(&path)
+                    .map(|(text, limited)| LegacyHistory::Zones(text, limited)),
+            };
+            let _ = send.send(result);
+            Ok(())
+        });
+        if let Err(error) = queued {
+            status.set_label(&format!("Unable to open the archive. {error}"));
+        } else {
+            let weak_content = content.downgrade();
+            glib::timeout_add_local(Duration::from_millis(20), move || {
+                let Some(content) = weak_content.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                match receive.try_recv() {
+                    Ok(Ok(LegacyHistory::Blocks(records, budget))) => {
+                        show_archived_blocks(&content, &status, (records, budget), config.clone());
+                    }
+                    Ok(Ok(LegacyHistory::Zones(text, limited))) => {
+                        if text.is_empty() {
+                            status.set_label("No archived records.");
+                        } else {
+                            status.set_visible(limited);
+                            status.set_label(
+                                "Showing the most recent records within the archive limits.",
+                            );
+                            let view = gtk::TextView::builder()
+                                .editable(false)
+                                .monospace(true)
+                                .build();
+                            view.buffer().set_text(&text);
+                            content.append(
+                                &gtk::ScrolledWindow::builder()
+                                    .vexpand(true)
+                                    .child(&view)
+                                    .build(),
+                            );
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        status.set_label(&format!("Unable to read the archive. {error}"))
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        return glib::ControlFlow::Continue
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        status.set_label("Unable to read the archive.")
+                    }
+                }
+                glib::ControlFlow::Break
+            });
+        }
+        window.present();
+    }
+
+    /// A reconnect replaces the frontend of this pane after its previous PTY
+    /// has drained. Preserve its visible history and the authority of any
+    /// queued writes so the replacement never restores an older disk snapshot.
+    pub(crate) fn history_for_reconnect(&self) -> PaneHistoryInit {
+        PaneHistoryInit {
+            id: self.history_id,
+            handoff: self
+                .render_backend
+                .persists_block_history()
+                .then(|| BlockHistoryHandoff {
+                    blocks: self.block_data.borrow().clone(),
+                    reserved_ids: self.reserved_history_block_ids.borrow().clone(),
+                    baselines: Arc::clone(&self.history_baselines),
+                    outcome: self.history_load_outcome.borrow().clone(),
+                    pending_clear: Arc::clone(&self.history_explicit_replace_pending),
+                }),
+        }
+    }
+
+    pub(crate) fn retire_history_after_reconnect(&self) {
+        // The handoff owns future saves once the replacement has launched.
+        if self.render_backend.persists_block_history() {
+            self.history_close_started.set(true);
+        }
+    }
+
+    pub(super) fn restore_history_handoff(&mut self, handoff: BlockHistoryHandoff) {
+        self.history_baselines = handoff.baselines;
+        self.history_explicit_replace_pending = handoff.pending_clear;
+        *self.history_load_outcome.get_mut() = handoff.outcome;
+        replace_reserved_history_ids(&self.reserved_history_block_ids, handoff.reserved_ids);
+        mutate_block_data_and_redraw(
+            &self.block_data,
+            self.failure_marker_redraw.as_ref(),
+            |blocks| *blocks = handoff.blocks,
+        );
+    }
+
     /// Bind deletion authority to the target selected when the user invoked
     /// Clear. Older failed targets stay first; exact repeats are coalesced.
     pub(super) fn arm_history_explicit_replace(&self) {
@@ -1590,17 +1890,16 @@ impl TermView {
             configured_history_target(
                 config.block_history_path.as_deref(),
                 config.block_history_compress,
+                self.history_id,
             )
         };
         enqueue_pending_clear(&self.history_explicit_replace_pending, target);
     }
 
-    /// Where this pane's bounded zone document lives: a sibling of the Block
-    /// history file, distinct by stem so a pane that changes mode between runs
-    /// can never decode one as the other.
+    /// Keep the bounded zone document separate from the same pane's Block data.
     fn zone_history_path(&self) -> Option<PathBuf> {
-        let configured = self.config.borrow().block_history_path.as_ref().cloned()?;
-        let base = history_path(&configured);
+        let config = self.config.borrow();
+        let base = history_path(config.block_history_path.as_deref()?);
         // Resolve relative configuration against the current directory for
         // each observation, so save authority cannot follow a cwd change.
         let base = if base.is_absolute() {
@@ -1608,15 +1907,7 @@ impl TermView {
         } else {
             std::env::current_dir().ok()?.join(base)
         };
-        let stem = base
-            .file_stem()
-            .map(|stem| stem.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "blocks".to_string());
-        let name = match base.extension() {
-            Some(ext) => format!("{stem}-zones.{}", ext.to_string_lossy()),
-            None => format!("{stem}-zones"),
-        };
-        Some(base.with_file_name(name))
+        scoped_history_path(&base, self.history_id, "zones")
     }
 
     /// Persist the backend's bounded zone document. Encoding is small and
@@ -1740,6 +2031,7 @@ impl TermView {
                 configured_history_target(
                     config.block_history_path.as_deref(),
                     config.block_history_compress,
+                    self.history_id,
                 ),
                 (config.lazy_load_threshold as usize).min(config.max_visible_blocks as usize),
             )
@@ -1807,6 +2099,7 @@ impl TermView {
             configured_history_target(
                 config.block_history_path.as_deref(),
                 config.block_history_compress,
+                self.history_id,
             )
         };
         let (saves, has_pending_clear) = {
@@ -1865,6 +2158,7 @@ impl TermView {
                 configured_history_target(
                     config.block_history_path.as_deref(),
                     config.block_history_compress,
+                    self.history_id,
                 ),
                 (config.lazy_load_threshold as usize).min(config.max_visible_blocks as usize),
             )
@@ -2008,6 +2302,7 @@ mod tests {
                 None,
                 false,
                 Some("fixture"),
+                Default::default(),
                 "fixture-token",
                 &[],
                 &[],
@@ -2106,6 +2401,9 @@ mod tests {
                 None,
                 false,
                 Some("history-fixture"),
+                super::PaneHistoryInit::new(Some(uuid::Uuid::from_u128(
+                    0x61965a87_5aea_4622_9851_d0d0608ab7be,
+                ))),
                 "fixture-token",
                 &[],
                 &[],
@@ -2319,10 +2617,12 @@ mod tests {
         gtk::init().expect("GTK display");
         for repaired in [false, true] {
             let directory = TestDir::new("native-block-retry");
-            let path = directory.path().join("history.bin");
+            let base = directory.path().join("history.bin");
+            let history = super::PaneHistoryInit::default();
+            let path = super::scoped_history_path(&base, history.id, "blocks").unwrap();
             write_native_zone_fixture(&path, &[0xff]);
             let mut config = crate::config::Config::safe_defaults();
-            config.block_history_path = Some(path.to_string_lossy().into_owned());
+            config.block_history_path = Some(base.to_string_lossy().into_owned());
             config.block_history_compress = false;
             let view = Rc::new(
                 super::TermView::new_with_spawner(
@@ -2332,6 +2632,7 @@ mod tests {
                     None,
                     false,
                     Some("retry-fixture"),
+                    history,
                     "fixture-token",
                     &[],
                     &[],
@@ -2532,6 +2833,107 @@ mod tests {
             .into_iter()
             .map(|block| block.cmd)
             .collect()
+    }
+
+    #[test]
+    fn scoped_history_preserves_the_configured_directory_and_separates_names() {
+        let directory = TestDir::new("scoped-paths");
+        let base = directory.path().join("x".repeat(250));
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        let first_blocks = super::scoped_history_path(&base, first, "blocks").unwrap();
+        let paths = HashSet::from([
+            first_blocks.clone(),
+            super::scoped_history_path(&base, first, "zones").unwrap(),
+            super::scoped_history_path(&base, second, "blocks").unwrap(),
+            super::scoped_history_path(&base.with_file_name("other.bin"), first, "blocks").unwrap(),
+        ]);
+        assert_eq!(paths.len(), 4);
+        for path in paths {
+            assert_eq!(path.parent(), Some(directory.path()));
+            assert!(path.file_name().unwrap().len() < 255);
+        }
+        fs::write(&base, b"old history").unwrap();
+        save_history_snapshot(
+            &first_blocks,
+            &[sample_block(1, "from first pane")],
+            false,
+            Some(HistoryRevision::Missing),
+        )
+        .unwrap();
+        assert_eq!(read_commands(&first_blocks), ["from first pane"]);
+        assert_eq!(fs::read(&base).unwrap(), b"old history");
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn reconnect_transfers_unsaved_history_only_to_the_replacement() {
+        gtk::init().expect("GTK display");
+        let directory = TestDir::new("reconnect-handoff");
+        let mut config = crate::config::Config::safe_defaults();
+        config.block_history_path = Some(
+            directory
+                .path()
+                .join("history.bin")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let make_view = |session, history| {
+            super::TermView::new_with_spawner(
+                &config,
+                &crate::config::TerminalMode::Block,
+                &["inert-fixture-never-executed".to_string()],
+                None,
+                false,
+                Some(session),
+                history,
+                "fixture-token",
+                &[],
+                &[],
+                |_, _, _, _| crate::pty::OwnedPty::from_openpty(Some(false)),
+            )
+            .unwrap()
+        };
+
+        let previous = make_view("old-shell", Default::default());
+        previous
+            .block_data
+            .borrow_mut()
+            .push_back(sample_block(1, "unsaved"));
+        previous.reserved_history_block_ids.borrow_mut().insert(2);
+        let replacement = make_view("new-shell", previous.history_for_reconnect());
+        let unrelated = make_view("new-shell", Default::default());
+        assert_eq!(replacement.history_id, previous.history_id);
+        assert_ne!(unrelated.history_id, replacement.history_id);
+        assert_eq!(replacement.block_data.borrow()[0].cmd, "unsaved");
+        assert!(replacement.reserved_history_block_ids.borrow().contains(&2));
+        assert!(unrelated.block_data.borrow().is_empty());
+        assert!(Arc::ptr_eq(
+            &replacement.history_baselines,
+            &previous.history_baselines
+        ));
+        assert!(Arc::ptr_eq(
+            &replacement.history_explicit_replace_pending,
+            &previous.history_explicit_replace_pending
+        ));
+
+        let target = super::configured_history_target(
+            config.block_history_path.as_deref(),
+            config.block_history_compress,
+            previous.history_id,
+        )
+        .unwrap();
+        previous.retire_history_after_reconnect();
+        drop(previous);
+        let (finished, done) = std::sync::mpsc::sync_channel(1);
+        persistence::enqueue(
+            persistence::PersistenceKey::unique_for_path("handoff-test", &target.path),
+            "Wait for preceding fixture saves",
+            move || finished.send(()).map_err(io::Error::other),
+        )
+        .unwrap();
+        done.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!target.path.exists(), "the old view must give up its final write");
     }
 
     #[test]
@@ -3887,7 +4289,7 @@ mod tests {
     static LABELED_WORKER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn closing_panes_each_save_to_the_shared_history_file() {
+    fn concurrent_close_writes_merge_for_one_archive() {
         let dir = TestDir::new("closing-panes");
         let path = dir.path().join("history.bin");
         let (release, wait) = std::sync::mpsc::sync_channel(1);
@@ -3904,7 +4306,7 @@ mod tests {
             },
             explicit_replace: false,
         }];
-        for (id, command) in [(1, "first-pane"), (2, "second-pane")] {
+        for (id, command) in [(1, "first-write"), (2, "second-write")] {
             let baselines = Arc::new(Mutex::new(HashMap::new()));
             replace_history_baseline(
                 &baselines,
@@ -3933,7 +4335,7 @@ mod tests {
 
         let reread = read_history_records(&path, false, 10, UndecodablePolicy::Reject).unwrap();
         let commands: Vec<_> = reread.blocks.iter().map(|block| block.cmd.as_str()).collect();
-        assert_eq!(commands, ["first-pane", "second-pane"]);
+        assert_eq!(commands, ["first-write", "second-write"]);
     }
 
     #[test]

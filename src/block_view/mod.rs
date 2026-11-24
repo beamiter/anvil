@@ -91,7 +91,7 @@ pub(crate) use cross_selection::*;
 pub(crate) use css::*;
 pub(crate) use export::SessionExportFormat;
 pub(crate) use find::*;
-pub(crate) use history::BLOCK_HISTORY_PERSIST_OPERATION;
+pub(crate) use history::{PaneHistoryInit, BLOCK_HISTORY_PERSIST_OPERATION};
 use onboarding::BlockOnboarding;
 #[allow(unused_imports)]
 pub(crate) use palette::*;
@@ -4592,6 +4592,7 @@ fn long_block_notification_exit_code(reported: Option<i32>) -> Option<i32> {
 }
 
 pub struct TermView {
+    history_id: uuid::Uuid,
     menu_keybindings: shortcut_hints::MenuKeybindings,
     root: gtk::Box,
     block_scroll: ScrolledWindow,
@@ -12767,6 +12768,7 @@ impl TermView {
         cwd: Option<&str>,
         cwd_external: bool,
         session_id: Option<&str>,
+        history: PaneHistoryInit,
         cwd_token: &str,
         initial_commands: &[String],
         env_overrides: &[(String, String)],
@@ -12778,6 +12780,7 @@ impl TermView {
             cwd,
             cwd_external,
             session_id,
+            history,
             cwd_token,
             initial_commands,
             env_overrides,
@@ -12812,6 +12815,7 @@ impl TermView {
         cwd: Option<&str>,
         cwd_external: bool,
         session_id: Option<&str>,
+        history: PaneHistoryInit,
         cwd_token: &str,
         initial_commands: &[String],
         env_overrides: &[(String, String)],
@@ -16069,7 +16073,8 @@ impl TermView {
             active.borrow().live_clip().connect_map(move |_| kick());
         }
 
-        let term_view = TermView {
+        let mut term_view = TermView {
+            history_id: history.id,
             root,
             block_scroll,
             chat_organism_surface,
@@ -16162,8 +16167,11 @@ impl TermView {
                 .expect("reader backend installed before TermView construction"),
         };
 
-        // Load history if configured
-        let _ = term_view.load_history();
+        if let Some(handoff) = history.handoff {
+            term_view.restore_history_handoff(handoff);
+        } else {
+            let _ = term_view.load_history();
+        }
 
         // Create widgets for loaded blocks. Each block's `cols` is what the live
         // VTE was wrapping at when the command ran; restoring at the same cols
@@ -17077,6 +17085,18 @@ impl TermView {
                     popover_c.popdown();
                     if let Some(view) = view.upgrade() {
                         view.select_all_blocks();
+                    }
+                });
+                vbox.append(&item);
+            }
+            for (kind, path) in view.legacy_history_archives() {
+                let item = menu_item(kind.title());
+                let popover = popover.clone();
+                let view = Rc::downgrade(&view);
+                item.connect_clicked(move |_| {
+                    popover.popdown();
+                    if let Some(view) = view.upgrade() {
+                        view.open_legacy_history(kind, path.clone());
                     }
                 });
                 vbox.append(&item);
@@ -18782,6 +18802,7 @@ pub(crate) fn organism_settings_test_view_for_mode(
         None,
         false,
         None,
+        Default::default(),
         "organism-test",
         &[],
         &[],
@@ -19290,6 +19311,7 @@ mod tests {
                     None,
                     false,
                     None,
+                    Default::default(),
                     "ssh-viewport-test",
                     &[],
                     &[],

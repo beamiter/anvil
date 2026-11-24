@@ -394,6 +394,7 @@ mod tests {
                     working_directory: None,
                     working_directory_external: false,
                     session_id: None,
+                    history: Default::default(),
                     cwd_token: "nonsecret-test-only".into(),
                     initial_commands: InitialCommands::default(),
                     probe: PaneProbe::default(),

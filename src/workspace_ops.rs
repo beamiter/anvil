@@ -823,6 +823,7 @@ impl AppModel {
             cwd,
             cwd_external: false,
             session_id: None,
+            history_id: uuid::Uuid::new_v4(),
             mode: TerminalMode::Vte,
             probe: Default::default(),
             last_exit: None,
@@ -1086,6 +1087,7 @@ impl AppModel {
             initial_commands,
             working_directory,
             None,
+            Default::default(),
             false,
             env_extra,
             shared_kind,
@@ -1198,6 +1200,7 @@ impl AppModel {
                 cwd_external,
                 remote_name,
                 sid,
+                history_id,
                 cmds,
                 ..
             } => {
@@ -1233,6 +1236,7 @@ impl AppModel {
                                 InitialCommands::default(),
                                 None,
                                 restored_sid.clone(),
+                                block_view::PaneHistoryInit::new(*history_id),
                                 true,
                                 Vec::new(),
                                 None,
@@ -1317,6 +1321,7 @@ impl AppModel {
                     } else {
                         restored_sid
                     },
+                    block_view::PaneHistoryInit::new(*history_id),
                     external_cwd,
                     Vec::new(),
                     (!self.safe_mode).then_some(SharedPaneKind::ConfiguredShell),
@@ -1383,7 +1388,7 @@ impl AppModel {
             }
         } else {
             let pane = tab.panes.iter().find(|p| p.widget() == *widget);
-            let (mode, cwd, cwd_external, remote_name, sid, cmds) = match pane {
+            let (mode, cwd, cwd_external, remote_name, sid, history_id, cmds) = match pane {
                 Some(p) => {
                     let managed_remote =
                         tab.remote.as_ref().filter(|remote| remote.pane_id == p.id);
@@ -1411,12 +1416,21 @@ impl AppModel {
                         cwd_external,
                         managed_remote.map(|remote| remote.configured_profile().name.clone()),
                         p.session_id.clone(),
+                        Some(p.history_id),
                         cmds,
                     )
                 }
-                None => ("block".to_string(), None, false, None, None, None),
+                None => return session::PaneLayout::empty_leaf(),
             };
-            session::PaneLayout::captured_leaf(mode, cwd, cwd_external, remote_name, sid, cmds)
+            session::PaneLayout::captured_leaf(
+                mode,
+                cwd,
+                cwd_external,
+                remote_name,
+                sid,
+                history_id,
+                cmds,
+            )
         }
     }
 
@@ -1885,6 +1899,7 @@ impl AppModel {
             InitialCommands::default(),
             None,
             None,
+            Default::default(),
             true,
             Vec::new(),
             None,
@@ -2040,6 +2055,12 @@ impl AppModel {
             false
         };
         let old_widget = self.tabs[idx].panes[0].widget();
+        let old_pane = &self.tabs[idx].panes[0];
+        let old_view = old_pane.terminal.term_view();
+        let history = old_view.as_deref().map_or_else(
+            || block_view::PaneHistoryInit::new(Some(old_pane.history_id)),
+            block_view::TermView::history_for_reconnect,
+        );
         self.tabs[idx].holder.remove(&old_widget);
         let new_pane_id = self.next_pane_id;
         self.next_pane_id += 1;
@@ -2055,11 +2076,17 @@ impl AppModel {
             InitialCommands::default(),
             None,
             None,
+            history,
             true,
             Vec::new(),
             None,
             sender,
         );
+        if pane.terminal.term_view().is_some() {
+            if let Some(old_view) = old_view {
+                old_view.retire_history_after_reconnect();
+            }
+        }
         self.tabs[idx].holder.append(&pane.widget());
         self.tabs[idx].panes = vec![pane];
         self.tabs[idx].active_pane = 0;
@@ -2629,6 +2656,7 @@ impl AppModel {
             InitialCommands::default(),
             cwd,
             None,
+            Default::default(),
             false,
             Vec::new(),
             (!self.safe_mode).then_some(SharedPaneKind::ConfiguredShell),
@@ -2861,6 +2889,7 @@ impl AppModel {
                     InitialCommands::default(),
                     wd,
                     None,
+                    Default::default(),
                     false,
                     Vec::new(),
                     shared_kind,
@@ -4176,6 +4205,7 @@ mod pane_tree_tests {
             false,
             None,
             Some("0123456789abcdef0123456789abcdef".to_string()),
+            None,
             None,
         );
         let wire = serde_json::to_value(&leaf).expect("actual bounded capture serializes");

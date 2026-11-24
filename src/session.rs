@@ -27,6 +27,7 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 const LEGACY_STATE_FILE: &str = "tabs.state";
 const STATE_PREFIX: &str = "tabs.";
@@ -99,6 +100,9 @@ pub(crate) enum PaneLayout {
         /// Stable local jsh identity learned through OSC 7770.
         #[serde(skip_serializing_if = "Option::is_none")]
         sid: Option<String>,
+        /// Local archive identity, independent of the shell or remote session.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        history_id: Option<Uuid>,
         /// Restorable command argv to replay on restore (e.g. `["ssh", "host"]`).
         /// Keeping it structured prevents shell metacharacters inside one
         /// argument from becoming a different local command after a restart.
@@ -169,6 +173,7 @@ impl PaneLayout {
         cwd_external: bool,
         remote_name: Option<String>,
         sid: Option<String>,
+        history_id: Option<Uuid>,
         cmds: Option<Vec<String>>,
     ) -> Self {
         Self::Leaf {
@@ -182,12 +187,47 @@ impl PaneLayout {
             remote_name: retain_bounded_string(remote_name, MAX_RESTORED_REMOTE_NAME_BYTES),
             sid: retain_bounded_string(sid, MAX_RESTORED_SID_BYTES)
                 .filter(|value| crate::config::valid_session_id(value)),
+            history_id,
             cmds: cmds.filter(|argv| restorable_command_within_limits(argv)),
         }
     }
 
     pub(crate) fn empty_leaf() -> Self {
-        Self::captured_leaf("block".to_string(), None, false, None, None, None)
+        Self::captured_leaf("block".to_string(), None, false, None, None, None, None)
+    }
+
+    fn visit_history_ids(&mut self, visit: &mut impl FnMut(&mut Option<Uuid>)) {
+        match self {
+            Self::Leaf { history_id, .. } => visit(history_id),
+            Self::Split { start, end, .. } => {
+                start.visit_history_ids(visit);
+                end.visit_history_ids(visit);
+            }
+        }
+    }
+}
+
+fn discard_ambiguous_history_ids(tabs: &mut [SavedTab]) {
+    let mut first = HashSet::new();
+    let mut ambiguous = HashSet::new();
+    for tab in &mut *tabs {
+        tab.layout.visit_history_ids(&mut |owner| {
+            if let Some(id) = *owner {
+                if !first.insert(id) {
+                    ambiguous.insert(id);
+                }
+            }
+        });
+    }
+    if !ambiguous.is_empty() {
+        log::warn!("Ignoring duplicate pane history identities in the session snapshot");
+        for tab in tabs {
+            tab.layout.visit_history_ids(&mut |owner| {
+                if owner.is_some_and(|id| ambiguous.contains(&id)) {
+                    *owner = None;
+                }
+            });
+        }
     }
 }
 
@@ -1087,6 +1127,7 @@ impl<'de> serde::de::Visitor<'de> for PaneLayoutSeed<'_> {
         let mut cwd_external = None;
         let mut remote_name = None;
         let mut sid = None;
+        let mut history_id = None;
         let mut cmds = None;
         let mut orientation = None;
         let mut position = None;
@@ -1125,6 +1166,15 @@ impl<'de> serde::de::Visitor<'de> for PaneLayoutSeed<'_> {
                         field: "sid",
                         limit: MAX_RESTORED_SID_BYTES,
                     }))?
+                }
+                "history_id" => {
+                    history_id = map
+                        .next_value_seed(BoundedOptionalText(BoundedText {
+                            field: "history_id",
+                            limit: uuid::fmt::Hyphenated::LENGTH,
+                        }))?
+                        .and_then(|value| Uuid::parse_str(&value).ok())
+                        .filter(|id| id.get_version_num() == 4);
                 }
                 "cmds" => cmds = map.next_value_seed(RestorableArgvSeed)?,
                 "orientation" => orientation = Some(map.next_value::<char>()?),
@@ -1172,6 +1222,7 @@ impl<'de> serde::de::Visitor<'de> for PaneLayoutSeed<'_> {
                     cwd_external: cwd_external.unwrap_or_default(),
                     remote_name,
                     sid: sid.filter(|value| crate::config::valid_session_id(value)),
+                    history_id,
                     cmds,
                 })
             }
@@ -1361,9 +1412,11 @@ impl<'de> serde::de::Visitor<'de> for SavedSessionSeed<'_> {
                 }
             }
         }
+        let mut tabs = tabs.ok_or_else(|| A::Error::missing_field("tabs"))?;
+        discard_ambiguous_history_ids(&mut tabs);
         Ok(SavedSession {
             active: active.ok_or_else(|| A::Error::missing_field("active"))?,
-            tabs: tabs.ok_or_else(|| A::Error::missing_field("tabs"))?,
+            tabs,
             ai_conversation,
         })
     }
@@ -3051,6 +3104,7 @@ mod tests {
                     cwd_external: false,
                     remote_name: None,
                     sid: None,
+                    history_id: None,
                     cmds: None,
                 },
             }],
@@ -3268,6 +3322,7 @@ mod tests {
             cwd_external: false,
             remote_name: None,
             sid: None,
+            history_id: None,
             cmds: None,
         };
         let mut layout = leaf();
@@ -3412,6 +3467,7 @@ mod tests {
                         cwd_external: true,
                         remote_name: None,
                         sid: None,
+                        history_id: None,
                         cmds: Some(argv),
                     },
                     ..base.clone()
@@ -3431,6 +3487,7 @@ mod tests {
             true,
             Some("r".repeat(MAX_RESTORED_REMOTE_NAME_BYTES + 1)),
             Some(maximum_sid.clone()),
+            None,
             Some(vec![
                 "ssh".to_string(),
                 "x".repeat(MAX_RESTORED_COMMAND_ARG_BYTES + 1),
@@ -3444,6 +3501,7 @@ mod tests {
                 cwd_external: true,
                 remote_name: None,
                 sid: Some(sid),
+                history_id: None,
                 cmds: None,
             } if mode == "block" && sid == &maximum_sid
         ));
@@ -3455,6 +3513,7 @@ mod tests {
             None,
             Some("s".repeat(MAX_RESTORED_SID_BYTES + 1)),
             None,
+            None,
         );
         assert!(matches!(oversized_sid, PaneLayout::Leaf { sid: None, .. }));
 
@@ -3464,6 +3523,7 @@ mod tests {
             false,
             None,
             Some("session.with.dots".to_string()),
+            None,
             None,
         );
         assert!(matches!(invalid_sid, PaneLayout::Leaf { sid: None, .. }));
@@ -3544,6 +3604,7 @@ mod tests {
                     cwd_external: true,
                     remote_name: None,
                     sid: None,
+                    history_id: None,
                     cmds: Some(vec![
                         "ssh".to_string(),
                         "x".repeat(MAX_SNAPSHOT_BYTES as usize),
@@ -3845,6 +3906,7 @@ mod tests {
                     cwd_external: index > 0,
                     remote_name: None,
                     sid: None,
+                    history_id: None,
                     cmds: Some(argv.iter().map(|part| (*part).to_string()).collect()),
                 },
             })
@@ -3932,6 +3994,65 @@ mod tests {
     }
 
     #[test]
+    fn pane_history_identity_survives_the_layout_and_never_aliases_duplicate_leaves() {
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        let unrelated = uuid::Uuid::new_v4();
+        let leaf = |history_id| {
+            PaneLayout::captured_leaf(
+                "block".into(),
+                None,
+                true,
+                None,
+                Some("same-remote-session".into()),
+                history_id,
+                None,
+            )
+        };
+        let layout = |end| PaneLayout::Split {
+            orientation: 'h',
+            position: 320,
+            start: Box::new(leaf(Some(first))),
+            end: Box::new(leaf(Some(end))),
+        };
+        let round_trip = |end| {
+            let session = SavedSession::captured(
+                1,
+                vec![
+                    SavedTab::captured("Split".into(), false, false, false, layout(end)),
+                    SavedTab::captured("Other".into(), false, false, false, leaf(Some(unrelated))),
+                ],
+                None,
+            );
+            let mut decoded =
+                decode_saved_session(&serde_json::to_string(&session).unwrap()).unwrap();
+            assert_eq!(decoded.active, 1);
+            let mut restored = Vec::new();
+            for tab in &mut decoded.tabs {
+                tab.layout.visit_history_ids(&mut |id| restored.push(*id));
+            }
+            restored
+        };
+        assert_eq!(
+            round_trip(second),
+            [Some(first), Some(second), Some(unrelated)]
+        );
+        assert_eq!(round_trip(first), [None, None, Some(unrelated)]);
+        for old_or_invalid in [
+            r#"{"type":"leaf","mode":"block"}"#,
+            r#"{"type":"leaf","mode":"block","history_id":"../shared-file"}"#,
+        ] {
+            assert!(matches!(
+                decode_pane_layout(old_or_invalid).unwrap(),
+                PaneLayout::Leaf {
+                    history_id: None,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
     fn pane_session_id_round_trips_and_invalid_snapshots_degrade_safely() {
         let with_sid = PaneLayout::Leaf {
             mode: "block".to_string(),
@@ -3939,6 +4060,7 @@ mod tests {
             cwd_external: false,
             remote_name: None,
             sid: Some("jsh-session-42".to_string()),
+            history_id: None,
             cmds: None,
         };
         let encoded = serde_json::to_string(&with_sid).unwrap();
@@ -4020,6 +4142,7 @@ mod tests {
             cwd_external: true,
             remote_name: Some("example".to_string()),
             sid: None,
+            history_id: None,
             cmds: Some(argv.clone()),
         };
 

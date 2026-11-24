@@ -409,6 +409,7 @@ pub struct VteInit {
     pub working_directory: Option<String>,
     pub working_directory_external: bool,
     pub session_id: Option<String>,
+    pub(crate) history: crate::block_view::PaneHistoryInit,
     /// Per-pane secret consumed by the shell integration to authenticate OSC 7
     /// cwd updates even when a Flatpak host shell hides foreground processes.
     pub cwd_token: String,

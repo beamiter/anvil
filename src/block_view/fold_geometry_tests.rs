@@ -68,6 +68,7 @@ fn fold_actions_update_visible_and_parked_geometry() {
             None,
             false,
             None,
+            Default::default(),
             "fold-geometry-test",
             &[],
             &[],

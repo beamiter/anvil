@@ -221,6 +221,7 @@ pub(crate) struct Pane {
     /// useful as terminal/AI context but must not drive local filesystem work.
     pub(crate) cwd_external: bool,
     pub(crate) session_id: Option<String>,
+    pub(crate) history_id: uuid::Uuid,
     pub(crate) mode: TerminalMode,
     pub(crate) probe: terminal::PaneProbe,
     /// Exit code of the last finished block in this pane. Block mode only:

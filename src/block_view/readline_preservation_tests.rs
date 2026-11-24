@@ -107,6 +107,7 @@ fn shell(root: &Path, mode: crate::config::TerminalMode, identity: &str) -> Shel
         None,
         false,
         Some(identity),
+        Default::default(),
         "readline-test",
         &[],
         &[],
