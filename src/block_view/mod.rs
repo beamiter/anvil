@@ -16275,11 +16275,29 @@ impl TermView {
         }
     }
 
+    #[cfg(anvil_shared_terminal)]
+    pub(crate) fn organism_body_rect_is_blank(
+        &self,
+        x: f64,
+        y: f64,
+        width: i32,
+        height: i32,
+    ) -> bool {
+        // Chat's body is seated on the message canvas. Its placement is
+        // already bounded by the native height of the conversation children.
+        self.chat_organism_surface.is_some()
+            || self
+                .active
+                .borrow()
+                .shared_organism_rect_is_blank(x, y, width, height)
+    }
+
     pub(crate) fn live_organism_surface_metrics(&self) -> LiveOrganismSurfaceMetrics {
+        let active = self.active.borrow();
+        let (cell_width, cell_height) = active.live_cell_size();
+        let (cell_width, cell_height) = (cell_width.max(1), cell_height.max(1));
         if self.chat_organism_surface.is_some() {
             let scroll = &self.block_scroll;
-            let cell_width = (self.active_vte.char_width() as i32).max(1);
-            let cell_height = (self.active_vte.char_height() as i32).max(1);
             let occupied_bottom = chat_canvas_occupied_bottom(&self.block_list, scroll);
             log::debug!(target: "anvil::organism_canvas", "canvas={}x{} occupied_bottom={} mapped={} fullscreen={}",scroll.width(),scroll.height(),occupied_bottom,scroll.is_mapped(),self.fullscreen.get());
             return LiveOrganismSurfaceMetrics {
@@ -16294,20 +16312,27 @@ impl TermView {
                 cursor_row: (occupied_bottom.max(0.0) / cell_height as f32).ceil() as i32 - 1,
             };
         }
-        let active = self.active.borrow();
-        let visible_height = active
-            .live_visible_height_px()
-            .min(active.active_vte.height().max(0));
+        let (width, height) = active.live_surface_size();
+        let visible_height = active.live_visible_height_px().min(height);
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &active.shared_active {
+            let last_row = (visible_height / cell_height).saturating_sub(1).max(0);
+            let cursor = terminal.embedded().painted_primary_cursor_row();
+            return LiveOrganismSurfaceMetrics {
+                width,
+                height: visible_height,
+                cell_width,
+                cell_height,
+                right_gutter: LIVE_ORGANISM_RIGHT_GUTTER,
+                alt_screen: active.live_organism_alt_screen(),
+                cursor_row: cursor.map_or(last_row, |row| (row as i32).min(last_row)),
+            };
+        }
         LiveOrganismSurfaceMetrics {
-            // The hidden surface may not be allocated yet. The always-mapped
-            // VTE is its measured child and shares the same clipped space.
-            width: active.active_vte.width().max(0),
-            // The VTE keeps the whole viewport grid while a command runs; only
-            // the card's own height is on screen. Placing the body by the grid
-            // would drop it into the clipped rows.
+            width,
             height: visible_height,
-            cell_width: (active.active_vte.char_width() as i32).max(1),
-            cell_height: (active.active_vte.char_height() as i32).max(1),
+            cell_width,
+            cell_height,
             right_gutter: LIVE_ORGANISM_RIGHT_GUTTER,
             alt_screen: active.live_organism_alt_screen(),
             cursor_row: {
@@ -17257,7 +17282,7 @@ impl TermView {
         }
 
         let adj = self.block_scroll.vadjustment();
-        let cell_h = self.active_vte.char_height() as f64;
+        let cell_h = f64::from(self.active.borrow().live_cell_size().1);
         let step = if cell_h > 0.0 {
             cell_h
         } else {
