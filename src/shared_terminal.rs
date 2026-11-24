@@ -236,6 +236,14 @@ impl SharedTerminal {
         }
     }
 
+    #[cfg(anvil_shared_terminal)]
+    pub(crate) fn document_links() -> LinkActions {
+        LinkActions {
+            find_plain: Some(jterm_core::link::document_url_at),
+            ..Self::links()
+        }
+    }
+
     pub(crate) fn links() -> LinkActions {
         LinkActions {
             admit: jterm_core::link::is_openable_osc8,

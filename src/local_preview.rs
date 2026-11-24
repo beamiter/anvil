@@ -79,6 +79,15 @@ struct PreviewUi {
 fn hit(window: &gtk4::Widget, x: f64, y: f64) -> Option<(usize, PathBuf)> {
     let mut picked = window.pick(x, y, gtk4::PickFlags::DEFAULT)?;
     let terminal = loop {
+        #[cfg(anvil_shared_terminal)]
+        if let Some(document) = picked.downcast_ref::<gtk4::TextView>() {
+            let point =
+                window.compute_point(document, &gtk4::graphene::Point::new(x as f32, y as f32))?;
+            let (text, byte) =
+                jterm_gtk_view::finished_text_at(document, point.x().into(), point.y().into())?;
+            let reference = jterm_core::link::document_local_reference_at(&text, byte)?;
+            return candidate(&reference).map(|path| (document.as_ptr() as usize, path));
+        }
         if let Ok(terminal) = picked.clone().downcast::<vte4::Terminal>() {
             break terminal;
         }

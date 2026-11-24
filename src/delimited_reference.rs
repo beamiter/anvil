@@ -1,96 +1,10 @@
-//! Recover the parenthesized destinations that a TUI may wrap before printing.
-use std::ops::Range;
-use std::sync::LazyLock;
-
-const MAX_BYTES: usize = 4096;
-
-pub(crate) struct Reference {
-    pub target: String,
-    pub web: bool,
-    /// Reserve the visible region without authorizing a guessed target.
-    pub blocked: bool,
-    pub spans: Vec<(usize, Range<usize>)>,
-}
-
-pub(crate) fn detect(rows: &[(&str, bool)]) -> Vec<Reference> {
-    static DESTINATION: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(
-            r"\(((?:(?i:https?)://|(?:\.{0,2}|~)/|[\p{L}\p{N}_][\p{L}\p{N}\p{M}_.-]*/)[^()\r\n]*(?:\n[^()\r\n]+){0,7})\)",
-        )
-        .unwrap()
-    });
-    static FILE_END: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(
-            r"(?i-u:\.(?:canvas\.tsx|tsx|jsx|mdx?|txt|rs|py|jsonc?|toml|ya?ml|css|html|svg|png|jpe?g|webp|ts|js|pdf|csv|sh))(?::[0-9]+){0,2}$",
-        )
-        .unwrap()
-    });
-
-    if !rows.iter().any(|(text, _)| text.contains('(')) {
-        return Vec::new();
-    }
-    let mut text = String::new();
-    let mut row_starts = Vec::with_capacity(rows.len());
-    for (row, _) in rows {
-        row_starts.push(text.len());
-        text.push_str(row);
-        text.push('\n');
-    }
-
-    let mut references = Vec::new();
-    for matched in DESTINATION.captures_iter(&text) {
-        let raw = matched.get(1).unwrap();
-        if raw.len() > MAX_BYTES {
-            continue;
-        }
-        let first_row = row_starts.partition_point(|&start| start <= raw.start()) - 1;
-        let is_web = raw.as_str().split_once("://").is_some_and(|(scheme, _)| {
-            scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
-        });
-        // A full-looking physical row is not reliable soft-wrap metadata.
-        // Preserve raw bytes and reserve every ambiguous region BEFORE format
-        // validation, so neither a file nor a URL can fall back to a fragment.
-        let spans = raw
-            .as_str()
-            .split('\n')
-            .enumerate()
-            .map(|(index, fragment)| {
-                let row = first_row + index;
-                let start = if index == 0 {
-                    raw.start() - row_starts[row]
-                } else {
-                    0
-                };
-                (row, start..start + fragment.len())
-            })
-            .collect::<Vec<_>>();
-        let target = raw.as_str().to_owned();
-        let blocked = spans.len() > 1
-            || target.chars().any(char::is_control)
-            || if is_web {
-                !jterm_core::link::is_openable_url(&target)
-            } else {
-                target.contains("://")
-                    || target.contains(['\\', '<', '>', '|'])
-                    || !FILE_END.is_match(&target)
-            };
-        // Unambiguous single-row URLs remain owned by the native URL matcher.
-        // Only exact single-row local paths with spaces need extra activation.
-        if blocked || (!is_web && target.contains(char::is_whitespace)) {
-            references.push(Reference {
-                target,
-                web: is_web,
-                blocked,
-                spans,
-            });
-        }
-    }
-    references
-}
-
-#[cfg(test)]
 mod tests {
-    use super::*;
+    use jterm_core::link::{detect_delimited_references, DelimitedReference};
+
+    fn detect(rows: &[(&str, bool)]) -> Vec<DelimitedReference> {
+        let lines: Vec<_> = rows.iter().map(|&(line, _)| line).collect();
+        detect_delimited_references(&lines)
+    }
 
     #[test]
     fn joins_delimited_paths_with_wide_text_and_real_spaces() {

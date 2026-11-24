@@ -4,7 +4,7 @@ use std::rc::Rc;
 use unicode_width::UnicodeWidthStr;
 use vte4::{Format, Terminal, TerminalExt};
 
-use crate::delimited_reference::{self, Reference};
+use jterm_core::link::{detect_delimited_references, DelimitedReference};
 
 use relm4::gtk as gtk4;
 
@@ -21,21 +21,7 @@ fn rows(terminal: &Terminal, first: i64, last: i64) -> Vec<String> {
         .collect()
 }
 
-fn detect(terminal: &Terminal, lines: &[String]) -> Vec<Reference> {
-    let cols = terminal.column_count().max(1) as usize;
-    let rows: Vec<_> = lines
-        .iter()
-        .map(|text| {
-            (
-                text.as_str(),
-                text.trim_end().width() >= cols.saturating_sub(1),
-            )
-        })
-        .collect();
-    delimited_reference::detect(&rows)
-}
-
-pub(crate) fn hit(terminal: &Terminal, x: f64, y: f64) -> Option<Reference> {
+pub(crate) fn hit(terminal: &Terminal, x: f64, y: f64) -> Option<DelimitedReference> {
     let border = terminal.border();
     let (left, top) = border.map_or((0.0, 0.0), |border| {
         (f64::from(border.left()), f64::from(border.top()))
@@ -56,7 +42,8 @@ pub(crate) fn hit(terminal: &Terminal, x: f64, y: f64) -> Option<Reference> {
     let lines = rows(terminal, first, last);
     let selected_row = (row - first) as usize;
     let col = dx.floor() as usize;
-    detect(terminal, &lines).into_iter().find(|reference| {
+    let rows: Vec<_> = lines.iter().map(String::as_str).collect();
+    detect_delimited_references(&rows).into_iter().find(|reference| {
         reference.spans.iter().any(|(row, bytes)| {
             *row == selected_row
                 && (lines[*row][..bytes.start].width()..lines[*row][..bytes.end].width())

@@ -4947,7 +4947,7 @@ impl FinishedBlock {
                 };
                 command.inspect(|command| {
                     command.set_background(precomputed.document_background.filter(|_| !chat));
-                    command.install_links(crate::shared_terminal::SharedTerminal::links());
+                    command.install_links(crate::shared_terminal::SharedTerminal::document_links());
                 })
             } else {
                 None
@@ -5036,7 +5036,7 @@ impl FinishedBlock {
                         .update_property(&[gtk::accessible::Property::Label("Background output")]);
                 }
                 output.set_background(precomputed.document_background.filter(|_| !chat));
-                output.install_links(crate::shared_terminal::SharedTerminal::links());
+                output.install_links(crate::shared_terminal::SharedTerminal::document_links());
                 jterm_gtk_view::FinishedOutputView::new(output, viewport_cap, max_expanded_cap)
             })
         } else {
