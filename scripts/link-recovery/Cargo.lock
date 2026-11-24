@@ -449,7 +449,7 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.2.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=c4bcdb73b27e21deaf4d7d4a608384e20e8963d7#c4bcdb73b27e21deaf4d7d4a608384e20e8963d7"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=1e3d1f0bb0fa9b6463de12edb3e9faee66668c65#1e3d1f0bb0fa9b6463de12edb3e9faee66668c65"
 dependencies = [
  "companion-client",
  "companion-core",
@@ -460,6 +460,7 @@ dependencies = [
  "fuzzy-matcher",
  "jagent",
  "jterm_engine",
+ "jterm_protocol",
  "jterm_remote_client",
  "jterm_runtime",
  "libc",
@@ -482,7 +483,7 @@ dependencies = [
 [[package]]
 name = "jterm_engine"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=c4bcdb73b27e21deaf4d7d4a608384e20e8963d7#c4bcdb73b27e21deaf4d7d4a608384e20e8963d7"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=1e3d1f0bb0fa9b6463de12edb3e9faee66668c65#1e3d1f0bb0fa9b6463de12edb3e9faee66668c65"
 dependencies = [
  "smallvec",
  "unicode-segmentation",
@@ -490,9 +491,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "jterm_protocol"
+version = "0.1.0"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=1e3d1f0bb0fa9b6463de12edb3e9faee66668c65#1e3d1f0bb0fa9b6463de12edb3e9faee66668c65"
+dependencies = [
+ "jterm_engine",
+ "serde",
+]
+
+[[package]]
 name = "jterm_remote_client"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=c4bcdb73b27e21deaf4d7d4a608384e20e8963d7#c4bcdb73b27e21deaf4d7d4a608384e20e8963d7"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=1e3d1f0bb0fa9b6463de12edb3e9faee66668c65#1e3d1f0bb0fa9b6463de12edb3e9faee66668c65"
 dependencies = [
  "serde",
  "serde_json",
@@ -501,10 +511,12 @@ dependencies = [
 [[package]]
 name = "jterm_runtime"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=c4bcdb73b27e21deaf4d7d4a608384e20e8963d7#c4bcdb73b27e21deaf4d7d4a608384e20e8963d7"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=1e3d1f0bb0fa9b6463de12edb3e9faee66668c65#1e3d1f0bb0fa9b6463de12edb3e9faee66668c65"
 dependencies = [
+ "crossbeam-channel",
  "libc",
  "log",
+ "parking_lot",
 ]
 
 [[package]]
