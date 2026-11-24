@@ -2,10 +2,12 @@
 use super::*;
 use crate::config::Config;
 use gtk::Orientation;
+use jterm_core::screen_replay::FinishedDocument;
 use relm4::gtk;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 use vte4::Terminal;
 use vte4::TerminalExt;
 
@@ -317,6 +319,11 @@ pub(crate) struct BlockData {
     /// before this field exist rebuild without a notice.
     #[serde(default)]
     pub(crate) output_head_dropped: bool,
+    /// Stored in the history frame extension. The archived body and JSON
+    /// exports continue to carry the plain logical output.
+    #[rkyv(with = rkyv::with::Skip)]
+    #[serde(skip)]
+    pub(crate) finished_document: Option<Arc<FinishedDocument>>,
 }
 
 /// Fence long enough to contain `text`: untrusted output may itself hold a run
@@ -337,6 +344,12 @@ pub(super) fn markdown_fence(text: &str) -> String {
 }
 
 impl BlockData {
+    pub(super) fn finished_document_bytes(&self) -> usize {
+        self.finished_document
+            .as_deref()
+            .map_or(0, FinishedDocument::retained_bytes)
+    }
+
     pub(crate) fn is_background(&self) -> bool {
         self.cmd.trim().is_empty()
     }
@@ -394,6 +407,7 @@ impl BlockData {
             },
             &[],
         )
+        .saturating_add(self.finished_document_bytes())
     }
 
     /// Export block to JSON format
@@ -2643,6 +2657,7 @@ mod tests {
             command_exact: true,
             command_truncated: false,
             output_head_dropped: false,
+            finished_document: None,
         }
     }
 
@@ -3816,6 +3831,7 @@ fn finished_card_refit_height(rows: i64, cell_height: i32, compact: bool) -> i32
 /// old self-sufficient behavior for restore paths and tests.
 #[derive(Clone, Default)]
 pub(crate) struct FinishedBlockPrecomputed {
+    pub(super) finished_document: Option<Arc<FinishedDocument>>,
     #[cfg(anvil_shared_terminal)]
     pub(crate) document_command: bool,
     #[cfg(anvil_shared_terminal)]
@@ -4405,7 +4421,14 @@ impl FinishedBlock {
             &[],
             block.output.len(),
             None,
-            FinishedBlockPrecomputed::documents(config, background),
+            FinishedBlockPrecomputed {
+                finished_document: block
+                    .finished_document
+                    .as_ref()
+                    .filter(|document| document.archive.text == block.output)
+                    .cloned(),
+                ..FinishedBlockPrecomputed::documents(config, background)
+            },
         )
     }
 
@@ -4478,6 +4501,12 @@ impl FinishedBlock {
                 cwd,
                 cols,
                 images,
+            )
+            .saturating_add(
+                precomputed
+                    .finished_document
+                    .as_deref()
+                    .map_or(0, FinishedDocument::retained_bytes),
             )
         });
 
@@ -5016,15 +5045,23 @@ impl FinishedBlock {
         #[cfg(anvil_shared_terminal)]
         let output_archive =
             if precomputed.document_output && (precomputed.document_command || is_background) {
-                jterm_core::screen_replay::project_finished_output(output, cols.max(1) as usize)
-                    .map(Rc::new)
+                precomputed.finished_document.clone().or_else(|| {
+                    FinishedDocument::capture(output, (cols.clamp(1, u16::MAX as i64) as u16, 0))
+                        .map(Arc::new)
+                })
             } else {
                 None
             };
         #[cfg(anvil_shared_terminal)]
+        let stripped_output = output_archive
+            .as_ref()
+            .map(|document| document.archive.text.clone());
+        #[cfg(not(anvil_shared_terminal))]
+        let stripped_output = None;
+        #[cfg(anvil_shared_terminal)]
         let output_document = output_archive.as_deref().map(|document| {
             let output = jterm_gtk_view::FinishedTextView::output(
-                document,
+                &document.archive,
                 crate::font::terminal_font_description(&config.font_desc, config),
                 config.default_font_scale,
                 config.foreground,
@@ -5670,14 +5707,14 @@ impl FinishedBlock {
                             #[cfg(anvil_shared_terminal)]
                             let full_text = output_archive
                                 .as_deref()
-                                .map_or(full_text, |document| document.text.as_str());
+                                .map_or(full_text, |document| document.archive.text.as_str());
                             #[cfg(anvil_shared_terminal)]
                             let archive_filter = output_archive.as_deref().map(|document| {
                                 if !filter_enabled.get() {
                                     return Ok(None);
                                 }
                                 jterm_core::screen_replay::filter_archived_output(
-                                    document,
+                                    &document.archive,
                                     &q,
                                     regex_tg.is_active(),
                                     case_tg.is_active(),
@@ -5785,7 +5822,7 @@ impl FinishedBlock {
                                             .as_ref()
                                             .and_then(|result| result.as_ref().ok())
                                             .and_then(Option::as_ref)
-                                            .unwrap_or(original);
+                                            .unwrap_or(&original.archive);
                                         output.present_output(document);
                                         render_stamp.replace(output_render_stamp(
                                             cols,
@@ -6038,7 +6075,7 @@ impl FinishedBlock {
             output_scrollbar,
             full_output,
             displayed_output,
-            stripped_output: Rc::new(RefCell::new(None)),
+            stripped_output: Rc::new(RefCell::new(stripped_output)),
             cmd_text: cmd.to_string(),
             copy_cmd_btn,
             copy_output_btn,

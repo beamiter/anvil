@@ -49,6 +49,7 @@ fn selected_output_batch_preserves_live_input_focus_and_exact_selection() {
             command_exact: true,
             command_truncated: false,
             output_head_dropped: false,
+            finished_document: None,
         };
         let card = FinishedBlock::new(
             id,

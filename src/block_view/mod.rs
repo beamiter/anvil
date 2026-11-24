@@ -5199,6 +5199,7 @@ struct BlockRenderPayload {
     prompt: String,
     output_with_ansi: String,
     output_plain: String,
+    capture_size: (u16, u16),
     /// Part of the command's output is gone before the card was built: the
     /// raw ring dropped its front, or the screen replay's cell budget evicted
     /// its oldest history rows. The card says so instead of passing the
@@ -5385,6 +5386,7 @@ impl BlockRenderPayloadAccessor for LazyBlockRenderPayload {
                 prompt,
                 output_with_ansi: replayed.with_ansi,
                 output_plain: replayed.plain,
+                capture_size: self.pty_winsize,
                 output_head_dropped: replayed.head_dropped,
             }
         })
@@ -9820,7 +9822,15 @@ impl RenderBackend for BlockBackend {
         let prompt = payload.prompt.as_str();
         let cmd = record.cmd.as_str();
         let output_with_ansi = payload.output_with_ansi.as_str();
-        let output_plain = payload.output_plain.as_str();
+        let finished_document = jterm_core::screen_replay::FinishedDocument::capture(
+            output_with_ansi,
+            payload.capture_size,
+        )
+        .map(std::sync::Arc::new);
+        let output_plain = finished_document.as_ref().map_or_else(
+            || payload.output_plain.as_str(),
+            |document| &document.archive.text,
+        );
         let plain_output_bytes = output_plain.len();
         let block_cwd = record.cwd.as_deref();
         let cols = bounded_finished_vte_columns(self.grid_cols());
@@ -9850,7 +9860,13 @@ impl RenderBackend for BlockBackend {
             prompt: prompt.to_owned(),
             cmd: cmd.to_owned(),
             cmd_markup: None,
-            output: output_plain.trim().to_owned(),
+            output: if finished_document.is_some() {
+                output_plain
+            } else {
+                output_plain.trim()
+            }
+            .to_owned(),
+            finished_document: finished_document.clone(),
             exit_code: record.exit_code,
             lifecycle_schema: blocks::BLOCK_LIFECYCLE_SCHEMA,
             completion_provenance: record.completion_provenance.into(),
@@ -9885,6 +9901,7 @@ impl RenderBackend for BlockBackend {
                 cols,
                 &images,
             )
+            .saturating_add(block_data.finished_document_bytes())
         };
         let prebuild_retention_plan = {
             let finished = self.finished_blocks_for_cb.borrow();
@@ -9954,6 +9971,7 @@ impl RenderBackend for BlockBackend {
         precomputed.output_rows = Some(output_rows);
         precomputed.output_preview = Some(fold_preview::from_plain(output_plain));
         precomputed.retained_bytes = Some(newest_estimated_bytes);
+        precomputed.finished_document = finished_document;
         let finished = FinishedBlock::new_with_pool(
             block_id,
             prompt,
@@ -21390,6 +21408,7 @@ mod tests {
                 command_truncated: record.command_source
                     == super::CommandTextSource::ScreenAfterTruncation,
                 output_head_dropped: payload.output_head_dropped,
+                finished_document: None,
             };
             self.block_records
                 .borrow_mut()
@@ -30013,6 +30032,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             command_exact: !cmd.trim().is_empty(),
             command_truncated: false,
             output_head_dropped: false,
+            finished_document: None,
         }
     }
 

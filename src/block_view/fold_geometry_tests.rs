@@ -113,6 +113,7 @@ fn fold_actions_update_visible_and_parked_geometry() {
                 command_exact: true,
                 command_truncated: false,
                 output_head_dropped: false,
+                finished_document: None,
             });
             view.finished_blocks.borrow_mut().push(card);
         }

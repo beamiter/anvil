@@ -4167,6 +4167,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_head_dropped: false,
+            finished_document: None,
         };
         let metadata = CompletedCommandRecord {
             id: 2,
@@ -4496,6 +4497,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_head_dropped: false,
+            finished_document: None,
         };
         let metadata = CompletedCommandRecord {
             id: 2,
@@ -4530,6 +4532,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_head_dropped: false,
+            finished_document: None,
         };
         let records = || {
             [
@@ -6052,6 +6055,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_head_dropped: false,
+            finished_document: None,
         };
         let block_record = || [BackendRecordRef::Block(&block)];
         let hits = metadata_filter_hits(block_record(), CrossBlockSearchScope::All, 1, &filters);
@@ -6455,6 +6459,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_head_dropped: false,
+            finished_document: None,
         };
         let backend_record = BackendRecordRef::Block(&block);
         let re = regex::Regex::new("needle").unwrap();
@@ -7173,6 +7178,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_head_dropped: false,
+            finished_document: None,
         };
         let backend = [BackendRecordRef::Block(&block)];
         let re = regex::Regex::new("needle").unwrap();
@@ -7257,6 +7263,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_head_dropped: false,
+            finished_document: None,
         };
         let backend = [BackendRecordRef::Block(&block)];
         let re = regex::Regex::new("needle").unwrap();

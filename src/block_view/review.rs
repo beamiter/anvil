@@ -480,6 +480,7 @@ mod tests {
             command_exact: true,
             command_truncated: false,
             output_head_dropped: false,
+            finished_document: None,
         }
     }
 

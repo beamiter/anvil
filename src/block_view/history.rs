@@ -7,7 +7,9 @@ use super::zone_history;
 use super::{mutate_block_data_and_redraw, BlockData, TermView};
 use crate::persistence::{self, PersistenceKey};
 use gtk::prelude::*;
+use jterm_core::screen_replay::FinishedHistoryFrame;
 use relm4::gtk;
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
@@ -264,6 +266,7 @@ fn estimated_snapshot_retained_bytes(blocks: &[BlockData], capacity: usize) -> u
                 .saturating_add(block.cmd.capacity())
                 .saturating_add(block.cmd_markup.as_ref().map_or(0, String::capacity))
                 .saturating_add(block.output.capacity())
+                .saturating_add(block.finished_document_bytes())
                 .saturating_add(block.cwd.as_ref().map_or(0, String::capacity))
         },
     )
@@ -680,6 +683,7 @@ impl From<LegacyBlockDataV3> for BlockData {
             command_exact: legacy.command_exact,
             command_truncated: legacy.command_truncated,
             output_head_dropped: false,
+            finished_document: None,
         }
     }
 }
@@ -734,37 +738,60 @@ impl From<LegacyBlockDataV2> for BlockData {
             command_exact: false,
             command_truncated: false,
             output_head_dropped: false,
+            finished_document: None,
         }
     }
+}
+
+fn decode_rkyv_body(data: &[u8]) -> Option<BlockData> {
+    rkyv::from_bytes::<BlockData, rkyv::rancor::Error>(data)
+        .ok()
+        .filter(|block| block.lifecycle_schema == super::blocks::BLOCK_LIFECYCLE_SCHEMA)
+        .or_else(|| {
+            rkyv::from_bytes::<LegacyBlockDataV3, rkyv::rancor::Error>(data)
+                .ok()
+                .filter(|block| block.lifecycle_schema == super::blocks::BLOCK_LIFECYCLE_SCHEMA_V3)
+                .map(BlockData::from)
+        })
+        .or_else(|| {
+            rkyv::from_bytes::<LegacyBlockDataV2, rkyv::rancor::Error>(data)
+                .ok()
+                .map(BlockData::from)
+        })
+        .map(normalize_block_lifecycle)
+}
+
+fn decode_rkyv_block(data: &[u8]) -> Option<BlockData> {
+    let frame = FinishedHistoryFrame::read(data);
+    if let Some(mut block) = decode_rkyv_body(frame.record) {
+        block.finished_document = frame.document(&block.output).map(Arc::new);
+        Some(block)
+    } else if frame.record.len() != data.len() {
+        decode_rkyv_body(data)
+    } else {
+        None
+    }
+}
+
+fn attach_finished_document<'a>(block: &BlockData, body: &'a [u8]) -> Cow<'a, [u8]> {
+    block
+        .finished_document
+        .as_deref()
+        .map_or(Cow::Borrowed(body), |document| {
+            document.attach(&block.output, body)
+        })
 }
 
 fn decode_block_record(data: &[u8], prefer_compressed: bool) -> io::Result<(BlockData, usize)> {
     let decode_as = |compressed| -> io::Result<(BlockData, usize)> {
         let decoded = decode_record(data, compressed, MAX_DECODED_RECORD_BYTES)?;
         let decoded_len = decoded.len();
-        let block = rkyv::from_bytes::<BlockData, rkyv::rancor::Error>(&decoded)
-            .ok()
-            .filter(|block| block.lifecycle_schema == super::blocks::BLOCK_LIFECYCLE_SCHEMA)
-            .or_else(|| {
-                rkyv::from_bytes::<LegacyBlockDataV3, rkyv::rancor::Error>(&decoded)
-                    .ok()
-                    .filter(|block| {
-                        block.lifecycle_schema == super::blocks::BLOCK_LIFECYCLE_SCHEMA_V3
-                    })
-                    .map(BlockData::from)
-            })
-            .or_else(|| {
-                rkyv::from_bytes::<LegacyBlockDataV2, rkyv::rancor::Error>(&decoded)
-                    .ok()
-                    .map(BlockData::from)
-            })
-            .ok_or_else(|| {
+        let block = decode_rkyv_block(&decoded).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     "invalid Block-history rkyv record",
                 )
             })?;
-        let block = normalize_block_lifecycle(block);
         Ok((block, decoded_len))
     };
 
@@ -1278,8 +1305,9 @@ fn encode_history_frames_bounded(
         if newest_first.len() == max_frames {
             break;
         }
-        let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(block)
+        let body = rkyv::to_bytes::<rkyv::rancor::Error>(block)
             .map_err(|error| io::Error::other(error.to_string()))?;
+        let serialized = attach_finished_document(block, &body);
         if serialized.len() > max_decoded_record_bytes {
             log::warn!(
                 "save_history: skipping a {} byte block (decoded record limit {})",
@@ -1289,10 +1317,10 @@ fn encode_history_frames_bounded(
             continue;
         }
         let record = if compress {
-            zstd::encode_all(serialized.as_slice(), 3)
+            zstd::encode_all(serialized.as_ref(), 3)
                 .map_err(|error| io::Error::other(error.to_string()))?
         } else {
-            serialized.as_slice().to_vec()
+            serialized.as_ref().to_vec()
         };
         if record.len() > max_encoded_record_bytes || record.len() > u32::MAX as usize {
             log::warn!(
@@ -2493,6 +2521,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_head_dropped: false,
+            finished_document: None,
         }
     }
 
@@ -3115,6 +3144,51 @@ mod tests {
         let compressed = zstd::encode_all(&b"0123456789abcdef"[..], 1).unwrap();
         let error = decode_record(&compressed, true, 8).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn styled_history_preserves_the_document_and_legacy_plain_record() {
+        let document = jterm_core::screen_replay::FinishedDocument::capture(
+            "  \x1b[32m中\x1b[0m\t\x1b]8;;https://example.test/\x07label\x1b]8;;\x07\r\n\r\n",
+            (83, 27),
+        )
+        .unwrap();
+        assert_eq!(document.archive.text, "  中\tlabel\n");
+        let mut block = sample_block(9, "printf");
+        block.output = document.archive.text.clone();
+        block.finished_document = Some(Arc::new(document.clone()));
+        block.output_head_dropped = true;
+
+        for compressed in [false, true] {
+            let frames = encode_history_frames_bounded(
+                std::slice::from_ref(&block),
+                compressed,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+            )
+            .unwrap();
+            let [frame] = frames.as_slice() else {
+                panic!("expected one record");
+            };
+            let (restored, decoded_len) = decode_block_record(frame, compressed).unwrap();
+            assert_eq!(restored.output, block.output);
+            assert_eq!(restored.finished_document.as_deref(), Some(&document));
+            assert!(restored.output_head_dropped);
+
+            let bytes = if compressed {
+                decode_record(frame, true, super::MAX_DECODED_RECORD_BYTES).unwrap()
+            } else {
+                frame.clone()
+            };
+            assert_eq!(decoded_len, bytes.len());
+            let legacy = super::decode_rkyv_body(&bytes).expect("legacy reader's body");
+            assert_eq!(legacy.output, block.output);
+            assert_eq!(legacy.exit_code, block.exit_code);
+            assert!(legacy.finished_document.is_none());
+        }
     }
 
     #[test]
