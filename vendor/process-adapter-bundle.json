@@ -12,7 +12,7 @@
     "vendor/companion-process/src/pty_session.rs": "34ef861a92c1afe27059f491664802f932b996306f09d5a04e91db94b8661a2f",
     "vendor/companion-process/src/shell_identity.rs": "cff15f40ec159f8c099a74335d51bc236d524e4166088f9d1bf785ebff28435f"
   },
-  "public_core_base": "7982ef52ad6ec7ce82e3a2acf8f55a1aaddb9d0b",
+  "public_core_base": "c4bcdb73b27e21deaf4d7d4a608384e20e8963d7",
   "schema": 1,
   "scope": "Versioned process observer and GTK launch ownership. The GTK adapter also tracks child drain in the opt-in shared runtime. The file hashes identify these exact adapter sources.",
   "version": "0.1.0"
