@@ -64,12 +64,12 @@ fn native_chat_passthrough_initial_focus_accepts_composition() {
         .default_height(600)
         .child(&row)
         .build();
-    assert!(!view.active_vte.is_mapped());
+    assert!(!view.vte().is_mapped());
     view.grab_focus();
     window.present();
     wait_for(
         "passthrough terminal maps and receives requested focus",
-        || view.active_vte.is_mapped() && view.active_vte.has_focus(),
+        || view.vte().is_mapped() && view.vte().has_focus(),
     );
     pump_for(Duration::from_millis(180));
     assert_ne!(
@@ -95,7 +95,7 @@ fn native_chat_passthrough_initial_focus_accepts_composition() {
     ] {
         drive(&view, output, state);
         assert!(
-            view.active_vte.has_focus(),
+            view.vte().has_focus(),
             "Chat reparent must preserve its own logical focus"
         );
         view.pty.drain_test_slave(Duration::from_millis(30));
@@ -151,9 +151,9 @@ fn native_ime_commit_cancel_and_independent_ptys() {
         (&first, &second, "ascii-a", b"a".as_slice()),
         (&second, &first, "ascii-b", b"b".as_slice()),
     ] {
-        assert!(owner.active_vte.grab_focus());
+        assert!(owner.vte().grab_focus());
         pump_for(Duration::from_millis(180));
-        assert!(owner.active_vte.has_focus());
+        assert!(owner.vte().has_focus());
         native_ime_keys("compose");
         assert!(
             owner
@@ -265,16 +265,13 @@ fn native_ime_send_button_preserves_composition() {
             assert!(status.success());
             pump_for(Duration::from_millis(250));
         };
-        assert!(owner.active_vte.grab_focus());
+        assert!(owner.vte().grab_focus());
         pump_for(Duration::from_millis(250));
         // Positive control: use the production gesture, capture and admission
         // callbacks rather than directly emitting clicked or commit.
         click();
         native_ime_expect(&owner.pty, b"\r");
-        assert!(
-            owner.active_vte.has_focus(),
-            "idle Send retains the input owner"
-        );
+        assert!(owner.vte().has_focus(), "idle Send retains the input owner");
         native_ime_keys("compose");
         assert!(owner
             .pty
@@ -289,7 +286,7 @@ fn native_ime_send_button_preserves_composition() {
             "Send cannot submit or alter an active composition"
         );
         assert!(
-            owner.active_vte.has_focus(),
+            owner.vte().has_focus(),
             "blocked Send keeps native candidate ownership"
         );
         native_ime_keys("commit");
@@ -318,14 +315,14 @@ fn native_ime_send_button_preserves_composition() {
     }
     // Hidden-but-live contexts must not be forgotten prematurely. Remapping
     // and native cancellation must recover without any application IM reset.
-    assert!(first.active_vte.grab_focus());
+    assert!(first.vte().grab_focus());
     native_ime_keys("compose");
     assert!(super::super::ime_gate::blocked());
     first.root.set_visible(false);
     pump_for(Duration::from_millis(180));
     first.root.set_visible(true);
     pump_for(Duration::from_millis(180));
-    assert!(first.active_vte.grab_focus());
+    assert!(first.vte().grab_focus());
     native_ime_keys("cancel");
     assert!(!first
         .pty
@@ -386,7 +383,7 @@ fn native_ime_initial_and_returning_stack_tab_keep_same_owner() {
             .default_height(600)
             .child(&stack)
             .build();
-        assert!(!view.active_vte.is_mapped());
+        assert!(!view.vte().is_mapped());
         stack.set_visible_child_name("terminal");
         view.grab_focus();
         window.present();
@@ -396,18 +393,15 @@ fn native_ime_initial_and_returning_stack_tab_keep_same_owner() {
                 wait_for("other tab mapped", || other.is_mapped());
                 assert!(other.grab_focus());
                 pump_for(Duration::from_millis(80));
-                assert!(!view.active_vte.is_mapped());
+                assert!(!view.vte().is_mapped());
                 stack.set_visible_child_name("terminal");
                 view.grab_focus();
             }
             wait_for("terminal focus owner", || {
-                view.active_vte.is_mapped() && view.active_vte.has_focus()
+                view.vte().is_mapped() && view.vte().has_focus()
             });
             pump_for(Duration::from_millis(180));
-            assert!(
-                view.active_vte.has_focus(),
-                "focus survives deferred layout"
-            );
+            assert!(view.vte().has_focus(), "focus survives deferred layout");
             view.pty.drain_test_slave(Duration::from_millis(30));
             native_ime_keys("compose");
             assert!(view

@@ -480,11 +480,14 @@ fn search_in_scope(
     case_sensitive: bool,
 ) -> (SearchStatus, bool) {
     view.clear_unified_navigation_cursor();
-    if view.find_scope() == FindScope::LiveScreen && !view.uses_shared_active_terminal() {
+    if let Some(terminal) = view
+        .legacy_terminal()
+        .filter(|_| view.find_scope() == FindScope::LiveScreen)
+    {
         // Drops any block hits (and the live terminal's regex) first.
         view.clear_find();
         return (
-            super::vte::search_terminal(view.vte(), query, use_regex, case_sensitive),
+            super::vte::search_terminal(terminal, query, use_regex, case_sensitive),
             true,
         );
     }
@@ -932,7 +935,9 @@ impl Component for BlockTerminal {
                 // URLs and claude's OSC 8 links underlined on hover and did
                 // nothing. The handler denies every other click, so selection,
                 // click-to-move and a program's mouse reporting are untouched.
-                super::vte::setup_terminal_click_handler(view.vte());
+                if let Some(terminal) = view.legacy_terminal() {
+                    super::vte::setup_terminal_click_handler(terminal);
+                }
                 TermView::arm_shell_integration_notice(&view, init.shell_argv.as_ref());
                 if let Some(container) = root.downcast_ref::<gtk::Box>() {
                     container.append(&view.widget());
@@ -1213,11 +1218,13 @@ impl Component for BlockTerminal {
                 );
                 if plan == FindStep::Native {
                     // The alternate-screen app's screen, searched natively.
-                    let found = if step > 0 {
-                        view.vte().search_find_next()
-                    } else {
-                        view.vte().search_find_previous()
-                    };
+                    let found = view.legacy_terminal().is_some_and(|terminal| {
+                        if step > 0 {
+                            terminal.search_find_next()
+                        } else {
+                            terminal.search_find_previous()
+                        }
+                    });
                     self.search_status = self.search_status.stepped(step, found);
                 } else if plan == FindStep::Rescope {
                     // The app left and the blocks are back, or it arrived while

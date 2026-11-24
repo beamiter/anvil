@@ -340,7 +340,7 @@ pub(super) fn layout(
             holder.add_css_class("chat-empty-anchor");
         }
         block_layout();
-        if native && terminal.parent().is_some() {
+        if let Some(terminal) = terminal.filter(|terminal| native && terminal.parent().is_some()) {
             if let Some(scroll) = transcript.child().and_downcast::<gtk::ScrolledWindow>() {
                 if let Some(rows) = super::viewport_rows_for(&terminal, &scroll) {
                     terminal.set_size(terminal.column_count().max(1), rows);
@@ -1096,7 +1096,7 @@ mod tests {
         window.set_child(Some(&box_));
         window.present();
         wait_for("real window is allocated", || {
-            view.root.height() > 100 && view.active_vte.is_mapped()
+            view.root.height() > 100 && view.vte().is_mapped()
         });
         pump_for(Duration::from_millis(180));
         (view, window, entry)
@@ -1151,7 +1151,7 @@ mod tests {
         wait_for("idle before height-only resize", || {
             view.resize_tick_id.borrow().is_none()
         });
-        let identity = view.active_vte.clone();
+        let identity = view.vte().clone();
         let fd = view.pty.master_fd_raw();
         let base = view.pty.test_slave_winsize();
         assert!(base.0 > 10 && base.1 > 3);
@@ -1165,7 +1165,7 @@ mod tests {
         assert_eq!(view.pty.test_slave_winsize().0, base.0);
         if native {
             assert_eq!(
-                view.active_vte.row_count(),
+                view.vte().row_count(),
                 i64::from(view.pty.test_slave_winsize().1)
             );
         }
@@ -1175,10 +1175,10 @@ mod tests {
             || window.height() == height && view.pty.test_slave_winsize() == base,
         );
         pump_for(Duration::from_millis(180));
-        assert_eq!(view.active_vte, identity);
+        assert_eq!(view.vte(), &identity);
         assert_eq!(view.pty.master_fd_raw(), fd);
         if native {
-            assert_eq!(view.active_vte.row_count(), i64::from(base.1));
+            assert_eq!(view.vte().row_count(), i64::from(base.1));
         }
     }
 
@@ -1406,14 +1406,14 @@ mod tests {
                 "narrow window was not actually allocated: requested {width}, got {}",
                 window.width()
             );
-            assert_eq!(view.active_vte.font_scale(), scale);
+            assert_eq!(view.vte().font_scale(), scale);
             eprintln!(
                 "allocated window={}x{}, font scale={scale}",
                 window.width(),
                 window.height()
             );
-            dock_limit.set(dock.height() + 2 * view.active_vte.char_height() as i32);
-            let cap = clip.height() + 2 * view.active_vte.char_height() as i32;
+            dock_limit.set(dock.height() + 2 * view.vte().char_height() as i32);
+            let cap = clip.height() + 2 * view.vte().char_height() as i32;
             assert!(
                 cap < view.root.height() * 3 / 4,
                 "fixture must distinguish compact and native"
@@ -1516,9 +1516,9 @@ mod tests {
                 expected
             );
             for view in [&*chat, &block] {
-                assert_eq!(view.active_vte.font_scale(), scale);
+                assert_eq!(view.vte().font_scale(), scale);
                 assert_eq!(
-                    view.active_vte.font().unwrap().size(),
+                    view.vte().font().unwrap().size(),
                     gtk::pango::FontDescription::from_string(desc).size()
                 );
             }
@@ -1582,11 +1582,8 @@ mod tests {
                 36 * gtk::pango::SCALE,
                 "UI settings must not change Content entry"
             );
-            assert_eq!(chat.active_vte.font_scale(), 1.5);
-            assert_eq!(
-                chat.active_vte.font().unwrap().size(),
-                24 * gtk::pango::SCALE
-            );
+            assert_eq!(chat.vte().font_scale(), 1.5);
+            assert_eq!(chat.vte().font().unwrap().size(), 24 * gtk::pango::SCALE);
             assert_eq!(status.text(), hint.text());
             assert!(!hint.is_visible());
             eprintln!("visible footer: UI size={size} scale={scale} factor={factor} Tools glyph={glyph:?} status_raw={}", status.pango_context().font_description().unwrap().size());
@@ -1613,7 +1610,7 @@ mod tests {
 
     fn docked_reparent_scroll_and_resize_lifecycle(mode: crate::config::TerminalMode) {
         let (view, window, other) = fixture_for_mode(mode);
-        let terminal = view.active_vte.clone();
+        let terminal = view.vte().clone();
         let holder = view.active.borrow().widget().clone();
         let send = button(&view, "chat-send");
         let stop = button(&view, "chat-stop");
@@ -1656,16 +1653,16 @@ mod tests {
         );
         assert_eq!(view.selected_block_id.get(), None);
         assert!(view.selected_block_ids.borrow().is_empty());
-        view.active_vte.select_all();
+        view.vte().select_all();
         pump_for(Duration::from_millis(30));
-        assert!(view.active_vte.has_selection());
+        assert!(view.vte().has_selection());
         assert!(view
             .cross_selection
             .copy_text()
             .unwrap()
             .unwrap()
             .contains("continuation"));
-        view.active_vte.unselect_all();
+        view.vte().unselect_all();
         other.grab_focus();
         drive(&view, START, BlockState::CollectingOutput);
         assert!(owns_focus(&other), "background command cannot steal focus");
@@ -1714,7 +1711,7 @@ mod tests {
         assert!(owns_focus(&other));
         assert!(send.is_visible() && !stop.is_visible());
         assert_eq!(holder.parent().as_ref(), Some(view.block_list.upcast_ref()));
-        assert_eq!(terminal, view.active_vte);
+        assert_eq!(&terminal, view.vte());
         let adjustment = view.block_scroll.vadjustment();
         wait_for("real finished cards overflow the outer history", || {
             adjustment.upper() - adjustment.lower() > adjustment.page_size()
@@ -1800,7 +1797,7 @@ mod tests {
         let (view, window, other) = fixture_for_mode(mode);
         other.grab_focus();
         drive(&view, PROMPT, BlockState::AwaitingCommand);
-        let terminal = view.active_vte.clone();
+        let terminal = view.vte().clone();
         let clip = view.active.borrow().live_clip();
         let fd = view.pty.master_fd_raw();
         let window_size = (window.width(), window.height());
@@ -1845,7 +1842,7 @@ mod tests {
             },
         );
         assert_eq!((window.width(), window.height()), window_size);
-        assert_eq!(view.active_vte, terminal);
+        assert_eq!(view.vte(), &terminal);
         assert_eq!(view.pty.master_fd_raw(), fd);
         assert!(owns_focus(&other));
         window.close();
@@ -1947,7 +1944,7 @@ mod tests {
             view.selection_anchor_id.set(Some(42));
             view.user_scrolled_up.set(true);
             view.unread_count.set(7);
-            let text = view.active_vte.text_format(vte4::Format::Text);
+            let text = view.vte().text_format(vte4::Format::Text);
             if closed {
                 view.pty.kill();
                 assert!(view
@@ -1968,7 +1965,7 @@ mod tests {
             assert_eq!(view.selection_anchor_id.get(), Some(42));
             assert!(view.user_scrolled_up.get());
             assert_eq!(view.unread_count.get(), 7);
-            assert_eq!(view.active_vte.text_format(vte4::Format::Text), text);
+            assert_eq!(view.vte().text_format(vte4::Format::Text), text);
             assert_eq!(received.get(), 0);
             // Use actual parser replay to enter Running even when a Closed
             // fixture cannot emit new output, then exercise the real Stop too.
@@ -2031,8 +2028,8 @@ mod tests {
         );
         // The stale control sees Running both before and after replay. Identity,
         // rather than just surface/state equality, must reject the new command.
-        view.active_vte.select_all();
-        assert!(view.active_vte.has_selection());
+        view.vte().select_all();
+        assert!(view.vte().has_selection());
         view.selection_feed_hold.begin_drag();
         let next_start = [NEXT, START].concat();
         assert!(view.selection_feed_hold.try_buffer(&next_start));
@@ -2046,7 +2043,7 @@ mod tests {
             f64::from(stop_bounds.y()) + hit.1,
         );
         assert!(
-            view.active_vte.has_selection(),
+            view.vte().has_selection(),
             "the control owns selection-feed release"
         );
         press_capture(&stop, hit.0, hit.1);

@@ -172,7 +172,7 @@ pub(super) struct ReviewContext {
     pub anchor: Rc<Cell<Option<u64>>>,
     pub submission: VerifiedSubmissionCtx,
     pub bracketed: Rc<Cell<bool>>,
-    pub live: Terminal,
+    pub live: gtk::Widget,
 }
 
 pub(super) fn install(backend: &BlockBackend, card: &FinishedBlock) {
@@ -185,7 +185,7 @@ pub(super) fn install(backend: &BlockBackend, card: &FinishedBlock) {
             anchor: backend.selection_anchor_id_rc.clone(),
             submission: backend.verified_submission.clone(),
             bracketed: backend.bracketed_paste_rc.clone(),
-            live: backend.active_vte.clone(),
+            live: backend.active_rc.borrow().focus_widget(),
         },
         card,
     );

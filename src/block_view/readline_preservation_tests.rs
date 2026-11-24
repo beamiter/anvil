@@ -221,7 +221,7 @@ fn search_and_native_split_preserve_readline_draft_cursor_and_undo() {
         let identity = (
             original.0.pty.pid_i32(),
             original.0.pty.master_fd_raw(),
-            original.0.active_vte.clone(),
+            original.0.vte().clone(),
         );
         let original_columns = pty_columns(&original.0);
         assert!(original_columns > 0);
@@ -264,7 +264,7 @@ fn search_and_native_split_preserve_readline_draft_cursor_and_undo() {
             bar.set_search_mode(false);
             original.0.grab_focus();
             settle();
-            assert!(owns_focus(&window, &original.0.active_vte));
+            assert!(owns_focus(&window, original.0.vte()));
             assert_eq!(snapshot(&original.0, &scratch.0), before);
         }
 
@@ -292,18 +292,18 @@ fn search_and_native_split_preserve_readline_draft_cursor_and_undo() {
             },
             "split must resize the original live pane",
         );
-        assert!(owns_focus(&window, &sibling.0.active_vte));
+        assert!(owns_focus(&window, sibling.0.vte()));
         assert_eq!(snapshot(&sibling.0, &scratch.0), (0, String::new()));
         send(&sibling.0, b"printf SIBLING");
         let sibling_before = snapshot(&sibling.0, &scratch.0);
         original.0.grab_focus();
         settle();
-        assert!(owns_focus(&window, &original.0.active_vte));
+        assert!(owns_focus(&window, original.0.vte()));
         assert_eq!(
             (
                 original.0.pty.pid_i32(),
                 original.0.pty.master_fd_raw(),
-                original.0.active_vte.clone()
+                original.0.vte().clone()
             ),
             identity
         );

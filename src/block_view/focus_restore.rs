@@ -337,12 +337,12 @@ mod tests {
         // Establish that lifecycle before requiring the docked VTE to be mapped.
         feed(&view, PROMPT);
         let end = Instant::now() + Duration::from_secs(3);
-        while !view.active_vte.is_mapped() || view.root.height() <= 30 {
+        while !view.vte().is_mapped() || view.root.height() <= 30 {
             assert!(
                 Instant::now() < end,
                 "{mode:?} fixture: state={:?}, mapped={}, root_height={}",
                 view.bstate.get(),
-                view.active_vte.is_mapped(),
+                view.vte().is_mapped(),
                 view.root.height()
             );
             pump();
@@ -376,8 +376,8 @@ mod tests {
                         pump();
                         assert_eq!(view.bstate.get(), BlockState::AltScreen);
                     }
-                    view.active_vte.grab_focus();
-                    assert!(view.active_vte.has_focus());
+                    view.vte().grab_focus();
+                    assert!(view.vte().has_focus());
                     feed(&view, if alt_exit { b"\x1b[?1049l" } else { PROMPT });
                     assert_ne!(view.bstate.get(), BlockState::AltScreen);
                     peer.grab_focus();
@@ -398,33 +398,33 @@ mod tests {
                         pump();
                         assert_eq!(view.bstate.get(), BlockState::AltScreen);
                     }
-                    view.active_vte.grab_focus();
-                    assert!(view.active_vte.has_focus());
+                    view.vte().grab_focus();
+                    assert!(view.vte().has_focus());
                     feed(&view, if alt_exit { b"\x1b[?1049l" } else { PROMPT });
                     gtk::prelude::GtkWindowExt::set_focus(&window, Widget::NONE);
                     if remap {
-                        view.active_vte.set_visible(false);
-                        view.active_vte.set_visible(true);
+                        view.vte().set_visible(false);
+                        view.vte().set_visible(true);
                         // Mapping may synchronously restore this same terminal.
                         // Reject any unrelated owner before recreating the empty
                         // focus precondition that the queued idle must repair.
                         let remapped_owner = gtk::prelude::GtkWindowExt::focus(&window);
                         assert!(
                             remapped_owner.as_ref().is_none_or(|owner| {
-                                owner == view.active_vte.upcast_ref::<Widget>()
+                                owner == view.vte().upcast_ref::<Widget>()
                             }),
                             "remap selected another owner (alt_exit={alt_exit}): {remapped_owner:?}"
                         );
                         gtk::prelude::GtkWindowExt::set_focus(&window, Widget::NONE);
                     }
-                    assert!(view.active_vte.is_mapped());
+                    assert!(view.vte().is_mapped());
                     assert!(
                         gtk::prelude::GtkWindowExt::focus(&window).is_none(),
                         "fixture must clear focus before idle (alt_exit={alt_exit}, remap={remap})"
                     );
                     pump();
                     assert!(
-                        view.active_vte.has_focus(),
+                        view.vte().has_focus(),
                         "legitimate restore was lost (alt_exit={alt_exit}, remap={remap})"
                     );
                 }
@@ -438,7 +438,7 @@ mod tests {
     #[ignore = "requires DISPLAY; mapped focus and widget lifecycle"]
     fn deferred_focus_preserves_remaps_and_retires_hidden_targets() {
         let (view, window, column, peers) = fixture(TerminalMode::Block);
-        let terminal = &view.active_vte;
+        let terminal = view.vte();
         terminal.grab_focus();
         view.render_backend.focus_live_deferred();
         gtk::prelude::GtkWindowExt::set_focus(&window, Widget::NONE);
@@ -574,7 +574,7 @@ mod tests {
         bind_persistent_menu_focus(&button, &popover);
         column.append(&button);
         pump();
-        let owner = &view.active_vte;
+        let owner = view.vte();
         for pump_while_b_open in [false, true] {
             assert!(owner.grab_focus());
             assert!(owns_focus(owner));
@@ -619,7 +619,7 @@ mod tests {
     fn popover_focus_return_retires_on_newer_owner() {
         let (view, window, column, peers) = fixture(TerminalMode::Block);
         let owners = [
-            view.active_vte.clone().upcast::<Widget>(),
+            view.vte().clone().upcast::<Widget>(),
             peers[1].clone(),
             peers[2].clone(),
         ];
@@ -637,7 +637,7 @@ mod tests {
                 popover.set_parent(&view.block_scroll);
                 let action = gtk::Button::with_label("Copy");
                 popover.set_child(Some(&action));
-                let restore = FocusRestore::popover(&view.active_vte, &popover).unwrap();
+                let restore = FocusRestore::popover(view.vte(), &popover).unwrap();
                 let observer_state = Rc::downgrade(&restore.superseded);
                 let restore = std::cell::RefCell::new(Some(restore));
                 let closed = Rc::new(Cell::new(false));

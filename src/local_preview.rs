@@ -67,7 +67,9 @@ fn host_owns_click(terminal: &vte4::Terminal) -> bool {
             .borrow()
             .iter()
             .filter_map(std::rc::Weak::upgrade)
-            .any(|view| view.vte() == terminal && view.host_owns_local_preview_click())
+            .any(|view| {
+                view.legacy_terminal() == Some(terminal) && view.host_owns_local_preview_click()
+            })
     })
 }
 struct PreviewUi {

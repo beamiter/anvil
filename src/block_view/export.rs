@@ -659,7 +659,7 @@ impl TermView {
             let output_text = strip_ansi(&block.full_output.borrow());
 
             let full_text = format!("{}\n{}\n{}", prompt_text, cmd_text, output_text);
-            let clipboard = self.active_vte.clipboard();
+            let clipboard = self.root.clipboard();
             clipboard.set_text(&full_text);
         }
     }

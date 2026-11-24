@@ -1528,13 +1528,13 @@ mod tests {
         use gtk::prelude::*;
         use vte4::TerminalExt;
         gtk::init().expect("gtk init");
-        let active = super::ActiveBlock::new(
+        let active = super::ActiveBlock::new_legacy(
             &crate::config::Config::safe_defaults(),
             Rc::new(RefCell::new(std::collections::VecDeque::new())),
         );
-        active.active_vte.add_css_class("ssh-inset-fixture");
-        assert_eq!(active.active_vte.yalign(), vte4::Align::Start);
-        let display = gtk::prelude::WidgetExt::display(&active.active_vte);
+        active.legacy_surface().add_css_class("ssh-inset-fixture");
+        assert_eq!(active.legacy_surface().yalign(), vte4::Align::Start);
+        let display = gtk::prelude::WidgetExt::display(active.legacy_surface());
         let provider = gtk::CssProvider::new();
         gtk::style_context_add_provider_for_display(
             &display,
@@ -1560,19 +1560,19 @@ mod tests {
                 ".ssh-inset-fixture {{ padding: {padding}px; border: 0; margin: 0; }}"
             ));
             settle();
-            let insets = super::terminal_vertical_insets(&active.active_vte);
+            let insets = super::terminal_vertical_insets(active.legacy_surface());
             assert_eq!(insets, 2 * padding);
-            let cell_h = active.active_vte.char_height() as i32;
+            let cell_h = active.legacy_surface().char_height() as i32;
             for visible_rows in [6, 12, 24] {
                 active.set_live_geometry(cell_h, 24, visible_rows);
                 settle();
                 assert_eq!(
-                    active.active_vte.row_count(),
+                    active.legacy_surface().row_count(),
                     24,
                     "CSS must not create or remove a PTY grid row"
                 );
                 let origin = active
-                    .active_vte
+                    .legacy_surface()
                     .compute_point(&active.live_clip(), &gtk::graphene::Point::new(0.0, 0.0))
                     .expect("shared clip ancestor");
                 assert!(
@@ -1769,7 +1769,6 @@ mod tests {
             None,
         );
         card.connect_actions(
-            &owner.active_vte,
             &owner.verified_submission,
             &owner.bracketed_paste,
             &owner.active,
@@ -2342,7 +2341,7 @@ mod tests {
 
         // The live input cell carries the density as a class only; its height
         // comes from `BLOCK_ACTIVE_COMPACT_VCHROME_PX` via the same class.
-        let live = ActiveBlock::new(&config, Rc::new(RefCell::new(VecDeque::new())));
+        let live = ActiveBlock::new_legacy(&config, Rc::new(RefCell::new(VecDeque::new())));
         assert!(!live.widget().has_css_class("block-compact"));
         live.set_compact(true);
         assert!(live.widget().has_css_class("block-compact"));
@@ -6629,20 +6628,17 @@ impl FinishedBlock {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn connect_actions(
         &self,
-        vte: &Terminal,
         verified_submission: &super::VerifiedSubmissionCtx,
         bracketed_paste: &Rc<Cell<bool>>,
         active: &Rc<RefCell<ActiveBlock>>,
     ) {
-        let vte_for_cmd = vte.clone();
         let cmd_for_copy = self.cmd_text.clone();
         let feedback = ButtonFeedback::new(&self.copy_cmd_btn);
         self.copy_cmd_btn.connect_clicked(move |btn| {
-            vte_for_cmd.clipboard().set_text(&cmd_for_copy);
+            btn.clipboard().set_text(&cmd_for_copy);
             feedback.flash(btn, "emblem-ok-symbolic", "Command copied");
         });
 
-        let vte_for_out = vte.clone();
         // Copies what the card is showing: the whole transcript normally, and
         // the filtered lines while a filter is on. Copying the full transcript
         // out of a filtered card is the one thing nobody asks for — filtering
@@ -6665,7 +6661,7 @@ impl FinishedBlock {
                 Some(text) => (text, "Filtered output copied"),
                 None => (strip_ansi(&full_output_for_copy.borrow()), "Output copied"),
             };
-            vte_for_out.clipboard().set_text(&text);
+            btn.clipboard().set_text(&text);
             feedback.flash(btn, "emblem-ok-symbolic", label);
         });
 
@@ -6710,7 +6706,7 @@ impl FinishedBlock {
 /// stacked above this card.
 pub(crate) struct ActiveBlock {
     pub(crate) widget: gtk::Box,
-    pub(crate) active_vte: Terminal,
+    pub(super) active_vte: Option<Terminal>,
     #[cfg(anvil_shared_terminal)]
     pub(super) shared_active: Option<Rc<super::shared_active::SharedActiveTerminal>>,
     /// The measured wrapper around the live VTE. It carries the terminal's
@@ -6838,7 +6834,13 @@ fn live_rows_height_px(cell_h: i32, rows: i64, insets: i32) -> i32 {
 impl ActiveBlock {
     /// `pub(super)`: only `TermView::new` constructs the live block, and it is
     /// the owner of the engine-side `raw_output` ring passed in here.
-    pub(super) fn new(config: &Config, raw_output: Rc<RefCell<VecDeque<u8>>>) -> Self {
+    pub(super) fn new(
+        config: &Config,
+        raw_output: Rc<RefCell<VecDeque<u8>>>,
+        #[cfg(anvil_shared_terminal)] shared_active: Option<
+            Rc<super::shared_active::SharedActiveTerminal>,
+        >,
+    ) -> Self {
         let widget = gtk::Box::new(Orientation::Vertical, 0);
         widget.add_css_class("block-active");
         if config.block_compact {
@@ -6855,14 +6857,25 @@ impl ActiveBlock {
         // regardless of the requested height.
         widget.set_vexpand(false);
 
-        let active_vte = create_active_terminal(config);
-        active_vte.set_hexpand(true);
-        active_vte.set_vexpand(false);
+        let create_legacy = || {
+            let terminal = create_active_terminal(config);
+            terminal.set_hexpand(true);
+            terminal.set_vexpand(false);
+            terminal
+        };
+        #[cfg(anvil_shared_terminal)]
+        let active_vte = shared_active.is_none().then(create_legacy);
+        #[cfg(not(anvil_shared_terminal))]
+        let active_vte = Some(create_legacy());
         let vte_overlay = gtk::Overlay::new();
         vte_overlay.set_hexpand(true);
         vte_overlay.set_vexpand(false);
 
-        vte_overlay.set_child(Some(&active_vte));
+        vte_overlay.set_child(active_vte.as_ref());
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &shared_active {
+            vte_overlay.set_child(Some(&terminal.widget));
+        }
 
         let live_organism_surface = gtk::Fixed::new();
         live_organism_surface.set_hexpand(true);
@@ -6905,8 +6918,8 @@ impl ActiveBlock {
         vte_overlay.set_measure_overlay(&unified_chrome_surface, false);
         vte_overlay.set_clip_overlay(&unified_chrome_surface, true);
 
-        let live_scrollbar =
-            gtk::Scrollbar::new(Orientation::Vertical, active_vte.vadjustment().as_ref());
+        let legacy_adjustment = active_vte.as_ref().and_then(ScrollableExt::vadjustment);
+        let live_scrollbar = gtk::Scrollbar::new(Orientation::Vertical, legacy_adjustment.as_ref());
         live_scrollbar.add_css_class("block-output-scrollbar");
         live_scrollbar.set_tooltip_text(Some("Scroll within the running output"));
         live_scrollbar.set_halign(gtk::Align::End);
@@ -6954,7 +6967,7 @@ impl ActiveBlock {
         // against rows the card is not showing and cut off halfway.
         live_clip.add_overlay(&live_scrollbar);
         widget.append(&live_clip);
-        if let Some(adjustment) = active_vte.vadjustment() {
+        if let Some(adjustment) = legacy_adjustment {
             let scrollbar = live_scrollbar.downgrade();
             let sync_visibility = move |adjustment: &gtk::Adjustment| {
                 let Some(scrollbar) = scrollbar.upgrade() else {
@@ -6970,11 +6983,33 @@ impl ActiveBlock {
             adjustment.connect_changed(sync_visibility);
         }
 
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &shared_active {
+            let adjustment = terminal.scrollback();
+            live_scrollbar.set_adjustment(Some(adjustment));
+            let scrollbar = live_scrollbar.downgrade();
+            let unified = terminal.transcript().is_some();
+            let sync = move |adjustment: &gtk::Adjustment| {
+                if let Some(scrollbar) = scrollbar.upgrade() {
+                    let scrollable =
+                        adjustment.upper() - adjustment.lower() > adjustment.page_size();
+                    scrollbar.set_visible(unified || scrollable);
+                    if unified {
+                        scrollbar.set_opacity(if scrollable { 1.0 } else { 0.0 });
+                        scrollbar.set_can_target(scrollable);
+                        scrollbar.set_can_focus(scrollable);
+                        scrollbar.update_state(&[gtk::accessible::State::Hidden(!scrollable)]);
+                    }
+                }
+            };
+            sync(adjustment);
+            adjustment.connect_changed(sync);
+        }
         ActiveBlock {
             widget,
             active_vte,
             #[cfg(anvil_shared_terminal)]
-            shared_active: None,
+            shared_active,
             vte_overlay,
             live_spacer,
             live_clip,
@@ -6994,31 +7029,18 @@ impl ActiveBlock {
         }
     }
 
-    #[cfg(anvil_shared_terminal)]
-    pub(super) fn mount_shared(
-        &mut self,
-        terminal: Rc<super::shared_active::SharedActiveTerminal>,
-    ) {
-        self.vte_overlay.set_child(Some(&terminal.widget));
-        let adjustment = terminal.scrollback();
-        self.live_scrollbar.set_adjustment(Some(adjustment));
-        let scrollbar = self.live_scrollbar.downgrade();
-        let unified = terminal.transcript().is_some();
-        let sync = move |adjustment: &gtk::Adjustment| {
-            if let Some(scrollbar) = scrollbar.upgrade() {
-                let scrollable = adjustment.upper() - adjustment.lower() > adjustment.page_size();
-                scrollbar.set_visible(unified || scrollable);
-                if unified {
-                    scrollbar.set_opacity(if scrollable { 1.0 } else { 0.0 });
-                    scrollbar.set_can_target(scrollable);
-                    scrollbar.set_can_focus(scrollable);
-                    scrollbar.update_state(&[gtk::accessible::State::Hidden(!scrollable)]);
-                }
-            }
-        };
-        sync(adjustment);
-        adjustment.connect_changed(sync);
-        self.shared_active = Some(terminal);
+    #[cfg(test)]
+    pub(super) fn new_legacy(config: &Config, raw_output: Rc<RefCell<VecDeque<u8>>>) -> Self {
+        Self::new(
+            config,
+            raw_output,
+            #[cfg(anvil_shared_terminal)]
+            None,
+        )
+    }
+
+    pub(super) fn legacy_surface(&self) -> &Terminal {
+        self.active_vte.as_ref().expect("legacy live terminal")
     }
 
     pub(super) fn focus_widget(&self) -> gtk::Widget {
@@ -7026,7 +7048,7 @@ impl ActiveBlock {
         if let Some(terminal) = &self.shared_active {
             return terminal.screen().clone().upcast();
         }
-        self.active_vte.clone().upcast()
+        self.legacy_surface().clone().upcast()
     }
 
     pub(super) fn surface_adjustment(&self) -> Option<gtk::Adjustment> {
@@ -7034,7 +7056,9 @@ impl ActiveBlock {
         if let Some(terminal) = &self.shared_active {
             return Some(terminal.scrollback().clone());
         }
-        self.active_vte.vadjustment()
+        self.active_vte
+            .as_ref()
+            .and_then(ScrollableExt::vadjustment)
     }
 
     #[cfg(anvil_shared_terminal)]
@@ -7142,7 +7166,11 @@ impl ActiveBlock {
     /// The column count the live VTE is wrapping at — the single source of truth
     /// for pre-wrapping finished blocks so they align with what the user watched.
     pub(crate) fn grid_cols(&self) -> usize {
-        (self.active_vte.column_count().max(20)) as usize
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return usize::from(terminal.grid_size().0).max(20);
+        }
+        self.legacy_surface().column_count().max(20) as usize
     }
 
     /// Give the live terminal a `grid_px`-tall grid and show `visible_px` of it.
@@ -7166,7 +7194,7 @@ impl ActiveBlock {
         // and split width; a canvas-minus-fixed-insets estimate cannot follow
         // those seats and leaves full-screen applications on a stale grid.
         let width_px = self.live_clip.width();
-        let insets = terminal_vertical_insets(&self.active_vte);
+        let insets = terminal_vertical_insets(self.legacy_surface());
         let visible_px = live_rows_height_px(cell_h, visible_rows, insets);
         if width_px <= 0 {
             // Before the first allocation there is no width to hand out, but
@@ -7242,10 +7270,8 @@ impl ActiveBlock {
                 terminal.widget.height().max(0),
             );
         }
-        (
-            self.active_vte.width().max(0),
-            self.active_vte.height().max(0),
-        )
+        let terminal = self.legacy_surface();
+        (terminal.width().max(0), terminal.height().max(0))
     }
 
     pub(super) fn live_cell_size(&self) -> (i32, i32) {
@@ -7254,10 +7280,8 @@ impl ActiveBlock {
             let (_, _, width, height) = terminal.cell_metrics();
             return (width, height);
         }
-        (
-            self.active_vte.char_width() as i32,
-            self.active_vte.char_height() as i32,
-        )
+        let terminal = self.legacy_surface();
+        (terminal.char_width() as i32, terminal.char_height() as i32)
     }
 
     #[cfg(anvil_shared_terminal)]
@@ -7305,16 +7329,17 @@ impl ActiveBlock {
             terminal.output().reset_prompt(preserve_scrollback);
             return;
         }
+        let terminal = self.legacy_surface();
         if preserve_scrollback {
-            self.active_vte.feed(b"\x1b[0m");
+            terminal.feed(b"\x1b[0m");
             // Kept scrollback means no VTE reset, so a program that died
             // with mouse or focus reporting on would leave libvte turning the
             // shell's clicks into reports. Switch them off by hand, as the
             // reset below does for the default path.
-            self.active_vte.feed(super::MOUSE_AND_FOCUS_REPORTING_OFF);
+            terminal.feed(super::MOUSE_AND_FOCUS_REPORTING_OFF);
         } else {
-            self.active_vte.reset(true, true);
-            self.active_vte.feed(b"\x1b[H\x1b[2J\x1b[3J");
+            terminal.reset(true, true);
+            terminal.feed(b"\x1b[H\x1b[2J\x1b[3J");
         }
     }
 
@@ -7333,7 +7358,7 @@ impl ActiveBlock {
     }
 
     pub(crate) fn grab_focus(&self) {
-        self.active_vte.grab_focus();
+        self.focus_widget().grab_focus();
     }
 
     pub(crate) fn set_live_organism_visible(&self, visible: bool) {

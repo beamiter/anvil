@@ -641,7 +641,7 @@ impl TermView {
             }
             record.cmd.clone()
         };
-        self.active_vte.clipboard().set_text(&command);
+        self.root.clipboard().set_text(&command);
         Ok(())
     }
 }

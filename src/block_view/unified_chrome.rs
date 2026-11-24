@@ -1149,7 +1149,7 @@ impl UnifiedChrome {
     }
 
     pub(super) fn new(
-        terminal: &Terminal,
+        terminal: Option<&Terminal>,
         surface: &gtk::DrawingArea,
         authority: Rc<RefCell<ZoneChromeAuthority>>,
         config: Rc<RefCell<super::Config>>,
@@ -1174,6 +1174,7 @@ impl UnifiedChrome {
             chrome.connect_shared(shared, config);
             return chrome;
         }
+        let terminal = terminal.expect("legacy Unified terminal");
         let terminal_for_draw = terminal.clone();
         let authority_for_draw = authority.clone();
         let config_for_draw = config;

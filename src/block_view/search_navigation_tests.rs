@@ -246,13 +246,12 @@ fn retained_scrollback_case(mode: crate::config::TerminalMode, new_lines: usize)
     view.bstate.set(BlockState::CollectingOutput);
     settle();
     {
-        view.active_vte
-            .feed("needle old\r\n".repeat(100).as_bytes());
+        view.vte().feed("needle old\r\n".repeat(100).as_bytes());
         settle();
-        let origin = view.active_vte.cursor_position().1;
+        let origin = view.vte().cursor_position().1;
         view.active.borrow().live_cursor_origin().set(Some(origin));
-        view.active_vte.feed(b"$ run\r\n");
-        view.active_vte
+        view.vte().feed(b"$ run\r\n");
+        view.vte()
             .feed("needle new\r\n".repeat(new_lines).as_bytes());
         settle();
         assert_eq!(
@@ -263,7 +262,7 @@ fn retained_scrollback_case(mode: crate::config::TerminalMode, new_lines: usize)
         let result = view.find_in_blocks("needle.*", true, false);
         if new_lines == 0 {
             assert_eq!(result, find::FindSearchResult::NoMatches);
-            assert!(!view.active_vte.has_selection());
+            assert!(!view.vte().has_selection());
             window.close();
             settle();
             return;
@@ -277,7 +276,7 @@ fn retained_scrollback_case(mode: crate::config::TerminalMode, new_lines: usize)
         );
         assert_eq!(progress.current, 1);
         assert_eq!(
-            view.active_vte.text_selected(vte4::Format::Text).as_deref(),
+            view.vte().text_selected(vte4::Format::Text).as_deref(),
             Some("needle new")
         );
         // Previous at the first match wraps only within the running range.
@@ -286,7 +285,7 @@ fn retained_scrollback_case(mode: crate::config::TerminalMode, new_lines: usize)
         };
         assert_eq!(progress.current, new_lines);
         assert_eq!(
-            view.active_vte.text_selected(vte4::Format::Text).as_deref(),
+            view.vte().text_selected(vte4::Format::Text).as_deref(),
             Some("needle new")
         );
         let find::FindNavigationResult::Progress(progress) = view.find_next() else {
@@ -294,7 +293,7 @@ fn retained_scrollback_case(mode: crate::config::TerminalMode, new_lines: usize)
         };
         assert_eq!(progress.current, 1);
         assert_eq!(
-            view.active_vte.text_selected(vte4::Format::Text).as_deref(),
+            view.vte().text_selected(vte4::Format::Text).as_deref(),
             Some("needle new")
         );
         for expected in 2..=new_lines {
@@ -304,7 +303,7 @@ fn retained_scrollback_case(mode: crate::config::TerminalMode, new_lines: usize)
             };
             assert_eq!(progress.current, expected);
             assert_eq!(
-                view.active_vte.text_selected(vte4::Format::Text).as_deref(),
+                view.vte().text_selected(vte4::Format::Text).as_deref(),
                 Some("needle new")
             );
         }
@@ -357,7 +356,7 @@ fn retained_scrollback_case(mode: crate::config::TerminalMode, new_lines: usize)
     };
     assert_eq!(progress.current, new_lines + 1);
     assert_eq!(
-        view.active_vte.text_selected(vte4::Format::Text).as_deref(),
+        view.vte().text_selected(vte4::Format::Text).as_deref(),
         Some("needle new")
     );
     let find::FindNavigationResult::Progress(progress) = view.find_next() else {
@@ -369,7 +368,7 @@ fn retained_scrollback_case(mode: crate::config::TerminalMode, new_lines: usize)
     };
     assert_eq!(progress.current, 2);
     assert_eq!(
-        view.active_vte.text_selected(vte4::Format::Text).as_deref(),
+        view.vte().text_selected(vte4::Format::Text).as_deref(),
         Some("needle new")
     );
     window.close();
@@ -422,12 +421,11 @@ fn live_find_change_case(mode: crate::config::TerminalMode, change: &str) {
     view.ftcs_seen.set(true);
     view.bstate.set(BlockState::CollectingOutput);
     settle();
-    view.active_vte
-        .feed("older output\r\n".repeat(40).as_bytes());
+    view.vte().feed("older output\r\n".repeat(40).as_bytes());
     settle();
-    let origin = view.active_vte.cursor_position().1;
+    let origin = view.vte().cursor_position().1;
     view.active.borrow().live_cursor_origin().set(Some(origin));
-    view.active_vte.feed(b"$ run\r\nneedle\r\n");
+    view.vte().feed(b"$ run\r\nneedle\r\n");
     settle();
     let find::FindSearchResult::Matches(progress) = view.find_in_blocks("needle", false, false)
     else {
@@ -435,17 +433,17 @@ fn live_find_change_case(mode: crate::config::TerminalMode, change: &str) {
     };
     assert_eq!(progress.total, 1);
     assert_eq!(
-        view.active_vte.text_selected(vte4::Format::Text).as_deref(),
+        view.vte().text_selected(vte4::Format::Text).as_deref(),
         Some("needle")
     );
 
     // Ordinary scrolling/selection do not change terminal contents and must
     // not invalidate a query or create a find/rebuild feedback loop.
     let generation = view.contents_generation.get();
-    let adjustment = view.active_vte.vadjustment().unwrap();
+    let adjustment = view.vte().vadjustment().unwrap();
     adjustment.set_value(adjustment.lower());
-    view.active_vte.select_all();
-    view.active_vte.unselect_all();
+    view.vte().select_all();
+    view.vte().unselect_all();
     settle();
     assert_eq!(view.contents_generation.get(), generation);
     assert!(matches!(
@@ -458,14 +456,14 @@ fn live_find_change_case(mode: crate::config::TerminalMode, change: &str) {
     ));
 
     match change {
-        "append" => view.active_vte.feed(b"needle\r\n"),
-        "rewrite" => view.active_vte.feed(b"\x1b[1A\r\x1b[2Kgone\r\n"),
+        "append" => view.vte().feed(b"needle\r\n"),
+        "rewrite" => view.vte().feed(b"\x1b[1A\r\x1b[2Kgone\r\n"),
         "resize" => {
-            let old_grid = (view.active_vte.row_count(), view.active_vte.column_count());
+            let old_grid = (view.vte().row_count(), view.vte().column_count());
             window.set_default_size(860, 440);
             settle();
             assert_ne!(
-                (view.active_vte.row_count(), view.active_vte.column_count()),
+                (view.vte().row_count(), view.vte().column_count()),
                 old_grid,
                 "fixture must change the native search geometry"
             );
@@ -483,14 +481,14 @@ fn live_find_change_case(mode: crate::config::TerminalMode, change: &str) {
     let result = view.find_in_blocks("needle", false, false);
     if change == "rewrite" {
         assert_eq!(result, find::FindSearchResult::NoMatches);
-        assert!(!view.active_vte.has_selection());
+        assert!(!view.vte().has_selection());
     } else {
         let find::FindSearchResult::Matches(progress) = result else {
             panic!("refreshed live match");
         };
         assert_eq!(progress.total, if change == "append" { 2 } else { 1 });
         assert_eq!(
-            view.active_vte.text_selected(vte4::Format::Text).as_deref(),
+            view.vte().text_selected(vte4::Format::Text).as_deref(),
             Some("needle")
         );
         assert!(matches!(

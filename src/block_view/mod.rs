@@ -2942,7 +2942,7 @@ fn log_completed_block_retention(context: &str, plan: CompletedBlockRetentionPla
 
 fn clear_find_handles(
     _finished_blocks: &Rc<RefCell<Vec<FinishedBlock>>>,
-    active_vte: &Terminal,
+    active_vte: Option<&Terminal>,
     find_state: &Rc<RefCell<FindState>>,
 ) {
     find::clear_find_state(find_state.as_ref(), active_vte);
@@ -4608,7 +4608,7 @@ pub struct TermView {
     notice_dock: gtk::Box,
     /// The single persistent live VTE (anvil model): prompt + typing + output all
     /// render here natively; finished commands snapshot into styled blocks above.
-    active_vte: Terminal,
+    active_vte: Option<Terminal>,
     /// Existing native contents clock, shared with prompt/layout observation.
     /// Search reads it; selection and scrolling never advance it.
     contents_generation: Rc<Cell<u64>>,
@@ -5722,7 +5722,7 @@ struct BlockBackend {
     menu_keybindings: shortcut_hints::MenuKeybindings,
     active_rc: Rc<RefCell<ActiveBlock>>,
     /// The legacy surface used when no shared view is mounted.
-    active_vte: Terminal,
+    active_vte: Option<Terminal>,
     #[cfg(anvil_shared_terminal)]
     shared_active: Option<Rc<SharedActiveTerminal>>,
     #[cfg(anvil_shared_terminal)]
@@ -6525,7 +6525,7 @@ struct UnifiedBackend {
     shared_active: Option<Rc<SharedActiveTerminal>>,
     #[cfg(anvil_shared_terminal)]
     shared_cwd: Option<DirectoryReport>,
-    vte: Terminal,
+    legacy: Option<LegacyUnifiedSurface>,
     navigation: unified_navigation::NavigationBar,
     user_scrolled_up: Rc<Cell<bool>>,
     unread_count: Rc<Cell<u32>>,
@@ -6549,24 +6549,28 @@ struct UnifiedBackend {
     /// lifetimes than searchable Unified records.
     bookmarks: Rc<BookmarkState>,
     find_state_for_cb: Rc<RefCell<FindState>>,
-    /// Per-pane fail-closed marker state. Marker bytes are fed only inside the
-    /// backend, never through the parser or any engine capture buffer.
-    zone_marker: Rc<RefCell<ZoneMarkerInjector>>,
     /// Probe/paint half of Unified zone chrome. Marker authority is separate
     /// from completed records so eviction cannot delete history metadata.
     chrome: unified_chrome::UnifiedChrome,
-    /// Probe-addressed images layered between VTE and the organism surface.
-    image_layer: unified_images::UnifiedImageLayer,
-    /// Strong owner for the retention observer rendezvous. Chrome's Terminal
-    /// signal closures retain only a Weak slot, so pane teardown releases the
-    /// layer, VTE, Fixed and textures instead of forming a GObject/Rc cycle.
-    _image_layer_slot_owner: Rc<RefCell<Option<unified_images::UnifiedImageLayer>>>,
     /// Shared with the engine so a replayed zone draws from the same id
     /// sequence a live one does; a persisted id is never reused.
     reserved_history_block_ids: Rc<RefCell<HashSet<u64>>>,
     kitty_assembler: RefCell<kitty_graphics::Assembler>,
     /// Decoded result parked until the engine has written the protocol reply.
     kitty_pending_admission: RefCell<Option<PendingUnifiedImage>>,
+}
+
+struct LegacyUnifiedSurface {
+    vte: Terminal,
+    /// Per-pane fail-closed marker state. Marker bytes are fed only inside the
+    /// backend, never through the parser or any engine capture buffer.
+    zone_marker: Rc<RefCell<ZoneMarkerInjector>>,
+    /// Probe-addressed images layered between VTE and the organism surface.
+    image_layer: unified_images::UnifiedImageLayer,
+    /// Strong owner for the retention observer rendezvous. Chrome's Terminal
+    /// signal closures retain only a Weak slot, so pane teardown releases the
+    /// layer, VTE, Fixed and textures instead of forming a GObject/Rc cycle.
+    _image_layer_slot_owner: Rc<RefCell<Option<unified_images::UnifiedImageLayer>>>,
 }
 
 /// Captures the shared handles the PTY reader/exit callbacks need, so
@@ -8434,6 +8438,12 @@ fn finished_command(vte_capture: &str, input_shadow: &str) -> String {
 /// `ReaderCtx` handler statements and `render_finalized_block`; the free
 /// helper functions they wrap stay module-level because non-reader paths
 /// (restore, resize, submit) share them.
+impl BlockBackend {
+    fn legacy_surface(&self) -> &Terminal {
+        self.active_vte.as_ref().expect("legacy live terminal")
+    }
+}
+
 impl RenderBackend for BlockBackend {
     fn hard_reset(&self) {
         // Reset may be followed by PromptStart in the same PTY batch, before
@@ -8463,7 +8473,7 @@ impl RenderBackend for BlockBackend {
         let more_button = finished_menu_clone.more_btn.clone();
         let block_data_for_export = self.block_data_for_cb.clone();
         let finished_blocks_for_menu = Rc::downgrade(&self.finished_blocks_for_cb);
-        let vte_for_copy = self.active_vte.clone();
+        let live_for_copy = self.active_rc.borrow().focus_widget();
         let bracketed_paste_for_rerun_menu = self.bracketed_paste_rc.clone();
         let verified_submission_for_rerun_menu = self.verified_submission.clone();
         let active_for_rerun_menu = self.active_rc.clone();
@@ -8592,7 +8602,7 @@ impl RenderBackend for BlockBackend {
                 Ok(Some(text)) => {
                     let item = make_item("Copy Selection");
                     let popover_c = popover.clone();
-                    let vte_for_action = vte_for_copy.clone();
+                    let vte_for_action = live_for_copy.clone();
                     item.connect_clicked(move |_| {
                         popover_c.popdown();
                         vte_for_action.clipboard().set_text(&text);
@@ -8630,7 +8640,7 @@ impl RenderBackend for BlockBackend {
                 let popover_c = popover.clone();
                 let block_data_for_copy = block_data_for_export.clone();
                 let selected_ids_for_copy = selected_ids_for_menu.clone();
-                let vte_for_action = vte_for_copy.clone();
+                let vte_for_action = live_for_copy.clone();
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
                     let selected = selected_ids_for_copy.borrow();
@@ -8763,7 +8773,7 @@ impl RenderBackend for BlockBackend {
                     let selected_for_retry = selected_for_menu.clone();
                     let anchor_for_retry = anchor_for_menu.clone();
                     let active_for_retry = active_for_rerun_menu.clone();
-                    let vte_for_retry = vte_for_copy.clone();
+                    let vte_for_retry = live_for_copy.clone();
                     item.connect_clicked(move |_| {
                         popover_c.popdown();
                         // Re-derive every guard live at dispatch: the prompt,
@@ -8838,7 +8848,7 @@ impl RenderBackend for BlockBackend {
                 let popover_c = popover.clone();
                 let block_data_for_copy = block_data_for_export.clone();
                 let selected_ids_for_copy = selected_ids_for_menu.clone();
-                let vte_for_action = vte_for_copy.clone();
+                let vte_for_action = live_for_copy.clone();
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
                     let selected = selected_ids_for_copy.borrow();
@@ -8863,7 +8873,7 @@ impl RenderBackend for BlockBackend {
                 let popover_c = popover.clone();
                 let block_data_for_copy = block_data_for_export.clone();
                 let selected_ids_for_copy = selected_ids_for_menu.clone();
-                let vte_for_action = vte_for_copy.clone();
+                let vte_for_action = live_for_copy.clone();
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
                     let selected = selected_ids_for_copy.borrow();
@@ -8893,7 +8903,7 @@ impl RenderBackend for BlockBackend {
                 {
                     let item = make_item("Copy Directory");
                     let popover_c = popover.clone();
-                    let vte_for_action = vte_for_copy.clone();
+                    let vte_for_action = live_for_copy.clone();
                     let cwd = cwd.clone();
                     item.connect_clicked(move |_| {
                         popover_c.popdown();
@@ -9048,7 +9058,7 @@ impl RenderBackend for BlockBackend {
                 let popover_c = popover.clone();
                 let block_data_for_md = block_data_for_export.clone();
                 let selected_ids_for_md = selected_ids_for_menu.clone();
-                let vte_for_action = vte_for_copy.clone();
+                let vte_for_action = live_for_copy.clone();
                 let block_id_md = block_id;
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
@@ -9064,7 +9074,7 @@ impl RenderBackend for BlockBackend {
                 let item = make_item("Export as JSON");
                 let popover_c = popover.clone();
                 let block_data_for_json = block_data_for_export.clone();
-                let vte_for_json = vte_for_copy.clone();
+                let vte_for_json = live_for_copy.clone();
                 let block_id_json = block_id;
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
@@ -9153,7 +9163,7 @@ impl RenderBackend for BlockBackend {
                 let item = make_item("Export as Markdown");
                 let popover_c = popover.clone();
                 let block_data_for_md = block_data_for_export.clone();
-                let vte_for_md = vte_for_copy.clone();
+                let vte_for_md = live_for_copy.clone();
                 let block_id_md = block_id;
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
@@ -9248,7 +9258,9 @@ impl RenderBackend for BlockBackend {
     }
 
     fn feed_legacy(&self, bytes: &[u8]) {
-        self.active_vte.feed(bytes);
+        if let Some(terminal) = &self.active_vte {
+            terminal.feed(bytes);
+        }
     }
 
     fn directory_report(&self, _bytes: &[u8]) {
@@ -9299,7 +9311,7 @@ impl RenderBackend for BlockBackend {
         }
         sync_active_to_pty(
             &self.layout_active_surface,
-            &self.active_vte,
+            self.legacy_surface(),
             &self.block_scroll_rc,
             &self.pty_for_init,
             &self.pty_winsize,
@@ -9707,10 +9719,8 @@ impl RenderBackend for BlockBackend {
         if let Some(terminal) = &self.shared_active {
             return (terminal.cursor_position(), terminal.row_count());
         }
-        (
-            self.active_vte.cursor_position(),
-            self.active_vte.row_count(),
-        )
+        let terminal = self.legacy_surface();
+        (terminal.cursor_position(), terminal.row_count())
     }
 
     fn cursor_position_report(&self) -> (i64, i64) {
@@ -9721,13 +9731,17 @@ impl RenderBackend for BlockBackend {
         // inline-viewport TUI (codex, and anything else on ratatui/crossterm)
         // anchors its frame on this reply, so it lands off screen and the card
         // renders blank. Rebase onto the visible grid, exactly as Unified does.
-        let (col, row) = self.active_vte.cursor_position();
-        let top_row = gtk::prelude::ScrollableExt::vadjustment(&self.active_vte)
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return terminal.cursor_position();
+        }
+        let (col, row) = self.legacy_surface().cursor_position();
+        let top_row = gtk::prelude::ScrollableExt::vadjustment(self.legacy_surface())
             .map(|adjustment| adjustment.value() as i64)
             .unwrap_or(0);
         (
             col,
-            screen_relative_cpr_row(row, top_row, self.active_vte.row_count()),
+            screen_relative_cpr_row(row, top_row, self.legacy_surface().row_count()),
         )
     }
 
@@ -9751,7 +9765,7 @@ impl RenderBackend for BlockBackend {
             self.rebase_prompt_anchor_on_row_delta,
             provisional,
             recorded_rows,
-            self.active_vte.row_count(),
+            self.legacy_surface().row_count(),
         )
     }
 
@@ -9768,7 +9782,7 @@ impl RenderBackend for BlockBackend {
         if let Some(terminal) = &self.shared_active {
             return i64::from(terminal.grid_size().0);
         }
-        self.active_vte.column_count()
+        self.legacy_surface().column_count()
     }
 
     fn capture_text_range(
@@ -9782,7 +9796,7 @@ impl RenderBackend for BlockBackend {
         if let Some(terminal) = &self.shared_active {
             return terminal.capture((start_col, start_row), (end_col, end_row));
         }
-        self.active_vte
+        self.legacy_surface()
             .text_range_format(vte4::Format::Text, start_row, start_col, end_row, end_col)
             .0
             .map(|gs| gs.to_string())
@@ -9889,7 +9903,7 @@ impl RenderBackend for BlockBackend {
             // remove the VTE owning a highlighted hit.
             clear_find_handles(
                 &self.finished_blocks_for_cb,
-                &self.active_vte,
+                self.active_vte.as_ref(),
                 &self.find_state_rc,
             );
         }
@@ -9988,7 +10002,6 @@ impl RenderBackend for BlockBackend {
         let finished_widget = finished_clone.widget().clone();
 
         finished_clone.connect_actions(
-            &self.active_vte,
             &self.verified_submission,
             &self.bracketed_paste_rc,
             &self.active_rc,
@@ -10055,7 +10068,7 @@ impl RenderBackend for BlockBackend {
         if retention_plan.evict_prefix > 0 {
             clear_find_handles(
                 &self.finished_blocks_for_cb,
-                &self.active_vte,
+                self.active_vte.as_ref(),
                 &self.find_state_rc,
             );
         }
@@ -10275,12 +10288,16 @@ fn capture_vte_search_windows_bounded(
 }
 
 impl UnifiedBackend {
+    fn legacy_surface(&self) -> &LegacyUnifiedSurface {
+        self.legacy.as_ref().expect("legacy Unified terminal")
+    }
+
     fn kitty_cursor(&self) -> (i64, i64) {
         #[cfg(anvil_shared_terminal)]
         if let Some(terminal) = &self.shared_active {
             return terminal.kitty_cursor().unwrap_or((-1, -1));
         }
-        self.vte.cursor_position()
+        self.legacy_surface().vte.cursor_position()
     }
 
     fn prepare_inline_image(
@@ -10295,7 +10312,8 @@ impl UnifiedBackend {
                 .prepare_inline_image(texture, encoded_source_bytes, requested?)
                 .map(PendingUnifiedImage::Shared);
         }
-        self.image_layer
+        self.legacy_surface()
+            .image_layer
             .prepare(texture, encoded_source_bytes, requested)
             .map(PendingUnifiedImage::Vte)
     }
@@ -10335,18 +10353,28 @@ impl UnifiedBackend {
             transcript.end_output(Some(record.id), _max_zones);
             return;
         }
-        self.chrome.begin_zone(record.id, &self.vte);
-        self.zone_marker.borrow_mut().begin_zone(record.id);
+        self.chrome
+            .begin_zone(record.id, &self.legacy_surface().vte);
+        self.legacy_surface()
+            .zone_marker
+            .borrow_mut()
+            .begin_zone(record.id);
         self.feed_legacy(&zone_history::replay_bytes(record, text, truncated));
-        close_zone_marker(&self.zone_marker, Some(record.id), |bytes| {
-            self.vte.feed(bytes)
-        });
+        close_zone_marker(
+            &self.legacy_surface().zone_marker,
+            Some(record.id),
+            |bytes| self.legacy_surface().vte.feed(bytes),
+        );
     }
 }
 
 impl RenderBackend for UnifiedBackend {
     fn feed_legacy(&self, bytes: &[u8]) {
-        feed_vte_with_zone_marker(&self.vte, &self.zone_marker, bytes);
+        feed_vte_with_zone_marker(
+            &self.legacy_surface().vte,
+            &self.legacy_surface().zone_marker,
+            bytes,
+        );
     }
 
     fn directory_report(&self, _bytes: &[u8]) {
@@ -10368,16 +10396,16 @@ impl RenderBackend for UnifiedBackend {
             );
             return;
         }
-        self.chrome.begin_zone(zone_id, &self.vte);
+        self.chrome.begin_zone(zone_id, &self.legacy_surface().vte);
         self.chrome
             .enforce_limit(self.config_for_cb.borrow().max_visible_blocks as usize);
         let open = {
-            let mut marker = self.zone_marker.borrow_mut();
+            let mut marker = self.legacy_surface().zone_marker.borrow_mut();
             marker.begin_zone(zone_id);
             marker.open_bytes()
         };
         if let Some(open) = open {
-            self.vte.feed(&open);
+            self.legacy_surface().vte.feed(&open);
         }
     }
 
@@ -10410,30 +10438,43 @@ impl RenderBackend for UnifiedBackend {
             transcript.begin_output(zone_id);
             return;
         }
-        close_zone_marker(&self.zone_marker, zone_id, |bytes| self.vte.feed(bytes));
+        close_zone_marker(&self.legacy_surface().zone_marker, zone_id, |bytes| {
+            self.legacy_surface().vte.feed(bytes)
+        });
     }
 
     fn erase_scrollback(&self) {
-        self.chrome.erase_scrollback(&self.vte);
-        self.image_layer.set_row_epoch(self.chrome.row_epoch());
+        if let Some(legacy) = &self.legacy {
+            self.chrome.erase_scrollback(&legacy.vte);
+            legacy.image_layer.set_row_epoch(self.chrome.row_epoch());
+        }
     }
 
     fn erase_display(&self) {
         self.chrome.erase_display();
         self.kitty_assembler.borrow_mut().reset();
         self.kitty_pending_admission.borrow_mut().take();
-        self.image_layer.hard_reset();
-        self.image_layer.set_row_epoch(self.chrome.row_epoch());
+        if let Some(legacy) = &self.legacy {
+            legacy.image_layer.hard_reset();
+            legacy.image_layer.set_row_epoch(self.chrome.row_epoch());
+        }
     }
 
     fn hard_reset(&self) {
-        self.zone_marker.borrow_mut().close_zone(None);
+        if let Some(legacy) = &self.legacy {
+            legacy.zone_marker.borrow_mut().close_zone(None);
+        }
         self.chrome.clear_authority();
-        find::invalidate_find_state(self.find_state_for_cb.as_ref(), &self.vte);
+        find::invalidate_find_state(
+            self.find_state_for_cb.as_ref(),
+            self.legacy.as_ref().map(|legacy| &legacy.vte),
+        );
         self.kitty_assembler.borrow_mut().reset();
         self.kitty_pending_admission.borrow_mut().take();
-        self.image_layer.hard_reset();
-        self.image_layer.set_row_epoch(self.chrome.row_epoch());
+        if let Some(legacy) = &self.legacy {
+            legacy.image_layer.hard_reset();
+            legacy.image_layer.set_row_epoch(self.chrome.row_epoch());
+        }
     }
 
     /// Preserve the continuous surface between prompts. A bare SGR reset keeps
@@ -10463,7 +10504,7 @@ impl RenderBackend for UnifiedBackend {
         }
         sync_active_to_pty(
             &self.layout_active_surface,
-            &self.vte,
+            &self.legacy_surface().vte,
             &self.block_scroll_rc,
             &self.pty_for_init,
             &self.pty_winsize,
@@ -10493,14 +10534,18 @@ impl RenderBackend for UnifiedBackend {
         }
         // Chrome only answers with a row it proved at the current epoch; any
         // doubt is `None` and this jump honestly fails.
-        let Some(value) = self.chrome.proven_zone_scroll_value(&self.vte, block_id) else {
+        let Some(value) = self
+            .chrome
+            .proven_zone_scroll_value(&self.legacy_surface().vte, block_id)
+        else {
             return false;
         };
-        let Some(adjustment) = gtk::prelude::ScrollableExt::vadjustment(&self.vte) else {
+        let Some(adjustment) = gtk::prelude::ScrollableExt::vadjustment(&self.legacy_surface().vte)
+        else {
             return false;
         };
         adjustment.set_value(value);
-        self.vte.grab_focus();
+        self.legacy_surface().vte.grab_focus();
         true
     }
 
@@ -10512,7 +10557,7 @@ impl RenderBackend for UnifiedBackend {
         // The same proof, read only: a hit is labelled reachable exactly when
         // chrome can already name the row it would scroll to.
         self.chrome
-            .proven_zone_scroll_value(&self.vte, block_id)
+            .proven_zone_scroll_value(&self.legacy_surface().vte, block_id)
             .is_some()
     }
 
@@ -10521,7 +10566,8 @@ impl RenderBackend for UnifiedBackend {
         if let Some(transcript) = self.transcript() {
             return transcript.zone_scroll_row(block_id).map(|row| row as f64);
         }
-        self.chrome.proven_zone_scroll_value(&self.vte, block_id)
+        self.chrome
+            .proven_zone_scroll_value(&self.legacy_surface().vte, block_id)
     }
 
     fn completed_search_surfaces(
@@ -10542,7 +10588,7 @@ impl RenderBackend for UnifiedBackend {
             block_index: 0,
             is_output: true,
             is_live: true,
-            terminal: self.vte.clone(),
+            terminal: self.legacy_surface().vte.clone(),
         };
         if max_bytes == 0 || deadline_exhausted() {
             return BackendSearchBatch {
@@ -10551,15 +10597,20 @@ impl RenderBackend for UnifiedBackend {
                 native_fallback: Some(native_fallback()),
             };
         }
-        let Some(bounds) = self.chrome.trusted_ring_bounds(&self.vte) else {
+        let Some(bounds) = self.chrome.trusted_ring_bounds(&self.legacy_surface().vte) else {
             return BackendSearchBatch {
                 surfaces: Vec::new(),
                 incomplete: true,
                 native_fallback: Some(native_fallback()),
             };
         };
-        let (cursor_col, _cursor_row) = self.vte.cursor_position();
-        let columns = self.vte.column_count().max(cursor_col).max(1);
+        let (cursor_col, _cursor_row) = self.legacy_surface().vte.cursor_position();
+        let columns = self
+            .legacy_surface()
+            .vte
+            .column_count()
+            .max(cursor_col)
+            .max(1);
         let started = std::time::Instant::now();
         let captured_windows = {
             let capture_deadline_exhausted =
@@ -10572,7 +10623,13 @@ impl RenderBackend for UnifiedBackend {
                 max_bytes,
                 capture_deadline_exhausted,
                 |span| {
-                    capture_vte_text_range(&self.vte, span.start_row, 0, span.end_row, span.end_col)
+                    capture_vte_text_range(
+                        &self.legacy_surface().vte,
+                        span.start_row,
+                        0,
+                        span.end_row,
+                        span.end_col,
+                    )
                 },
             )
         };
@@ -10621,7 +10678,7 @@ impl RenderBackend for UnifiedBackend {
                 windows,
                 scanned_bytes,
                 reset_cursor: true,
-                presentation: TerminalTextSurface::Native(self.vte.clone()),
+                presentation: TerminalTextSurface::Native(self.legacy_surface().vte.clone()),
                 render_stamp: blocks::NEUTRAL_RENDER_STAMP,
             }],
             incomplete,
@@ -10706,7 +10763,7 @@ impl RenderBackend for UnifiedBackend {
             );
             return true;
         }
-        let Some(adj) = gtk::prelude::ScrollableExt::vadjustment(&self.vte) else {
+        let Some(adj) = gtk::prelude::ScrollableExt::vadjustment(&self.legacy_surface().vte) else {
             return true;
         };
         let step = adj.step_increment().max(1.0);
@@ -10734,7 +10791,10 @@ impl RenderBackend for UnifiedBackend {
         record: &CompletedCommandRecord,
         payload: &dyn BlockRenderPayloadAccessor,
     ) {
-        find::invalidate_find_state(self.find_state_for_cb.as_ref(), &self.vte);
+        find::invalidate_find_state(
+            self.find_state_for_cb.as_ref(),
+            self.legacy.as_ref().map(|legacy| &legacy.vte),
+        );
         let max_zones = self.config_for_cb.borrow().max_visible_blocks as usize;
         // The engine keeps the raw ring alive through the whole finalize
         // fan-out, so this bounded read still sees the command's bytes. No
@@ -10786,7 +10846,9 @@ impl RenderBackend for UnifiedBackend {
     fn enter_alt_screen_chrome(&self) {
         self.navigation.set_suspended(true);
         self.chrome.set_alt_screen(true);
-        self.image_layer.set_alt_screen(true);
+        if let Some(legacy) = &self.legacy {
+            legacy.image_layer.set_alt_screen(true);
+        }
         let active = self.active_rc.borrow();
         active.set_live_organism_visible(false);
         active.set_live_organism_alt_screen(true);
@@ -10795,7 +10857,9 @@ impl RenderBackend for UnifiedBackend {
     fn exit_alt_screen_chrome(&self) {
         self.navigation.set_suspended(false);
         self.chrome.set_alt_screen(false);
-        self.image_layer.set_alt_screen(false);
+        if let Some(legacy) = &self.legacy {
+            legacy.image_layer.set_alt_screen(false);
+        }
         self.active_rc.borrow().set_live_organism_alt_screen(false);
     }
 
@@ -10813,7 +10877,9 @@ impl RenderBackend for UnifiedBackend {
             .kitty_assembler
             .borrow_mut()
             .feed_at(payload, self.kitty_cursor());
-        self.image_layer.set_row_epoch(self.chrome.row_epoch());
+        if let Some(legacy) = &self.legacy {
+            legacy.image_layer.set_row_epoch(self.chrome.row_epoch());
+        }
         match outcome {
             kitty_graphics::Outcome::Complete {
                 texture,
@@ -10854,8 +10920,10 @@ impl RenderBackend for UnifiedBackend {
         };
         match pending {
             PendingUnifiedImage::Vte(pending) => {
-                let zone_reopen = self.zone_marker.borrow().open_bytes();
-                self.image_layer.admit(pending, zone_reopen.as_deref());
+                let zone_reopen = self.legacy_surface().zone_marker.borrow().open_bytes();
+                self.legacy_surface()
+                    .image_layer
+                    .admit(pending, zone_reopen.as_deref());
             }
             #[cfg(anvil_shared_terminal)]
             PendingUnifiedImage::Shared(pending) => {
@@ -10899,17 +10967,24 @@ impl RenderBackend for UnifiedBackend {
         if let Some(terminal) = &self.shared_active {
             return (terminal.cursor_position(), terminal.row_count());
         }
-        (self.vte.cursor_position(), self.vte.row_count())
+        (
+            self.legacy_surface().vte.cursor_position(),
+            self.legacy_surface().vte.row_count(),
+        )
     }
 
     fn cursor_position_report(&self) -> (i64, i64) {
-        let (col, row) = self.vte.cursor_position();
-        let top_row = gtk::prelude::ScrollableExt::vadjustment(&self.vte)
+        #[cfg(anvil_shared_terminal)]
+        if let Some(terminal) = &self.shared_active {
+            return terminal.cursor_position();
+        }
+        let (col, row) = self.legacy_surface().vte.cursor_position();
+        let top_row = gtk::prelude::ScrollableExt::vadjustment(&self.legacy_surface().vte)
             .map(|adjustment| adjustment.value() as i64)
             .unwrap_or(0);
         (
             col,
-            screen_relative_cpr_row(row, top_row, self.vte.row_count()),
+            screen_relative_cpr_row(row, top_row, self.legacy_surface().vte.row_count()),
         )
     }
 
@@ -10939,7 +11014,7 @@ impl RenderBackend for UnifiedBackend {
             self.rebase_prompt_anchor_on_row_delta,
             provisional,
             recorded_rows,
-            self.vte.row_count(),
+            self.cursor_and_rows().1,
         )
     }
 
@@ -10948,7 +11023,7 @@ impl RenderBackend for UnifiedBackend {
         if let Some(terminal) = &self.shared_active {
             return i64::from(terminal.grid_size().0).max(20);
         }
-        self.vte.column_count().max(20)
+        self.legacy_surface().vte.column_count().max(20)
     }
 
     fn live_column_count(&self) -> i64 {
@@ -10956,7 +11031,7 @@ impl RenderBackend for UnifiedBackend {
         if let Some(terminal) = &self.shared_active {
             return i64::from(terminal.grid_size().0);
         }
-        self.vte.column_count()
+        self.legacy_surface().vte.column_count()
     }
 
     fn capture_text_range(
@@ -10970,7 +11045,8 @@ impl RenderBackend for UnifiedBackend {
         if let Some(terminal) = &self.shared_active {
             return terminal.capture((start_col, start_row), (end_col, end_row));
         }
-        self.vte
+        self.legacy_surface()
+            .vte
             .text_range_format(vte4::Format::Text, start_row, start_col, end_row, end_col)
             .0
             .map(|text| text.to_string())
@@ -10981,12 +11057,14 @@ impl ReaderCtx {
     /// `live_vte` is passed in rather than read back off the backend:
     /// `ReaderCtx` itself no longer names widget types, and the selection
     /// hold's VTE hooks are wiring, not lifecycle dispatch.
-    fn install(self, pty: &Rc<OwnedPty>, live_vte: &Terminal) -> std::io::Result<()> {
+    fn install(self, pty: &Rc<OwnedPty>, live_vte: Option<&Terminal>) -> std::io::Result<()> {
         // Installed ahead of the live VTE's own commit handler (TermView::new
         // connects that one later), so the hold reads the CPR ledger before
         // the handler settles a matched report.
-        self.selection_feed_hold
-            .install_vte_hooks(live_vte, self.cpr_outstanding_rc.clone());
+        if let Some(terminal) = live_vte {
+            self.selection_feed_hold
+                .install_vte_hooks(terminal, self.cpr_outstanding_rc.clone());
+        }
 
         let ctx = Rc::new(self);
 
@@ -11930,7 +12008,8 @@ struct KeyCtx {
     /// Only for an Alt chord's ESC that is still held when the next key is
     /// pressed; everything else the keyboard sends goes through `commit`.
     pty_for_key: Rc<OwnedPty>,
-    active_vte_for_key: glib::WeakRef<Terminal>,
+    live_for_key: glib::WeakRef<gtk::Widget>,
+    row_height_for_key: Rc<dyn Fn() -> f64>,
     running_cmd_for_key: Rc<RefCell<String>>,
     native_transcript_for_key: NativeTranscriptScroll,
     bracketed_paste_for_key: Rc<Cell<bool>>,
@@ -11980,7 +12059,8 @@ impl KeyCtx {
         let KeyCtx {
             live_keys_for_key,
             pty_for_key,
-            active_vte_for_key,
+            live_for_key,
+            row_height_for_key,
             running_cmd_for_key,
             native_transcript_for_key,
             bracketed_paste_for_key,
@@ -12002,8 +12082,8 @@ impl KeyCtx {
         } = self;
         key_ctrl.connect_key_pressed(move |controller, keyval, keycode, modifiers| {
             use gtk::gdk::Key;
-            let (Some(active_vte_for_key), Some(block_scroll_for_key), Some(jump_fab_for_key)) = (
-                active_vte_for_key.upgrade(),
+            let (Some(live), Some(block_scroll_for_key), Some(jump_fab_for_key)) = (
+                live_for_key.upgrade(),
                 block_scroll_for_key.upgrade(),
                 jump_fab_for_key.upgrade(),
             ) else {
@@ -12013,7 +12093,7 @@ impl KeyCtx {
             // finished card. Never take keys from the live VTE, a filter/search
             // entry, a context popover, or a focused button's activation.
             if scope == KeyScope::StrandedFocus {
-                if active_vte_for_key.has_focus() {
+                if live.has_focus() {
                     return glib::Propagation::Proceed;
                 }
                 let focused = root_for_key
@@ -12076,7 +12156,7 @@ impl KeyCtx {
                 {
                     return false;
                 }
-                active_vte_for_key.grab_focus();
+                live.grab_focus();
                 // The focus grab scrolls the holder's top into view; pin the
                 // bottom back, exactly as the typing-key recovery does.
                 return_to_live_prompt(
@@ -12085,7 +12165,7 @@ impl KeyCtx {
                     &jump_fab_for_key,
                     &unread_for_key,
                 );
-                controller.forward(&active_vte_for_key);
+                controller.forward(&live);
                 true
             };
 
@@ -12101,7 +12181,8 @@ impl KeyCtx {
 
             // Warp pages and jumps through block history locally. While a command
             // or fullscreen/raw terminal owns the viewport, forward these keys to it.
-            if !ctrl
+            if let Some(terminal) = live.downcast_ref::<Terminal>().filter(|_| {
+                !ctrl
                 && !shift
                 && !alt
                 && !modifiers.intersects(
@@ -12112,10 +12193,10 @@ impl KeyCtx {
                     keyval,
                     Key::Page_Up | Key::Page_Down | Key::KP_Page_Up | Key::KP_Page_Down
                 )
-            {
+            }) {
                 live_keys_for_key.last_key.set(None);
                 native_transcript_for_key.page(
-                    &active_vte_for_key,
+                    terminal,
                     &block_scroll_for_key,
                     &scroll_debouncer_for_key,
                     matches!(keyval, Key::Page_Down | Key::KP_Page_Down),
@@ -12178,7 +12259,7 @@ impl KeyCtx {
                 && matches!(keyval, Key::Page_Up | Key::Page_Down)
             {
                 let adj = block_scroll_for_key.vadjustment();
-                let row = (active_vte_for_key.char_height() as f64).max(1.0);
+                let row = row_height_for_key().max(1.0);
                 let step = (adj.page_size() - 2.0 * row).max(row);
                 let delta = if keyval == Key::Page_Up { -step } else { step };
                 live_keys_for_key.last_key.set(None);
@@ -12308,7 +12389,7 @@ impl KeyCtx {
                         &selected_block_id_for_key,
                         &selection_anchor_id_for_key,
                     );
-                    active_vte_for_key.grab_focus();
+                    live.grab_focus();
                     emit_human_input(&human_input_for_key, HumanInputKind::Keyboard);
                 } else {
                     let refusal = if target.is_some() {
@@ -12323,7 +12404,7 @@ impl KeyCtx {
                         selected_block_id_for_key.get(),
                         selection_refusal_hint(SelectionAction::Run, refusal),
                     );
-                    active_vte_for_key.error_bell();
+                    live.error_bell();
                 }
                 return glib::Propagation::Stop;
             }
@@ -12386,7 +12467,7 @@ impl KeyCtx {
                             &selected_block_id_for_key,
                             &selection_anchor_id_for_key,
                         );
-                        active_vte_for_key.grab_focus();
+                        live.grab_focus();
                         return glib::Propagation::Stop;
                     }
                     // Selection mode owns its visible Enter action. A refusal
@@ -12416,7 +12497,7 @@ impl KeyCtx {
                         selected_block_id_for_key.get(),
                         selection_refusal_hint(SelectionAction::Recall, refusal),
                     );
-                    active_vte_for_key.error_bell();
+                    live.error_bell();
                     // While a command runs the refusal is certain, so it costs
                     // one Enter: the next one reaches the program. Clearing the
                     // selection here would hide the explanation in the frame
@@ -12738,6 +12819,54 @@ impl TermView {
         // by this pane throughout prompt, command and native-app transitions.
         let docked_input = chat_mode || block_mode;
 
+        // ── PTY ───────────────────────────────────────────────────────────
+        let (argv_vec, session_applied) =
+            crate::config::shell_argv_with_session(shell_argv, session_id);
+        let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
+        let request_shell_token = shell_argv_supports_agent_ids(&argv_vec);
+
+        // Git defaults LESS to "FRX" when the user has not set it. "F" quits
+        // the pager when output fits on one screen, and "X" disables less'
+        // alternate-screen setup. anvil defaults it to raw-control-char
+        // rendering only: keep colored git output, keep the interactive pager
+        // even for a short `git log`, and let less use alt-screen so transient
+        // pager content stays ephemeral. An explicit user LESS still wins.
+        //
+        // That choice now lives with the spawn itself, as
+        // `child_env::ChildEnv::less_default` in `crate::pty` — one place that
+        // also gets it right for the Flatpak bridge, where "the parent has no
+        // LESS" is the wrong question to ask about the host session.
+        let vim_environment = if env_overrides.is_empty() {
+            crate::vim9_ide::shell_environment(shell_argv, config.vim9.auto_gui)
+        } else {
+            Vec::new()
+        };
+        let mut env_extra = Vec::from(crate::terminal::cwd_token_environment(cwd_token));
+        env_extra.extend(
+            vim_environment
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        );
+        env_extra.extend(
+            env_overrides
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        );
+        let session_id_owned = session_id.map(|s| s.to_string());
+        if let Some(ref sid) = session_id_owned {
+            if session_applied {
+                env_extra.push(("JSH_SESSION_ID", sid.as_str()));
+            }
+        }
+
+        let pty = Rc::new(spawn(&argv, cwd, &env_extra, request_shell_token)?);
+        #[cfg(anvil_shared_terminal)]
+        let shared_active = pty
+            .uses_shared_session()
+            .then(|| SharedActiveTerminal::new(config, pty.clone()))
+            .transpose()
+            .map_err(std::io::Error::other)?;
+
         ime_gate::install();
         // ── Build widget tree ──────────────────────────────────────────────
         let root = gtk::Box::new(Orientation::Vertical, 0);
@@ -12762,6 +12891,11 @@ impl TermView {
         block_scroll.set_hexpand(true);
         block_scroll.set_vexpand(true);
         block_scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
+        #[cfg(anvil_shared_terminal)]
+        if mode.is_unified() && shared_active.is_some() {
+            // The shared transcript owns scrolling independently of this viewport.
+            block_scroll.set_policy(gtk::PolicyType::External, gtk::PolicyType::External);
+        }
         block_scroll.set_child(Some(&block_list));
         block_scroll.add_css_class("block-scroll");
         // A focusable ScrolledWindow steals keyboard focus from the live VTE
@@ -12784,8 +12918,11 @@ impl TermView {
         let active = Rc::new(RefCell::new(ActiveBlock::new(
             config,
             live_raw_output.clone(),
+            #[cfg(anvil_shared_terminal)]
+            shared_active.clone(),
         )));
         let active_vte = active.borrow().active_vte.clone();
+        let live_focus = active.borrow().focus_widget();
         let block_live_chrome = (*mode == crate::config::TerminalMode::Block).then(|| {
             let chrome = block_reference::LiveChrome::new();
             active
@@ -13089,7 +13226,7 @@ impl TermView {
         chat_stop.set_visible(false);
         let workspace_action_callbacks: WorkspaceActionCallbacks =
             Rc::new(RefCell::new(Vec::new()));
-        let focus_terminal = active_vte.downgrade();
+        let focus_terminal = live_focus.downgrade();
         let (chat_controls, chat_hint) = crate::workspace_shell::composer_tools(
             &chat_send,
             Some(&chat_stop),
@@ -13187,62 +13324,6 @@ impl TermView {
 
         let unread_count: Rc<Cell<u32>> = Rc::new(Cell::new(0));
 
-        // ── PTY ───────────────────────────────────────────────────────────
-        let (argv_vec, session_applied) =
-            crate::config::shell_argv_with_session(shell_argv, session_id);
-        let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
-        let request_shell_token = shell_argv_supports_agent_ids(&argv_vec);
-
-        // Git defaults LESS to "FRX" when the user has not set it. "F" quits
-        // the pager when output fits on one screen, and "X" disables less'
-        // alternate-screen setup. anvil defaults it to raw-control-char
-        // rendering only: keep colored git output, keep the interactive pager
-        // even for a short `git log`, and let less use alt-screen so transient
-        // pager content stays ephemeral. An explicit user LESS still wins.
-        //
-        // That choice now lives with the spawn itself, as
-        // `child_env::ChildEnv::less_default` in `crate::pty` — one place that
-        // also gets it right for the Flatpak bridge, where "the parent has no
-        // LESS" is the wrong question to ask about the host session.
-        let vim_environment = if env_overrides.is_empty() {
-            crate::vim9_ide::shell_environment(shell_argv, config.vim9.auto_gui)
-        } else {
-            Vec::new()
-        };
-        let mut env_extra = Vec::from(crate::terminal::cwd_token_environment(cwd_token));
-        env_extra.extend(
-            vim_environment
-                .iter()
-                .map(|(key, value)| (key.as_str(), value.as_str())),
-        );
-        env_extra.extend(
-            env_overrides
-                .iter()
-                .map(|(key, value)| (key.as_str(), value.as_str())),
-        );
-        let session_id_owned = session_id.map(|s| s.to_string());
-        if let Some(ref sid) = session_id_owned {
-            if session_applied {
-                env_extra.push(("JSH_SESSION_ID", sid.as_str()));
-            }
-        }
-
-        let pty = Rc::new(spawn(&argv, cwd, &env_extra, request_shell_token)?);
-        #[cfg(anvil_shared_terminal)]
-        let shared_active = if pty.uses_shared_session() {
-            if mode.is_unified() {
-                // The transcript owns scrolling. External keeps the viewport
-                // free to shrink when its toolbar returns after alternate screen.
-                block_scroll.set_policy(gtk::PolicyType::External, gtk::PolicyType::External);
-            }
-            let terminal =
-                SharedActiveTerminal::new(config, pty.clone()).map_err(std::io::Error::other)?;
-            active.borrow_mut().mount_shared(terminal.clone());
-            Some(terminal)
-        } else {
-            None
-        };
-        let live_focus = active.borrow().focus_widget();
         {
             let focus_requested = focus_requested.clone();
             live_focus.connect_map(move |widget| {
@@ -13253,8 +13334,10 @@ impl TermView {
         }
 
         // Store child PID on the live VTE so kill_all_terminal_children can find it
-        unsafe {
-            active_vte.set_data::<i32>("child-pid", pty.pid_i32());
+        if let Some(terminal) = &active_vte {
+            unsafe {
+                terminal.set_data::<i32>("child-pid", pty.pid_i32());
+            }
         }
 
         // ── Register CSS ──────────────────────────────────────────────────
@@ -13267,7 +13350,9 @@ impl TermView {
         // the fallback authority; ordinary unintegrated shells stay untouched.
 
         let native_transcript_scroll = NativeTranscriptScroll::new(bstate.clone(), direct_cli);
-        native_transcript_scroll.install(&active_vte);
+        if let Some(terminal) = &active_vte {
+            native_transcript_scroll.install(terminal);
+        }
 
         // Keystroke-shadow command line; kept only to drive the idle input-cell
         // height (newline count). The authoritative command text is read off the
@@ -13483,7 +13568,7 @@ impl TermView {
             // TermView.  Keep every widget edge weak so closing a pane cannot
             // form signal -> callback -> ancestor/terminal reference cycles.
             let holder = active.borrow().widget().downgrade();
-            let vte = active_vte.downgrade();
+            let vte = active_vte.as_ref().map(Terminal::downgrade);
             let scroll = block_scroll.downgrade();
             let bstate = bstate.clone();
             let typed_cmd = typed_cmd.clone();
@@ -13517,21 +13602,15 @@ impl TermView {
                 (terminal, canvas, sent)
             });
             Rc::new(move || {
-                let (Some(holder), Some(vte), Some(scroll)) =
-                    (holder.upgrade(), vte.upgrade(), scroll.upgrade())
-                else {
+                let (Some(holder), Some(scroll)) = (holder.upgrade(), scroll.upgrade()) else {
                     return;
                 };
                 let Some(active_block) = active_for_layout.upgrade() else {
                     return;
                 };
-                let cell_h = (vte.char_height() as i32).max(1);
-                let Some(viewport_rows) = viewport_rows_for(&vte, &scroll) else {
-                    return;
-                };
                 // Re-fit blocks that are already on screen to a resized pane.
                 // Cards that scrolled off and back re-fit themselves on map.
-                let fit_finished_outputs = || {
+                let fit_finished_outputs = |cell_h| {
                     let page_height = scroll.vadjustment().page_size() as i32;
                     let page_width = scroll.hadjustment().page_size() as i32;
                     let layout_key = finished_layout_key(page_width, page_height, cell_h);
@@ -13582,11 +13661,18 @@ impl TermView {
                             live_force_full_for_layout.get(),
                         ) {
                             publish_shared_winsize(&terminal, sent, grid);
-                            fit_finished_outputs();
+                            fit_finished_outputs(terminal.cell_metrics().3.max(1));
                         }
                     }
                     return;
                 }
+                let Some(vte) = vte.as_ref().and_then(glib::WeakRef::upgrade) else {
+                    return;
+                };
+                let cell_h = (vte.char_height() as i32).max(1);
+                let Some(viewport_rows) = viewport_rows_for(&vte, &scroll) else {
+                    return;
+                };
                 let cols = vte.column_count().max(1);
                 let state = bstate.get();
                 holder.set_visible(true);
@@ -13690,7 +13776,7 @@ impl TermView {
                     if let Ok(active_block) = active_block.try_borrow() {
                         active_block.set_live_geometry(cell_h, viewport_rows, visible_rows);
                     }
-                    fit_finished_outputs();
+                    fit_finished_outputs(cell_h);
                     return;
                 }
                 // Not running: the prompt, an alternate-screen app or the raw
@@ -13781,7 +13867,7 @@ impl TermView {
                 if let Ok(live) = active_block.try_borrow() {
                     live.set_live_geometry(cell_h, grid_rows, card_rows);
                 }
-                fit_finished_outputs();
+                fit_finished_outputs(cell_h);
             })
         };
         // Unified has one layout state: a viewport-sized surface for prompts,
@@ -13790,14 +13876,12 @@ impl TermView {
             #[cfg(anvil_shared_terminal)]
             let sent = pty_winsize.sent.clone();
             let holder = active.borrow().widget().downgrade();
-            let vte = active_vte.downgrade();
+            let vte = active_vte.as_ref().map(Terminal::downgrade);
             let scroll = block_scroll.downgrade();
             let last_size_target: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
             let active_for_layout = Rc::downgrade(&active);
             Rc::new(move || {
-                let (Some(holder), Some(vte), Some(scroll)) =
-                    (holder.upgrade(), vte.upgrade(), scroll.upgrade())
-                else {
+                let (Some(holder), Some(scroll)) = (holder.upgrade(), scroll.upgrade()) else {
                     return;
                 };
                 let Some(active_block) = active_for_layout.upgrade() else {
@@ -13815,6 +13899,9 @@ impl TermView {
                         return;
                     }
                 }
+                let Some(vte) = vte.as_ref().and_then(glib::WeakRef::upgrade) else {
+                    return;
+                };
                 let cell_h = (vte.char_height() as i32).max(1);
                 let Some(viewport_rows) = viewport_rows_for(&vte, &scroll) else {
                     return;
@@ -13860,7 +13947,7 @@ impl TermView {
         };
 
         let contents_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
-        {
+        if let Some(active_vte) = &active_vte {
             // Drive sizing from the data path (contents changed: prompt printed,
             // user typing, output streaming, alt-screen toggle), and follow the
             // bottom from here too — NOT from the vadjustment `changed` signal.
@@ -13926,7 +14013,7 @@ impl TermView {
         // Bell signal is delivered natively by VTE — no need to scan the byte
         // stream for BEL ourselves (and disambiguate it from OSC string
         // terminators). VTE already does that disambiguation inside its parser.
-        {
+        if let Some(active_vte) = &active_vte {
             let bell_cbs = bell_callbacks.clone();
             active_vte.connect_bell(move |_| {
                 for cb in bell_cbs.borrow().iter() {
@@ -14015,11 +14102,11 @@ impl TermView {
         let live_keys: Rc<LiveKeyRecord> = Rc::new(LiveKeyRecord::default());
         let agent_prompt_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         let chat_send_intent: Rc<Cell<Option<chat::SendIntent>>> = Rc::new(Cell::new(None));
-        if docked_input && live_focus == *active_vte.upcast_ref::<gtk::Widget>() {
+        if let Some(active_vte) = active_vte.as_ref().filter(|_| docked_input) {
             chat::connect_submit(
                 &chat_send,
                 &bstate,
-                &active_vte,
+                active_vte,
                 &pty,
                 &selection_feed_hold,
                 &agent_prompt_generation,
@@ -14101,7 +14188,7 @@ impl TermView {
         let submission_surface_owner: Rc<dyn SubmissionSurface> = {
             let vte_surface = || {
                 Rc::new(VteSubmissionSurface {
-                    vte: active_vte.clone(),
+                    vte: active_vte.as_ref().expect("legacy live terminal").clone(),
                     rebase_on_row_delta: rebase_prompt_anchor_on_row_delta,
                 }) as Rc<dyn SubmissionSurface>
             };
@@ -14171,7 +14258,7 @@ impl TermView {
                 }
             })
         };
-        {
+        if let Some(active_vte) = &active_vte {
             let dispatch = cwd_from_uri.clone();
             active_vte.connect_current_directory_uri_notify(move |vte| {
                 if let Some(uri) = vte.current_directory_uri() {
@@ -14180,7 +14267,7 @@ impl TermView {
             });
         }
 
-        {
+        if let Some(active_vte) = &active_vte {
             let title_cbs = title_callbacks.clone();
             active_vte.connect_window_title_changed(move |vte| {
                 // An empty title is forwarded too: it is a program resetting
@@ -14315,15 +14402,20 @@ impl TermView {
             // This is the only reader-path mode switch. The PTY, parser,
             // lifecycle engine and all state above and below it are shared.
             let backend: Rc<dyn RenderBackend> = if unified {
-                let zone_marker = Rc::new(RefCell::new(ZoneMarkerInjector::from_system_entropy()));
+                let zone_marker = active_vte_rc
+                    .as_ref()
+                    .map(|_| Rc::new(RefCell::new(ZoneMarkerInjector::from_system_entropy())));
+                let marker_nonce = zone_marker
+                    .as_ref()
+                    .and_then(|marker| marker.borrow().nonce());
                 let image_layer_slot: Rc<RefCell<Option<unified_images::UnifiedImageLayer>>> =
                     Rc::new(RefCell::new(None));
                 let chrome_authority = Rc::new(RefCell::new(
-                    unified_chrome::ZoneChromeAuthority::new(zone_marker.borrow().nonce()),
+                    unified_chrome::ZoneChromeAuthority::new(marker_nonce),
                 ));
                 let image_layer_for_retention = Rc::downgrade(&image_layer_slot);
                 let chrome = unified_chrome::UnifiedChrome::new(
-                    &active_vte_rc,
+                    active_vte_rc.as_ref(),
                     &active_rc.borrow().unified_chrome_surface,
                     chrome_authority,
                     config_for_cb.clone(),
@@ -14337,20 +14429,28 @@ impl TermView {
                     #[cfg(anvil_shared_terminal)]
                     shared_active.as_ref(),
                 );
-                let image_layer = unified_images::UnifiedImageLayer::new(
-                    &active_vte_rc,
-                    &active_rc.borrow().unified_image_surface,
-                    zone_marker.borrow().nonce(),
-                    chrome.image_row_projection(),
-                );
-                *image_layer_slot.borrow_mut() = Some(image_layer.clone());
+                let legacy = active_vte_rc.zip(zone_marker).map(|(vte, zone_marker)| {
+                    let image_layer = unified_images::UnifiedImageLayer::new(
+                        &vte,
+                        &active_rc.borrow().unified_image_surface,
+                        marker_nonce,
+                        chrome.image_row_projection(),
+                    );
+                    *image_layer_slot.borrow_mut() = Some(image_layer.clone());
+                    LegacyUnifiedSurface {
+                        vte,
+                        zone_marker,
+                        image_layer,
+                        _image_layer_slot_owner: image_layer_slot,
+                    }
+                });
                 active_rc.borrow().unified_chrome_surface.set_visible(true);
                 Rc::new(UnifiedBackend {
                     #[cfg(anvil_shared_terminal)]
                     shared_active: shared_active.clone(),
                     #[cfg(anvil_shared_terminal)]
                     shared_cwd: shared_active.as_ref().map(|_| cwd_from_uri.clone()),
-                    vte: active_vte_rc,
+                    legacy,
                     navigation: unified_navigation
                         .as_ref()
                         .expect("Unified navigation")
@@ -14367,10 +14467,7 @@ impl TermView {
                     zones: unified_zones.clone(),
                     bookmarks: block_bookmarks.clone(),
                     find_state_for_cb: find_state.clone(),
-                    zone_marker,
                     chrome,
-                    image_layer,
-                    _image_layer_slot_owner: image_layer_slot,
                     reserved_history_block_ids: reserved_history_block_ids.clone(),
                     kitty_assembler: RefCell::new(kitty_graphics::Assembler::new()),
                     kitty_pending_admission: RefCell::new(None),
@@ -14517,7 +14614,7 @@ impl TermView {
                 selection_feed_hold: selection_feed_hold.clone(),
                 watch_reader: watch_reader.clone(),
             }
-            .install(&pty, &active_vte)?;
+            .install(&pty, active_vte.as_ref())?;
 
             // Shells without OSC 133 never emit PromptEnd, so the normal
             // integration-driven replay path above would leave startup/session
@@ -14689,7 +14786,7 @@ impl TermView {
             let scroll = block_scroll.downgrade();
             let user_scrolled = user_scrolled_up.clone();
             let unread = unread_count.clone();
-            let live_vte = active_vte.downgrade();
+            let active = Rc::downgrade(&active);
             let debouncer = scroll_debouncer.clone();
             jump_fab.connect_clicked(move |fab| {
                 let Some(scroll) = scroll.upgrade() else {
@@ -14702,9 +14799,9 @@ impl TermView {
                 user_scrolled.set(false);
                 unread.set(0);
                 fab.set_visible(false);
-                if let Some(adjustment) = live_vte
+                if let Some(adjustment) = active
                     .upgrade()
-                    .and_then(|terminal| terminal.vadjustment())
+                    .and_then(|active| active.borrow().surface_adjustment())
                 {
                     adjustment.set_value(
                         (adjustment.upper() - adjustment.page_size()).max(adjustment.lower()),
@@ -15243,95 +15340,97 @@ impl TermView {
                 }
             }
 
-            active_vte.connect_commit(move |terminal, text, _size| {
-                let submission_pending = armed_agent_execution_for_commit.borrow().is_some()
-                    || reviewed_submission_for_commit.borrow().is_some();
-                let chat_send = chat_send_for_commit.take();
-                let route = if chat_send.is_some() {
-                    // Optional Send supports only a whole plain Enter. Never
-                    // consume a pending key, split an ESC sequence or enqueue
-                    // an enhanced-keyboard encoding after its target was checked.
-                    if !chat_send_commit_allowed(text, submission_pending, &live_keys_for_commit, kitty_flags_for_commit.get()) {
-                        LiveCommit::Refused
+            if let Some(active_vte) = &active_vte {
+                active_vte.connect_commit(move |terminal, text, _size| {
+                    let submission_pending = armed_agent_execution_for_commit.borrow().is_some()
+                        || reviewed_submission_for_commit.borrow().is_some();
+                    let chat_send = chat_send_for_commit.take();
+                    let route = if chat_send.is_some() {
+                        // Optional Send supports only a whole plain Enter. Never
+                        // consume a pending key, split an ESC sequence or enqueue
+                        // an enhanced-keyboard encoding after its target was checked.
+                        if !chat_send_commit_allowed(text, submission_pending, &live_keys_for_commit, kitty_flags_for_commit.get()) {
+                            LiveCommit::Refused
+                        } else {
+                            LiveCommit::Typed(std::borrow::Cow::Borrowed(b"\r"))
+                        }
                     } else {
-                        LiveCommit::Typed(std::borrow::Cow::Borrowed(b"\r"))
+                        route_live_commit(
+                            text.as_bytes(),
+                            &cpr_outstanding_for_commit,
+                            submission_pending,
+                            &live_keys_for_commit,
+                            kitty_flags_for_commit.get(),
+                            || {
+                                kitty_rewrite_applies(bstate_for_commit.get(), || {
+                                    raw_fallback_shell_is_foreground(
+                                        pty_for_commit.shell_is_foreground(),
+                                        kitty_pusher_for_commit.get(),
+                                        || pty_for_commit.foreground_group(),
+                                    )
+                                })
+                            },
+                        )
+                    };
+                    let bytes = match route {
+                        // The child's answer or its mouse and focus input, never
+                        // the user typing at it: nothing below applies.
+                        LiveCommit::Report(_) => {
+                            pty_for_commit.write_bytes(text.as_bytes());
+                            return;
+                        }
+                        LiveCommit::Refused => {
+                            log::warn!(
+                                "Ignoring VTE commit while submission or optional-action protocol is unavailable"
+                            );
+                            return;
+                        }
+                        LiveCommit::Held => {
+                            // VTE sends the key's own commit in the same key-press
+                            // dispatch, so this never waits in practice. Should it
+                            // not come, the ESC still goes out once the dispatch
+                            // is over rather than being lost.
+                            let keys = Rc::downgrade(&live_keys_for_commit);
+                            let pty = Rc::downgrade(&pty_for_commit);
+                            glib::idle_add_local_once(move || {
+                                let (Some(keys), Some(pty)) = (keys.upgrade(), pty.upgrade()) else {
+                                    return;
+                                };
+                                if let Some(stale) = keys.take_held_escape() {
+                                    pty.write_bytes(stale);
+                                }
+                            });
+                            return;
+                        }
+                        LiveCommit::Encoded(encoded) => {
+                            with_accepted_pty_input(&pty_for_commit, &encoded, || {
+                                emit_human_input(&human_input_for_commit, HumanInputKind::Keyboard);
+                            });
+                            return;
+                        }
+                        LiveCommit::Typed(bytes) => bytes,
+                    };
+                    if let Some(intent) = chat_send {
+                        if bytes.as_ref() == b"\r"
+                            && pty_for_commit
+                                .try_dispatch_chat_byte(b'\r', intent.foreground, true, || {
+                                    bstate_for_commit.get() == BlockState::AwaitingCommand
+                                        && prompt_generation_for_commit.get() == intent.generation
+                                        && kitty_flags_for_commit.get() == 0
+                                        && !live_keys_for_commit.has_pending_input()
+                                        && armed_agent_execution_for_commit.borrow().is_none()
+                                        && reviewed_submission_for_commit.borrow().is_none()
+                                })
+                                .is_ok()
+                        {
+                            terminal.grab_focus();
+                            accepted(&bytes);
+                        }
+                    } else {
+                        with_accepted_pty_input(&pty_for_commit, &bytes, || accepted(&bytes));
                     }
-                } else {
-                    route_live_commit(
-                        text.as_bytes(),
-                        &cpr_outstanding_for_commit,
-                        submission_pending,
-                        &live_keys_for_commit,
-                        kitty_flags_for_commit.get(),
-                        || {
-                            kitty_rewrite_applies(bstate_for_commit.get(), || {
-                                raw_fallback_shell_is_foreground(
-                                    pty_for_commit.shell_is_foreground(),
-                                    kitty_pusher_for_commit.get(),
-                                    || pty_for_commit.foreground_group(),
-                                )
-                            })
-                        },
-                    )
-                };
-                let bytes = match route {
-                    // The child's answer or its mouse and focus input, never
-                    // the user typing at it: nothing below applies.
-                    LiveCommit::Report(_) => {
-                        pty_for_commit.write_bytes(text.as_bytes());
-                        return;
-                    }
-                    LiveCommit::Refused => {
-                        log::warn!(
-                            "Ignoring VTE commit while submission or optional-action protocol is unavailable"
-                        );
-                        return;
-                    }
-                    LiveCommit::Held => {
-                        // VTE sends the key's own commit in the same key-press
-                        // dispatch, so this never waits in practice. Should it
-                        // not come, the ESC still goes out once the dispatch
-                        // is over rather than being lost.
-                        let keys = Rc::downgrade(&live_keys_for_commit);
-                        let pty = Rc::downgrade(&pty_for_commit);
-                        glib::idle_add_local_once(move || {
-                            let (Some(keys), Some(pty)) = (keys.upgrade(), pty.upgrade()) else {
-                                return;
-                            };
-                            if let Some(stale) = keys.take_held_escape() {
-                                pty.write_bytes(stale);
-                            }
-                        });
-                        return;
-                    }
-                    LiveCommit::Encoded(encoded) => {
-                        with_accepted_pty_input(&pty_for_commit, &encoded, || {
-                            emit_human_input(&human_input_for_commit, HumanInputKind::Keyboard);
-                        });
-                        return;
-                    }
-                    LiveCommit::Typed(bytes) => bytes,
-                };
-                if let Some(intent) = chat_send {
-                    if bytes.as_ref() == b"\r"
-                        && pty_for_commit
-                            .try_dispatch_chat_byte(b'\r', intent.foreground, true, || {
-                                bstate_for_commit.get() == BlockState::AwaitingCommand
-                                    && prompt_generation_for_commit.get() == intent.generation
-                                    && kitty_flags_for_commit.get() == 0
-                                    && !live_keys_for_commit.has_pending_input()
-                                    && armed_agent_execution_for_commit.borrow().is_none()
-                                    && reviewed_submission_for_commit.borrow().is_none()
-                            })
-                            .is_ok()
-                    {
-                        terminal.grab_focus();
-                        accepted(&bytes);
-                    }
-                } else {
-                    with_accepted_pty_input(&pty_for_commit, &bytes, || accepted(&bytes));
-                }
-            });
+                });
+            }
         }
 
         // Keep explicit terminal interrupts available while a normal command is
@@ -15478,7 +15577,15 @@ impl TermView {
             let key_ctx = KeyCtx {
                 live_keys_for_key: live_keys.clone(),
                 pty_for_key: pty.clone(),
-                active_vte_for_key: active_vte.downgrade(),
+                live_for_key: live_focus.downgrade(),
+                row_height_for_key: {
+                    let active = Rc::downgrade(&active);
+                    Rc::new(move || {
+                        active
+                            .upgrade()
+                            .map_or(1.0, |active| f64::from(active.borrow().live_cell_size().1))
+                    })
+                },
                 running_cmd_for_key: running_cmd.clone(),
                 native_transcript_for_key: native_transcript_scroll.clone(),
                 bracketed_paste_for_key: bracketed_paste.clone(),
@@ -15512,8 +15619,10 @@ impl TermView {
 
             let key_ctrl = gtk::EventControllerKey::new();
             key_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
-            key_ctx.connect(&key_ctrl, KeyScope::LiveSurface);
-            active_vte.add_controller(key_ctrl);
+            if let Some(terminal) = &active_vte {
+                key_ctx.connect(&key_ctrl, KeyScope::LiveSurface);
+                terminal.add_controller(key_ctrl);
+            }
         }
 
         // Clicking the live prompt is also an explicit exit from historical
@@ -15538,35 +15647,37 @@ impl TermView {
                     );
                 }
             });
-            active_vte.add_controller(active_click);
+            live_focus.add_controller(active_click);
         }
 
         // A plain click in the live prompt places the shell's edit cursor
         // there, the way an editor would, instead of making the user walk an
         // arrow key across a long command.
-        crate::terminal::click_cursor::install(
-            &active_vte,
-            crate::terminal::click_cursor::ClickCursorCtx {
-                enabled: config.click_moves_cursor,
-                pty: Rc::clone(&pty),
-                prompt_anchor: {
-                    let prompt_end_pos = prompt_end_pos.clone();
-                    let prompt_anchor_rows = prompt_anchor_rows.clone();
-                    Rc::new(move |terminal| {
-                        prompt_anchor_for_surface(
-                            rebase_prompt_anchor_on_row_delta,
-                            prompt_end_pos.get(),
-                            prompt_anchor_rows.get(),
-                            terminal.row_count(),
-                        )
-                    })
+        if let Some(active_vte) = &active_vte {
+            crate::terminal::click_cursor::install(
+                active_vte,
+                crate::terminal::click_cursor::ClickCursorCtx {
+                    enabled: config.click_moves_cursor,
+                    pty: Rc::clone(&pty),
+                    prompt_anchor: {
+                        let prompt_end_pos = prompt_end_pos.clone();
+                        let prompt_anchor_rows = prompt_anchor_rows.clone();
+                        Rc::new(move |terminal| {
+                            prompt_anchor_for_surface(
+                                rebase_prompt_anchor_on_row_delta,
+                                prompt_end_pos.get(),
+                                prompt_anchor_rows.get(),
+                                terminal.row_count(),
+                            )
+                        })
+                    },
+                    bstate: bstate.clone(),
+                    mouse_mode: mouse_reporting_mode.clone(),
+                    fullscreen: fullscreen.clone(),
+                    suggestion_rgb: crate::terminal::click_cursor::suggestion_rgb(&config.palette),
                 },
-                bstate: bstate.clone(),
-                mouse_mode: mouse_reporting_mode.clone(),
-                fullscreen: fullscreen.clone(),
-                suggestion_rgb: crate::terminal::click_cursor::suggestion_rgb(&config.palette),
-            },
-        );
+            );
+        }
 
         // Wheel handling inside an alt-screen + mouse-reporting app (less / vim /
         // htop). VTE only synthesizes mouse-wheel CSI sequences when it owns the
@@ -15579,7 +15690,7 @@ impl TermView {
         // - alt-screen + mouse mode + !scroll_reporting_enabled → swallow wheel
         //   (user has opted out of mouse-driven paging).
         // - otherwise → let the event bubble to block_scroll for normal scroll.
-        {
+        if let Some(active_vte) = &active_vte {
             // Track pointer position over the live VTE in cell coordinates so
             // wheel events emitted below can include accurate col/row.
             let pointer_cell: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((1, 1)));
@@ -15789,7 +15900,7 @@ impl TermView {
         let cross_selection = CrossSelection::install(
             &selection_root,
             finished_blocks_rc.clone(),
-            active_vte.clone(),
+            TerminalTextSurface::from_widget(live_focus.clone()).expect("selectable live terminal"),
             selected_block_ids.clone(),
             selected_block_id.clone(),
             selection_anchor_id.clone(),
@@ -15819,7 +15930,7 @@ impl TermView {
         let resize_legacy: Rc<dyn Fn()> = {
             let pty_for_resize = pty.clone();
             let scroll_for_resize = block_scroll.downgrade();
-            let vte_for_resize = active_vte.downgrade();
+            let vte_for_resize = active_vte.as_ref().map(Terminal::downgrade);
             let layout_for_resize = layout_active_surface.clone();
             let clip_for_resize = active.borrow().live_clip().downgrade();
             // Shared with `sync_active_to_pty`: a value only the sync sent
@@ -15834,7 +15945,7 @@ impl TermView {
                 if tick_id.borrow().is_some() {
                     return;
                 }
-                let Some(vte) = vte_for_resize.upgrade() else {
+                let Some(vte) = vte_for_resize.as_ref().and_then(glib::WeakRef::upgrade) else {
                     return;
                 };
                 let pty_for_resize = pty_for_resize.clone();
@@ -16076,7 +16187,6 @@ impl TermView {
                             Some(term_view.active.borrow().widget()),
                         );
                         finished.connect_actions(
-                            &term_view.active_vte,
                             &term_view.verified_submission,
                             &term_view.bracketed_paste,
                             &term_view.active,
@@ -16341,13 +16451,14 @@ impl TermView {
             right_gutter: LIVE_ORGANISM_RIGHT_GUTTER,
             alt_screen: active.live_organism_alt_screen(),
             cursor_row: {
-                let (_, cursor_row) = active.active_vte.cursor_position();
-                let top_row = gtk::prelude::ScrollableExt::vadjustment(&active.active_vte)
+                let terminal = active.legacy_surface();
+                let (_, cursor_row) = terminal.cursor_position();
+                let top_row = gtk::prelude::ScrollableExt::vadjustment(terminal)
                     .map(|adjustment| adjustment.value().floor() as i64)
                     .unwrap_or(0);
-                let cell_height = active.active_vte.char_height().max(1);
-                let visible_rows = ((visible_height as i64) / cell_height)
-                    .clamp(1, active.active_vte.row_count().max(1));
+                let cell_height = terminal.char_height().max(1);
+                let visible_rows =
+                    ((visible_height as i64) / cell_height).clamp(1, terminal.row_count().max(1));
                 cursor_row
                     .saturating_sub(top_row)
                     .clamp(0, visible_rows.saturating_sub(1)) as i32
@@ -16655,8 +16766,13 @@ impl TermView {
         }
     }
 
-    pub fn vte(&self) -> &Terminal {
-        &self.active_vte
+    pub(crate) fn legacy_terminal(&self) -> Option<&Terminal> {
+        self.active_vte.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn vte(&self) -> &Terminal {
+        self.legacy_terminal().expect("legacy terminal fixture")
     }
 
     pub fn cwd(&self) -> String {
@@ -16841,9 +16957,8 @@ impl TermView {
         let copy = gtk::Button::with_label("Copy Command");
         copy.add_css_class("flat");
         {
-            let clipboard_vte = self.active_vte.clone();
             copy.connect_clicked(move |button| {
-                clipboard_vte.clipboard().set_text(hint.load);
+                button.clipboard().set_text(hint.load);
                 button.set_label("Copied");
             });
         }
@@ -17379,7 +17494,9 @@ impl TermView {
         // and Undo or Drop retries it with the pane's then-current state.
         self.arm_history_explicit_replace();
         self.clear_find();
-        self.active_vte.unselect_all();
+        if let Some(terminal) = self.legacy_terminal() {
+            terminal.unselect_all();
+        }
 
         // Fold the live card flag into BlockData before draining so clear/undo
         // and a subsequent history rewrite keep the same notice bit.
@@ -17551,7 +17668,6 @@ impl TermView {
                     .widget()
                     .insert_before(&self.block_list, Some(&anchor));
                 finished.connect_actions(
-                    &self.active_vte,
                     &self.verified_submission,
                     &self.bracketed_paste,
                     &self.active,
@@ -17781,7 +17897,6 @@ impl TermView {
                     .widget()
                     .insert_before(&self.block_list, Some(&anchor));
                 finished.connect_actions(
-                    &self.active_vte,
                     &self.verified_submission,
                     &self.bracketed_paste,
                     &self.active,
@@ -18160,7 +18275,9 @@ impl TermView {
     }
 
     pub(crate) fn set_scrollback_lines(&self, lines: i64) {
-        self.active_vte.set_scrollback_lines(lines);
+        if let Some(terminal) = self.legacy_terminal() {
+            terminal.set_scrollback_lines(lines);
+        }
         #[cfg(anvil_shared_terminal)]
         if let Some(terminal) = self.active.borrow().shared_active.as_ref() {
             terminal.set_history_row_limit(usize::try_from(lines).unwrap_or(usize::MAX));
@@ -18178,7 +18295,9 @@ impl TermView {
     pub fn apply_theme(&self) {
         clear_dynamic_colors(&self.dynamic_colors);
         let config = self.config.borrow();
-        apply_theme_to_vte(&self.active_vte, &config);
+        if let Some(terminal) = self.legacy_terminal() {
+            apply_theme_to_vte(terminal, &config);
+        }
         #[cfg(anvil_shared_terminal)]
         if let Some(terminal) = &self.active.borrow().shared_active {
             terminal.update_theme(&config, config.default_font_scale);
@@ -18211,7 +18330,9 @@ impl TermView {
     /// into the config would persist a family list the user never chose.
     pub fn set_font(&self, desc: &str) {
         let font_desc = crate::font::terminal_font_description(desc, &self.config.borrow());
-        self.active_vte.set_font(Some(&font_desc));
+        if let Some(terminal) = self.legacy_terminal() {
+            terminal.set_font(Some(&font_desc));
+        }
         for block in self.finished_blocks.borrow().iter() {
             if let Some(terminal) = &block.command_vte {
                 terminal.set_font(Some(&font_desc));
@@ -18247,7 +18368,9 @@ impl TermView {
 
     /// Update font scale for VTE terminal and block view CSS.
     pub fn set_font_scale(&self, scale: f64) {
-        self.active_vte.set_font_scale(scale);
+        if let Some(terminal) = self.legacy_terminal() {
+            terminal.set_font_scale(scale);
+        }
         for block in self.finished_blocks.borrow().iter() {
             if let Some(terminal) = &block.command_vte {
                 terminal.set_font_scale(scale);
@@ -18348,7 +18471,8 @@ impl TermView {
             let (cols, rows) = terminal.grid_size();
             return (i64::from(cols), i64::from(rows));
         }
-        (self.active_vte.column_count(), self.active_vte.row_count())
+        let terminal = self.legacy_terminal().expect("legacy live terminal");
+        (terminal.column_count(), terminal.row_count())
     }
 
     /// Collect a snapshot of internal runtime state for the debug dashboard.
@@ -19187,13 +19311,13 @@ mod tests {
                     "background output must cross the production finalization/reset path"
                 );
                 assert!(
-                    view.active_vte.cursor_position().1 > view.active_vte.row_count(),
+                    view.vte().cursor_position().1 > view.vte().row_count(),
                     "prewarm must retain nonzero absolute ring coordinates"
                 );
                 let command = if wrapped {
                     format!(
                         "ssh root@{}",
-                        "h".repeat(view.active_vte.column_count() as usize + 20)
+                        "h".repeat(view.vte().column_count() as usize + 20)
                     )
                 } else {
                     "command ssh remote".to_string()
@@ -19210,7 +19334,7 @@ mod tests {
                 let winsize = view.pty.test_slave_winsize();
                 let replies = Rc::new(RefCell::new(Vec::<String>::new()));
                 let captured = replies.clone();
-                let signal = view.active_vte.connect_commit(move |_, text, _| {
+                let signal = view.vte().connect_commit(move |_, text, _| {
                     captured.borrow_mut().push(text.to_string());
                 });
                 let assert_cursor_visible = || {
@@ -19218,7 +19342,7 @@ mod tests {
                     // Ask VTE itself for the screen-relative cursor. This
                     // bypasses our parser's CPR implementation and avoids
                     // using the very origin calculation being tested.
-                    view.active_vte.feed(b"\x1b[6n");
+                    view.vte().feed(b"\x1b[6n");
                     settle();
                     let row = replies
                         .borrow()
@@ -19237,38 +19361,33 @@ mod tests {
                     // real PTY stream above: reproduce a late compact-baseline
                     // sample without claiming to reproduce scheduler timing.
                     // The native CPR is an independent screen-row oracle.
-                    assert!(row > 6 && row < view.active_vte.row_count());
-                    let cursor = view.active_vte.cursor_position().1;
+                    assert!(row > 6 && row < view.vte().row_count());
+                    let cursor = view.vte().cursor_position().1;
                     let late_origin = Cell::new(Some(live_visible_baseline_origin(cursor, 6)));
                     let late_high = Cell::new(cursor);
                     let old_extent = live_content_extent_for(
                         late_origin.get().unwrap(),
                         cursor,
-                        view.active_vte.row_count(),
+                        view.vte().row_count(),
                     );
                     assert!(
                         old_extent < row,
                         "old late-origin formula must undercount this fixture"
                     );
-                    let corrected = super::live_content_extent(
-                        &view.active_vte,
-                        &late_origin,
-                        &late_high,
-                        true,
-                        6,
-                    )
-                    .expect("displayed origin is measurable");
+                    let corrected =
+                        super::live_content_extent(view.vte(), &late_origin, &late_high, true, 6)
+                            .expect("displayed origin is measurable");
                     assert!(
                         corrected >= row,
                         "late-origin recovery must include native cursor row"
                     );
                     let clip = view.active.borrow().live_clip();
                     let offset = view
-                        .active_vte
+                        .vte()
                         .compute_point(&clip, &gtk::graphene::Point::new(0.0, 0.0))
                         .expect("terminal is inside live clip");
                     assert_eq!(
-                        view.active_vte.yalign(),
+                        view.vte().yalign(),
                         vte4::Align::Start,
                         "the cursor oracle assumes no internal vertical alignment offset"
                     );
@@ -19277,13 +19396,13 @@ mod tests {
                     // adding style_context.padding() here counts it twice.
                     // https://docs.gtk.org/gtk4/coordinates.html#widgets
                     #[allow(deprecated)] // Diagnostics only, not cursor arithmetic.
-                    let css_padding = view.active_vte.style_context().padding();
-                    let scroll_border = gtk::prelude::ScrollableExt::border(&view.active_vte);
-                    let cell_height = view.active_vte.char_height();
+                    let css_padding = view.vte().style_context().padding();
+                    let scroll_border = gtk::prelude::ScrollableExt::border(view.vte());
+                    let cell_height = view.vte().char_height();
                     let bottom = f64::from(offset.y()) + (row * cell_height) as f64;
                     eprintln!("SSH cursor geometry: mode={mode:?} wrapped={wrapped} integrated={integrated} row={row} grid={} char_height={cell_height} terminal_offset_y={} css_padding_top={} scroll_border_top={:?} terminal_height={} clip_height={} requested_visible={} bottom={bottom}",
-                        view.active_vte.row_count(), offset.y(), css_padding.top(),
-                        scroll_border.as_ref().map(|border| border.top()), view.active_vte.height(),
+                        view.vte().row_count(), offset.y(), css_padding.top(),
+                        scroll_border.as_ref().map(|border| border.top()), view.vte().height(),
                         clip.height(), view.active.borrow().live_visible_height_px());
                     assert!(bottom <= f64::from(clip.height()),
                         "{mode:?} wrapped={wrapped} integrated={integrated}: cursor bottom {bottom} exceeds clip {} (row {row})", clip.height());
@@ -19313,7 +19432,7 @@ mod tests {
                 view.pty.emit_test_output(b"\r\nroot@remote ~\r\n");
                 settle();
                 assert_cursor_visible();
-                view.active_vte.disconnect(signal);
+                view.vte().disconnect(signal);
                 window.close();
                 settle();
             }
@@ -19328,11 +19447,11 @@ mod tests {
         use vte4::TerminalExt;
 
         gtk::init().expect("gtk init");
-        let active = Rc::new(RefCell::new(super::ActiveBlock::new(
+        let active = Rc::new(RefCell::new(super::ActiveBlock::new_legacy(
             &Config::safe_defaults(),
             Rc::new(RefCell::new(VecDeque::new())),
         )));
-        let terminal = active.borrow().active_vte.clone();
+        let terminal = active.borrow().legacy_surface().clone();
         let holder = active.borrow().widget.clone();
         let window = gtk::Window::builder()
             .default_width(900)
@@ -28449,7 +28568,15 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
         let key_ctx = KeyCtx {
             live_keys_for_key: keys,
             pty_for_key: harness.pty.clone(),
-            active_vte_for_key: active.downgrade(),
+            live_for_key: active.upcast_ref::<gtk::Widget>().downgrade(),
+            row_height_for_key: {
+                let terminal = active.downgrade();
+                Rc::new(move || {
+                    terminal
+                        .upgrade()
+                        .map_or(1.0, |terminal| terminal.char_height() as f64)
+                })
+            },
             running_cmd_for_key: Rc::new(RefCell::new(String::new())),
             native_transcript_for_key: super::NativeTranscriptScroll::new(
                 harness.bstate.clone(),
@@ -28528,7 +28655,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
                 anchor: Rc::new(Cell::new(Some(41))),
                 submission: harness.ctx.verified_submission.clone(),
                 bracketed: Rc::new(Cell::new(false)),
-                live: active.clone(),
+                live: active.clone().upcast(),
             },
             &card,
         );
@@ -29496,7 +29623,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
                 anchor: anchor.clone(),
                 submission: harness.ctx.verified_submission.clone(),
                 bracketed: bracketed.clone(),
-                live,
+                live: live.upcast(),
             },
             &cards.borrow()[1],
         );

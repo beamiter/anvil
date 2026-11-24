@@ -209,7 +209,7 @@ impl CrossSelection {
     pub(super) fn install(
         block_scroll: &impl IsA<gtk::Widget>,
         finished_blocks: Rc<RefCell<Vec<FinishedBlock>>>,
-        active_vte: vte4::Terminal,
+        active_surface: TerminalTextSurface,
         selected_block_ids: SelectedBlockIds,
         selected_block_id: Rc<Cell<Option<u64>>>,
         selection_anchor_id: Rc<Cell<Option<u64>>>,
@@ -222,12 +222,6 @@ impl CrossSelection {
         // native pick-based owner on their common canvas; Block still passes
         // its original scroller. No synthetic chrome acquires a text origin.
         let block_scroll = block_scroll.upcast_ref::<gtk::Widget>();
-        let active_surface = TerminalTextSurface::Native(active_vte);
-        #[cfg(anvil_shared_terminal)]
-        let active_surface = match &shared_active {
-            Some(terminal) => TerminalTextSurface::Document(terminal.screen().clone()),
-            None => active_surface,
-        };
         let this = Rc::new(Self {
             finished_blocks,
             active_surface,
@@ -926,7 +920,7 @@ mod tests {
             let same_surface = || {
                 screen.is_mapped()
                     && screen.buffer() == buffer
-                    && !view.active_vte.is_mapped()
+                    && view.legacy_terminal().is_none()
                     && view
                         .active
                         .borrow()
@@ -1748,7 +1742,7 @@ mod tests {
         let cross = CrossSelection::install(
             &scroll,
             Rc::new(RefCell::new(vec![card.clone()])),
-            active.clone(),
+            TerminalTextSurface::Native(active.clone()),
             selected,
             Rc::new(Cell::new(Some(41))),
             Rc::new(Cell::new(Some(41))),

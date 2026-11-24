@@ -165,7 +165,7 @@ fn unified_navigation_preserves_native_ownership_and_follows_live() {
     settle();
     assert_eq!(view.navigated_record_id.get(), Some(3));
     assert!(bar.next.is_sensitive());
-    let native_adjustment = view.active_vte.vadjustment().unwrap();
+    let native_adjustment = view.vte().vadjustment().unwrap();
     native_adjustment.emit_by_name::<()>("value-changed", &[]);
     native_adjustment.emit_by_name::<()>("changed", &[]);
     assert_eq!(
@@ -175,7 +175,7 @@ fn unified_navigation_preserves_native_ownership_and_follows_live() {
     );
     bar.next.emit_clicked();
     assert_eq!(view.navigated_record_id.get(), None);
-    assert!(owns_focus(&window, &view.active_vte));
+    assert!(owns_focus(&window, view.vte()));
 
     // Copy is identity-bound and does not touch the ordinary native selection,
     // the input shadow, or a different editor's keyboard focus.
@@ -189,20 +189,20 @@ fn unified_navigation_preserves_native_ownership_and_follows_live() {
     bar.compare.emit_clicked();
     assert!(actions.borrow().contains(&Action::CompareCommandOutput));
     assert_eq!(view.navigated_record_id.get(), Some(2));
-    view.active_vte.select_all();
-    assert!(view.active_vte.has_selection());
+    view.vte().select_all();
+    assert!(view.vte().has_selection());
     assert!(outside.grab_focus());
     bar.copy.emit_clicked();
     let copied = gtk::glib::MainContext::default()
-        .block_on(view.active_vte.clipboard().read_text_future())
+        .block_on(view.vte().clipboard().read_text_future())
         .unwrap();
     assert_eq!(copied.as_deref(), Some(commands[1]));
-    assert!(view.active_vte.has_selection());
+    assert!(view.vte().has_selection());
     assert!(owns_focus(&window, &outside));
     assert_eq!(view.typed_cmd.borrow().as_str(), "unfinished draft");
-    view.active_vte.unselect_all();
+    view.vte().unselect_all();
 
-    let adjustment = view.active_vte.vadjustment().expect("native adjustment");
+    let adjustment = view.vte().vadjustment().expect("native adjustment");
     let bottom = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
     assert!(
         bottom > adjustment.lower() + 20.0,
@@ -307,7 +307,7 @@ fn unified_navigation_preserves_native_ownership_and_follows_live() {
         window.set_default_size(width, 600);
         wait_until(|| window.width() <= width + 8 && grid_matches_pty(&view));
         let nav = bar.root.compute_bounds(&window).expect("mapped navigation");
-        let terminal = view.active_vte.compute_bounds(&window).expect("mapped VTE");
+        let terminal = view.vte().compute_bounds(&window).expect("mapped VTE");
         assert!(
             nav.height() > 0.0 && nav.height() < 60.0,
             "compact independent row: {nav:?}"
@@ -365,7 +365,7 @@ fn unified_navigation_preserves_native_ownership_and_follows_live() {
     assert!(outside.grab_focus());
     bar.live.emit_clicked();
     settle();
-    assert!(owns_focus(&window, &view.active_vte));
+    assert!(owns_focus(&window, view.vte()));
     assert_eq!(view.navigated_record_id.get(), None);
     assert_eq!(view.unread_count.get(), 0);
     assert!(!view.user_scrolled_up.get());
