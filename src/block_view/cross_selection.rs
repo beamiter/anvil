@@ -1237,7 +1237,9 @@ mod tests {
         settle();
         view.pty.emit_test_output("echo needle needle\r\n\x1b]133;C;cmdline_url=echo%20needle%20needle\x07\x1b]8;;https://example.test/completed\x07\x1b[1;31mdocument-body\x1b[0m\x1b]8;;\x07\r\nrow two e\u{301} 👩‍💻\r\nrow three\r\nrow four\r\nrow five\r\n\x1b[38;2;33;77;121mfindbody marker\x1b[0m\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07".as_bytes());
         settle();
-        view.pty.emit_test_output(b"echo link\r\n\x1b]133;C;cmdline_url=echo%20link\x07https://example.test\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        view.pty.emit_test_output(b"echo link");
+        settle();
+        view.pty.emit_test_output(b"\r\n\x1b]133;C\x07https://example.test/mixed-output\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
         settle();
         view.pty.emit_test_output(b"echo color\r\n\x1b]133;C;cmdline_url=echo%20color\x07\x1b[5mblinking text\x1b[0m\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
         settle();
@@ -1247,9 +1249,11 @@ mod tests {
             let finished = view.finished_blocks.borrow();
             assert_eq!(finished.len(), 4);
             assert!(
-                finished[1].command_document.is_some(),
-                "URL checks the output gate"
+                finished[1].command_vte.is_some() && finished[1].command_document.is_none(),
+                "the command captured from the screen still uses VTE"
             );
+            let captured = finished[1].cmd_text.as_str();
+            assert_eq!(captured.strip_prefix("$ ").unwrap_or(captured), "echo link");
             assert!(finished[3].command_vte.is_none());
             let multiline = finished[3]
                 .command_document
@@ -1298,7 +1302,7 @@ mod tests {
         if document_output {
             assert_eq!(
                 second.document_text().as_deref(),
-                Some("https://example.test")
+                Some("https://example.test/mixed-output")
             );
         }
         assert!(!command.is_editable());
@@ -1427,6 +1431,20 @@ mod tests {
             );
         }
 
+        if document_output {
+            assert!(matches!(
+                view.find_in_blocks("mixed-output", false, true),
+                FindSearchResult::Matches(progress) if progress.total == 1
+            ));
+            settle();
+            view.copy_to_clipboard();
+            let copied = gtk::glib::MainContext::default()
+                .block_on(second.widget().clipboard().read_text_future())
+                .unwrap()
+                .unwrap();
+            assert_eq!(copied, "mixed-output");
+            view.clear_find();
+        }
         let cross = &view.cross_selection;
         let surfaces = cross.ordered_vtes();
         let first = TerminalTextSurface::Document(command);
@@ -1437,19 +1455,26 @@ mod tests {
         let body = copied
             .find("document-body")
             .expect("selected first card output");
+        let inferred_command = copied
+            .find("echo link")
+            .unwrap_or_else(|| panic!("native command missing from {copied:?}"));
         let following = copied
-            .find("https://example.test")
+            .find("https://example.test/mixed-output")
             .expect("selected next card output");
-        assert!(body < following, "{copied:?}");
+        assert!(
+            body < inferred_command && inferred_command < following,
+            "{copied:?}"
+        );
         if document_output {
             assert_eq!(view.clear_blocks(), 4);
             assert_eq!(view.undo_clear_blocks(), 4);
             settle();
             let finished = view.finished_blocks.borrow();
             assert!(finished[0].command_document.is_some());
+            assert!(finished[1].command_vte.is_some());
             assert_eq!(
                 finished[1].output_surface().document_text().as_deref(),
-                Some("https://example.test")
+                Some("https://example.test/mixed-output")
             );
             assert!(finished[3].command_document.is_some());
             drop(finished);
