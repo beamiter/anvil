@@ -3711,6 +3711,11 @@ impl OrganismRuntime {
                     (x, y, (px, py) != (x, y))
                 }
             };
+            #[cfg(anvil_shared_terminal)]
+            if !view.organism_body_rect_is_blank(x, y, surface.body_width, surface.body_height) {
+                self.hide_live_body(view);
+                return;
+            }
             if view.move_live_organism_body(self.live_presentation.upcast_ref(), x, y) {
                 self.body_in_transit.set(moved);
                 self.body_position.set(Some((x, y)));
