@@ -2313,6 +2313,30 @@ fn prepare_test_slave(slave: &OwnedFd) {
     }
 }
 
+impl jterm_gtk_view::Pty for OwnedPty {
+    fn write(&self, bytes: &[u8]) -> Result<(), String> {
+        self.try_write_bytes(bytes)
+            .map_err(|error| error.to_string())
+    }
+
+    fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+        self.try_resize(cols, rows)
+            .map_err(|error| error.to_string())
+    }
+
+    fn stop(&self) {
+        self.kill();
+    }
+
+    fn start_reader(
+        &self,
+        output: impl FnMut(Vec<u8>) + 'static,
+        exited: impl FnOnce(jterm_core::exit_status::PtyExit) + 'static,
+    ) -> Result<(), String> {
+        OwnedPty::start_reader(self, output, exited).map_err(|error| error.to_string())
+    }
+}
+
 impl Drop for OwnedPty {
     fn drop(&mut self) {
         self.kill();

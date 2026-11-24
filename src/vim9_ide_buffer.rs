@@ -3451,7 +3451,13 @@ mod tests {
             std::env::temp_dir(),
         ))
         .unwrap();
-        let terminal = EditorTerminal::legacy();
+        let terminal = EditorTerminal::start(&jterm_core::vim9::Vim9Launch {
+            program: "/bin/cat".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: session.root().to_path_buf(),
+        })
+        .unwrap();
         let native = NativeBuffer::new(&session, &terminal, true, true);
         let field = gtk::Entry::new();
         let layout = gtk::Box::new(gtk::Orientation::Vertical, 0);

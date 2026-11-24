@@ -1,4 +1,4 @@
-//! Opt-in GTK/VTE coverage using an actual Vim executable.
+//! Opt-in GTK coverage using an actual Vim executable.
 //! Run the ignored test under Xvfb (or an existing display), with
 //! JTERM_VIM9_BIN pointing to Vim 9+ with channel/job/timers.
 
@@ -16,6 +16,13 @@ fn descendants<T: IsA<gtk::Widget> + glib::object::ObjectType>(root: &gtk::Widge
         child = widget.next_sibling();
     }
     widgets
+}
+
+fn editor_terminal(root: &gtk::Widget) -> EditorTerminal {
+    descendants::<gtk::Widget>(root)
+        .iter()
+        .find_map(EditorTerminal::from_test_widget)
+        .expect("mounted native Vim editor")
 }
 
 fn wait_for(window: &gtk::Widget, description: &str, ready: impl Fn() -> bool) {
@@ -103,10 +110,7 @@ fn native_vim9_edit_save_build_and_modified_close() {
     let window = app.windows().into_iter().next().expect("native IDE window");
     let native_window = window.clone().downcast::<adw::ApplicationWindow>().unwrap();
     let widget: &gtk::Widget = window.upcast_ref();
-    let editor = descendants::<vte4::Terminal>(widget)
-        .into_iter()
-        .next()
-        .expect("real VTE editor");
+    let editor = editor_terminal(widget);
     let save = named_button(widget, "Save (Ctrl+S)");
     wait_for(widget, "authenticated Vim bridge", || save.is_sensitive());
 
@@ -120,7 +124,7 @@ fn native_vim9_edit_save_build_and_modified_close() {
     // Deliberately disagree with ANSI colors and disable termguicolors. A
     // terminal repaint would be green; the GUI must receive the exact pink
     // guifg and cyan guisp through the independent semantic render channel.
-    editor.feed_child(b":set notermguicolors | hi Normal guifg=#abcdef guibg=#101820 ctermfg=2 ctermbg=0 | hi JTermGuiProbe guifg=#fa5ea9 guibg=#101820 guisp=#2ce5d7 gui=bold,italic,undercurl ctermfg=2 ctermbg=0 cterm=NONE | syn match JTermGuiProbe /before/\r");
+    editor.write_test_input(b":set notermguicolors | hi Normal guifg=#abcdef guibg=#101820 ctermfg=2 ctermbg=0 | hi JTermGuiProbe guifg=#fa5ea9 guibg=#101820 guisp=#2ce5d7 gui=bold,italic,undercurl ctermfg=2 ctermbg=0 cterm=NONE | syn match JTermGuiProbe /before/\r");
     wait_for(
         widget,
         "GUI RGB survives a different terminal palette",
@@ -149,7 +153,7 @@ fn native_vim9_edit_save_build_and_modified_close() {
     }
 
     // Plugin APIs share the native RGB path while termguicolors remains off.
-    editor.feed_child(b":hi JTermPluginProbe guifg=#f1a234 guibg=#304050 guisp=#ee3344 gui=undercurl ctermfg=2 ctermbg=0 | let g:gui_plugin = matchadd('JTermPluginProbe', 'before')\r");
+    editor.write_test_input(b":hi JTermPluginProbe guifg=#f1a234 guibg=#304050 guisp=#ee3344 gui=undercurl ctermfg=2 ctermbg=0 | let g:gui_plugin = matchadd('JTermPluginProbe', 'before')\r");
     wait_for(
         widget,
         "plugin regex highlight reaches native GUI paint",
@@ -165,7 +169,7 @@ fn native_vim9_edit_save_build_and_modified_close() {
             })
         },
     );
-    editor.feed_child(b":call matchdelete(g:gui_plugin) | let g:gui_plugin = matchaddpos('JTermPluginProbe', [[1,2,3]])\r");
+    editor.write_test_input(b":call matchdelete(g:gui_plugin) | let g:gui_plugin = matchaddpos('JTermPluginProbe', [[1,2,3]])\r");
     wait_for(widget, "plugin positional highlight stays native", || {
         native_buffer.painted_frame().is_some_and(|frame| {
             frame
@@ -182,7 +186,7 @@ fn native_vim9_edit_save_build_and_modified_close() {
             .expect("capture native plugin highlight")
             .success());
     }
-    editor.feed_child(b":call matchdelete(g:gui_plugin)\r");
+    editor.write_test_input(b":call matchdelete(g:gui_plugin)\r");
     wait_for(
         widget,
         "plugin removal restores syntax without editing text",
@@ -197,13 +201,13 @@ fn native_vim9_edit_save_build_and_modified_close() {
     );
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "before\n");
 
-    editor.feed_child(b"i");
+    editor.write_test_input(b"i");
     wait_for(widget, "native insert-mode buffer", || {
         native_buffer
             .painted_frame()
             .is_some_and(|frame| frame.mode.starts_with('i'))
     });
-    let native_im = named_key_controller(&editor, "vim9-native-input-method")
+    let native_im = named_key_controller(editor.widget(), "vim9-native-input-method")
         .im_context()
         .expect("native composition context is active");
     native_im.emit_by_name::<()>("commit", &[&"中文"]);
@@ -230,7 +234,7 @@ fn native_vim9_edit_save_build_and_modified_close() {
             .expect("capture native Unicode buffer")
             .success());
     }
-    editor.feed_child(b"\x1bu");
+    editor.write_test_input(b"\x1bu");
     wait_for(widget, "Vim undo reverses the native IM commit", || {
         native_buffer.painted_frame().is_some_and(|frame| {
             frame.mode == "n"
@@ -258,7 +262,7 @@ fn native_vim9_edit_save_build_and_modified_close() {
     });
 
     // Optional X11 integration exercises actual key-event delivery through
-    // the native IM filter, not only feed_child or a synthetic commit signal.
+    // the native IM filter, not only direct PTY input or a synthetic commit signal.
     if std::env::var_os("JTERM_VIM9_TEST_REAL_KEYS").is_some() {
         let pid = std::process::id().to_string();
         let found = std::process::Command::new("xdotool")
@@ -329,13 +333,24 @@ fn native_vim9_edit_save_build_and_modified_close() {
 
     // PTY keystrokes mutate real Vim. The native Save button then sends a typed
     // bridge request; the test does not simulate either text editing or saving.
-    editor.feed_child(b"gg0iNATIVE \x1b");
-    wait_for(widget, "modified editor state", || {
-        window.title().is_some_and(|title| title.contains('●'))
-            && descendants::<gtk::Label>(widget)
-                .iter()
-                .any(|label| label.text().starts_with("N ·"))
-    });
+    editor.write_test_input(b"gg0iNATIVE \x1b");
+    wait_for(
+        widget,
+        "the edited buffer has returned to Normal mode",
+        || {
+            window.title().is_some_and(|title| title.contains('●'))
+                && native_buffer.painted_frame().is_some_and(|frame| {
+                    frame.mode == "n"
+                        && frame
+                            .runs
+                            .iter()
+                            .filter(|run| run.line == 1)
+                            .map(|run| run.text.as_str())
+                            .collect::<String>()
+                            == "NATIVE before"
+                })
+        },
+    );
     let text_search = descendants::<gtk::Entry>(widget)
         .into_iter()
         .find(|entry| entry.placeholder_text().as_deref() == Some("Search project text (Enter)"))
@@ -577,7 +592,7 @@ fn native_vim9_edit_save_build_and_modified_close() {
                 })
         })
     });
-    editor.feed_child(b"gg0iSAVED \x1b");
+    editor.write_test_input(b"gg0iSAVED \x1b");
     wait_for(widget, "modified nested buffer", || {
         window.title().is_some_and(|title| title.contains('●'))
             && descendants::<gtk::Label>(widget)
@@ -701,7 +716,7 @@ fn native_vim9_edit_save_build_and_modified_close() {
         assert!(status.success(), "native workbench screenshot");
     }
 
-    editor.feed_child(b"gg0iUNSAVED \x1b");
+    editor.write_test_input(b"gg0iUNSAVED \x1b");
     wait_for(widget, "second modified buffer", || {
         window.title().is_some_and(|title| title.contains('●'))
             && descendants::<gtk::Label>(widget)
@@ -768,10 +783,7 @@ fn native_vim9_quick_open_locations() {
     let window = app.windows().into_iter().next().expect("native IDE window");
     let native_window = window.clone().downcast::<adw::ApplicationWindow>().unwrap();
     let widget: &gtk::Widget = window.upcast_ref();
-    let editor = descendants::<vte4::Terminal>(widget)
-        .into_iter()
-        .next()
-        .expect("real VTE editor");
+    let editor = editor_terminal(widget);
     wait_for(widget, "authenticated Vim bridge", || {
         named_button(widget, "Save (Ctrl+S)").is_sensitive()
     });
@@ -861,7 +873,7 @@ fn native_vim9_quick_open_locations() {
 
     // Current-buffer navigation is a Goto action, so it must not reopen a
     // named file, reject an unnamed buffer, or overwrite its unsaved text.
-    editor.feed_child(b":enew\rione\ntwo\nthree\x1b");
+    editor.write_test_input(b":enew\rione\ntwo\nthree\x1b");
     wait_for(widget, "modified unnamed buffer", || {
         window
             .title()
@@ -886,7 +898,7 @@ fn native_vim9_quick_open_locations() {
         },
     );
     assert_eq!(std::fs::read_to_string(sample).unwrap(), "before\n");
-    editor.feed_child(b":qa!\r");
+    editor.write_test_input(b":qa!\r");
     wait_for(widget, "Vim fixture exits", || app.windows().is_empty());
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -925,10 +937,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
     let window = app.windows().into_iter().next().unwrap();
     let native_window = window.clone().downcast::<adw::ApplicationWindow>().unwrap();
     let widget: &gtk::Widget = window.upcast_ref();
-    let editor = descendants::<vte4::Terminal>(widget)
-        .into_iter()
-        .next()
-        .unwrap();
+    let editor = editor_terminal(widget);
     let buffer = descendants::<native_buffer::BufferSurface>(widget)
         .into_iter()
         .next()
@@ -1026,7 +1035,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
     query.set_text(">next diagnostic");
     query.emit_activate();
     assert!(contains(&picker, "The quickfix list has no problems"));
-    editor.feed_child(b":call setqflist([{'filename':'sample.txt','lnum':1,'col':1,'text':'palette problem','type':'W'}])\r");
+    editor.write_test_input(b":call setqflist([{'filename':'sample.txt','lnum':1,'col':1,'text':'palette problem','type':'W'}])\r");
     stage(b"anvil-palette-stage: wait-06\n");
     wait_for(
         widget,
@@ -1054,7 +1063,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
     // Prepare a modified buffer without an ambiguous standalone Escape,
     // which can leave Vim waiting for a terminal key sequence after the
     // modified-buffer title has already arrived.
-    editor.feed_child(b":call setqflist([]) | call setline(1, 'PALETTE before')\r");
+    editor.write_test_input(b":call setqflist([]) | call setline(1, 'PALETTE before')\r");
     stage(b"anvil-palette-stage: wait-08\n");
     wait_for(widget, "unsaved palette fixture", || {
         window.title().is_some_and(|title| title.contains('●'))
@@ -1093,7 +1102,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
                 .painted_frame()
                 .is_some_and(|frame| frame.windows.len() == 2)
     });
-    editor.feed_child(b"u");
+    editor.write_test_input(b"u");
     stage(b"anvil-palette-stage: wait-12\n");
     wait_for(widget, "fixture undo retains disk contents", || {
         window.title().is_some_and(|title| !title.contains('●'))
@@ -1119,7 +1128,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
         ),
     )
     .unwrap();
-    editor.feed_child(format!(":source {}\r", provider.display()).as_bytes());
+    editor.write_test_input(format!(":source {}\r", provider.display()).as_bytes());
     let (picker, query, _) = open_picker();
     query.set_text(">simple git status");
     stage(b"anvil-palette-stage: wait-13\n");
@@ -1172,7 +1181,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
         assert!(captured.success(), "native Simple palette screenshot");
     }
     query.set_text(">simplegit status");
-    editor.feed_child(b":let g:vim9_simple_branch = 'palette-next'\r");
+    editor.write_test_input(b":let g:vim9_simple_branch = 'palette-next'\r");
     stage(b"anvil-palette-stage: wait-17\n");
     wait_for(
         widget,
@@ -1209,7 +1218,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
     query.emit_activate();
     let format_error = "The current buffer's language service does not provide this action";
     assert!(contains(&picker, format_error));
-    editor.feed_child(b":command! LspFormat echo 'format fixture'\r");
+    editor.write_test_input(b":command! LspFormat echo 'format fixture'\r");
     stage(b"anvil-palette-stage: wait-20\n");
     wait_for(
         widget,
@@ -1280,7 +1289,7 @@ fn native_vim9_command_palette_modes_and_live_availability() {
                 && window.title().is_some_and(|title| title.contains(">notes"))
         },
     );
-    editor.feed_child(b":qa!\r");
+    editor.write_test_input(b":qa!\r");
     stage(b"anvil-palette-stage: wait-27\n");
     wait_for(widget, "palette fixture exit", || app.windows().is_empty());
     stage(b"anvil-palette-stage: cleanup\n");
@@ -1457,10 +1466,7 @@ fn exercise_embedded_vim9_capture(font_only: bool) {
         }),
     );
     let widget: &gtk::Widget = window.upcast_ref();
-    let editor = descendants::<vte4::Terminal>(widget)
-        .into_iter()
-        .next()
-        .unwrap();
+    let editor = editor_terminal(widget);
     wait_for(widget, "embedded Vim bridge and focus", || {
         named_button(widget, "Save (Ctrl+S)").is_sensitive() && editor.has_focus()
     });
@@ -1516,7 +1522,8 @@ fn exercise_embedded_vim9_capture(font_only: bool) {
             buffer.painted_geometry().is_some()
         });
         let old_line_height = buffer.painted_geometry().unwrap().0.line_height;
-        let old_size = editor.font().unwrap().size();
+        let old_editor_height = editor.cell_metrics().3;
+        let old_size = buffer.native_font_size();
         assert!(embedded_owns_font_key(
             &window,
             gdk::Key::equal,
@@ -1527,7 +1534,7 @@ fn exercise_embedded_vim9_capture(font_only: bool) {
             widget,
             "parent capture defers to embedded buffer font",
             || {
-                editor.font().unwrap().size() == old_size + gtk::pango::SCALE
+                editor.cell_metrics().3 > old_editor_height
                     && buffer.native_font_size() == old_size + gtk::pango::SCALE
                     && buffer
                         .painted_geometry()
@@ -1537,7 +1544,7 @@ fn exercise_embedded_vim9_capture(font_only: bool) {
         assert_eq!(terminal_font_count.get(), 0);
         send("ctrl+0");
         wait_for(widget, "embedded buffer font reset", || {
-            editor.font().unwrap().size() == 12 * gtk::pango::SCALE
+            editor.cell_metrics().3 == old_editor_height
                 && buffer.native_font_size() == 12 * gtk::pango::SCALE
         });
         wait_for(widget, "font reset restores buffer grid", || {
@@ -1568,7 +1575,7 @@ fn exercise_embedded_vim9_capture(font_only: bool) {
                     .success());
             }
         };
-        move_pointer(editor.upcast_ref());
+        move_pointer(editor.widget());
         wait_for(widget, "pointer enters embedded Vim buffer", || {
             embedded_owns_font_scroll(layout.upcast_ref())
         });
@@ -1577,7 +1584,7 @@ fn exercise_embedded_vim9_capture(font_only: bool) {
             widget,
             "parent capture defers real Ctrl-wheel to buffer font",
             || {
-                editor.font().unwrap().size() == 13 * gtk::pango::SCALE
+                editor.cell_metrics().3 > old_editor_height
                     && buffer.native_font_size() == 13 * gtk::pango::SCALE
                     && buffer
                         .painted_geometry()
@@ -1587,7 +1594,7 @@ fn exercise_embedded_vim9_capture(font_only: bool) {
         assert_eq!(parent_wheel_count.get(), 0);
         send("ctrl+0");
         wait_for(widget, "wheel font reset restores buffer grid", || {
-            editor.font().unwrap().size() == 12 * gtk::pango::SCALE
+            editor.cell_metrics().3 == old_editor_height
                 && buffer
                     .painted_geometry()
                     .is_some_and(|(metrics, _)| metrics.line_height == old_line_height)
@@ -1616,7 +1623,7 @@ fn exercise_embedded_vim9_capture(font_only: bool) {
             "font capture verified: keyboard and real Ctrl-wheel changed VTE/Pango/grid, sibling font routes preserved"
         );
         editor.grab_focus();
-        editor.feed_child(b":qa!\r");
+        editor.write_test_input(b":qa!\r");
         wait_for(widget, "font-test embedded exit restores shell", || {
             gtk::prelude::WidgetExt::is_visible(&source) && !has_embedded_editor(&pane)
         });
@@ -1743,7 +1750,7 @@ fn exercise_embedded_vim9_capture(font_only: bool) {
     wait_for(widget, "embedded picker final dismissal", || {
         window.visible_dialog().is_none() && editor.has_focus()
     });
-    editor.feed_child(b":qa!\r");
+    editor.write_test_input(b":qa!\r");
     wait_for(widget, "embedded exit restores its waiting shell", || {
         gtk::prelude::WidgetExt::is_visible(&source)
             && gtk::prelude::RootExt::focus(&window).is_some_and(|focus| {
@@ -1791,10 +1798,7 @@ fn native_vim9_split_unicode_visual_and_font_scaling() {
     let window = app.windows().into_iter().next().expect("native IDE window");
     window.set_default_size(1440, 980);
     let widget: &gtk::Widget = window.upcast_ref();
-    let editor = descendants::<vte4::Terminal>(widget)
-        .into_iter()
-        .next()
-        .expect("real Vim PTY");
+    let editor = editor_terminal(widget);
     let buffer = descendants::<native_buffer::BufferSurface>(widget)
         .into_iter()
         .next()
@@ -1830,8 +1834,8 @@ fn native_vim9_split_unicode_visual_and_font_scaling() {
 
     // Fixture options are intentionally ordinary supported Vim views. GUI and
     // terminal colors disagree to expose any accidental terminal-grid repaint.
-    editor.feed_child(b":set nowrap nonumber norelativenumber nocursorline notermguicolors | hi Normal guifg=#dce8f5 guibg=#17212b ctermfg=2 ctermbg=0 | hi GuiLeft guifg=#fa5ea9 gui=bold,italic ctermfg=2 | hi Visual guibg=#574b90 gui=NONE ctermbg=2 | syn match GuiLeft /LEFT/ | vsplit right.txt\r");
-    editor.feed_child(b":set nowrap nonumber norelativenumber nocursorline | hi GuiRight guifg=#4cdec1 gui=underline ctermfg=2 | syn match GuiRight /RIGHT/\r");
+    editor.write_test_input(b":set nowrap nonumber norelativenumber nocursorline notermguicolors | hi Normal guifg=#dce8f5 guibg=#17212b ctermfg=2 ctermbg=0 | hi GuiLeft guifg=#fa5ea9 gui=bold,italic ctermfg=2 | hi Visual guibg=#574b90 gui=NONE ctermbg=2 | syn match GuiLeft /LEFT/ | vsplit right.txt\r");
+    editor.write_test_input(b":set nowrap nonumber norelativenumber nocursorline | hi GuiRight guifg=#4cdec1 gui=underline ctermfg=2 | syn match GuiRight /RIGHT/\r");
     wait_for(
         widget,
         "independent split text and GUI syntax colors",
@@ -1869,7 +1873,7 @@ fn native_vim9_split_unicode_visual_and_font_scaling() {
     assert!(first_frame.covers(first_frame.cursor.row, first_frame.cursor.column));
 
     let scene_builds = buffer.scene_build_count();
-    editor.feed_child(b"l");
+    editor.write_test_input(b"l");
     wait_for(
         widget,
         "cursor-only frame reuses the native text scene",
@@ -1886,7 +1890,7 @@ fn native_vim9_split_unicode_visual_and_font_scaling() {
         "cursor-only updates must not rebuild GTK text and background nodes"
     );
 
-    editor.feed_child(b":set hlsearch | hi Search guibg=#70421f gui=NONE\r/RIGHT\r");
+    editor.write_test_input(b":set hlsearch | hi Search guibg=#70421f gui=NONE\r/RIGHT\r");
     wait_for(
         widget,
         "Vim search highlight stays in its matching split",
@@ -1904,7 +1908,7 @@ fn native_vim9_split_unicode_visual_and_font_scaling() {
             })
         },
     );
-    editor.feed_child(b"gg0v4l");
+    editor.write_test_input(b"gg0v4l");
     wait_for(
         widget,
         "native Visual selection in the active split",
@@ -1922,7 +1926,7 @@ fn native_vim9_split_unicode_visual_and_font_scaling() {
             })
         },
     );
-    editor.feed_child(b"\x1bgg0iEDIT \x1b");
+    editor.write_test_input(b"\x1bgg0iEDIT \x1b");
     wait_for(widget, "actual Vim edit is painted in its split", || {
         buffer.painted_frame().is_some_and(|frame| {
             frame.mode == "n" && frame.runs.iter().any(|run| run.text.contains("EDIT "))
@@ -1982,7 +1986,7 @@ fn native_vim9_split_unicode_visual_and_font_scaling() {
         .into_iter()
         .next()
         .unwrap();
-    let previous_metrics = (editor.char_width(), editor.char_height());
+    let previous_metrics = (editor.cell_metrics().2, editor.cell_metrics().3);
     let previous_frame = buffer.painted_frame().unwrap();
     font.set_font_desc(&gtk::pango::FontDescription::from_string("Monospace 18"));
     font_menu.popdown();
@@ -1990,13 +1994,13 @@ fn native_vim9_split_unicode_visual_and_font_scaling() {
         widget,
         "larger font resizes the actual Vim grid and all panes",
         || {
-            editor.char_height() > previous_metrics.1
+            editor.cell_metrics().3 > previous_metrics.1
                 && buffer.painted_frame().is_some_and(|frame| {
                     frame.windows.len() == 3
                         && frame.revision > previous_frame.revision
                         && frame.columns < previous_frame.columns
-                        && frame.rows == editor.row_count() as usize
-                        && frame.columns == editor.column_count() as usize
+                        && frame.rows == editor.grid_size().0
+                        && frame.columns == editor.grid_size().1
                         && frame.covers(frame.cursor.row, frame.cursor.column)
                 })
         },
@@ -2006,7 +2010,7 @@ fn native_vim9_split_unicode_visual_and_font_scaling() {
         "Native font scaling at GTK scale {}: cell {:?} -> {:?}, Vim grid {}x{} -> {}x{}, revision {} -> {}",
         window.scale_factor(),
         previous_metrics,
-        (editor.char_width(), editor.char_height()),
+        (editor.cell_metrics().2, editor.cell_metrics().3),
         previous_frame.columns,
         previous_frame.rows,
         larger_frame.columns,
@@ -2017,7 +2021,7 @@ fn native_vim9_split_unicode_visual_and_font_scaling() {
     capture("gui-splits.png");
 
     let before_style = buffer.painted_frame().unwrap();
-    let before_metrics = (editor.char_width(), editor.char_height());
+    let before_metrics = (editor.cell_metrics().2, editor.cell_metrics().3);
     let mut styled_font = font.font_desc().unwrap();
     styled_font.set_weight(gtk::pango::Weight::Bold);
     font.set_font_desc(&styled_font);
@@ -2027,27 +2031,27 @@ fn native_vim9_split_unicode_visual_and_font_scaling() {
         || {
             buffer.painted_frame().is_some_and(|frame| {
                 frame.revision > before_style.revision
-                    && frame.rows == editor.row_count() as usize
-                    && frame.columns == editor.column_count() as usize
+                    && frame.rows == editor.grid_size().0
+                    && frame.columns == editor.grid_size().1
             })
         },
     );
-    if before_metrics == (editor.char_width(), editor.char_height()) {
+    if before_metrics == (editor.cell_metrics().2, editor.cell_metrics().3) {
         let styled = buffer.painted_frame().unwrap();
         assert_eq!(styled.rows, before_style.rows);
         assert_eq!(styled.columns, before_style.columns);
     }
 
     let geometry_matches = |frame: &jterm_core::vim9::Vim9RenderFrame| {
-        frame.rows == editor.row_count() as usize
-            && frame.columns == editor.column_count() as usize
+        frame.rows == editor.grid_size().0
+            && frame.columns == editor.grid_size().1
             && buffer.painted_geometry().is_some_and(|(metrics, caret)| {
-                metrics.cell_width == editor.char_width() as f32
-                    && metrics.line_height == editor.char_height() as f32
+                metrics.cell_width == editor.cell_metrics().2
+                    && metrics.line_height == editor.cell_metrics().3
                     && Some(caret) == metrics.cursor_rect(&frame.cursor)
             })
     };
-    let zoom = named_key_controller(&editor, "vim9-buffer-zoom");
+    let zoom = named_key_controller(editor.widget(), "vim9-buffer-zoom");
     let before_zoom = buffer.painted_frame().unwrap().revision;
     assert!(zoom.emit_by_name::<bool>(
         "key-pressed",
@@ -2081,7 +2085,7 @@ fn native_vim9_split_unicode_visual_and_font_scaling() {
 
     // An unsupported feature in any pane must retire every native overlay,
     // never leave a stale valid pane over Vim's updated screen.
-    editor.feed_child(b":setlocal conceallevel=2\r");
+    editor.write_test_input(b":setlocal conceallevel=2\r");
     wait_for(
         widget,
         "unsupported split state retires the native overlay",
@@ -2092,7 +2096,7 @@ fn native_vim9_split_unicode_visual_and_font_scaling() {
                     .any(|label| label.text().starts_with("Vim ·"))
         },
     );
-    editor.feed_child(b":setlocal conceallevel=0\r");
+    editor.write_test_input(b":setlocal conceallevel=0\r");
     wait_for(widget, "native mixed split layout resumes", || {
         buffer
             .painted_frame()
@@ -2136,10 +2140,7 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
     );
     let window = app.windows().into_iter().next().unwrap();
     let widget: &gtk::Widget = window.upcast_ref();
-    let editor = descendants::<vte4::Terminal>(widget)
-        .into_iter()
-        .next()
-        .unwrap();
+    let editor = editor_terminal(widget);
     let buffer = descendants::<native_buffer::BufferSurface>(widget)
         .into_iter()
         .next()
@@ -2177,7 +2178,7 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
             positions.iter().map(|p| p.1).max()? - positions.iter().map(|p| p.1).min()? + 1,
         ))
     };
-    editor.feed_child(b":let g:native_saved_cursor = &guicursor | highlight GuiCursorProbe guifg=#102030 guibg=#e1a273 gui=NONE | set guicursor=n-v:block-GuiCursorProbe,i:ver25-GuiCursorProbe,r:hor30-GuiCursorProbe,a:blinkon0\r");
+    editor.write_test_input(b":let g:native_saved_cursor = &guicursor | highlight GuiCursorProbe guifg=#102030 guibg=#e1a273 gui=NONE | set guicursor=n-v:block-GuiCursorProbe,i:ver25-GuiCursorProbe,r:hor30-GuiCursorProbe,a:blinkon0\r");
     wait_for(widget, "native solid cursor highlight", || {
         buffer.painted_frame().is_some_and(|f| {
             f.mode == "n"
@@ -2192,28 +2193,29 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
         cursor_pixels(0x102030).is_some(),
         "solid cursor must repaint readable foreground ink"
     );
-    editor.feed_child(b"i");
+    editor.write_test_input(b"i");
     wait_for(widget, "native insertion cursor shape", || {
         buffer.painted_frame().is_some_and(|f| f.mode == "i")
             && cursor_pixels(0xe1a273)
                 .is_some_and(|r| r.0 * 2 < block_cursor.0 && r.1 == block_cursor.1)
     });
-    editor.feed_child(b"\x1bR");
+    editor.write_test_input(b"\x1bR");
     wait_for(widget, "native replacement cursor shape", || {
         buffer
             .painted_frame()
             .is_some_and(|f| f.mode.starts_with('R'))
             && cursor_pixels(0xe1a273).is_some_and(|r| r.1 * 2 < block_cursor.1)
     });
-    editor.feed_child("\x1b:normal! gg0f中\r".as_bytes());
+    editor.write_test_input("\x1b:normal! gg0f中\r".as_bytes());
     wait_for(widget, "wide cursor retains both source cells", || {
         buffer
             .painted_frame()
             .is_some_and(|f| f.mode == "n" && f.cursor.width == 2)
             && cursor_pixels(0xe1a273).is_some_and(|r| r.0 >= block_cursor.0 * 2)
     });
-    editor
-        .feed_child(b":set guicursor=a:block-GuiCursorProbe-blinkwait250-blinkoff150-blinkon150\r");
+    editor.write_test_input(
+        b":set guicursor=a:block-GuiCursorProbe-blinkwait250-blinkoff150-blinkon150\r",
+    );
     wait_for(widget, "native cursor blink off", || {
         buffer.painted_frame().is_some_and(|f| {
             f.mode == "n"
@@ -2232,14 +2234,14 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
         scene_builds,
         "blinking must retain shaped text"
     );
-    editor.feed_child(b":let &guicursor = g:native_saved_cursor | normal! gg0\r");
+    editor.write_test_input(b":let &guicursor = g:native_saved_cursor | normal! gg0\r");
     // Real insert-mode completion remains native, preserves Vim's input
     // ownership, and paints GUI menu colors above the retained buffer scene.
     let original_buffer = buffer.painted_frame().unwrap().buffer;
-    editor.feed_child(b":enew | set completeopt=menuone,noinsert,noselect pumheight=8 | call setline(1, ['', 'PUM_underlay sentinel']) | normal! gg0\r");
-    editor.feed_child(b":hi Pmenu guifg=#9fe1f3 guibg=#25374b ctermfg=1 ctermbg=2 gui=NONE | hi PmenuSel guifg=#102030 guibg=#c479a1 ctermfg=2 ctermbg=1 gui=NONE | hi! link PmenuMatch Pmenu | hi! link PmenuMatchSel PmenuSel\r");
+    editor.write_test_input(b":enew | set completeopt=menuone,noinsert,noselect pumheight=8 | call setline(1, ['', 'PUM_underlay sentinel']) | normal! gg0\r");
+    editor.write_test_input(b":hi Pmenu guifg=#9fe1f3 guibg=#25374b ctermfg=1 ctermbg=2 gui=NONE | hi PmenuSel guifg=#102030 guibg=#c479a1 ctermfg=2 ctermbg=1 gui=NONE | hi! link PmenuMatch Pmenu | hi! link PmenuMatchSel PmenuSel\r");
     editor.grab_focus();
-    editor.feed_child("i\x12=[complete(1, ['现代alpha', '现代beta']), ''][1]\r".as_bytes());
+    editor.write_test_input("i\x12=[complete(1, ['现代alpha', '现代beta']), ''][1]\r".as_bytes());
     wait_for(widget, "native Unicode completion menu", || {
         buffer.painted_frame().is_some_and(|frame| {
             frame.completion.as_ref().is_some_and(|menu| {
@@ -2262,13 +2264,13 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
     );
     let menu_frame = buffer.painted_frame().unwrap();
     let menu = menu_frame.completion.as_ref().unwrap();
-    let menu_x = (menu.view.column + 1) as f64 * editor.char_width() as f64;
-    let menu_y = (menu.view.row + 1) as f64 * editor.char_height() as f64;
+    let menu_x = (menu.view.column + 1) as f64 * editor.cell_metrics().2 as f64;
+    let menu_y = (menu.view.row + 1) as f64 * editor.cell_metrics().3 as f64;
     assert!(
         !buffer.enqueue_scroll(menu_x, menu_y, 1.0, gdk::ScrollUnit::Wheel),
         "completion wheel input must pass through to Vim, never become a semantic buffer scroll"
     );
-    editor.feed_child(b"\x0e");
+    editor.write_test_input(b"\x0e");
     let selected_row = |frame: &jterm_core::vim9::Vim9RenderFrame| {
         frame
             .completion
@@ -2297,7 +2299,7 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
             .unwrap()
             .success());
     }
-    editor.feed_child(b"\x0e");
+    editor.write_test_input(b"\x0e");
     wait_for(widget, "Vim selects next native completion", || {
         buffer
             .painted_frame()
@@ -2305,7 +2307,7 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
             .and_then(|frame| selected_row(frame))
             .is_some_and(|row| row != first_selected)
     });
-    editor.feed_child(b"\x10");
+    editor.write_test_input(b"\x10");
     wait_for(widget, "Vim selects previous native completion", || {
         buffer
             .painted_frame()
@@ -2313,7 +2315,7 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
             .and_then(|frame| selected_row(frame))
             == Some(first_selected)
     });
-    editor.feed_child(b"\x19\x1b");
+    editor.write_test_input(b"\x19\x1b");
     wait_for(
         widget,
         "accepted completion restores the native body",
@@ -2339,14 +2341,14 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
         editor.has_focus(),
         "accepting completion must retain editor focus"
     );
-    editor.feed_child(b":call setline(1, '') | normal! gg0\r");
-    editor.feed_child("i\x12=[complete(1, ['现代alpha', '现代beta']), ''][1]\r".as_bytes());
+    editor.write_test_input(b":call setline(1, '') | normal! gg0\r");
+    editor.write_test_input("i\x12=[complete(1, ['现代alpha', '现代beta']), ''][1]\r".as_bytes());
     wait_for(widget, "completion reopens", || {
         buffer
             .painted_frame()
             .is_some_and(|frame| frame.completion.is_some())
     });
-    editor.feed_child(b"\x0e\x05\x1b");
+    editor.write_test_input(b"\x0e\x05\x1b");
     wait_for(
         widget,
         "cancelled completion restores the original line",
@@ -2365,7 +2367,7 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
             })
         },
     );
-    editor.feed_child(b":bwipeout!\r");
+    editor.write_test_input(b":bwipeout!\r");
     wait_for(
         widget,
         "completion test returns to the original scroll buffer",
@@ -2375,7 +2377,8 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
                 .is_some_and(|frame| frame.buffer == original_buffer && frame.mode == "n")
         },
     );
-    editor.feed_child(b":set nowrap mouse=a nonumber norelativenumber scrolloff=0 | vsplit\r");
+    editor
+        .write_test_input(b":set nowrap mouse=a nonumber norelativenumber scrolloff=0 | vsplit\r");
     wait_for(widget, "two independent scroll viewports", || {
         buffer
             .painted_frame()
@@ -2390,8 +2393,8 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
         .unwrap();
     let inactive_id = inactive.window;
     let view = &inactive.view;
-    let cell_width = editor.char_width() as f64;
-    let line_height = editor.char_height() as f64;
+    let cell_width = editor.cell_metrics().2 as f64;
+    let line_height = editor.cell_metrics().3 as f64;
     let x = (view.column + 3) as f64 * cell_width;
     let y = (view.row + 3) as f64 * line_height;
     let settings = buffer.settings();
@@ -2434,8 +2437,8 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
     // A mouse mapping/virtualedit governs pointer gestures, not scrolling.
     // Insert-mode scrolling must commit its source viewport without leaving
     // Insert mode or moving focus into the hovered inactive split.
-    editor.feed_child(b":set virtualedit=all\r");
-    editor.feed_child(b"i");
+    editor.write_test_input(b":set virtualedit=all\r");
+    editor.write_test_input(b"i");
     wait_for(
         widget,
         "Insert scroll without native mouse ownership",
@@ -2473,7 +2476,7 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
         })
     });
     assert!(buffer.scroll_offset(inactive_id).abs() < 0.001);
-    editor.feed_child(b"\x1b:set virtualedit=\r");
+    editor.write_test_input(b"\x1b:set virtualedit=\r");
     wait_for(widget, "Normal-mode scroll fixture restored", || {
         buffer
             .painted_frame()
@@ -2594,7 +2597,7 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
             .save_to_png(PathBuf::from(path).with_extension("scroll.png"))
             .unwrap();
     }
-    let stop = named_key_controller(&editor, "vim9-buffer-scroll-stop");
+    let stop = named_key_controller(editor.widget(), "vim9-buffer-scroll-stop");
     assert!(!stop.emit_by_name::<bool>(
         "key-pressed",
         &[&gdk::Key::i, &0u32, &gdk::ModifierType::empty()]
@@ -2604,7 +2607,7 @@ fn native_vim9_fractional_scroll_and_split_isolation() {
         0.0,
         "editing cancels visual interpolation before hit testing"
     );
-    editor.feed_child(b":qa!\r");
+    editor.write_test_input(b":qa!\r");
     wait_for(widget, "scroll fixture exits", || app.windows().is_empty());
     std::fs::remove_dir_all(root).unwrap();
 }

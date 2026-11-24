@@ -1817,7 +1817,9 @@ fn open_with_config_and_exit(
         });
     }
 
-    if let Some(vte) = editor.vte() {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let vte = editor.vte();
         let launch = session.launch();
         let mut argv = vec![launch.program.clone()];
         argv.extend(launch.args.clone());
