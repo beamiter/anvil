@@ -284,6 +284,13 @@ impl Pane {
     /// launcher chain and may return its reusable ControlPath separately from
     /// the stable destination argv.
     pub(crate) fn observed_ssh_command(&self) -> Option<process::ObservedSshCommand> {
+        #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
+        if let TermCtl::Shared(view) = &self.terminal {
+            return view
+                .pane()?
+                .runtime()?
+                .inspect_child(jterm_core::process::observed_ssh_command_via_stat);
+        }
         process::observed_ssh_command(self.probe.pty_fd.get(), self.probe.shell_pid.get())
     }
 
