@@ -1063,17 +1063,14 @@ impl AppModel {
         } else {
             self.config.borrow().terminal_mode
         };
-        let shared_kind = if self.safe_mode {
-            None
-        } else {
-            match &command {
-                None => Some(SharedPaneKind::ConfiguredShell),
-                Some(CommandTab::HostedAttachment(_)) => Some(SharedPaneKind::HostedAttachment),
-                Some(CommandTab::Explicit | CommandTab::Helper(_)) => {
-                    Some(SharedPaneKind::ExplicitCommand)
-                }
-                Some(CommandTab::Task(_)) => None,
+        let shared_kind = match &command {
+            None => Some(SharedPaneKind::ConfiguredShell),
+            Some(_) if self.safe_mode => None,
+            Some(CommandTab::HostedAttachment(_)) => Some(SharedPaneKind::HostedAttachment),
+            Some(CommandTab::Explicit | CommandTab::Helper(_)) => {
+                Some(SharedPaneKind::ExplicitCommand)
             }
+            Some(CommandTab::Task(_)) => None,
         };
         let title_cwd = working_directory.clone();
         let pane = create_pane(
@@ -1324,7 +1321,7 @@ impl AppModel {
                     block_view::PaneHistoryInit::new(*history_id),
                     external_cwd,
                     Vec::new(),
-                    (!self.safe_mode).then_some(SharedPaneKind::ConfiguredShell),
+                    Some(SharedPaneKind::ConfiguredShell),
                     sender,
                 );
                 let widget = pane.widget();
@@ -2659,7 +2656,7 @@ impl AppModel {
             Default::default(),
             false,
             Vec::new(),
-            (!self.safe_mode).then_some(SharedPaneKind::ConfiguredShell),
+            Some(SharedPaneKind::ConfiguredShell),
             sender,
         );
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -2875,7 +2872,6 @@ impl AppModel {
         let keybindings = self.kbmap.clone();
         let organism_hub = self.organism_hub.clone();
         let shell_argv = self.shell_argv.clone();
-        let shared_kind = (!self.safe_mode).then_some(SharedPaneKind::ConfiguredShell);
         let split = prepare_then_commit(
             || {
                 let pane = create_pane(
@@ -2892,7 +2888,7 @@ impl AppModel {
                     Default::default(),
                     false,
                     Vec::new(),
-                    shared_kind,
+                    Some(SharedPaneKind::ConfiguredShell),
                     sender,
                 );
                 if let Some(error) = pane.terminal.synchronous_launch_error() {
