@@ -216,6 +216,7 @@ impl Fixture {
                 command_exact: true,
                 command_truncated: false,
                 output_head_dropped: false,
+                output_source: None,
                 finished_document: None,
             });
             view.finished_blocks.borrow_mut().push(card);

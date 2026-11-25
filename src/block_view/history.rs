@@ -737,6 +737,7 @@ impl From<LegacyBlockDataV3> for BlockData {
             command_exact: legacy.command_exact,
             command_truncated: legacy.command_truncated,
             output_head_dropped: false,
+            output_source: None,
             finished_document: None,
         }
     }
@@ -792,6 +793,7 @@ impl From<LegacyBlockDataV2> for BlockData {
             command_exact: false,
             command_truncated: false,
             output_head_dropped: false,
+            output_source: None,
             finished_document: None,
         }
     }
@@ -819,6 +821,10 @@ fn decode_rkyv_block(data: &[u8]) -> Option<BlockData> {
     let frame = FinishedHistoryFrame::read(data);
     if let Some(mut block) = decode_rkyv_body(frame.record) {
         block.finished_document = frame.document(&block.output).map(Arc::new);
+        block.output_source = match block.finished_document.as_deref() {
+            Some(document) => document.output_source(),
+            None => frame.output_source(),
+        };
         Some(block)
     } else if frame.record.len() != data.len() {
         decode_rkyv_body(data)
@@ -828,11 +834,17 @@ fn decode_rkyv_block(data: &[u8]) -> Option<BlockData> {
 }
 
 fn attach_finished_document<'a>(block: &BlockData, body: &'a [u8]) -> Cow<'a, [u8]> {
+    if let Some(document) = block.finished_document.as_deref() {
+        let frame = document.attach(&block.output, body);
+        if matches!(frame, Cow::Owned(_)) {
+            return frame;
+        }
+    }
     block
-        .finished_document
-        .as_deref()
-        .map_or(Cow::Borrowed(body), |document| {
-            document.attach(&block.output, body)
+        .output_source
+        .as_ref()
+        .map_or(Cow::Borrowed(body), |source| {
+            FinishedHistoryFrame::attach_source(source, body)
         })
 }
 
@@ -2822,6 +2834,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_head_dropped: false,
+            output_source: None,
             finished_document: None,
         }
     }

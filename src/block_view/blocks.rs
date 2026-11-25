@@ -2,7 +2,7 @@
 use super::*;
 use crate::config::Config;
 use gtk::Orientation;
-use jterm_core::screen_replay::FinishedDocument;
+use jterm_core::screen_replay::{CapturedExecutionSource, FinishedDocument};
 use relm4::gtk;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
@@ -324,6 +324,9 @@ pub(crate) struct BlockData {
     #[rkyv(with = rkyv::with::Skip)]
     #[serde(skip)]
     pub(crate) finished_document: Option<Arc<FinishedDocument>>,
+    #[rkyv(with = rkyv::with::Skip)]
+    #[serde(skip)]
+    pub(crate) output_source: Option<CapturedExecutionSource>,
 }
 
 /// Fence long enough to contain `text`: untrusted output may itself hold a run
@@ -416,6 +419,9 @@ impl BlockData {
             return "{}".to_string();
         };
         if let Some(object) = value.as_object_mut() {
+            if let Some(source) = &self.output_source {
+                object.insert("output_source".to_string(), serde_json::json!(source));
+            }
             if self.is_background() {
                 object.remove("completion_provenance");
                 object.remove("start_mark_seen");
@@ -455,6 +461,13 @@ impl BlockData {
             md.push_str(&format!("\n{fence}\n\n"));
         }
 
+        if let Some(source) = &self.output_source {
+            md.push_str(&format!("{source}\n\n"));
+        }
+
+        if self.output_head_dropped {
+            md.push_str("Earlier output not retained.\n\n");
+        }
         if !self.output.is_empty() {
             let fence = markdown_fence(&self.output);
             md.push_str(&format!("**Output:**\n{fence}\n"));
@@ -2657,6 +2670,7 @@ mod tests {
             command_exact: true,
             command_truncated: false,
             output_head_dropped: false,
+            output_source: None,
             finished_document: None,
         }
     }

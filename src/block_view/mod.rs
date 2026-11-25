@@ -1,6 +1,10 @@
 use gtk::gdk::RGBA;
 use gtk::prelude::*;
 use gtk::{glib, Orientation, ScrolledWindow};
+use jterm_core::parser::ShellMarkerPosition;
+use jterm_core::screen_replay::{
+    CapturedExecutionSource, FinishedDocument, FinishedExecutionSource, RunningExecutionSource,
+};
 use relm4::gtk;
 use std::cell::{Cell, OnceCell, Ref, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -4866,6 +4870,7 @@ struct EngineState {
     /// RIS. This is deliberately separate from `cmd_running_rc`: prompt-trust
     /// recovery may resume capture without creating a second lifecycle.
     command_finished_event_pending: bool,
+    pending_execution_source: Option<RunningExecutionSource>,
     /// Duration the shell measured for the running command, when it sends one.
     /// Beats `block_start_time_for_cb`, which starts when this process noticed
     /// the mark.
@@ -5197,6 +5202,7 @@ enum CapturedFinalizeOutput {
 }
 
 struct BlockRenderPayload {
+    execution_source: Option<FinishedExecutionSource>,
     prompt: String,
     output_with_ansi: String,
     output_plain: String,
@@ -5319,6 +5325,7 @@ trait BlockRenderPayloadAccessor {
 }
 
 struct LazyBlockRenderPayload {
+    execution_source: Option<FinishedExecutionSource>,
     value: OnceCell<BlockRenderPayload>,
     prompt: RefCell<Option<String>>,
     output: RefCell<Option<CapturedFinalizeOutput>>,
@@ -5342,6 +5349,7 @@ impl LazyBlockRenderPayload {
     ) -> Self {
         Self {
             value: OnceCell::new(),
+            execution_source: None,
             prompt: RefCell::new(Some(prompt)),
             output: RefCell::new(Some(output)),
             dropped_front,
@@ -5384,6 +5392,7 @@ impl BlockRenderPayloadAccessor for LazyBlockRenderPayload {
                 ),
             };
             BlockRenderPayload {
+                execution_source: self.execution_source.clone(),
                 prompt,
                 output_with_ansi: replayed.with_ansi,
                 output_plain: replayed.plain,
@@ -6260,6 +6269,8 @@ enum ResetAwareParserPart {
     /// strict ST as well; the local capture is retained (pending a dedicated
     /// equivalence check) so payload bytes never reach the shared parser.
     ApcSequence(Vec<u8>),
+    /// Discarded before reaching the core parser, but part of the PTY source.
+    SkippedSourceBytes(usize),
     /// Byte-exact ED3/RIS barrier. The sequence is fed to core in its own
     /// part so the reset's invalidation is ordered between the capability
     /// observations of the prefix and suffix parts; core emits the matching
@@ -6283,6 +6294,7 @@ enum ResetAwareParserState {
         capture_apc: bool,
         apc_payload: Vec<u8>,
         apc_overflow: bool,
+        apc_bytes: usize,
     },
 }
 
@@ -6397,6 +6409,7 @@ impl ResetAwareParserSplitter {
                                 capture_apc,
                                 apc_payload: Vec::new(),
                                 apc_overflow: false,
+                                apc_bytes: 2,
                             };
                         }
                         _ => {
@@ -6440,6 +6453,7 @@ impl ResetAwareParserSplitter {
                     capture_apc,
                     mut apc_payload,
                     mut apc_overflow,
+                    mut apc_bytes,
                 } => {
                     let byte = bytes[index];
                     if after_escape && byte != b'\\' {
@@ -6449,13 +6463,20 @@ impl ResetAwareParserSplitter {
                         // their real stream order without duplicating bytes.
                         flush_opaque_passthrough(&mut parts, &mut opaque);
                         flush_reset_passthrough(&mut parts, &mut passthrough);
+                        if capture_apc {
+                            parts.push(ResetAwareParserPart::SkippedSourceBytes(apc_bytes));
+                        }
                         self.state = ResetAwareParserState::Escape;
                         continue;
                     }
                     index += 1;
                     if after_escape {
                         if capture_apc {
-                            if !apc_overflow {
+                            if apc_overflow {
+                                parts.push(ResetAwareParserPart::SkippedSourceBytes(
+                                    apc_bytes.saturating_add(2),
+                                ));
+                            } else {
                                 parts.push(ResetAwareParserPart::ApcSequence(apc_payload));
                             }
                         } else if bypass_parser {
@@ -6482,9 +6503,11 @@ impl ResetAwareParserSplitter {
                             capture_apc,
                             apc_payload,
                             apc_overflow,
+                            apc_bytes,
                         };
                     } else {
                         if capture_apc {
+                            apc_bytes = apc_bytes.saturating_add(1);
                             if apc_payload.len() < MAX_LOCAL_APC_PAYLOAD_BYTES {
                                 apc_payload.push(byte);
                             } else {
@@ -6503,6 +6526,7 @@ impl ResetAwareParserSplitter {
                             capture_apc,
                             apc_payload,
                             apc_overflow,
+                            apc_bytes,
                         };
                     }
                 }
@@ -6581,6 +6605,7 @@ struct LegacyUnifiedSurface {
 struct ReaderCtx {
     /// Every widget/surface effect and query goes through this seam.
     backend: Rc<dyn RenderBackend>,
+    source_stream_id: uuid::Uuid,
     #[cfg(anvil_shared_terminal)]
     terminal_output: Option<Rc<shared_active::ActiveTerminalOutput>>,
     bstate_rc: Rc<Cell<BlockState>>,
@@ -6746,7 +6771,7 @@ impl ReaderCtx {
         })
     }
 
-    fn handle_event(&self, event: &ParserEvent) {
+    fn handle_event(&self, event: &ParserEvent, position: Option<ShellMarkerPosition>) {
         let state = self.bstate_rc.get();
         match event {
             ParserEvent::RemoteSessionId(id) => self.on_remote_session_id(id),
@@ -6755,10 +6780,10 @@ impl ReaderCtx {
                 self.backend.directory_report(bytes);
                 self.on_bytes(bytes, state);
             }
-            ParserEvent::PromptStart => self.on_prompt_start(),
+            ParserEvent::PromptStart => self.on_prompt_start(position),
             ParserEvent::PromptEnd => self.on_prompt_end(),
-            ParserEvent::CommandStart(meta) => self.on_command_start(meta),
-            ParserEvent::CommandEnd { exit, meta } => self.on_command_end(*exit, meta),
+            ParserEvent::CommandStart(meta) => self.on_command_start(meta, position),
+            ParserEvent::CommandEnd { exit, meta } => self.on_command_end(*exit, meta, position),
             ParserEvent::AltScreenEnter(mode) => self.on_alt_screen_enter(*mode),
             ParserEvent::AltScreenLeave(mode) => self.on_alt_screen_leave(*mode),
             ParserEvent::ClipboardSet(text) => self.on_clipboard_set(text),
@@ -6851,6 +6876,7 @@ impl ReaderCtx {
             engine.pending_exit_code = None;
             engine.pending_completion_provenance = CompletionProvenance::Unknown;
             engine.command_finished_event_pending = false;
+            engine.pending_execution_source = None;
             engine.shell_duration_ms = None;
             engine.shell_started_at_ms = None;
             engine.clear_command_identity();
@@ -6938,12 +6964,21 @@ impl ReaderCtx {
         }
         let mut events = self.event_buf.borrow_mut();
         events.clear();
-        self.parser.borrow_mut().feed(bytes, &mut events);
+        let mut positions = Vec::new();
+        self.parser
+            .borrow_mut()
+            .feed_with_marker_positions(bytes, &mut events, &mut positions);
+        let mut positions = positions.into_iter();
         coalesce_bytes_events(&mut events);
         // `events` remains borrowed across dispatch exactly as in the former
         // process_chunk body; handlers never touch this staging buffer.
         for event in events.iter() {
-            self.handle_event(event);
+            let position = if event.is_shell_lifecycle() {
+                positions.next().flatten()
+            } else {
+                None
+            };
+            self.handle_event(event, position);
         }
     }
 
@@ -6977,9 +7012,19 @@ impl ReaderCtx {
                 ResetAwareParserPart::OpaqueBytes(bytes) => {
                     // Capability packets nested in an opaque control string
                     // are data, not shell-integration authority.
+                    self.parser.borrow_mut().skip_source_bytes(bytes.len());
                     self.on_bytes(&bytes, self.bstate_rc.get());
                 }
-                ResetAwareParserPart::ApcSequence(payload) => self.on_apc_sequence(&payload),
+                ResetAwareParserPart::ApcSequence(payload) => {
+                    // Complete APC retains the exact payload plus two bytes at each edge.
+                    self.parser
+                        .borrow_mut()
+                        .skip_source_bytes(payload.len() + 4);
+                    self.on_apc_sequence(&payload);
+                }
+                ResetAwareParserPart::SkippedSourceBytes(len) => {
+                    self.parser.borrow_mut().skip_source_bytes(len);
+                }
                 ResetAwareParserPart::Reset { bytes, .. } => {
                     // Pure ordering barrier: the splitter carved these exact
                     // bytes into their own part so prefix parts were observed
@@ -7099,7 +7144,7 @@ impl ReaderCtx {
         }
     }
 
-    fn on_prompt_start(&self) {
+    fn on_prompt_start(&self, position: Option<ShellMarkerPosition>) {
         self.ftcs_seen_rc.set(true);
         let mut state = self.bstate_rc.get();
         // One OSC 133 A event gets one foreground-ownership observation. The
@@ -7425,12 +7470,23 @@ impl ReaderCtx {
                 command_source,
                 start_mark_seen: !is_background,
             };
-            let payload = LazyBlockRenderPayload::new(
+            let execution_source = if is_background {
+                None
+            } else {
+                self.engine
+                    .borrow_mut()
+                    .pending_execution_source
+                    .take()
+                    .zip(position)
+                    .and_then(|(source, mark)| source.finish(self.source_stream_id, mark))
+            };
+            let mut payload = LazyBlockRenderPayload::new(
                 prompt,
                 captured_output,
                 output_dropped_front,
-                self.pty_winsize.sent.get(),
+                self.pty_winsize.child_winsize(),
             );
+            payload.execution_source = execution_source;
 
             // jsh owns the command lifecycle record. The lifecycle token its
             // accepted C minted and an enabled output consumer must both exist
@@ -7655,7 +7711,7 @@ impl ReaderCtx {
         }
     }
 
-    fn on_command_start(&self, meta: &CommandMeta) {
+    fn on_command_start(&self, meta: &CommandMeta, position: Option<ShellMarkerPosition>) {
         self.ftcs_seen_rc.set(true);
         let state = self.bstate_rc.get();
         if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
@@ -7678,6 +7734,8 @@ impl ReaderCtx {
             engine.osc133_depth = 0;
             engine.pending_completion_provenance = CompletionProvenance::Unknown;
             engine.command_finished_event_pending = true;
+            engine.pending_execution_source = position
+                .map(|mark| RunningExecutionSource::new(mark, self.pty_winsize.child_winsize()));
         }
         let reset_idle_kitty =
             std::mem::take(&mut self.engine.borrow_mut().idle_kitty_pipeline_dirty);
@@ -7822,7 +7880,12 @@ impl ReaderCtx {
         self.backend.mark_scroll_dirty();
     }
 
-    fn on_command_end(&self, exit: Option<i32>, meta: &CommandMeta) {
+    fn on_command_end(
+        &self,
+        exit: Option<i32>,
+        meta: &CommandMeta,
+        position: Option<ShellMarkerPosition>,
+    ) {
         let state = self.bstate_rc.get();
         if state != BlockState::CollectingOutput && state != BlockState::AltScreen {
             return;
@@ -7969,6 +8032,9 @@ impl ReaderCtx {
             engine.clear_command_identity();
             engine.pending_exit_code = exit;
             engine.pending_completion_provenance = CompletionProvenance::ShellReported;
+            if let (Some(source), Some(mark)) = (&mut engine.pending_execution_source, position) {
+                source.report_end(mark);
+            }
         }
         // jsh measures the command itself; only fall back to
         // this process's timer when the shell said nothing.
@@ -9387,7 +9453,9 @@ impl RenderBackend for BlockBackend {
         let finished = self.finished_blocks_for_cb.borrow();
         let mut remaining = max_bytes;
         let mut surfaces = Vec::new();
+        let mut capture_incomplete = false;
         for (block_index, block) in finished.iter().enumerate() {
+            capture_incomplete |= block.output_head_dropped();
             if remaining == 0 {
                 return BackendSearchBatch {
                     surfaces,
@@ -9551,7 +9619,7 @@ impl RenderBackend for BlockBackend {
         }
         BackendSearchBatch {
             surfaces,
-            incomplete: false,
+            incomplete: capture_incomplete,
             native_fallback: None,
         }
     }
@@ -9823,11 +9891,20 @@ impl RenderBackend for BlockBackend {
         let prompt = payload.prompt.as_str();
         let cmd = record.cmd.as_str();
         let output_with_ansi = payload.output_with_ansi.as_str();
-        let finished_document = jterm_core::screen_replay::FinishedDocument::capture(
-            output_with_ansi,
-            payload.capture_size,
-        )
-        .map(std::sync::Arc::new);
+        let output_source = payload.execution_source.clone().map(|mut source| {
+            source.head_dropped = payload.output_head_dropped;
+            CapturedExecutionSource {
+                execution: source,
+                capture_size: payload.capture_size,
+            }
+        });
+        let finished_document = FinishedDocument::capture(output_with_ansi, payload.capture_size)
+            .map(|mut document| {
+                document.execution_source = output_source
+                    .as_ref()
+                    .map(|source| source.execution.clone());
+                std::sync::Arc::new(document)
+            });
         let output_plain = finished_document.as_ref().map_or_else(
             || payload.output_plain.as_str(),
             |document| &document.archive.text,
@@ -9868,6 +9945,7 @@ impl RenderBackend for BlockBackend {
             }
             .to_owned(),
             finished_document: finished_document.clone(),
+            output_source,
             exit_code: record.exit_code,
             lifecycle_schema: blocks::BLOCK_LIFECYCLE_SCHEMA,
             completion_provenance: record.completion_provenance.into(),
@@ -11172,6 +11250,13 @@ struct PtyWinsize {
 }
 
 impl PtyWinsize {
+    fn child_winsize(&self) -> (u16, u16) {
+        match self.sent.get() {
+            (0, _) | (_, 0) => UNPUBLISHED_PTY_WINSIZE,
+            size => size,
+        }
+    }
+
     /// Send `sample` unless it is what the PTY already has. Returns whether
     /// it was sent. An identical TIOCSWINSZ would be dropped by the kernel
     /// anyway; skipping it here keeps the one shared memory truthful.
@@ -12803,8 +12888,9 @@ impl TermView {
             TerminalMode::Unified => "JTERM_SHARED_TRANSCRIPT",
             TerminalMode::Vte => return false,
         };
-        std::env::var_os(override_name)
-            .map_or_else(|| !crate::host::is_flatpak(), |value| value == "1")
+        // The prepared PTY owns the local endpoint while the bridge resolves
+        // the program and working directory in the host environment.
+        std::env::var_os(override_name).is_none_or(|value| value == "1")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -14543,6 +14629,7 @@ impl TermView {
             };
             *render_backend_slot.borrow_mut() = Some(backend.clone());
             ReaderCtx {
+                source_stream_id: uuid::Uuid::new_v4(),
                 backend,
                 #[cfg(anvil_shared_terminal)]
                 terminal_output: shared_active
@@ -14569,6 +14656,7 @@ impl TermView {
                     pending_completion_provenance: CompletionProvenance::Unknown,
                     pending_command_source: CommandTextSource::Screen,
                     command_finished_event_pending: false,
+                    pending_execution_source: None,
                     // Metadata jsh attaches to the same marks (see
                     // ParserEvent::CommandStart).
                     shell_duration_ms: None,
@@ -20721,7 +20809,8 @@ mod tests {
                 ResetAwareParserPart::Reset { kind, .. } => Some(*kind),
                 ResetAwareParserPart::Bytes(_)
                 | ResetAwareParserPart::OpaqueBytes(_)
-                | ResetAwareParserPart::ApcSequence(_) => None,
+                | ResetAwareParserPart::ApcSequence(_)
+                | ResetAwareParserPart::SkippedSourceBytes(_) => None,
             })
             .collect()
     }
@@ -20738,6 +20827,7 @@ mod tests {
                     bytes.extend_from_slice(payload);
                     bytes.extend_from_slice(b"\x1b\\");
                 }
+                ResetAwareParserPart::SkippedSourceBytes(_) => {}
             }
         }
         bytes
@@ -20807,6 +20897,7 @@ mod tests {
         assert_eq!(
             recovered,
             vec![
+                ResetAwareParserPart::SkippedSourceBytes(b"\x1b_Gunfinishedmore".len()),
                 ResetAwareParserPart::Reset {
                     kind: TerminalResetKind::HardReset,
                     bytes: b"\x1bc".to_vec(),
@@ -20842,6 +20933,9 @@ mod tests {
         assert_eq!(
             parts,
             vec![
+                ResetAwareParserPart::SkippedSourceBytes(
+                    4 + MAX_LOCAL_APC_PAYLOAD_BYTES + b"overflow".len(),
+                ),
                 ResetAwareParserPart::Bytes(b"after".to_vec()),
                 ResetAwareParserPart::ApcSequence(b"Gvalid".to_vec()),
                 ResetAwareParserPart::Bytes(b"tail".to_vec()),
@@ -21430,6 +21524,7 @@ mod tests {
                 command_truncated: record.command_source
                     == super::CommandTextSource::ScreenAfterTruncation,
                 output_head_dropped: payload.output_head_dropped,
+                output_source: None,
                 finished_document: None,
             };
             self.block_records
@@ -21847,6 +21942,7 @@ mod tests {
             };
 
             let ctx = ReaderCtx {
+                source_stream_id: uuid::Uuid::new_v4(),
                 backend: backend.clone(),
                 #[cfg(anvil_shared_terminal)]
                 terminal_output: None,
@@ -21863,6 +21959,7 @@ mod tests {
                     pending_completion_provenance: super::CompletionProvenance::Unknown,
                     pending_command_source: super::CommandTextSource::Screen,
                     command_finished_event_pending: false,
+                    pending_execution_source: None,
                     shell_duration_ms: None,
                     shell_started_at_ms: None,
                     #[cfg(not(anvil_shared_terminal))]
@@ -21945,7 +22042,7 @@ mod tests {
         }
 
         fn feed(&self, event: ParserEvent) {
-            self.ctx.handle_event(&event);
+            self.ctx.handle_event(&event, None);
         }
 
         fn feed_all(&self, events: impl IntoIterator<Item = ParserEvent>) {
@@ -30054,6 +30151,7 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
             command_exact: !cmd.trim().is_empty(),
             command_truncated: false,
             output_head_dropped: false,
+            output_source: None,
             finished_document: None,
         }
     }

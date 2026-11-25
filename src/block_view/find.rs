@@ -4167,6 +4167,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_head_dropped: false,
+            output_source: None,
             finished_document: None,
         };
         let metadata = CompletedCommandRecord {
@@ -4497,6 +4498,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_head_dropped: false,
+            output_source: None,
             finished_document: None,
         };
         let metadata = CompletedCommandRecord {
@@ -4532,6 +4534,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_head_dropped: false,
+            output_source: None,
             finished_document: None,
         };
         let records = || {
@@ -6055,6 +6058,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_head_dropped: false,
+            output_source: None,
             finished_document: None,
         };
         let block_record = || [BackendRecordRef::Block(&block)];
@@ -6459,6 +6463,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_head_dropped: false,
+            output_source: None,
             finished_document: None,
         };
         let backend_record = BackendRecordRef::Block(&block);
@@ -7178,6 +7183,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_head_dropped: false,
+            output_source: None,
             finished_document: None,
         };
         let backend = [BackendRecordRef::Block(&block)];
@@ -7263,6 +7269,7 @@ mod tests {
             command_exact: false,
             command_truncated: false,
             output_head_dropped: false,
+            output_source: None,
             finished_document: None,
         };
         let backend = [BackendRecordRef::Block(&block)];
