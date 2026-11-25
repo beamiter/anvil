@@ -192,9 +192,7 @@ impl SharedTerminal {
         inline_agent: bool,
     ) -> Option<Self> {
         let host_bridge = crate::host::is_flatpak();
-        if host_bridge && pinned_directory.is_some() {
-            return None;
-        }
+        let host_pin = pinned_directory.filter(|_| host_bridge);
         let home = std::env::var("HOME").ok();
         let cwd = cwd.or(home.as_deref());
         let vim = if env_extra.is_empty() {
@@ -207,11 +205,28 @@ impl SharedTerminal {
             .chain(env_extra)
             .map(|(name, value)| (name.as_str(), value.as_str()))
             .collect();
-        let launch = crate::host::wrap_argv(&crate::agent_cli::inline_argv(argv), cwd, &extra);
+        let argv = crate::agent_cli::inline_argv(argv);
+        let launch = if host_pin.is_some() {
+            crate::host::wrap_pinned_validation_argv(&argv, &extra)
+        } else {
+            crate::host::wrap_argv(&argv, cwd, &extra)
+        };
         let local_cwd = if host_bridge { Some("/") } else { cwd };
-        let result = Self::captured_runtime_environment(&extra).and_then(|environment| {
-            RuntimeShell::spawn_pane_command(&launch, local_cwd, pinned_directory, environment)
-        });
+        let result =
+            Self::captured_runtime_environment(&extra).and_then(|environment| match host_pin {
+                Some(directory) => RuntimeShell::spawn_forwarded_pane_command(
+                    &launch,
+                    directory,
+                    crate::host::FLATPAK_VALIDATION_DIRECTORY_FD,
+                    environment,
+                ),
+                None => RuntimeShell::spawn_pane_command(
+                    &launch,
+                    local_cwd,
+                    pinned_directory,
+                    environment,
+                ),
+            });
         Self::from_runtime(config, &launch, result.map(Some), false, inline_agent)
     }
 
