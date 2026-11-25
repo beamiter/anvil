@@ -14,8 +14,8 @@
     {
         "type": "git",
         "url": "https://github.com/beamiter/jterm_core",
-        "commit": "c4bcdb73b27e21deaf4d7d4a608384e20e8963d7",
-        "dest": "flatpak-cargo/git/jterm_core-c4bcdb7"
+        "commit": "7a32027258dfe5f05ec6eaa01b76b5d44396cbf6",
+        "dest": "flatpak-cargo/git/jterm_core-7a32027"
     },
     {
         "type": "archive",
@@ -106,19 +106,6 @@
         "type": "inline",
         "contents": "{\"package\": \"291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d\", \"files\": {}}",
         "dest": "cargo/vendor/anstyle-wincon-3.0.11",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/anyhow/anyhow-1.0.104.crate",
-        "sha256": "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470",
-        "dest": "cargo/vendor/anyhow-1.0.104"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470\", \"files\": {}}",
-        "dest": "cargo/vendor/anyhow-1.0.104",
         "dest-filename": ".cargo-checksum.json"
     },
     {
@@ -327,19 +314,6 @@
         "type": "inline",
         "contents": "{\"package\": \"9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801\", \"files\": {}}",
         "dest": "cargo/vendor/cfg-if-1.0.4",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/cfg_aliases/cfg_aliases-0.1.1.crate",
-        "sha256": "fd16c4719339c4530435d38e511904438d07cce7950afa3718a84ac36c10e89e",
-        "dest": "cargo/vendor/cfg_aliases-0.1.1"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"fd16c4719339c4530435d38e511904438d07cce7950afa3718a84ac36c10e89e\", \"files\": {}}",
-        "dest": "cargo/vendor/cfg_aliases-0.1.1",
         "dest-filename": ".cargo-checksum.json"
     },
     {
@@ -597,19 +571,6 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/downcast-rs/downcast-rs-1.2.1.crate",
-        "sha256": "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2",
-        "dest": "cargo/vendor/downcast-rs-1.2.1"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2\", \"files\": {}}",
-        "dest": "cargo/vendor/downcast-rs-1.2.1",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/env_filter/env_filter-2.0.0.crate",
         "sha256": "900d271a03799a1ee8d1ca9b19893b48ca674a9284fefcfb85f05e74ed314217",
         "dest": "cargo/vendor/env_filter-2.0.0"
@@ -727,19 +688,6 @@
         "type": "inline",
         "contents": "{\"package\": \"38e2275cc4e4fc009b0669731a1e5ab7ebf11f469eaede2bab9309a5b4d6057f\", \"files\": {}}",
         "dest": "cargo/vendor/field-offset-0.3.6",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/filedescriptor/filedescriptor-0.8.3.crate",
-        "sha256": "e40758ed24c9b2eeb76c35fb0aebc66c626084edd827e07e1552279814c6682d",
-        "dest": "cargo/vendor/filedescriptor-0.8.3"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"e40758ed24c9b2eeb76c35fb0aebc66c626084edd827e07e1552279814c6682d\", \"files\": {}}",
-        "dest": "cargo/vendor/filedescriptor-0.8.3",
         "dest-filename": ".cargo-checksum.json"
     },
     {
@@ -1413,12 +1361,12 @@
     {
         "type": "shell",
         "commands": [
-            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-c4bcdb7/.\" \"cargo/vendor/jterm_core\""
+            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-7a32027/.\" \"cargo/vendor/jterm_core\""
         ]
     },
     {
         "type": "inline",
-        "contents": "[package]\nname = \"jterm_core\"\nversion = \"0.2.0\"\nedition = \"2021\"\nrust-version = \"1.89\"\ndescription = \"Shared UI-independent core for the jterm family of terminal emulators\"\nreadme = \"README.md\"\nrepository = \"https://github.com/beamiter/jterm_core\"\nlicense = \"MIT\"\nkeywords = [\"terminal\", \"pty\", \"parser\", \"jterm\"]\ncategories = [\"command-line-utilities\", \"development-tools\"]\n\n[features]\nsession-parity-tests = []\nterminal-session-actor = [\"jterm_runtime/session-actor\"]\nterminal-session-actor-test-hooks = [\"terminal-session-actor\", \"jterm_runtime/session-actor-test-hooks\"]\n\n[dependencies]\ncrossbeam-channel = \"0.5\"\nparking_lot = \"0.12\"\nlibc = \"0.2.189\"\nlog = \"0.4\"\nlru = \"0.19\"\nmemchr = \"2.8.3\"\nonce_cell = \"1.21\"\ndirs = \"7.0\"\nfuzzy-matcher = \"0.3\"\nsha2 = \"0.10\"\nserde_norway = \"=0.9.42\"\ntoml = \"1.1\"\nunicode-width = \"0.2.3\"\nzstd = \"0.14\"\n\n[dependencies.jterm_engine]\nversion = \"0.1.0\"\npath = \"crates/jterm_engine\"\n\n[dependencies.jterm_remote_client]\nversion = \"0.1.0\"\npath = \"crates/jterm_remote_client\"\n\n[dependencies.jterm_runtime]\nversion = \"0.1.0\"\npath = \"crates/jterm_runtime\"\n\n[dependencies.companion-protocol]\nversion = \"0.1.0\"\ngit = \"https://github.com/beamiter/jcompanion.git\"\nrev = \"9aa569540091524d637a7115b64c587b9177a55b\"\n\n[dependencies.companion-core]\nversion = \"0.1.0\"\ngit = \"https://github.com/beamiter/jcompanion.git\"\nrev = \"9aa569540091524d637a7115b64c587b9177a55b\"\n\n[dependencies.companion-client]\nversion = \"0.1.0\"\ngit = \"https://github.com/beamiter/jcompanion.git\"\nrev = \"9aa569540091524d637a7115b64c587b9177a55b\"\n\n[dependencies.eva-character-atlas]\nversion = \"0.1.0\"\ngit = \"https://github.com/beamiter/jcompanion.git\"\nrev = \"9aa569540091524d637a7115b64c587b9177a55b\"\n\n[dependencies.jagent]\nversion = \"0.7.0\"\ngit = \"https://github.com/beamiter/jagent.git\"\nrev = \"f269c3c6afafcf9b6d60b3cccd741649fdb74576\"\n\n[dependencies.uuid]\nversion = \"~1.26.0\"\nfeatures = [\"v4\", \"serde\"]\n\n[dependencies.serde]\nversion = \"1.0.229\"\nfeatures = [\"derive\", \"rc\"]\n\n[dependencies.serde_json]\nversion = \"1.0.151\"\nfeatures = [\"raw_value\"]\n\n[dependencies.rusqlite]\nversion = \"=0.41.0\"\nfeatures = [\"bundled\", \"fallible_uint\"]\n",
+        "contents": "[package]\nname = \"jterm_core\"\nversion = \"0.2.0\"\nedition = \"2021\"\nrust-version = \"1.89\"\ndescription = \"Shared UI-independent core for the jterm family of terminal emulators\"\nreadme = \"README.md\"\nrepository = \"https://github.com/beamiter/jterm_core\"\nlicense = \"MIT\"\nkeywords = [\"terminal\", \"pty\", \"parser\", \"jterm\"]\ncategories = [\"command-line-utilities\", \"development-tools\"]\n\n[features]\nsession-parity-tests = []\nterminal-session-actor = [\"jterm_runtime/session-actor\"]\nterminal-session-actor-test-hooks = [\"terminal-session-actor\", \"jterm_runtime/session-actor-test-hooks\"]\n\n[dependencies]\ncrossbeam-channel = \"0.5\"\nparking_lot = \"0.12\"\nlibc = \"0.2.189\"\nlog = \"0.4\"\nlru = \"0.19\"\nmemchr = \"2.8.3\"\nonce_cell = \"1.21\"\ndirs = \"7.0\"\nfuzzy-matcher = \"0.3\"\nregex = \"1\"\nsha2 = \"0.10\"\nserde_norway = \"=0.9.42\"\ntoml = \"1.1\"\nunicode-width = \"0.2.3\"\nzstd = \"0.14\"\n\n[dependencies.jterm_engine]\nversion = \"0.1.0\"\npath = \"crates/jterm_engine\"\n\n[dependencies.jterm_protocol]\nversion = \"0.1.0\"\npath = \"crates/jterm_protocol\"\nfeatures = [\"engine-projection\"]\n\n[dependencies.jterm_remote_client]\nversion = \"0.1.0\"\npath = \"crates/jterm_remote_client\"\n\n[dependencies.jterm_runtime]\nversion = \"0.1.0\"\npath = \"crates/jterm_runtime\"\nfeatures = [\"session-actor\"]\n\n[dependencies.companion-protocol]\nversion = \"0.1.0\"\ngit = \"https://github.com/beamiter/jcompanion.git\"\nrev = \"9aa569540091524d637a7115b64c587b9177a55b\"\n\n[dependencies.companion-core]\nversion = \"0.1.0\"\ngit = \"https://github.com/beamiter/jcompanion.git\"\nrev = \"9aa569540091524d637a7115b64c587b9177a55b\"\n\n[dependencies.companion-client]\nversion = \"0.1.0\"\ngit = \"https://github.com/beamiter/jcompanion.git\"\nrev = \"9aa569540091524d637a7115b64c587b9177a55b\"\n\n[dependencies.eva-character-atlas]\nversion = \"0.1.0\"\ngit = \"https://github.com/beamiter/jcompanion.git\"\nrev = \"9aa569540091524d637a7115b64c587b9177a55b\"\n\n[dependencies.jagent]\nversion = \"0.7.0\"\ngit = \"https://github.com/beamiter/jagent.git\"\nrev = \"f269c3c6afafcf9b6d60b3cccd741649fdb74576\"\n\n[dependencies.uuid]\nversion = \"~1.26.0\"\nfeatures = [\"v4\", \"serde\"]\n\n[dependencies.serde]\nversion = \"1.0.229\"\nfeatures = [\"derive\", \"rc\"]\n\n[dependencies.serde_json]\nversion = \"1.0.151\"\nfeatures = [\"raw_value\"]\n\n[dependencies.rusqlite]\nversion = \"=0.41.0\"\nfeatures = [\"bundled\", \"fallible_uint\"]\n",
         "dest": "cargo/vendor/jterm_core",
         "dest-filename": "Cargo.toml"
     },
@@ -1431,7 +1379,7 @@
     {
         "type": "shell",
         "commands": [
-            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-c4bcdb7/crates/jterm_engine\" \"cargo/vendor/jterm_engine\""
+            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-7a32027/crates/jterm_engine\" \"cargo/vendor/jterm_engine\""
         ]
     },
     {
@@ -1449,7 +1397,7 @@
     {
         "type": "shell",
         "commands": [
-            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-c4bcdb7/crates/jterm_gtk_view\" \"cargo/vendor/jterm_gtk_view\""
+            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-7a32027/crates/jterm_gtk_view\" \"cargo/vendor/jterm_gtk_view\""
         ]
     },
     {
@@ -1467,7 +1415,25 @@
     {
         "type": "shell",
         "commands": [
-            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-c4bcdb7/crates/jterm_remote_client\" \"cargo/vendor/jterm_remote_client\""
+            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-7a32027/crates/jterm_protocol\" \"cargo/vendor/jterm_protocol\""
+        ]
+    },
+    {
+        "type": "inline",
+        "contents": "[package]\nname = \"jterm_protocol\"\nversion = \"0.1.0\"\nedition = \"2021\"\nrust-version = \"1.89\"\ndescription = \"Transport-independent terminal wire contracts\"\nlicense = \"MIT\"\npublish = false\n\n[dependencies.serde]\nversion = \"1\"\nfeatures = [\"derive\"]\n\n[dependencies.jterm_engine]\nversion = \"0.1.0\"\npath = \"../jterm_engine\"\noptional = true\n\n[features]\nengine-projection = [\"dep:jterm_engine\"]\n\n[dev-dependencies]\nserde_json = \"1\"\n\n[workspace]\n",
+        "dest": "cargo/vendor/jterm_protocol",
+        "dest-filename": "Cargo.toml"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": null, \"files\": {}}",
+        "dest": "cargo/vendor/jterm_protocol",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "shell",
+        "commands": [
+            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-7a32027/crates/jterm_remote_client\" \"cargo/vendor/jterm_remote_client\""
         ]
     },
     {
@@ -1485,12 +1451,12 @@
     {
         "type": "shell",
         "commands": [
-            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-c4bcdb7/crates/jterm_runtime\" \"cargo/vendor/jterm_runtime\""
+            "cp -r --reflink=auto \"flatpak-cargo/git/jterm_core-7a32027/crates/jterm_runtime\" \"cargo/vendor/jterm_runtime\""
         ]
     },
     {
         "type": "inline",
-        "contents": "[package]\nname = \"jterm_runtime\"\nversion = \"0.1.0\"\nedition = \"2021\"\nrust-version = \"1.89\"\ndescription = \"UI-independent terminal runtime and process helpers\"\nlicense = \"MIT\"\npublish = false\n\n[dependencies]\nlog = \"0.4\"\n\n[dependencies.jterm_engine]\nversion = \"0.1.0\"\npath = \"../jterm_engine\"\noptional = true\n\n[features]\nlinux-pty = [\"terminal\", \"dep:portable-pty\", \"session-actor\"]\nsession-actor = [\"dep:crossbeam-channel\", \"dep:parking_lot\"]\nsession-actor-test-hooks = [\"session-actor\"]\nterminal = [\"dep:jterm_engine\"]\n\n[target.\"cfg(unix)\".dependencies]\nlibc = \"0.2.189\"\n\n[target.\"cfg(unix)\".dependencies.crossbeam-channel]\nversion = \"0.5\"\noptional = true\n\n[target.\"cfg(unix)\".dependencies.parking_lot]\nversion = \"0.12\"\noptional = true\n\n[target.\"cfg(target_os = \\\"linux\\\")\".dependencies.portable-pty]\nversion = \"0.9\"\noptional = true\n\n[workspace]\n",
+        "contents": "[package]\nname = \"jterm_runtime\"\nversion = \"0.1.0\"\nedition = \"2021\"\nrust-version = \"1.89\"\ndescription = \"UI-independent terminal runtime and process helpers\"\nlicense = \"MIT\"\npublish = false\n\n[dependencies]\nlog = \"0.4\"\n\n[dependencies.jterm_engine]\nversion = \"0.1.0\"\npath = \"../jterm_engine\"\noptional = true\n\n[features]\nlinux-pty = [\"terminal\", \"session-actor\"]\nsession-actor = [\"dep:crossbeam-channel\", \"dep:parking_lot\"]\nsession-actor-test-hooks = [\"session-actor\"]\nterminal = [\"dep:jterm_engine\"]\n\n[target.\"cfg(unix)\".dependencies]\nlibc = \"0.2.189\"\n\n[target.\"cfg(unix)\".dependencies.crossbeam-channel]\nversion = \"0.5\"\noptional = true\n\n[target.\"cfg(unix)\".dependencies.parking_lot]\nversion = \"0.12\"\noptional = true\n\n[workspace]\n",
         "dest": "cargo/vendor/jterm_runtime",
         "dest-filename": "Cargo.toml"
     },
@@ -1498,19 +1464,6 @@
         "type": "inline",
         "contents": "{\"package\": null, \"files\": {}}",
         "dest": "cargo/vendor/jterm_runtime",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/lazy_static/lazy_static-1.5.1.crate",
-        "sha256": "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb",
-        "dest": "cargo/vendor/lazy_static-1.5.1"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb\", \"files\": {}}",
-        "dest": "cargo/vendor/lazy_static-1.5.1",
         "dest-filename": ".cargo-checksum.json"
     },
     {
@@ -1711,19 +1664,6 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/nix/nix-0.28.0.crate",
-        "sha256": "ab2156c4fce2f8df6c499cc1c763e4394b7482525bf2a9701c9d79d215f519e4",
-        "dest": "cargo/vendor/nix-0.28.0"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"ab2156c4fce2f8df6c499cc1c763e4394b7482525bf2a9701c9d79d215f519e4\", \"files\": {}}",
-        "dest": "cargo/vendor/nix-0.28.0",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/nix/nix-0.31.3.crate",
         "sha256": "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d",
         "dest": "cargo/vendor/nix-0.31.3"
@@ -1914,19 +1854,6 @@
         "type": "inline",
         "contents": "{\"package\": \"c2a106d1259c23fac8e543272398ae0e3c0b8d33c88ed73d0cc71b0f1d902618\", \"files\": {}}",
         "dest": "cargo/vendor/portable-atomic-util-0.2.7",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/portable-pty/portable-pty-0.9.0.crate",
-        "sha256": "b4a596a2b3d2752d94f51fac2d4a96737b8705dddd311a32b9af47211f08671e",
-        "dest": "cargo/vendor/portable-pty-0.9.0"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"b4a596a2b3d2752d94f51fac2d4a96737b8705dddd311a32b9af47211f08671e\", \"files\": {}}",
-        "dest": "cargo/vendor/portable-pty-0.9.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {
@@ -2348,19 +2275,6 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/serial2/serial2-0.2.39.crate",
-        "sha256": "c924c7ef58d1fb741cfecb65b9b38a9e049841edd1e419544089f0cbb5a127e7",
-        "dest": "cargo/vendor/serial2-0.2.39"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"c924c7ef58d1fb741cfecb65b9b38a9e049841edd1e419544089f0cbb5a127e7\", \"files\": {}}",
-        "dest": "cargo/vendor/serial2-0.2.39",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/sha2/sha2-0.10.9.crate",
         "sha256": "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283",
         "dest": "cargo/vendor/sha2-0.10.9"
@@ -2382,32 +2296,6 @@
         "type": "inline",
         "contents": "{\"package\": \"446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4\", \"files\": {}}",
         "dest": "cargo/vendor/sha2-0.11.0",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/shared_library/shared_library-0.1.9.crate",
-        "sha256": "5a9e7e0f2bfae24d8a5b5a66c5b257a83c7412304311512a0c054cd5e619da11",
-        "dest": "cargo/vendor/shared_library-0.1.9"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"5a9e7e0f2bfae24d8a5b5a66c5b257a83c7412304311512a0c054cd5e619da11\", \"files\": {}}",
-        "dest": "cargo/vendor/shared_library-0.1.9",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/shell-words/shell-words-1.1.1.crate",
-        "sha256": "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77",
-        "dest": "cargo/vendor/shell-words-1.1.1"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77\", \"files\": {}}",
-        "dest": "cargo/vendor/shell-words-1.1.1",
         "dest-filename": ".cargo-checksum.json"
     },
     {
@@ -2556,19 +2444,6 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/thiserror/thiserror-1.0.69.crate",
-        "sha256": "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52",
-        "dest": "cargo/vendor/thiserror-1.0.69"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52\", \"files\": {}}",
-        "dest": "cargo/vendor/thiserror-1.0.69",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/thiserror/thiserror-2.0.20.crate",
         "sha256": "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f",
         "dest": "cargo/vendor/thiserror-2.0.20"
@@ -2577,19 +2452,6 @@
         "type": "inline",
         "contents": "{\"package\": \"ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f\", \"files\": {}}",
         "dest": "cargo/vendor/thiserror-2.0.20",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/thiserror-impl/thiserror-impl-1.0.69.crate",
-        "sha256": "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1",
-        "dest": "cargo/vendor/thiserror-impl-1.0.69"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1\", \"files\": {}}",
-        "dest": "cargo/vendor/thiserror-impl-1.0.69",
         "dest-filename": ".cargo-checksum.json"
     },
     {
@@ -3011,45 +2873,6 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/winapi/winapi-0.3.9.crate",
-        "sha256": "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419",
-        "dest": "cargo/vendor/winapi-0.3.9"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419\", \"files\": {}}",
-        "dest": "cargo/vendor/winapi-0.3.9",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/winapi-i686-pc-windows-gnu/winapi-i686-pc-windows-gnu-0.4.0.crate",
-        "sha256": "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6",
-        "dest": "cargo/vendor/winapi-i686-pc-windows-gnu-0.4.0"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6\", \"files\": {}}",
-        "dest": "cargo/vendor/winapi-i686-pc-windows-gnu-0.4.0",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/winapi-x86_64-pc-windows-gnu/winapi-x86_64-pc-windows-gnu-0.4.0.crate",
-        "sha256": "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f",
-        "dest": "cargo/vendor/winapi-x86_64-pc-windows-gnu-0.4.0"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f\", \"files\": {}}",
-        "dest": "cargo/vendor/winapi-x86_64-pc-windows-gnu-0.4.0",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/windows-link/windows-link-0.2.1.crate",
         "sha256": "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5",
         "dest": "cargo/vendor/windows-link-0.2.1"
@@ -3084,19 +2907,6 @@
         "type": "inline",
         "contents": "{\"package\": \"23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81\", \"files\": {}}",
         "dest": "cargo/vendor/winnow-1.0.4",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/winreg/winreg-0.10.1.crate",
-        "sha256": "80d0f4e272c85def139476380b12f9ac60926689dd2e01d4923222f40580869d",
-        "dest": "cargo/vendor/winreg-0.10.1"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"80d0f4e272c85def139476380b12f9ac60926689dd2e01d4923222f40580869d\", \"files\": {}}",
-        "dest": "cargo/vendor/winreg-0.10.1",
         "dest-filename": ".cargo-checksum.json"
     },
     {
@@ -3192,7 +3002,7 @@
     },
     {
         "type": "inline",
-        "contents": "[source.vendored-sources]\ndirectory = \"cargo/vendor\"\n\n[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.\"https://github.com/beamiter/jcompanion\"]\ngit = \"https://github.com/beamiter/jcompanion\"\nreplace-with = \"vendored-sources\"\nrev = \"9aa569540091524d637a7115b64c587b9177a55b\"\n\n[source.\"https://github.com/beamiter/jagent\"]\ngit = \"https://github.com/beamiter/jagent\"\nreplace-with = \"vendored-sources\"\nrev = \"f269c3c6afafcf9b6d60b3cccd741649fdb74576\"\n\n[source.\"https://github.com/beamiter/jterm_core\"]\ngit = \"https://github.com/beamiter/jterm_core\"\nreplace-with = \"vendored-sources\"\nrev = \"c4bcdb73b27e21deaf4d7d4a608384e20e8963d7\"\n",
+        "contents": "[source.vendored-sources]\ndirectory = \"cargo/vendor\"\n\n[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.\"https://github.com/beamiter/jcompanion\"]\ngit = \"https://github.com/beamiter/jcompanion\"\nreplace-with = \"vendored-sources\"\nrev = \"9aa569540091524d637a7115b64c587b9177a55b\"\n\n[source.\"https://github.com/beamiter/jagent\"]\ngit = \"https://github.com/beamiter/jagent\"\nreplace-with = \"vendored-sources\"\nrev = \"f269c3c6afafcf9b6d60b3cccd741649fdb74576\"\n\n[source.\"https://github.com/beamiter/jterm_core\"]\ngit = \"https://github.com/beamiter/jterm_core\"\nreplace-with = \"vendored-sources\"\nrev = \"7a32027258dfe5f05ec6eaa01b76b5d44396cbf6\"\n",
         "dest": "cargo",
         "dest-filename": "config"
     }

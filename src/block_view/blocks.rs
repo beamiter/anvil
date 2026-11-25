@@ -1462,6 +1462,43 @@ mod tests {
     #[cfg(anvil_shared_terminal)]
     #[test]
     #[ignore = "requires an isolated native GTK display"]
+    fn completed_heading_uses_retained_text_when_legacy_markup_disagrees() {
+        gtk::init().expect("GTK display");
+        let mut config = crate::config::Config::safe_defaults();
+        config.terminal_mode = crate::config::TerminalMode::Block;
+        let command = "  printf value \t\n";
+        let card = super::FinishedBlock::new_with_pool(
+            1,
+            "$ ",
+            command,
+            Some("\x1b[31mlegacy text from a different command\x1b[0m"),
+            "stored result",
+            Some(0),
+            &config,
+            None,
+            None,
+            None,
+            80,
+            &[],
+            "stored result".len(),
+            None,
+            super::FinishedBlockPrecomputed::documents(&config, None),
+        );
+        assert_eq!(
+            card.command_surface().unwrap().document_text().as_deref(),
+            Some(command)
+        );
+        assert_eq!(
+            card.output_surface().document_text().as_deref(),
+            Some("stored result")
+        );
+        assert!(card.command_vte.is_none());
+        assert!(card.output_vte.is_none());
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    #[test]
+    #[ignore = "requires an isolated native GTK display"]
     fn completed_image_cards_share_the_caption_and_keep_the_picture() {
         use gtk::prelude::*;
         use gtk::{gdk, glib};
@@ -4956,40 +4993,47 @@ impl FinishedBlock {
         // after the wrapped feed and discard its prefix before the command's
         // own settling pass expands it again (notably with the 12px default).
         #[cfg(anvil_shared_terminal)]
-        let command_document =
-            if precomputed.document_command && jterm_gtk_view::supports_finished_command(cmd) {
-                let font = crate::font::terminal_font_description(&config.font_desc, config);
-                let command = match cmd_ansi.filter(|markup| !markup.is_empty()) {
-                    Some(markup) => {
-                        jterm_core::screen_replay::project_bounded_command_archive(markup, cmd)
-                            .and_then(|archive| {
-                                jterm_gtk_view::FinishedTextView::archived_command(
-                                    cmd,
-                                    &archive,
-                                    font,
-                                    config.default_font_scale,
-                                    config.foreground,
-                                    &config.palette,
-                                )
-                            })
-                    }
-                    None => jterm_gtk_view::FinishedTextView::command(
-                        cmd,
-                        cmd_bytes.as_slice(),
-                        font,
-                        config.default_font_scale,
-                        config.foreground,
-                        &config.palette,
-                    ),
+        let command_document = if precomputed.document_command && !is_background {
+            let font = crate::font::terminal_font_description(&config.font_desc, config);
+            let display = jterm_core::review_input::safe_multiline_display(
+                cmd,
+                jterm_core::review_input::MAX_REVIEW_INPUT_BYTES,
+            );
+            let archival_command = cmd_ansi.and_then(|markup| {
+                let archive =
+                    jterm_core::screen_replay::project_bounded_command_archive(markup, &display)?;
+                jterm_gtk_view::FinishedTextView::archived_command(
+                    &display,
+                    &archive,
+                    font.clone(),
+                    config.default_font_scale,
+                    config.foreground,
+                    &config.palette,
+                )
+            });
+            let command = archival_command.or_else(|| {
+                let highlighted = if display == cmd && cmd_ansi.is_none_or(str::is_empty) {
+                    std::borrow::Cow::Borrowed(cmd_bytes.as_slice())
+                } else {
+                    std::borrow::Cow::Owned(highlight_command_to_ansi(&display).into_bytes())
                 };
-                command.inspect(|command| {
-                    command.set_terminal_background(config.background);
-                    command.set_background(precomputed.document_background.filter(|_| !chat));
-                    command.install_links(crate::shared_terminal::SharedTerminal::document_links());
-                })
-            } else {
-                None
-            };
+                jterm_gtk_view::FinishedTextView::command(
+                    &display,
+                    &highlighted,
+                    font,
+                    config.default_font_scale,
+                    config.foreground,
+                    &config.palette,
+                )
+            });
+            command.inspect(|command| {
+                command.set_terminal_background(config.background);
+                command.set_background(precomputed.document_background.filter(|_| !chat));
+                command.install_links(crate::shared_terminal::SharedTerminal::document_links());
+            })
+        } else {
+            None
+        };
         #[cfg(anvil_shared_terminal)]
         let uses_command_vte = !is_background && command_document.is_none();
         #[cfg(not(anvil_shared_terminal))]
