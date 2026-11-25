@@ -583,7 +583,7 @@ enum SharedPaneKind {
 fn shared_explicit_command_admitted() -> bool {
     #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
     {
-        jterm_gtk_view::RuntimeShell::admits_explicit_command(host::is_flatpak())
+        host::bridge_available() && jterm_gtk_view::RuntimeShell::admits_explicit_command(false)
     }
     #[cfg(not(all(anvil_shared_terminal, target_os = "linux")))]
     {
@@ -1053,7 +1053,8 @@ impl SimpleComponent for AppModel {
         };
         #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
         let ordinary_shell = init.execute.is_none()
-            && jterm_gtk_view::RuntimeShell::supports_local_shell(&shell_argv, host::is_flatpak());
+            && host::bridge_available()
+            && jterm_gtk_view::RuntimeShell::supports_local_shell(&shell_argv, false);
         #[cfg(not(all(anvil_shared_terminal, target_os = "linux")))]
         let ordinary_shell = false;
         let explicit_command = init.execute.is_some() && shared_explicit_command_admitted();

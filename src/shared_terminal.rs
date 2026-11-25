@@ -120,6 +120,10 @@ impl SharedTerminal {
     ) -> Option<Self> {
         let home = std::env::var("HOME").ok();
         let cwd = cwd.or(home.as_deref());
+        if crate::host::is_flatpak() {
+            let argv = RuntimeShell::configured_shell_argv(argv, session_id)?;
+            return Self::open_host_command(config, &argv, cwd);
+        }
         let result = RuntimeShell::spawn_session_candidate(
             argv,
             cwd,
@@ -163,18 +167,32 @@ impl SharedTerminal {
     ) -> Option<Self> {
         let home = std::env::var("HOME").ok();
         let launch = crate::agent_cli::inline_argv(argv);
-        let result = RuntimeShell::spawn_explicit_command(
-            &launch,
-            cwd.or(home.as_deref()),
-            crate::host::is_flatpak(),
-            || {
+        let cwd = cwd.or(home.as_deref());
+        if crate::host::is_flatpak() {
+            return Self::open_host_command(config, &launch, cwd);
+        }
+        let result =
+            RuntimeShell::spawn_explicit_command(&launch, cwd, crate::host::is_flatpak(), || {
                 Self::runtime_environment(
                     argv,
                     config.borrow().vim9.auto_gui,
                     &jterm_gtk_view::INTERACTIVE_CHILD_ENV,
                 )
-            },
-        );
+            });
+        Self::from_runtime(config, &launch, result, false)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_host_command(
+        config: Rc<RefCell<Config>>,
+        argv: &[String],
+        cwd: Option<&str>,
+    ) -> Option<Self> {
+        let environment = &jterm_gtk_view::INTERACTIVE_CHILD_ENV;
+        let launch = crate::host::wrap_argv(argv, cwd, environment);
+        let result = RuntimeShell::spawn_explicit_command(&launch, Some("/"), false, || {
+            Self::runtime_environment(argv, config.borrow().vim9.auto_gui, environment)
+        });
         Self::from_runtime(config, &launch, result, false)
     }
 
