@@ -970,7 +970,7 @@ impl AppModel {
         let config = self.config.borrow();
         let index = config::unique_checked_remote_profile_index(
             &config.remote_hosts,
-            conn.configured_profile(),
+            conn.configured_profile()?,
         )?;
         Some((
             remote_fs::FsLocation::Remote(index),

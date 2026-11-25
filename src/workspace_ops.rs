@@ -1219,7 +1219,7 @@ impl AppModel {
                         pane_id,
                         restored_sid.clone(),
                     );
-                    match config::checked_remote_argv(&connection.host) {
+                    match connection.checked_launch_argv() {
                         Ok(shell_argv) => {
                             let shell_argv = Rc::new(shell_argv);
                             let pane = create_pane(
@@ -1387,11 +1387,14 @@ impl AppModel {
             let pane = tab.panes.iter().find(|p| p.widget() == *widget);
             let (mode, cwd, cwd_external, remote_name, sid, history_id, cmds) = match pane {
                 Some(p) => {
-                    let managed_remote =
+                    let remote =
                         tab.remote.as_ref().filter(|remote| remote.pane_id == p.id);
+                    if remote.is_some_and(RemoteConn::is_temporary) {
+                        return session::PaneLayout::empty_leaf();
+                    }
                     let cmds = snapshot_restorable_command(
-                        managed_remote.is_some(),
-                        if managed_remote.is_some() {
+                        remote.is_some(),
+                        if remote.is_some() {
                             None
                         } else {
                             p.restorable_command()
@@ -1411,7 +1414,9 @@ impl AppModel {
                         .to_string(),
                         p.cwd.clone(),
                         cwd_external,
-                        managed_remote.map(|remote| remote.configured_profile().name.clone()),
+                        remote
+                            .and_then(RemoteConn::configured_profile)
+                            .map(|profile| profile.name.clone()),
                         p.session_id.clone(),
                         Some(p.history_id),
                         cmds,
@@ -1477,9 +1482,14 @@ impl AppModel {
             .into_iter()
             .map(|index| {
                 let t = &self.tabs[index];
+                let temporary = t.remote.as_ref().is_some_and(RemoteConn::is_temporary);
                 session::SavedTab::captured(
-                    t.title.clone(),
-                    t.custom_title,
+                    if temporary {
+                        default_tab_title(index as u32 + 1, None)
+                    } else {
+                        t.title.clone()
+                    },
+                    t.custom_title && !temporary,
                     t.pinned,
                     t.private_title,
                     self.serialize_layout(t),
@@ -1838,15 +1848,7 @@ impl AppModel {
         host: &config::RemoteHost,
         sender: &ComponentSender<AppModel>,
     ) {
-        let argv = match config::checked_remote_argv(host) {
-            Ok(argv) => Rc::new(argv),
-            Err(message) => {
-                log::warn!("Remote connection rejected by execution gate: {message}");
-                self.show_toast(message);
-                return;
-            }
-        };
-        self.add_remote_tab_with_argv(host, argv, sender);
+        self.add_remote_connection(RemoteConn::new(host.clone(), self.next_pane_id), sender);
     }
 
     /// Open an unsaved, process-observed target as a plain interactive SSH
@@ -1857,29 +1859,28 @@ impl AppModel {
         host: &config::RemoteHost,
         sender: &ComponentSender<AppModel>,
     ) {
-        let argv = match config::checked_interactive_ssh_argv(host) {
+        self.add_remote_connection(RemoteConn::temporary(host.clone(), self.next_pane_id), sender);
+    }
+
+    fn add_remote_connection(
+        &mut self,
+        connection: RemoteConn,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        let argv = match connection.checked_launch_argv() {
             Ok(argv) => Rc::new(argv),
             Err(message) => {
-                log::warn!("Temporary SSH connection rejected by execution gate: {message}");
+                log::warn!("Remote connection rejected by execution gate: {message}");
                 self.show_toast(message);
                 return;
             }
         };
-        self.add_remote_tab_with_argv(host, argv, sender);
-    }
-
-    fn add_remote_tab_with_argv(
-        &mut self,
-        host: &config::RemoteHost,
-        argv: Rc<Vec<String>>,
-        sender: &ComponentSender<AppModel>,
-    ) {
         if !self.ensure_persisted_tab_capacity(true) {
             return;
         }
         let id = self.next_id;
         self.next_id += 1;
-        let pane_id = self.next_pane_id;
+        let pane_id = connection.pane_id;
         self.next_pane_id += 1;
         // Remote sessions need OSC 133/7/7770 parsing for blocks, cwd updates,
         // resumable session ids, and Agent observations. Keep them on the Block
@@ -1911,7 +1912,7 @@ impl AppModel {
             holder,
             panes: vec![pane],
             active_pane: 0,
-            title: host.name.clone(),
+            title: connection.host.name.clone(),
             custom_title: true,
             bell: false,
             activity: false,
@@ -1920,7 +1921,7 @@ impl AppModel {
             private_title: false,
             id,
             zoom: None,
-            remote: Some(RemoteConn::new(host.clone(), pane_id)),
+            remote: Some(connection),
         };
         self.insert_tab_after_active(tab);
         self.select_tab(id, sender);
@@ -2032,11 +2033,9 @@ impl AppModel {
         let Some(conn) = self.tabs[idx].remote.clone() else {
             return;
         };
-        // The gate above revalidated the immutable configured profile. Build
-        // from the frozen runtime host so only its learned/restored session may
-        // differ, and validate again immediately adjacent to execution.
-        let host_now = conn.host.clone();
-        let argv = match config::checked_remote_argv(&host_now) {
+        // Revalidate the original launch next to execution. A temporary Files
+        // connection reconnects with the same plain interactive argv contract.
+        let argv = match conn.checked_launch_argv() {
             Ok(argv) => Rc::new(argv),
             Err(message) => {
                 log::warn!("Remote reconnect rejected by execution gate: {message}");
@@ -2087,7 +2086,7 @@ impl AppModel {
         self.tabs[idx].holder.append(&pane.widget());
         self.tabs[idx].panes = vec![pane];
         self.tabs[idx].active_pane = 0;
-        self.tabs[idx].title = host_now.name.clone();
+        self.tabs[idx].title = conn.host.name;
         if let Some(c) = self.tabs[idx].remote.as_mut() {
             c.pane_id = new_pane_id;
             c.status = ConnStatus::Connecting;
@@ -2116,11 +2115,10 @@ impl AppModel {
             self.tabs[idx].zoom.is_some(),
             Some(connection.pane_id),
             pane_id,
-        ) && config::unique_checked_remote_profile_index(
-            &self.config.borrow().remote_hosts,
-            connection.configured_profile(),
-        )
-        .is_some()
+        ) && connection.configured_profile().is_none_or(|profile| {
+            config::unique_checked_remote_profile_index(&self.config.borrow().remote_hosts, profile)
+                .is_some()
+        })
     }
 
     /// Cancel a stale reconnect and remove only its dead remote leaf. Live

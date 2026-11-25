@@ -353,12 +353,12 @@ pub(crate) enum ConnStatus {
 
 #[derive(Clone)]
 pub(crate) struct RemoteConn {
-    /// Runtime launch target. It starts as `configured_profile` and may differ
-    /// only in `session`, which jsh learns or a validated snapshot restores.
+    /// Runtime target of the original launch, with an optional learned session.
     pub(crate) host: config::RemoteHost,
     /// Immutable full profile that authorized this connection. Runtime session
     /// learning must never erase the identity used for config remap/revocation.
-    configured_profile: config::RemoteHost,
+    /// A temporary interactive launch has no configured profile.
+    configured_profile: Option<config::RemoteHost>,
     /// Stable identity of the pane that owns this connection. A tab can also
     /// contain local split panes, so tab-level metadata alone is ambiguous.
     pub(crate) pane_id: u64,
@@ -372,6 +372,10 @@ impl RemoteConn {
         Self::with_session_override(configured_profile, pane_id, None)
     }
 
+    pub(crate) fn temporary(host: config::RemoteHost, pane_id: u64) -> Self {
+        Self::from_target(host, None, pane_id)
+    }
+
     /// Restore a managed profile while allowing the separately validated pane
     /// snapshot to override only its runtime jsh session id.
     pub(crate) fn with_session_override(
@@ -383,6 +387,14 @@ impl RemoteConn {
         if let Some(session) = session_override.filter(|value| config::valid_session_id(value)) {
             host.session = Some(session);
         }
+        Self::from_target(host, Some(configured_profile), pane_id)
+    }
+
+    fn from_target(
+        host: config::RemoteHost,
+        configured_profile: Option<config::RemoteHost>,
+        pane_id: u64,
+    ) -> Self {
         Self {
             host,
             configured_profile,
@@ -393,8 +405,20 @@ impl RemoteConn {
         }
     }
 
-    pub(crate) fn configured_profile(&self) -> &config::RemoteHost {
-        &self.configured_profile
+    pub(crate) fn configured_profile(&self) -> Option<&config::RemoteHost> {
+        self.configured_profile.as_ref()
+    }
+
+    pub(crate) fn is_temporary(&self) -> bool {
+        self.configured_profile.is_none()
+    }
+
+    pub(crate) fn checked_launch_argv(&self) -> Result<Vec<String>, &'static str> {
+        if self.is_temporary() {
+            config::checked_interactive_ssh_argv(&self.host)
+        } else {
+            config::checked_remote_argv(&self.host)
+        }
     }
 
     /// Learn the authenticated runtime session without changing configured
@@ -467,12 +491,12 @@ mod remote_conn_tests {
         let profile = configured_profile();
         let mut connection = RemoteConn::new(profile.clone(), 7);
 
-        assert_eq!(connection.configured_profile(), &profile);
+        assert_eq!(connection.configured_profile(), Some(&profile));
         assert_eq!(connection.host, profile);
         assert!(connection.learn_session("learned-session".to_string()));
         assert_eq!(connection.host.session.as_deref(), Some("learned-session"));
         assert_eq!(
-            connection.configured_profile().session.as_deref(),
+            connection.configured_profile().unwrap().session.as_deref(),
             Some("configured-session"),
             "runtime OSC state must not rewrite config identity"
         );
@@ -487,7 +511,7 @@ mod remote_conn_tests {
             Some("restored-session".to_string()),
         );
 
-        assert_eq!(connection.configured_profile(), &profile);
+        assert_eq!(connection.configured_profile(), Some(&profile));
         assert_eq!(connection.host.name, profile.name);
         assert_eq!(connection.host.host, profile.host);
         assert_eq!(connection.host.user, profile.user);
@@ -499,5 +523,21 @@ mod remote_conn_tests {
             Some("invalid session".to_string()),
         );
         assert_eq!(invalid.host, profile, "invalid overrides fail closed");
+    }
+
+    #[test]
+    fn temporary_reconnect_reuses_the_plain_interactive_launch() {
+        let target = configured_profile();
+        let expected = config::checked_interactive_ssh_argv(&target).unwrap();
+        let mut connection = RemoteConn::temporary(target, 7);
+
+        assert!(connection.configured_profile().is_none());
+        assert_eq!(connection.checked_launch_argv().unwrap(), expected);
+        assert!(connection.learn_session("remote-shell-session".to_owned()));
+        assert_eq!(connection.checked_launch_argv().unwrap(), expected);
+        assert_eq!(
+            expected.last().map(String::as_str),
+            Some("deploy@staging.example.com")
+        );
     }
 }
