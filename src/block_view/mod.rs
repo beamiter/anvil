@@ -1357,7 +1357,7 @@ fn resolve_command_text(
         };
         return (text, CommandTextSource::ScreenAfterTruncation);
     }
-    if let Some(command) = reported {
+    if let Some(command) = reported.filter(|command| !command.trim().is_empty()) {
         return (command.to_string(), CommandTextSource::ShellReported);
     }
     (scraped.to_string(), CommandTextSource::Screen)
@@ -7289,18 +7289,14 @@ impl ReaderCtx {
         // Finalize the previous command (deferred from CommandEnd),
         // or turn commandless async output into a first-class block.
         if completes_record {
-            // The VTE-text capture taken at CommandStart is
-            // authoritative — it reflects what was on screen
-            // when the user pressed Enter. Fall back to the
-            // keystroke shadow only if the VTE read came back
-            // empty (which would indicate the prompt-end
-            // anchor never captured a valid cursor position).
             let mut cmd = if is_background {
                 String::new()
             } else {
+                let engine = self.engine.borrow();
                 finished_command(
-                    &self.engine.borrow().vte_typed_cmd,
+                    &engine.vte_typed_cmd,
                     &self.typed_cmd_rc.borrow(),
+                    engine.pending_command_source,
                 )
             };
 
@@ -8492,12 +8488,17 @@ fn build_journal_completion(
     })
 }
 
-/// Pick the command text recorded for a finished block.  The live VTE is the
-/// most faithful source (history recall, cursor editing, suggestions), but its
-/// `feed()` updates can still be queued when OSC 133;C is handled.  Keep the
-/// input shadow as a fallback for that race instead of dropping the block.
-fn finished_command(vte_capture: &str, input_shadow: &str) -> String {
-    let captured = vte_capture.trim();
+/// Preserve the shell's exact spelling and trim padding from screen captures.
+/// Use the input shadow when the renderer has not yet received the command.
+fn finished_command(
+    recorded: &str,
+    input_shadow: &str,
+    source: CommandTextSource,
+) -> String {
+    if source == CommandTextSource::ShellReported {
+        return recorded.to_string();
+    }
+    let captured = recorded.trim();
     if captured.is_empty() {
         input_shadow.trim().to_string()
     } else {
@@ -27576,15 +27577,24 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
 
     #[test]
     fn command_finalize_falls_back_when_vte_feed_has_not_rendered_yet() {
-        assert_eq!(finished_command("", "git status"), "git status");
-        assert_eq!(finished_command("  ", "git status"), "git status");
+        for rendered in ["", "  "] {
+            assert_eq!(
+                finished_command(rendered, "git status", CommandTextSource::Screen),
+                "git status"
+            );
+        }
     }
 
     #[test]
     fn command_finalize_prefers_vte_capture_for_edited_or_recalled_input() {
         assert_eq!(
-            finished_command("git status --short", "git status"),
+            finished_command("git status --short", "git status", CommandTextSource::Screen),
             "git status --short"
+        );
+        let reported = "  git status --short \t\n";
+        assert_eq!(
+            finished_command(reported, "git status", CommandTextSource::ShellReported),
+            reported
         );
     }
 
