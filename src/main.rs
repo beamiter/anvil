@@ -574,10 +574,15 @@ struct AppModel {
 }
 
 #[derive(Clone, Copy)]
-enum SharedPaneKind {
+#[cfg_attr(not(all(anvil_shared_terminal, target_os = "linux")), allow(dead_code))]
+enum SharedPaneKind<'a> {
     ConfiguredShell,
     HostedAttachment,
     ExplicitCommand,
+    Task {
+        pinned_directory: Option<std::os::fd::BorrowedFd<'a>>,
+        inline_agent: bool,
+    },
 }
 
 fn shared_explicit_command_admitted() -> bool {
@@ -606,7 +611,7 @@ fn create_pane(
     history: block_view::PaneHistoryInit,
     cwd_external: bool,
     env_extra: Vec<(String, String)>,
-    shared_kind: Option<SharedPaneKind>,
+    shared_kind: Option<SharedPaneKind<'_>>,
     sender: &ComponentSender<AppModel>,
 ) -> Pane {
     // New Block panes use the existing native retained command-card backend.
@@ -792,7 +797,7 @@ fn create_pane(
 
 #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
 fn setup_shared_pane(
-    kind: SharedPaneKind,
+    kind: SharedPaneKind<'_>,
     init: &VteInit,
     tab_id: u64,
     pane_id: u64,
@@ -800,7 +805,7 @@ fn setup_shared_pane(
 ) -> Option<TermCtl> {
     if !matches!(init.mode, TerminalMode::Vte)
         || init.working_directory_external
-        || !init.env_extra.is_empty()
+        || (!matches!(kind, SharedPaneKind::Task { .. }) && !init.env_extra.is_empty())
     {
         return None;
     }
@@ -825,6 +830,17 @@ fn setup_shared_pane(
             init.config.clone(),
             &init.shell_argv,
             init.working_directory.as_deref(),
+        ),
+        SharedPaneKind::Task {
+            pinned_directory,
+            inline_agent,
+        } => shared_terminal::SharedTerminal::open_task(
+            init.config.clone(),
+            &init.shell_argv,
+            init.working_directory.as_deref(),
+            pinned_directory,
+            &init.env_extra,
+            inline_agent,
         ),
     }?;
     let configured_shell = matches!(kind, SharedPaneKind::ConfiguredShell);

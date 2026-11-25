@@ -6,6 +6,7 @@
 
 use super::*;
 use jterm_core::pane_layout::{directional_focus_target, PaneRect, Rect as PaneBounds};
+use std::os::fd::BorrowedFd;
 
 const PERSISTENCE_FAILURE_NOTICE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -14,23 +15,30 @@ const PERSISTENCE_FAILURE_NOTICE_COOLDOWN: std::time::Duration = std::time::Dura
 /// Both halves are stamped on the same pane in the same breath, and neither is
 /// meaningful on its own: the role decides how the task manager treats the
 /// terminal, the session id is what it binds to.
-pub(crate) struct TaskTerminalIdentity {
+pub(crate) struct TaskTerminalIdentity<'a> {
     pub(crate) role: crate::agent_task::TaskTerminalRole,
     pub(crate) session_id: String,
+    pub(crate) pinned_directory: Option<BorrowedFd<'a>>,
 }
 
-enum CommandTab {
+enum CommandTab<'a> {
     Explicit,
     Helper(String),
     HostedAttachment(String),
-    Task(String),
+    Task {
+        title: String,
+        role: crate::agent_task::TaskTerminalRole,
+        pinned_directory: Option<BorrowedFd<'a>>,
+    },
 }
 
-impl CommandTab {
+impl CommandTab<'_> {
     fn title(&self) -> Option<&str> {
         match self {
             Self::Explicit => None,
-            Self::Helper(title) | Self::HostedAttachment(title) | Self::Task(title) => Some(title),
+            Self::Helper(title) | Self::HostedAttachment(title) | Self::Task { title, .. } => {
+                Some(title)
+            }
         }
     }
 }
@@ -1014,20 +1022,23 @@ impl AppModel {
         argv: Vec<String>,
         working_directory: Option<String>,
         env_extra: Vec<(String, String)>,
-        identity: TaskTerminalIdentity,
+        identity: TaskTerminalIdentity<'_>,
         sender: &ComponentSender<AppModel>,
     ) -> Option<(u64, u64)> {
         let (tab_id, pane_id) = self.add_tab_full_inner(
             InitialCommands::default(),
             working_directory,
             Rc::new(argv),
-            Some(CommandTab::Task(title.to_string())),
+            Some(CommandTab::Task {
+                title: title.to_string(),
+                role: identity.role,
+                pinned_directory: identity.pinned_directory,
+            }),
             env_extra,
             sender,
         )?;
         let tab = self.tabs.iter_mut().find(|tab| tab.id == tab_id)?;
         let pane = tab.panes.iter_mut().find(|pane| pane.id == pane_id)?;
-        pane.task_role = Some(identity.role);
         if identity.role == crate::agent_task::TaskTerminalRole::Agent {
             if let TermCtl::Vte(controller) = &pane.terminal {
                 crate::block_view::install_inline_cli_reading(controller.model().terminal());
@@ -1045,7 +1056,7 @@ impl AppModel {
         initial_commands: InitialCommands,
         working_directory: Option<String>,
         shell_argv: Rc<Vec<String>>,
-        command: Option<CommandTab>,
+        command: Option<CommandTab<'_>>,
         env_extra: Vec<(String, String)>,
         sender: &ComponentSender<AppModel>,
     ) -> Option<(u64, u64)> {
@@ -1065,15 +1076,22 @@ impl AppModel {
         };
         let shared_kind = match &command {
             None => Some(SharedPaneKind::ConfiguredShell),
+            Some(CommandTab::Task {
+                pinned_directory,
+                role,
+                ..
+            }) => Some(SharedPaneKind::Task {
+                pinned_directory: *pinned_directory,
+                inline_agent: *role == crate::agent_task::TaskTerminalRole::Agent,
+            }),
             Some(_) if self.safe_mode => None,
             Some(CommandTab::HostedAttachment(_)) => Some(SharedPaneKind::HostedAttachment),
             Some(CommandTab::Explicit | CommandTab::Helper(_)) => {
                 Some(SharedPaneKind::ExplicitCommand)
             }
-            Some(CommandTab::Task(_)) => None,
         };
         let title_cwd = working_directory.clone();
-        let pane = create_pane(
+        let mut pane = create_pane(
             &self.config,
             &self.kbmap,
             &self.organism_hub,
@@ -1090,6 +1108,9 @@ impl AppModel {
             shared_kind,
             sender,
         );
+        if let Some(CommandTab::Task { role, .. }) = &command {
+            pane.task_role = Some(*role);
+        }
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         holder.set_hexpand(true);
         holder.set_vexpand(true);

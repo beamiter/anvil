@@ -1147,6 +1147,7 @@ impl AppModel {
             crate::workspace_ops::TaskTerminalIdentity {
                 role: TaskTerminalRole::Agent,
                 session_id: String::new(),
+                pinned_directory: None,
             },
             sender,
         ) else {
@@ -1332,6 +1333,7 @@ impl AppModel {
             crate::workspace_ops::TaskTerminalIdentity {
                 role: TaskTerminalRole::Validation,
                 session_id: String::new(),
+                pinned_directory: Some(std::os::fd::AsFd::as_fd(&prepared.pinned_cwd)),
             },
             sender,
         ) else {

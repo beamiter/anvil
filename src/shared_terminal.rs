@@ -138,7 +138,7 @@ impl SharedTerminal {
                 )
             },
         );
-        Self::from_runtime(config, argv, result, false)
+        Self::from_runtime(config, argv, result, false, false)
     }
 
     #[cfg(target_os = "linux")]
@@ -156,7 +156,7 @@ impl SharedTerminal {
                 &jterm_gtk_view::INTERACTIVE_CHILD_ENV,
             )
         });
-        Self::from_runtime(config, &launch, result, true)
+        Self::from_runtime(config, &launch, result, true, false)
     }
 
     #[cfg(target_os = "linux")]
@@ -179,7 +179,40 @@ impl SharedTerminal {
                     &jterm_gtk_view::INTERACTIVE_CHILD_ENV,
                 )
             });
-        Self::from_runtime(config, &launch, result, false)
+        Self::from_runtime(config, &launch, result, false, false)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_task(
+        config: Rc<RefCell<Config>>,
+        argv: &[String],
+        cwd: Option<&str>,
+        pinned_directory: Option<std::os::fd::BorrowedFd<'_>>,
+        env_extra: &[(String, String)],
+        inline_agent: bool,
+    ) -> Option<Self> {
+        let host_bridge = crate::host::is_flatpak();
+        if host_bridge && pinned_directory.is_some() {
+            return None;
+        }
+        let home = std::env::var("HOME").ok();
+        let cwd = cwd.or(home.as_deref());
+        let vim = if env_extra.is_empty() {
+            crate::vim9_ide::shell_environment(argv, config.borrow().vim9.auto_gui)
+        } else {
+            Vec::new()
+        };
+        let extra: Vec<_> = vim
+            .iter()
+            .chain(env_extra)
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let launch = crate::host::wrap_argv(&crate::agent_cli::inline_argv(argv), cwd, &extra);
+        let local_cwd = if host_bridge { Some("/") } else { cwd };
+        let result = Self::captured_runtime_environment(&extra).and_then(|environment| {
+            RuntimeShell::spawn_pane_command(&launch, local_cwd, pinned_directory, environment)
+        });
+        Self::from_runtime(config, &launch, result.map(Some), false, inline_agent)
     }
 
     #[cfg(target_os = "linux")]
@@ -193,7 +226,7 @@ impl SharedTerminal {
         let result = RuntimeShell::spawn_explicit_command(&launch, Some("/"), false, || {
             Self::runtime_environment(argv, config.borrow().vim9.auto_gui, environment)
         });
-        Self::from_runtime(config, &launch, result, false)
+        Self::from_runtime(config, &launch, result, false, false)
     }
 
     #[cfg(target_os = "linux")]
@@ -202,6 +235,7 @@ impl SharedTerminal {
         argv: &[String],
         result: Result<Option<Rc<RuntimeShell>>, String>,
         hosted_attachment: bool,
+        inline_task: bool,
     ) -> Option<Self> {
         let build = |runtime: Rc<RuntimeShell>| {
             let pid = runtime
@@ -211,6 +245,8 @@ impl SharedTerminal {
                 crate::gtk_process::Guard::capture(pid, RuntimeShell::candidate_program(argv));
             let mount = if hosted_attachment {
                 TerminalPane::with_hosted_attachment
+            } else if inline_task {
+                TerminalPane::with_inline_task
             } else {
                 TerminalPane::with_runtime_embedded
             };
@@ -305,10 +341,6 @@ impl SharedTerminal {
         auto_gui: bool,
         terminal_env: &[(&str, &str)],
     ) -> Result<Vec<std::ffi::CString>, String> {
-        let policy = jterm_core::child_env::ChildEnv {
-            less_default: Some("R"),
-            ..jterm_core::child_env::ChildEnv::from_identity()
-        };
         let vim = crate::vim9_ide::shell_environment(argv, auto_gui);
         let extra = terminal_env
             .iter()
@@ -318,7 +350,18 @@ impl SharedTerminal {
                     .map(|(name, value)| (name.as_str(), value.as_str())),
             )
             .collect::<Vec<_>>();
-        let env = jterm_core::child_env::envp_from_captured(&policy, &extra)
+        Self::captured_runtime_environment(&extra)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn captured_runtime_environment(
+        extra: &[(&str, &str)],
+    ) -> Result<Vec<std::ffi::CString>, String> {
+        let policy = jterm_core::child_env::ChildEnv {
+            less_default: Some("R"),
+            ..jterm_core::child_env::ChildEnv::from_identity()
+        };
+        let env = jterm_core::child_env::envp_from_captured(&policy, extra)
             .map_err(|error| error.to_string())?;
         let mut env = crate::agent_cli::environment(env);
         env.retain(|item| {
