@@ -2431,6 +2431,13 @@ fn resolve_configured_shell(token: &str) -> Option<PathBuf> {
 }
 
 pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
+    if crate::host::is_flatpak() {
+        if let Some(shell) = configured_shell.filter(|shell| !shell.trim().is_empty()) {
+            // The bridge resolves the configured path in the host namespace.
+            return vec![shell.to_owned()];
+        }
+    }
+
     // Explicit config / env var wins (needed when PATH is stripped by launchers like wofi).
     if let Some(token) = configured_shell {
         match resolve_configured_shell(token) {

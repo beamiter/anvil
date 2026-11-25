@@ -3467,12 +3467,39 @@ fn init_logging() {
 
 fn validate_launch_options(options: &mut cli::LaunchOptions) -> Result<(), String> {
     if let Some(directory) = options.working_directory.as_mut() {
-        *directory = launch_path::resolve(directory, options.ide)?;
+        *directory = if host::is_flatpak() && !options.ide {
+            let absolute = std::path::absolute(directory.as_path()).map_err(|error| {
+                format!("cannot open directory {}: {error}", directory.display())
+            })?;
+            let path = absolute.to_str().ok_or_else(|| {
+                format!(
+                    "launch path {} contains non-UTF-8 bytes",
+                    absolute.display()
+                )
+            })?;
+            if !host::working_directory_available(path) {
+                return Err(format!(
+                    "working directory does not exist or is not a directory: {path}"
+                ));
+            }
+            absolute
+        } else {
+            launch_path::resolve(directory, options.ide)?
+        };
     }
     if let Some(argv) = &options.execute {
         let executable = argv.first().expect("CLI parser rejects empty commands");
         let path = std::path::Path::new(executable);
-        let found = if shared_explicit_command_admitted() {
+        let found = if host::is_flatpak() {
+            if path.is_absolute() {
+                flatpak_executable_available(path)
+            } else if executable.contains('/') {
+                let base = options.working_directory.clone().or_else(dirs::home_dir);
+                base.is_some_and(|base| flatpak_executable_available(&base.join(path)))
+            } else {
+                host::command_available(executable)
+            }
+        } else if shared_explicit_command_admitted() {
             let cwd = options
                 .working_directory
                 .as_deref()
@@ -3502,6 +3529,24 @@ fn validate_launch_options(options: &mut cli::LaunchOptions) -> Result<(), Strin
         }
     }
     Ok(())
+}
+
+fn flatpak_executable_available(path: &std::path::Path) -> bool {
+    let mut probe = host::command("/bin/sh");
+    probe
+        .args([
+            "-c",
+            "test -f \"$1\" && test -x \"$1\"",
+            "anvil-executable-probe",
+        ])
+        .arg(path);
+    jterm_core::helper::bounded_command_output(
+        &mut probe,
+        4 * 1024,
+        4 * 1024,
+        std::time::Duration::from_millis(500),
+    )
+    .is_ok_and(|output| output.status.success())
 }
 
 fn init_config_file() -> Result<(), String> {
