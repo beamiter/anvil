@@ -904,6 +904,12 @@ impl Component for BlockTerminal {
                 init.probe.shell_pid.set(view.pid_i32());
                 init.probe.pty_fd.set(view.pty_fd_i32());
                 connect_view_outputs(&view, &sender, &terminal_done);
+                if init.working_directory_external {
+                    let sender = sender.clone();
+                    view.connect_first_pty_output(move || {
+                        let _ = sender.output(VteOutput::Activity);
+                    });
+                }
                 // Needs the `Rc` the component holds: the menu's items call
                 // back into the view, and the gesture lives on a widget the
                 // view itself owns.

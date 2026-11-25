@@ -4672,6 +4672,7 @@ pub struct TermView {
     bell_callbacks: VoidCallbacks,
     title_callbacks: StrCallbacks,
     activity_callbacks: VoidCallbacks,
+    first_pty_output: Rc<jterm_core::pty_reader::FirstPtyOutput>,
     human_input_callbacks: HumanInputCallbacks,
     alt_screen_callbacks: AltScreenCallbacks,
     command_started_callbacks: CommandStartedCallbacks,
@@ -11148,7 +11149,12 @@ impl ReaderCtx {
     /// `live_vte` is passed in rather than read back off the backend:
     /// `ReaderCtx` itself no longer names widget types, and the selection
     /// hold's VTE hooks are wiring, not lifecycle dispatch.
-    fn install(self, pty: &Rc<OwnedPty>, live_vte: Option<&Terminal>) -> std::io::Result<()> {
+    fn install(
+        self,
+        pty: &Rc<OwnedPty>,
+        live_vte: Option<&Terminal>,
+        first_pty_output: Rc<jterm_core::pty_reader::FirstPtyOutput>,
+    ) -> std::io::Result<()> {
         // Installed ahead of the live VTE's own commit handler (TermView::new
         // connects that one later), so the hold reads the CPR ledger before
         // the handler settles a matched report.
@@ -11182,6 +11188,7 @@ impl ReaderCtx {
                 if data.is_empty() {
                     return;
                 }
+                first_pty_output.observe(&data);
                 let origin = read_at.and_then(|at| ctx.watch_reader.fresh_origin(at));
                 if ctx.selection_feed_hold.try_buffer(&data) {
                     return;
@@ -14125,6 +14132,7 @@ impl TermView {
         }
         let title_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
         let activity_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
+        let first_pty_output = Rc::new(jterm_core::pty_reader::FirstPtyOutput::default());
         let human_input_callbacks: HumanInputCallbacks = Rc::new(RefCell::new(vec![]));
         {
             let onboarding = block_onboarding.clone();
@@ -14718,7 +14726,7 @@ impl TermView {
                 selection_feed_hold: selection_feed_hold.clone(),
                 watch_reader: watch_reader.clone(),
             }
-            .install(&pty, active_vte.as_ref())?;
+            .install(&pty, active_vte.as_ref(), first_pty_output.clone())?;
 
             // Shells without OSC 133 never emit PromptEnd, so the normal
             // integration-driven replay path above would leave startup/session
@@ -16197,6 +16205,7 @@ impl TermView {
             bell_callbacks,
             title_callbacks,
             activity_callbacks,
+            first_pty_output,
             human_input_callbacks,
             alt_screen_callbacks,
             command_started_callbacks,
@@ -17374,6 +17383,10 @@ impl TermView {
 
     pub fn connect_activity<F: Fn() + 'static>(&self, f: F) {
         self.activity_callbacks.borrow_mut().push(Box::new(f));
+    }
+
+    pub(crate) fn connect_first_pty_output(&self, callback: impl FnOnce() + 'static) {
+        self.first_pty_output.connect(callback);
     }
 
     /// Observe an established prompt proof becoming invalid. This is neither
