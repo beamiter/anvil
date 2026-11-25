@@ -4,10 +4,11 @@
 //! replace the file rather than append duplicate records.
 
 use super::zone_history;
-use super::{mutate_block_data_and_redraw, BlockData, TermView};
+use super::{mutate_block_data_and_redraw, BlockData, BlockFinishedCallback, TermView};
 use crate::persistence::{self, PersistenceKey};
 use gtk::{glib, prelude::*};
 use jterm_core::screen_replay::FinishedHistoryFrame;
+use jterm_gtk_view::HistoryCheckpoint;
 use relm4::gtk;
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -19,6 +20,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1605,6 +1607,7 @@ fn enqueue_history_saves(
     blocks: Vec<BlockData>,
     saves: Vec<PlannedHistorySave>,
     closing: bool,
+    checkpoint: &HistoryCheckpoint,
 ) -> io::Result<()> {
     if saves.is_empty() {
         return Ok(());
@@ -1620,7 +1623,7 @@ fn enqueue_history_saves(
         key,
         BLOCK_HISTORY_PERSIST_OPERATION,
         estimated_bytes,
-        move || execute_history_saves(&baselines, &pending, &blocks, saves),
+        checkpoint.track_write(move || execute_history_saves(&baselines, &pending, &blocks, saves)),
     )
 }
 
@@ -2078,6 +2081,38 @@ impl TermView {
         Ok(())
     }
 
+    fn live_history_checkpoint_enabled(&self) -> bool {
+        !self.history_close_started.get()
+            && self.render_backend.persists_block_history()
+            && self.config.borrow().block_history_path.is_some()
+    }
+
+    pub(crate) fn arm_completed_history_checkpoint(self: &Rc<Self>) {
+        let pane = Rc::downgrade(self);
+        self.block_finished_callbacks
+            .borrow_mut()
+            .push(BlockFinishedCallback::Checkpoint(Box::new(move || {
+                let Some(view) = pane
+                    .upgrade()
+                    .filter(|view| view.live_history_checkpoint_enabled())
+                else {
+                    return;
+                };
+                let pane = pane.clone();
+                view.history_checkpoint.schedule(move || {
+                    if let Some(view) = pane
+                        .upgrade()
+                        .filter(|view| view.live_history_checkpoint_enabled())
+                    {
+                        if let Err(error) = view.save_history() {
+                            log::warn!("checkpoint completed Block history: {error}");
+                            crate::history_notice::park_sync_block_history_failure(&error);
+                        }
+                    }
+                });
+            })));
+    }
+
     /// Queue the last pane snapshot while the persistence worker still accepts work.
     pub(crate) fn save_history_before_close(&self) {
         if self.history_close_started.replace(true) {
@@ -2151,6 +2186,7 @@ impl TermView {
             blocks,
             saves,
             self.history_close_started.get(),
+            &self.history_checkpoint,
         )
     }
 
@@ -4333,6 +4369,7 @@ mod tests {
                 vec![sample_block(id, command)],
                 saves.clone(),
                 true,
+                &super::HistoryCheckpoint::default(),
             )
             .unwrap();
         }
@@ -4374,6 +4411,7 @@ mod tests {
             vec![sample_block(1, "blocked")],
             saves,
             false,
+            &super::HistoryCheckpoint::default(),
         )
         .expect("admission must succeed; the lock only fails the write");
 
@@ -4426,6 +4464,7 @@ mod tests {
             vec![sample_block(3, "async-ok")],
             saves,
             false,
+            &super::HistoryCheckpoint::default(),
         )
         .unwrap();
 

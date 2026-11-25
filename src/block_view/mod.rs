@@ -3820,6 +3820,7 @@ type OutputBlockFinishedCallback = dyn Fn(
 );
 
 enum BlockFinishedCallback {
+    Checkpoint(Box<dyn Fn()>),
     Metadata(Box<MetadataBlockFinishedCallback>),
     ConditionalOutput {
         needs_output: Box<dyn Fn(Option<crate::agent::AgentExecutionRef>) -> bool>,
@@ -4736,6 +4737,7 @@ pub struct TermView {
     /// this to choose ReloadFirst vs SaveAgain (pairs forge `history_load`).
     history_load_outcome: RefCell<history::HistoryLoadOutcome>,
     history_close_started: Cell<bool>,
+    history_checkpoint: jterm_gtk_view::HistoryCheckpoint,
     zone_persistence: RefCell<zone_history::SessionPersistence>,
     /// Clear Blocks deletion authorities bound to resolved paths and codecs.
     /// Keep each ordered target armed until that exact replacement succeeds.
@@ -7576,6 +7578,7 @@ impl ReaderCtx {
                 let output_sample = OnceCell::new();
                 for cb in self.block_finished_cbs.borrow().iter() {
                     match cb {
+                        BlockFinishedCallback::Checkpoint(schedule) => schedule(),
                         BlockFinishedCallback::Metadata(callback) => callback(
                             record.cmd.clone(),
                             record.exit_code,
@@ -16237,6 +16240,7 @@ impl TermView {
             history_baselines: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             history_load_outcome: RefCell::new(history::HistoryLoadOutcome::Idle),
             history_close_started: Cell::new(false),
+            history_checkpoint: jterm_gtk_view::HistoryCheckpoint::default(),
             zone_persistence: RefCell::new(zone_history::SessionPersistence::default()),
             history_explicit_replace_pending: std::sync::Arc::new(std::sync::Mutex::new(
                 VecDeque::new(),
