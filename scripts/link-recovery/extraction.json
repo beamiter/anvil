@@ -1,5 +1,5 @@
 {
-  "src/terminal/url.rs": "799f4a8c5ea4386cc4370a28ccb8ae84383ccbec362e4ca127ce5b611be7901c",
+  "src/terminal/url.rs": "fc0287d586591de8bf7f48daabe99a80a1ae8756e17459a19a73d2061ceac833",
   "src/terminal/url_recovery.rs": "ca8d34c71e9eb03b149e4a94bce0130a2599af0d39c8508ea4c28065bb0fcbaa",
   "scripts/link-recovery/src/extracted.rs": "88692d91efb52420d1230d5df55910286620b26a9eba3adb7e39247893a0f53b",
   "scripts/link-recovery/src/url_recovery.rs": "ca8d34c71e9eb03b149e4a94bce0130a2599af0d39c8508ea4c28065bb0fcbaa",
