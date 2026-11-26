@@ -16,6 +16,7 @@ use relm4::factory::{DynamicIndex, FactoryComponent, FactorySender, FactoryVecDe
 use relm4::gtk;
 use relm4::prelude::*;
 
+use crate::keybindings::{chord_from_gdk, Action, KeybindingMap};
 use crate::workflows::{ArgsForm, Workflow};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -104,6 +105,7 @@ pub(crate) enum WorkflowMsg {
 #[derive(Debug)]
 pub(crate) enum WorkflowOutput {
     Command { pane_id: u64, command: String },
+    NavigateTab(Action),
 }
 
 pub(crate) struct WorkflowModel {
@@ -116,7 +118,7 @@ pub(crate) struct WorkflowModel {
 
 #[relm4::component(pub(crate))]
 impl Component for WorkflowModel {
-    type Init = adw::ApplicationWindow;
+    type Init = (adw::ApplicationWindow, Rc<RefCell<KeybindingMap>>);
     type Input = WorkflowMsg;
     type Output = WorkflowOutput;
     type CommandOutput = ();
@@ -183,10 +185,11 @@ impl Component for WorkflowModel {
     }
 
     fn init(
-        parent: Self::Init,
+        init: Self::Init,
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
+        let (parent, keybindings) = init;
         let rows =
             FactoryVecDeque::builder()
                 .launch_default()
@@ -205,6 +208,30 @@ impl Component for WorkflowModel {
         };
         let args_box = model.rows.widget();
         let widgets = view_output!();
+        let navigation = gtk::EventControllerKey::new();
+        navigation.set_propagation_phase(gtk::PropagationPhase::Capture);
+        navigation.connect_key_pressed({
+            let sender = sender.clone();
+            let opening = model.opening.clone();
+            move |_, key, _, state| {
+                use gtk::gdk::ModifierType;
+                if opening.borrow().is_none()
+                    || !state.intersects(
+                        ModifierType::CONTROL_MASK | ModifierType::ALT_MASK | ModifierType::SUPER_MASK,
+                    )
+                {
+                    return false.into();
+                }
+                let action = chord_from_gdk(key, state)
+                    .and_then(|chord| keybindings.borrow().lookup(&chord));
+                if let Some(action @ (Action::PrevTab | Action::NextTab)) = action {
+                    let _ = sender.output(WorkflowOutput::NavigateTab(action));
+                    return true.into();
+                }
+                false.into()
+            }
+        });
+        widgets.root.add_controller(navigation);
         // AdwDialog emits closed synchronously when closing begins. Capture
         // that opening here, not when the queued Relm message is handled.
         widgets.root.connect_closed({

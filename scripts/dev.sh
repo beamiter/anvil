@@ -39,12 +39,12 @@ if [[ "${CMD}" != package ]] && ! command -v nix >/dev/null 2>&1; then
     exit 1
 fi
 if [[ "${CMD}" == package ]] && ! command -v cargo >/dev/null 2>&1; then
-    echo "Error: Cargo and the system GTK/VTE development libraries are required for portable packaging." >&2
+    echo "Error: Cargo and the system GTK development libraries are required for portable packaging." >&2
     exit 1
 fi
 if [[ "${CMD}" == package && -n "${IN_NIX_SHELL:-}" ]]; then
     echo "Error: portable packaging must run outside a Nix development shell." >&2
-    echo "Exit the shell and run 'make package' with the system GTK/VTE toolchain." >&2
+    echo "Exit the shell and run 'make package' with the system GTK toolchain." >&2
     exit 1
 fi
 
@@ -67,7 +67,7 @@ case "${CMD}" in
 
     test)
         echo "Running tests..."
-        run_in_nix cargo test --all-targets --locked --no-fail-fast
+        run_in_nix python3 tools/vte-oracle/run.py test --all-targets --locked --no-fail-fast
         ;;
 
     test-display)
@@ -104,7 +104,7 @@ case "${CMD}" in
             python3 tools/check-process-bundle.py
             cargo fmt --all -- --check
             cargo check --all-targets --locked
-            cargo test --all-targets --locked --no-fail-fast
+            python3 tools/vte-oracle/run.py test --all-targets --locked --no-fail-fast
             bash scripts/test-gtk-display.sh
             bash scripts/clippy.sh
             RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked

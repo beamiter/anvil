@@ -335,6 +335,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires isolated GTK display and XTest; nonexecuting PTY recorder"]
+    #[cfg(anvil_vte_oracle)]
     fn queued_review_write_claims_enter_at_both_backend_boundaries() {
         use crate::config::{Config, TerminalMode};
         use crate::terminal::{

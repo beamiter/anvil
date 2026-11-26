@@ -9,12 +9,12 @@ changes cause a private backup and replacement. Value changes keep your config.
 Use `--no-config` to skip configuration updates.
 
 The archive is relocatable before installation, but it is not statically linked
-or self-contained; the compatible GTK/libadwaita/VTE runtime libraries below
+or self-contained; the compatible GTK/libadwaita runtime libraries below
 must already exist on the target system.
 
 ## Runtime requirements
 
-A graphical Linux desktop with GTK 4, libadwaita, and GTK4 VTE libraries is
+A graphical Linux desktop with GTK 4 and libadwaita libraries is
 required. Optional integrations include `notify-send`, OpenSSH, and an AI
 provider configured through environment variables.
 

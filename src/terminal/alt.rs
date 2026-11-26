@@ -10,10 +10,13 @@
 //! `htop` (text_range_format racing the VTE's paint). Aligns with warp's
 //! "alt-screen content is ephemeral; the live grid is what you see" model.
 
+#[cfg(anvil_legacy_renderer)]
 use relm4::gtk;
+#[cfg(anvil_legacy_renderer)]
 use vte4::{Terminal, TerminalExt};
 
 /// Scrape the currently-visible VTE grid as plain text.
+#[cfg(anvil_legacy_renderer)]
 pub(crate) fn visible_vte_text(vte: &Terminal) -> String {
     let rows = vte.row_count();
     let cols = vte.column_count();

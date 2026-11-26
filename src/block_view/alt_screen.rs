@@ -5,13 +5,21 @@
 //! and renders full-viewport; when it sends `?1049l`, the alt-screen content
 //! is **discarded** — the active block keeps only the command name + exit code.
 //! No frame-merge / pager-snapshot path runs, matching Warp.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use crate::config::Config;
 use gtk::gdk::RGBA;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use gtk::glib;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use gtk::pango::FontDescription;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use gtk::prelude::*;
 use relm4::gtk;
-use vte4::{CursorBlinkMode, CursorShape, Terminal};
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+use vte4::Terminal;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+use vte4::{CursorBlinkMode, CursorShape};
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use vte4::{TerminalExt, TerminalExtManual};
 
 /// Give dense block output a little breathing room.  In particular, long
@@ -303,6 +311,7 @@ pub(crate) fn set_find_render_trace(enabled: bool) {
 }
 
 #[cfg(test)]
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 pub(crate) fn trace_find_render(event: &str, terminal: &Terminal) {
     if !FIND_RENDER_TRACE.with(std::cell::Cell::get) {
         return;
@@ -330,6 +339,7 @@ pub(crate) fn trace_find_render(event: &str, terminal: &Terminal) {
 /// *previous* snapshot; the target is therefore recomputed from the content on
 /// every pass — never from the grid a previous pass set — so a later pass
 /// corrects a stale measurement downwards as well as upwards.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 pub(crate) fn fit_finished_terminal_to_content(
     terminal: &Terminal,
     floor_rows: i64,
@@ -365,6 +375,7 @@ pub(crate) fn fit_finished_terminal_to_content(
     trace_find_render("fit-after", terminal);
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn pin_finished_terminal_top(terminal: &Terminal) {
     // Preserve native find's viewport while deferred render settling finishes.
     if terminal.search_get_regex().is_some() && terminal.has_selection() {
@@ -381,6 +392,7 @@ fn pin_finished_terminal_top(terminal: &Terminal) {
 /// caught up, correcting the first in either direction. `floor_rows` / `max_rows`
 /// bound both passes, so a measurement taken mid-parse can never resize the
 /// block past the height its own render asked for.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 pub(crate) fn settle_finished_terminal_after_feed(
     terminal: &Terminal,
     floor_rows: i64,
@@ -403,6 +415,7 @@ pub(crate) fn settle_finished_terminal_after_feed(
 /// The command snapshot is the only finished VTE placed directly inside the
 /// horizontal prompt row. Output snapshots are direct children of the block's
 /// vertical card and already use `FinishedBlock::connect_scroll_forwarding`.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn is_finished_command_surface(terminal: &Terminal) -> bool {
     terminal
         .parent()
@@ -410,6 +423,7 @@ fn is_finished_command_surface(terminal: &Terminal) -> bool {
         .is_some_and(|parent| parent.orientation() == gtk::Orientation::Horizontal)
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn outer_block_scroller(terminal: &Terminal) -> Option<gtk::ScrolledWindow> {
     let mut parent = terminal.parent();
     while let Some(widget) = parent {
@@ -421,6 +435,7 @@ fn outer_block_scroller(terminal: &Terminal) -> Option<gtk::ScrolledWindow> {
     None
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn forward_command_surface_scroll(terminal: &Terminal, dy: f64) -> bool {
     if dy == 0.0 || !is_finished_command_surface(terminal) {
         return false;
@@ -708,6 +723,7 @@ mod tests {
 /// surface and for both read-only VTEs of every finished card. The value
 /// changes only when the config does, so a one-entry cache is enough — keyed
 /// on the icon fallback too, since that is the other half of what gets built.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn with_font_description<R>(config: &Config, f: impl FnOnce(&FontDescription) -> R) -> R {
     thread_local! {
         static CACHED: std::cell::RefCell<Option<(String, Option<String>, FontDescription)>> =
@@ -731,6 +747,7 @@ fn with_font_description<R>(config: &Config, f: impl FnOnce(&FontDescription) ->
     })
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 pub(crate) fn apply_theme_to_vte(terminal: &Terminal, config: &Config) {
     let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
     terminal.set_colors(
@@ -754,6 +771,7 @@ pub(crate) fn apply_theme_to_vte(terminal: &Terminal, config: &Config) {
 /// independently, so a session with 200 blocks paid ~400 identical compiles.
 /// `match_add_regex` takes its own reference, so one handle can be shared by
 /// every terminal.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn with_url_match_regex(f: impl FnOnce(&vte4::Regex)) {
     thread_local! {
         static URL_REGEX: Option<vte4::Regex> = vte4::Regex::for_match(
@@ -770,6 +788,7 @@ fn with_url_match_regex(f: impl FnOnce(&vte4::Regex)) {
 }
 
 /// Register the shared URL pattern on `terminal` so hyperlink hovering works.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 pub(crate) fn add_url_match_regex(terminal: &Terminal) {
     with_url_match_regex(|regex| {
         terminal.match_add_regex(regex, 0);
@@ -780,6 +799,7 @@ pub(crate) fn add_url_match_regex(terminal: &Terminal) {
 /// so the VTE translates keypresses into terminal byte sequences and emits them
 /// via its `commit` signal (which we forward to our PTY). It also owns IME
 /// natively, so there is no separate IMMulticontext to fight for fcitx/ibus focus.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 pub(crate) fn create_active_terminal(config: &Config) -> Terminal {
     let terminal = Terminal::builder()
         .hexpand(true)
@@ -818,6 +838,7 @@ pub(crate) fn command_header_background() -> RGBA {
     RGBA::new(16.0 / 255.0, 28.0 / 255.0, 48.0 / 255.0, 1.0)
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 pub(crate) fn apply_snapshot_theme_to_vte(terminal: &Terminal, config: &Config) {
     apply_theme_to_vte(terminal, config);
     let mut transparent = config.background;
@@ -837,6 +858,7 @@ pub(crate) fn apply_snapshot_theme_to_vte(terminal: &Terminal, config: &Config) 
 /// map/feed pass, the widget expands to VTE's complete rendered buffer so no
 /// wrapping, multiline input or terminal control sequence is clipped into a
 /// private inner scroll area.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 pub(crate) fn create_finished_terminal(
     config: &Config,
     cols: i64,

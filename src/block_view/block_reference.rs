@@ -2,8 +2,11 @@
 use super::{blocks::BlockStatus, command_row::CommandRow};
 use gtk::prelude::*;
 use relm4::gtk;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use std::cell::{Cell, RefCell};
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use std::rc::Rc;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use vte4::{Terminal, TerminalExt};
 
 pub(super) const HEADER_HEIGHT: i32 = 40;
@@ -144,6 +147,7 @@ pub(super) fn estimated_height(cell: i32, command_rows: i64, output_rows: i64) -
         .saturating_add(2 + 10)
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 pub(super) fn output_gutter(
     terminal: &Terminal,
     full_output: Rc<RefCell<String>>,
@@ -245,7 +249,9 @@ pub(super) struct FinishedChrome<'a> {
     pub content: &'a gtk::Box,
     pub header: &'a gtk::Box,
     pub command: &'a CommandRow,
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     pub command_vte: Option<&'a Terminal>,
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     pub command_text: &'a str,
     pub metadata: &'a gtk::Widget,
     pub status: BlockStatus,
@@ -262,7 +268,9 @@ pub(super) fn decorate_finished(chrome: FinishedChrome<'_>) {
         content,
         header,
         command,
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         command_vte,
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         command_text,
         metadata,
         status,
@@ -305,6 +313,7 @@ pub(super) fn decorate_finished(chrome: FinishedChrome<'_>) {
         content.remove(metadata);
     }
     content.remove(command);
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     if let Some(terminal) = command_vte {
         super::command_row::fit(
             command,

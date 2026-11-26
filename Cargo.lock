@@ -80,7 +80,7 @@ dependencies = [
  "eva-character-atlas",
  "fuzzy-matcher",
  "image",
- "io-lifetimes 3.0.1",
+ "io-lifetimes",
  "jterm_core",
  "jterm_gtk_view",
  "libc",
@@ -88,6 +88,7 @@ dependencies = [
  "memchr",
  "nix",
  "parking_lot",
+ "pcre2",
  "pcre2-sys",
  "regex",
  "regex-syntax",
@@ -101,7 +102,6 @@ dependencies = [
  "unicode-bidi-mirroring",
  "unicode-width",
  "uuid",
- "vte4",
  "zstd",
 ]
 
@@ -1001,12 +1001,6 @@ dependencies = [
 
 [[package]]
 name = "io-lifetimes"
-version = "2.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06432fb54d3be7964ecd3649233cddf80db2832f47fec34c01f65b3d9d774983"
-
-[[package]]
-name = "io-lifetimes"
 version = "3.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f0fb0570afe1fed943c5c3d4102d5358592d8625fda6a0007fdbe65a92fba96"
@@ -1093,7 +1087,7 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.2.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=7a32027258dfe5f05ec6eaa01b76b5d44396cbf6#7a32027258dfe5f05ec6eaa01b76b5d44396cbf6"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e#06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e"
 dependencies = [
  "companion-client",
  "companion-core",
@@ -1128,9 +1122,10 @@ dependencies = [
 [[package]]
 name = "jterm_engine"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=7a32027258dfe5f05ec6eaa01b76b5d44396cbf6#7a32027258dfe5f05ec6eaa01b76b5d44396cbf6"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e#06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e"
 dependencies = [
  "smallvec",
+ "unicode-normalization",
  "unicode-segmentation",
  "unicode-width",
 ]
@@ -1138,19 +1133,21 @@ dependencies = [
 [[package]]
 name = "jterm_gtk_view"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=7a32027258dfe5f05ec6eaa01b76b5d44396cbf6#7a32027258dfe5f05ec6eaa01b76b5d44396cbf6"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e#06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e"
 dependencies = [
  "futures-channel",
  "futures-util",
  "gtk4",
  "jterm_engine",
+ "jterm_protocol",
  "jterm_runtime",
+ "pcre2",
 ]
 
 [[package]]
 name = "jterm_protocol"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=7a32027258dfe5f05ec6eaa01b76b5d44396cbf6#7a32027258dfe5f05ec6eaa01b76b5d44396cbf6"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e#06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e"
 dependencies = [
  "jterm_engine",
  "serde",
@@ -1159,7 +1156,7 @@ dependencies = [
 [[package]]
 name = "jterm_remote_client"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=7a32027258dfe5f05ec6eaa01b76b5d44396cbf6#7a32027258dfe5f05ec6eaa01b76b5d44396cbf6"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e#06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e"
 dependencies = [
  "serde",
  "serde_json",
@@ -1168,7 +1165,7 @@ dependencies = [
 [[package]]
 name = "jterm_runtime"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=7a32027258dfe5f05ec6eaa01b76b5d44396cbf6#7a32027258dfe5f05ec6eaa01b76b5d44396cbf6"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e#06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e"
 dependencies = [
  "crossbeam-channel",
  "jterm_engine",
@@ -1405,6 +1402,17 @@ dependencies = [
  "redox_syscall",
  "smallvec",
  "windows-link",
+]
+
+[[package]]
+name = "pcre2"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e970b0fcce0c7ee6ef662744ff711f21ccd6f11b7cf03cd187a80e89797fc67"
+dependencies = [
+ "libc",
+ "log",
+ "pcre2-sys",
 ]
 
 [[package]]
@@ -2043,6 +2051,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
 name = "unicode-segmentation"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2095,40 +2112,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "vte4"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c61732974d4915c5112a82506cdc86e19a83d786497c2c8bcd80d065825c695d"
-dependencies = [
- "cairo-rs",
- "gdk4",
- "gio",
- "glib",
- "gtk4",
- "io-lifetimes 2.0.4",
- "libc",
- "pango",
- "vte4-sys",
-]
-
-[[package]]
-name = "vte4-sys"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd99766524f740945b1b3fc516dc2ee76311be2efa8d7a1238f35f04330b9afd"
-dependencies = [
- "cairo-sys-rs",
- "gdk4-sys",
- "gio-sys",
- "glib-sys",
- "gobject-sys",
- "gtk4-sys",
- "libc",
- "pango-sys",
- "system-deps",
-]
 
 [[package]]
 name = "wasi"

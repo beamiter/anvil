@@ -12,7 +12,9 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use vte4::Terminal;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use vte4::TerminalExt;
 
 use crate::config::Config;
@@ -30,6 +32,7 @@ use jterm_core::kitty_keyboard::{
     self, AltEscapeJoiner, JoinStep, KittyKey, KittyKeyboardStacks, Modifiers as KittyModifiers,
 };
 use jterm_core::terminal_report::{classify_terminal_report, TerminalReport};
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use jterm_core::wheel::WheelAccumulator;
 #[cfg(all(anvil_shared_terminal, test))]
 use jterm_gtk_view::authenticated_boundaries::private_command_id as command_id_uses_shell_token;
@@ -43,7 +46,7 @@ mod block_reference;
 mod blocks;
 mod bookmarks;
 mod chat;
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 mod chat_layout_tests;
 mod command_row;
 mod cross_selection;
@@ -71,6 +74,7 @@ mod resize_presentation;
 use resize_presentation::InlineResize;
 mod review;
 mod scroll;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 pub(crate) use native_transcript_scroll::install_inline_cli_reading;
 use native_transcript_scroll::NativeTranscriptScroll;
 mod scroll_transfer;
@@ -82,6 +86,7 @@ pub(crate) use selection_folding::FoldSelectionResult;
 #[cfg(anvil_shared_terminal)]
 use shared_active::SharedActiveTerminal;
 mod unified_chrome;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 mod unified_images;
 mod unified_navigation;
 pub(crate) mod watch_batch;
@@ -369,6 +374,7 @@ const ZONE_MARKER_CLOSE: &[u8] = b"\x1b]8;;\x1b\\";
 /// RIS/reset invalidation deliberately remains outside this increment. It has
 /// to evict marker authority and retained record ranges together.
 #[derive(Debug)]
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 struct ZoneMarkerInjector {
     nonce: Option<[u8; 16]>,
     open: Option<OpenZoneMarker>,
@@ -380,6 +386,7 @@ struct OpenZoneMarker {
     bytes: Rc<[u8]>,
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 impl ZoneMarkerInjector {
     fn from_system_entropy() -> Self {
         let nonce = secure_zone_marker_nonce();
@@ -2103,6 +2110,7 @@ fn build_color_query_reply(config: &Config, dynamic: DynamicColors, kind: ColorK
 /// twice — once from `build_keyboard_query_reply`, once from VTE — while
 /// `CSI ? u` and `CSI ? 4 m` arrived only from the synthesized path, because
 /// libvte implements neither the kitty keyboard protocol nor modifyOtherKeys.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn vte_answers_query_natively(query: KeyboardProtocolQuery) -> bool {
     matches!(
         query,
@@ -2946,10 +2954,14 @@ fn log_completed_block_retention(context: &str, plan: CompletedBlockRetentionPla
 
 fn clear_find_handles(
     _finished_blocks: &Rc<RefCell<Vec<FinishedBlock>>>,
-    active_vte: Option<&Terminal>,
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))] active_vte: Option<&Terminal>,
     find_state: &Rc<RefCell<FindState>>,
 ) {
-    find::clear_find_state(find_state.as_ref(), active_vte);
+    find::clear_find_state(
+        find_state.as_ref(),
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        active_vte,
+    );
 }
 
 /// Remove an oldest prefix and every piece of state indexed by those blocks.
@@ -3983,6 +3995,7 @@ fn prompt_anchor_for_surface(
     }
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn visible_editor_text(vte: &Terminal, anchor: (i64, i64)) -> Option<String> {
     let (end_col, end_row) = vte.cursor_position();
     let (start_col, start_row) = anchor;
@@ -4007,6 +4020,7 @@ trait SubmissionSurface {
     fn suffix_is_empty(&self) -> Option<bool>;
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 struct VteSubmissionSurface {
     vte: Terminal,
     /// Selected beside the render backend: Block rebases across compact/full
@@ -4014,6 +4028,7 @@ struct VteSubmissionSurface {
     rebase_on_row_delta: bool,
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 impl SubmissionSurface for VteSubmissionSurface {
     fn cursor_position(&self) -> (i64, i64) {
         self.vte.cursor_position()
@@ -4614,6 +4629,7 @@ pub struct TermView {
     notice_dock: gtk::Box,
     /// The single persistent live VTE (anvil model): prompt + typing + output all
     /// render here natively; finished commands snapshot into styled blocks above.
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     active_vte: Option<Terminal>,
     /// Existing native contents clock, shared with prompt/layout observation.
     /// Search reads it; selection and scrolling never advance it.
@@ -4975,6 +4991,7 @@ struct BackendSearchSurface {
 /// Last-resort native search for a persistent surface whose absolute ring
 /// rows are not currently trustworthy. It can prove one selected result but
 /// cannot claim a total or navigate beyond that representative result.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 struct BackendNativeSearchFallback {
     block_id: u64,
     block_index: usize,
@@ -4989,6 +5006,7 @@ struct BackendNativeSearchFallback {
 struct BackendSearchBatch {
     surfaces: Vec<BackendSearchSurface>,
     incomplete: bool,
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     native_fallback: Option<BackendNativeSearchFallback>,
 }
 
@@ -5456,6 +5474,7 @@ trait RenderBackend {
     // ── live surface ──
     /// Feed bytes to the live terminal surface (including re-synthesized
     /// `\x1b[?..h/l` alt-screen toggles).
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     fn feed_legacy(&self, bytes: &[u8]);
     fn directory_report(&self, _bytes: &[u8]) {}
     fn replies_through_commit(&self) -> bool {
@@ -5735,9 +5754,7 @@ struct BlockBackend {
     menu_keybindings: shortcut_hints::MenuKeybindings,
     active_rc: Rc<RefCell<ActiveBlock>>,
     /// The legacy surface used when no shared view is mounted.
-    active_vte: Option<Terminal>,
-    #[cfg(anvil_shared_terminal)]
-    shared_active: Option<Rc<SharedActiveTerminal>>,
+    surface: blocks::ActiveSurface,
     #[cfg(anvil_shared_terminal)]
     shared_cwd: Option<DirectoryReport>,
     /// Shared construction-time anchor policy; the submission surface receives
@@ -6224,6 +6241,7 @@ fn zone_output_snapshot_from_plain(
 /// The sole Unified live-feed wrapper. Marker bytes are separate terminal
 /// feeds, so guest bytes are not copied and injected bytes cannot enter the
 /// engine-owned prompt/output buffers.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn feed_vte_with_zone_marker(
     vte: &Terminal,
     zone_marker: &RefCell<ZoneMarkerInjector>,
@@ -6232,6 +6250,7 @@ fn feed_vte_with_zone_marker(
     feed_with_zone_marker(zone_marker, bytes, |part| vte.feed(part));
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn feed_with_zone_marker(
     zone_marker: &RefCell<ZoneMarkerInjector>,
     bytes: &[u8],
@@ -6246,6 +6265,7 @@ fn feed_with_zone_marker(
 
 /// End marker authority and close any guest-open OSC 8 hyperlink on every
 /// accepted C, even when entropy failure disabled our own marker.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn close_zone_marker(
     zone_marker: &RefCell<ZoneMarkerInjector>,
     zone_id: Option<u64>,
@@ -6542,6 +6562,7 @@ impl ResetAwareParserSplitter {
 }
 
 enum PendingUnifiedImage {
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     Vte(unified_images::PendingImage),
     #[cfg(anvil_shared_terminal)]
     Shared(jterm_gtk_view::PendingInlineImage),
@@ -6550,10 +6571,8 @@ enum PendingUnifiedImage {
 /// prompt, command output and alternate-screen applications.
 struct UnifiedBackend {
     #[cfg(anvil_shared_terminal)]
-    shared_active: Option<Rc<SharedActiveTerminal>>,
-    #[cfg(anvil_shared_terminal)]
     shared_cwd: Option<DirectoryReport>,
-    legacy: Option<LegacyUnifiedSurface>,
+    surface: UnifiedSurface,
     navigation: unified_navigation::NavigationBar,
     user_scrolled_up: Rc<Cell<bool>>,
     unread_count: Rc<Cell<u32>>,
@@ -6588,6 +6607,14 @@ struct UnifiedBackend {
     kitty_pending_admission: RefCell<Option<PendingUnifiedImage>>,
 }
 
+enum UnifiedSurface {
+    #[cfg(anvil_shared_terminal)]
+    Shared(Rc<SharedActiveTerminal>),
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+    Legacy(LegacyUnifiedSurface),
+}
+
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 struct LegacyUnifiedSurface {
     vte: Terminal,
     /// Per-pane fail-closed marker state. Marker bytes are fed only inside the
@@ -6731,6 +6758,7 @@ impl ReaderCtx {
             output.apply(bytes);
             return;
         }
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         self.backend.feed_legacy(bytes);
     }
 
@@ -8490,11 +8518,7 @@ fn build_journal_completion(
 
 /// Preserve the shell's exact spelling and trim padding from screen captures.
 /// Use the input shadow when the renderer has not yet received the command.
-fn finished_command(
-    recorded: &str,
-    input_shadow: &str,
-    source: CommandTextSource,
-) -> String {
+fn finished_command(recorded: &str, input_shadow: &str, source: CommandTextSource) -> String {
     if source == CommandTextSource::ShellReported {
         return recorded.to_string();
     }
@@ -8511,8 +8535,35 @@ fn finished_command(
 /// helper functions they wrap stay module-level because non-reader paths
 /// (restore, resize, submit) share them.
 impl BlockBackend {
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     fn legacy_surface(&self) -> &Terminal {
-        self.active_vte.as_ref().expect("legacy live terminal")
+        self.legacy_surface_opt().expect("legacy live terminal")
+    }
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+    fn legacy_surface_opt(&self) -> Option<&Terminal> {
+        match &self.surface {
+            blocks::ActiveSurface::Legacy(terminal) => Some(terminal),
+            #[cfg(anvil_shared_terminal)]
+            blocks::ActiveSurface::Shared(_) => None,
+        }
+    }
+    #[cfg(anvil_shared_terminal)]
+    fn shared_surface(&self) -> Option<&Rc<SharedActiveTerminal>> {
+        match &self.surface {
+            blocks::ActiveSurface::Shared(terminal) => Some(terminal),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            blocks::ActiveSurface::Legacy(_) => None,
+        }
+    }
+    fn clear_find(&self) {
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        let terminal = self.legacy_surface_opt();
+        clear_find_handles(
+            &self.finished_blocks_for_cb,
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            terminal,
+            &self.find_state_rc,
+        );
     }
 }
 
@@ -9329,8 +9380,11 @@ impl RenderBackend for BlockBackend {
         more_button.set_action_name(Some("block.show-menu"));
     }
 
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+
     fn feed_legacy(&self, bytes: &[u8]) {
-        if let Some(terminal) = &self.active_vte {
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        if let Some(terminal) = self.legacy_surface_opt() {
             terminal.feed(bytes);
         }
     }
@@ -9347,7 +9401,7 @@ impl RenderBackend for BlockBackend {
     fn replies_through_commit(&self) -> bool {
         #[cfg(anvil_shared_terminal)]
         {
-            self.shared_active.is_none()
+            self.shared_surface().is_none()
         }
         #[cfg(not(anvil_shared_terminal))]
         {
@@ -9357,7 +9411,7 @@ impl RenderBackend for BlockBackend {
 
     fn reset_active_surface(&self, preserve_scrollback: bool) {
         #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
+        if let Some(terminal) = &self.shared_surface() {
             terminal.reset_output();
         }
         self.active_rc.borrow().reset_active(preserve_scrollback);
@@ -9365,7 +9419,7 @@ impl RenderBackend for BlockBackend {
 
     fn close_prompt_zone(&self, _zone_id: Option<u64>) {
         #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
+        if let Some(terminal) = &self.shared_surface() {
             terminal.begin_output();
         }
     }
@@ -9375,19 +9429,24 @@ impl RenderBackend for BlockBackend {
     }
 
     fn sync_geometry_to_pty(&self) {
-        #[cfg(anvil_shared_terminal)]
-        if self.shared_active.is_some() {
-            self.layout_active_surface();
-            self.pty_winsize.kick_settle();
-            return;
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            blocks::ActiveSurface::Shared(_terminal) => {
+                self.layout_active_surface();
+                self.pty_winsize.kick_settle();
+                return;
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            blocks::ActiveSurface::Legacy(_) => {
+                sync_active_to_pty(
+                    &self.layout_active_surface,
+                    self.legacy_surface(),
+                    &self.block_scroll_rc,
+                    &self.pty_for_init,
+                    &self.pty_winsize,
+                );
+            }
         }
-        sync_active_to_pty(
-            &self.layout_active_surface,
-            self.legacy_surface(),
-            &self.block_scroll_rc,
-            &self.pty_for_init,
-            &self.pty_winsize,
-        );
     }
 
     fn layout_active_surface(&self) {
@@ -9406,7 +9465,7 @@ impl RenderBackend for BlockBackend {
         } else {
             block.command_surface()?
         };
-        let render_stamp = if is_output || presentation.native().is_some() {
+        let render_stamp = if is_output || presentation.is_native() {
             block.render_stamp()
         } else {
             blocks::NEUTRAL_RENDER_STAMP
@@ -9465,15 +9524,17 @@ impl RenderBackend for BlockBackend {
                 return BackendSearchBatch {
                     surfaces,
                     incomplete: true,
+                    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                     native_fallback: None,
                 };
             }
             if let Some(command) = block.command_surface() {
-                if command.native().is_none() && block.cmd_text.len() > remaining {
+                if !command.is_native() && block.cmd_text.len() > remaining {
                     // A partial immutable command would change anchored regex matches.
                     return BackendSearchBatch {
                         surfaces,
                         incomplete: true,
+                        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                         native_fallback: None,
                     };
                 }
@@ -9494,7 +9555,7 @@ impl RenderBackend for BlockBackend {
                         }],
                         scanned_bytes: command_prefix.len(),
                         reset_cursor: true,
-                        render_stamp: if command.native().is_some() {
+                        render_stamp: if command.is_native() {
                             block.render_stamp()
                         } else {
                             blocks::NEUTRAL_RENDER_STAMP
@@ -9505,6 +9566,7 @@ impl RenderBackend for BlockBackend {
                     return BackendSearchBatch {
                         surfaces,
                         incomplete: true,
+                        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                         native_fallback: None,
                     };
                 }
@@ -9512,6 +9574,7 @@ impl RenderBackend for BlockBackend {
                     return BackendSearchBatch {
                         surfaces,
                         incomplete: true,
+                        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                         native_fallback: None,
                     };
                 }
@@ -9528,6 +9591,7 @@ impl RenderBackend for BlockBackend {
                     return BackendSearchBatch {
                         surfaces,
                         incomplete: has_more,
+                        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                         native_fallback: None,
                     };
                 }
@@ -9565,6 +9629,7 @@ impl RenderBackend for BlockBackend {
                     return BackendSearchBatch {
                         surfaces,
                         incomplete: true,
+                        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                         native_fallback: None,
                     };
                 }
@@ -9597,6 +9662,7 @@ impl RenderBackend for BlockBackend {
                 return BackendSearchBatch {
                     surfaces,
                     incomplete: true,
+                    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                     native_fallback: None,
                 };
             }
@@ -9604,6 +9670,7 @@ impl RenderBackend for BlockBackend {
                 return BackendSearchBatch {
                     surfaces,
                     incomplete: true,
+                    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                     native_fallback: None,
                 };
             }
@@ -9618,6 +9685,7 @@ impl RenderBackend for BlockBackend {
                 return BackendSearchBatch {
                     surfaces,
                     incomplete: true,
+                    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                     native_fallback: None,
                 };
             }
@@ -9625,6 +9693,7 @@ impl RenderBackend for BlockBackend {
         BackendSearchBatch {
             surfaces,
             incomplete: capture_incomplete,
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             native_fallback: None,
         }
     }
@@ -9780,21 +9849,31 @@ impl RenderBackend for BlockBackend {
     }
 
     fn schedule_anchor_settle(&self, args: AnchorSettleArgs) {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            args.ready.set(terminal.cursor().is_some());
-            return;
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            blocks::ActiveSurface::Shared(terminal) => {
+                args.ready.set(terminal.cursor().is_some());
+                return;
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            blocks::ActiveSurface::Legacy(_) => {
+                schedule_prompt_anchor_settle(args);
+            }
         }
-        schedule_prompt_anchor_settle(args);
     }
 
     fn cursor_and_rows(&self) -> ((i64, i64), i64) {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            return (terminal.cursor_position(), terminal.row_count());
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            blocks::ActiveSurface::Shared(terminal) => {
+                return (terminal.cursor_position(), terminal.row_count());
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            blocks::ActiveSurface::Legacy(_) => {
+                let terminal = self.legacy_surface();
+                (terminal.cursor_position(), terminal.row_count())
+            }
         }
-        let terminal = self.legacy_surface();
-        (terminal.cursor_position(), terminal.row_count())
     }
 
     fn cursor_position_report(&self) -> (i64, i64) {
@@ -9805,58 +9884,76 @@ impl RenderBackend for BlockBackend {
         // inline-viewport TUI (codex, and anything else on ratatui/crossterm)
         // anchors its frame on this reply, so it lands off screen and the card
         // renders blank. Rebase onto the visible grid, exactly as Unified does.
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            return terminal.cursor_position();
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            blocks::ActiveSurface::Shared(terminal) => {
+                return terminal.cursor_position();
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            blocks::ActiveSurface::Legacy(_) => {
+                let (col, row) = self.legacy_surface().cursor_position();
+                let top_row = gtk::prelude::ScrollableExt::vadjustment(self.legacy_surface())
+                    .map(|adjustment| adjustment.value() as i64)
+                    .unwrap_or(0);
+                (
+                    col,
+                    screen_relative_cpr_row(row, top_row, self.legacy_surface().row_count()),
+                )
+            }
         }
-        let (col, row) = self.legacy_surface().cursor_position();
-        let top_row = gtk::prelude::ScrollableExt::vadjustment(self.legacy_surface())
-            .map(|adjustment| adjustment.value() as i64)
-            .unwrap_or(0);
-        (
-            col,
-            screen_relative_cpr_row(row, top_row, self.legacy_surface().row_count()),
-        )
     }
 
     fn live_surface_answers_query(&self, query: KeyboardProtocolQuery) -> bool {
-        #[cfg(anvil_shared_terminal)]
-        if self.shared_active.is_some() {
-            return true;
+        #[cfg(not(any(anvil_vte_oracle, anvil_legacy_renderer)))]
+        let _ = query;
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            blocks::ActiveSurface::Shared(_terminal) => {
+                return true;
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            blocks::ActiveSurface::Legacy(_) => vte_answers_query_natively(query),
         }
-        vte_answers_query_natively(query)
     }
 
     fn command_capture_anchor(&self, provisional: (i64, i64), recorded_rows: i64) -> (i64, i64) {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            return terminal.prompt_anchor(provisional, recorded_rows);
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            blocks::ActiveSurface::Shared(terminal) => {
+                return terminal.prompt_anchor(provisional, recorded_rows);
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            blocks::ActiveSurface::Legacy(_) => {
+                // Block changes the VTE from compact prompt height to full command
+                // height between B and C. Rebase the saved anchor by that row delta;
+                // the query-only submission surface carries the exact same policy bit.
+                prompt_anchor_for_surface(
+                    self.rebase_prompt_anchor_on_row_delta,
+                    provisional,
+                    recorded_rows,
+                    self.legacy_surface().row_count(),
+                )
+            }
         }
-        // Block changes the VTE from compact prompt height to full command
-        // height between B and C. Rebase the saved anchor by that row delta;
-        // the query-only submission surface carries the exact same policy bit.
-        prompt_anchor_for_surface(
-            self.rebase_prompt_anchor_on_row_delta,
-            provisional,
-            recorded_rows,
-            self.legacy_surface().row_count(),
-        )
     }
 
     fn grid_cols(&self) -> i64 {
         #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
+        if let Some(terminal) = &self.shared_surface() {
             return i64::from(terminal.grid_size().0).max(20);
         }
         self.active_rc.borrow().grid_cols() as i64
     }
 
     fn live_column_count(&self) -> i64 {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            return i64::from(terminal.grid_size().0);
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            blocks::ActiveSurface::Shared(terminal) => {
+                return i64::from(terminal.grid_size().0);
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            blocks::ActiveSurface::Legacy(_) => self.legacy_surface().column_count(),
         }
-        self.legacy_surface().column_count()
     }
 
     fn capture_text_range(
@@ -9866,14 +9963,18 @@ impl RenderBackend for BlockBackend {
         end_row: i64,
         end_col: i64,
     ) -> Option<String> {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            return terminal.capture((start_col, start_row), (end_col, end_row));
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            blocks::ActiveSurface::Shared(terminal) => {
+                return terminal.capture((start_col, start_row), (end_col, end_row));
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            blocks::ActiveSurface::Legacy(_) => self
+                .legacy_surface()
+                .text_range_format(vte4::Format::Text, start_row, start_col, end_row, end_col)
+                .0
+                .map(|gs| gs.to_string()),
         }
-        self.legacy_surface()
-            .text_range_format(vte4::Format::Text, start_row, start_col, end_row, end_col)
-            .0
-            .map(|gs| gs.to_string())
     }
 
     /// Mount a finished command as a history block and reset the live surface.
@@ -9903,13 +10004,15 @@ impl RenderBackend for BlockBackend {
                 capture_size: payload.capture_size,
             }
         });
-        let finished_document = FinishedDocument::capture(output_with_ansi, payload.capture_size)
-            .map(|mut document| {
-                document.execution_source = output_source
-                    .as_ref()
-                    .map(|source| source.execution.clone());
-                std::sync::Arc::new(document)
-            });
+        let projection =
+            FinishedDocument::project_for_display(output_with_ansi, payload.capture_size);
+        let finished_document = (!projection.clipped).then(|| {
+            let mut document = projection.document;
+            document.execution_source = output_source
+                .as_ref()
+                .map(|source| source.execution.clone());
+            std::sync::Arc::new(document)
+        });
         let output_plain = finished_document.as_ref().map_or_else(
             || payload.output_plain.as_str(),
             |document| &document.archive.text,
@@ -10000,11 +10103,7 @@ impl RenderBackend for BlockBackend {
         if prebuild_retention_plan.evict_prefix > 0 {
             // Retention changes block indices and may
             // remove the VTE owning a highlighted hit.
-            clear_find_handles(
-                &self.finished_blocks_for_cb,
-                self.active_vte.as_ref(),
-                &self.find_state_rc,
-            );
+            self.clear_find();
         }
         evict_finished_block_prefix(
             prebuild_retention_plan.evict_prefix,
@@ -10047,7 +10146,7 @@ impl RenderBackend for BlockBackend {
         let colors = self.dynamic_colors_rc.get();
         #[cfg(anvil_shared_terminal)]
         let colors = self
-            .shared_active
+            .shared_surface()
             .as_ref()
             .map_or(colors, |terminal| terminal.output_colors());
         let block_config = finished_block_config(colors, &self.config_for_cb.borrow());
@@ -10162,11 +10261,7 @@ impl RenderBackend for BlockBackend {
         };
         log_completed_block_retention("finalizing live block", retention_plan);
         if retention_plan.evict_prefix > 0 {
-            clear_find_handles(
-                &self.finished_blocks_for_cb,
-                self.active_vte.as_ref(),
-                &self.find_state_rc,
-            );
+            self.clear_find();
         }
         evict_finished_block_prefix(
             retention_plan.evict_prefix,
@@ -10217,6 +10312,7 @@ fn utf8_prefix_bounded(text: &str, max_bytes: usize) -> &str {
     &text[..end]
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn capture_vte_text_range(
     vte: &Terminal,
     start_row: i64,
@@ -10232,6 +10328,7 @@ fn capture_vte_text_range(
 const VTE_SEARCH_CAPTURE_TIME_LIMIT: std::time::Duration = std::time::Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 struct VteCaptureSpan {
     start_row: i64,
     end_row: i64,
@@ -10240,6 +10337,7 @@ struct VteCaptureSpan {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 struct BoundedVteCapture {
     text: String,
     incomplete: bool,
@@ -10256,6 +10354,7 @@ struct BoundedVteCapture {
 /// cannot be honestly charged from only its final `end_col`: every
 /// intermediate row is copied at full width. The time predicate lets the UI
 /// stop between calls, so a large blank ring is bounded too.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn capture_vte_rows_bounded(
     start_row: i64,
     end_row: i64,
@@ -10328,6 +10427,7 @@ fn capture_vte_rows_bounded(
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 struct BoundedVteSearchWindows {
     /// Native forward-search order after clearing selection begins at VTE's
     /// current viewport top, not at the oldest retained row.
@@ -10340,6 +10440,7 @@ struct BoundedVteSearchWindows {
 /// Extract one persistent VTE domain in native forward-cursor order. The
 /// second window is never requested after a partial first window, because an
 /// unseen tail hit would precede every counted history hit.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn capture_vte_search_windows_bounded(
     retained_start: i64,
     retained_end_exclusive: i64,
@@ -10384,16 +10485,48 @@ fn capture_vte_search_windows_bounded(
 }
 
 impl UnifiedBackend {
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     fn legacy_surface(&self) -> &LegacyUnifiedSurface {
-        self.legacy.as_ref().expect("legacy Unified terminal")
+        self.legacy_surface_opt().expect("legacy Unified terminal")
+    }
+
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+    fn legacy_surface_opt(&self) -> Option<&LegacyUnifiedSurface> {
+        match &self.surface {
+            UnifiedSurface::Legacy(legacy) => Some(legacy),
+            #[cfg(anvil_shared_terminal)]
+            UnifiedSurface::Shared(_) => None,
+        }
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    fn shared_surface(&self) -> Option<&Rc<SharedActiveTerminal>> {
+        match &self.surface {
+            UnifiedSurface::Shared(shared) => Some(shared),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            UnifiedSurface::Legacy(_) => None,
+        }
+    }
+
+    fn invalidate_find(&self) {
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        let terminal = self.legacy_surface_opt().map(|legacy| &legacy.vte);
+        find::invalidate_find_state(
+            self.find_state_for_cb.as_ref(),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            terminal,
+        );
     }
 
     fn kitty_cursor(&self) -> (i64, i64) {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            return terminal.kitty_cursor().unwrap_or((-1, -1));
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            UnifiedSurface::Shared(terminal) => {
+                return terminal.kitty_cursor().unwrap_or((-1, -1));
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            UnifiedSurface::Legacy(legacy) => legacy.vte.cursor_position(),
         }
-        self.legacy_surface().vte.cursor_position()
     }
 
     fn prepare_inline_image(
@@ -10402,30 +10535,38 @@ impl UnifiedBackend {
         encoded_source_bytes: usize,
         requested: Option<kitty_graphics::DisplayPlacement>,
     ) -> Option<PendingUnifiedImage> {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            return terminal
-                .prepare_inline_image(texture, encoded_source_bytes, requested?)
-                .map(PendingUnifiedImage::Shared);
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            UnifiedSurface::Shared(terminal) => {
+                return terminal
+                    .prepare_inline_image(texture, encoded_source_bytes, requested?)
+                    .map(PendingUnifiedImage::Shared);
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            UnifiedSurface::Legacy(legacy) => legacy
+                .image_layer
+                .prepare(texture, encoded_source_bytes, requested)
+                .map(PendingUnifiedImage::Vte),
         }
-        self.legacy_surface()
-            .image_layer
-            .prepare(texture, encoded_source_bytes, requested)
-            .map(PendingUnifiedImage::Vte)
     }
 
     #[cfg(anvil_shared_terminal)]
     fn transcript(&self) -> Option<&jterm_gtk_view::TranscriptView<shared_active::Transport>> {
-        self.shared_active.as_ref()?.transcript()
+        self.shared_surface()?.transcript()
     }
 
     fn apply_terminal_effect(&self, bytes: &[u8]) {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            terminal.output().apply(bytes);
-            return;
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            UnifiedSurface::Shared(terminal) => {
+                terminal.output().apply(bytes);
+                return;
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            UnifiedSurface::Legacy(_legacy) => {
+                self.feed_legacy(bytes);
+            }
         }
-        self.feed_legacy(bytes);
     }
 
     fn replay_zone_contents(
@@ -10436,35 +10577,44 @@ impl UnifiedBackend {
     ) {
         let text = snapshot.map(|snapshot| snapshot.plain.as_str());
         let truncated = snapshot.is_some_and(|snapshot| snapshot.truncated);
-        #[cfg(anvil_shared_terminal)]
-        if let Some(transcript) = self.transcript() {
-            let [prompt, input, output] = zone_history::replay_sections(record, text, truncated);
-            transcript.begin_restored_prompt(record.id);
-            self.chrome.begin_shared_zone(record.id, _max_zones);
-            self.apply_terminal_effect(&prompt);
-            transcript.end_prompt();
-            self.apply_terminal_effect(&input);
-            transcript.begin_output(Some(record.id));
-            self.apply_terminal_effect(&output);
-            transcript.end_output(Some(record.id), _max_zones);
-            return;
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            UnifiedSurface::Shared(terminal) => {
+                let transcript = terminal.transcript().expect("Unified transcript");
+
+                let [prompt, input, output] =
+                    zone_history::replay_sections(record, text, truncated);
+                transcript.begin_restored_prompt(record.id);
+                self.chrome.begin_shared_zone(record.id, _max_zones);
+                self.apply_terminal_effect(&prompt);
+                transcript.end_prompt();
+                self.apply_terminal_effect(&input);
+                transcript.begin_output(Some(record.id));
+                self.apply_terminal_effect(&output);
+                transcript.end_output(Some(record.id), _max_zones);
+                return;
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            UnifiedSurface::Legacy(_) => {
+                self.chrome
+                    .begin_zone(record.id, &self.legacy_surface().vte);
+                self.legacy_surface()
+                    .zone_marker
+                    .borrow_mut()
+                    .begin_zone(record.id);
+                self.feed_legacy(&zone_history::replay_bytes(record, text, truncated));
+                close_zone_marker(
+                    &self.legacy_surface().zone_marker,
+                    Some(record.id),
+                    |bytes| self.legacy_surface().vte.feed(bytes),
+                );
+            }
         }
-        self.chrome
-            .begin_zone(record.id, &self.legacy_surface().vte);
-        self.legacy_surface()
-            .zone_marker
-            .borrow_mut()
-            .begin_zone(record.id);
-        self.feed_legacy(&zone_history::replay_bytes(record, text, truncated));
-        close_zone_marker(
-            &self.legacy_surface().zone_marker,
-            Some(record.id),
-            |bytes| self.legacy_surface().vte.feed(bytes),
-        );
     }
 }
 
 impl RenderBackend for UnifiedBackend {
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     fn feed_legacy(&self, bytes: &[u8]) {
         feed_vte_with_zone_marker(
             &self.legacy_surface().vte,
@@ -10483,25 +10633,32 @@ impl RenderBackend for UnifiedBackend {
     }
 
     fn begin_prompt_zone(&self, zone_id: u64) {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(transcript) = self.transcript() {
-            transcript.begin_prompt(zone_id);
-            self.chrome.begin_shared_zone(
-                zone_id,
-                self.config_for_cb.borrow().max_visible_blocks as usize,
-            );
-            return;
-        }
-        self.chrome.begin_zone(zone_id, &self.legacy_surface().vte);
-        self.chrome
-            .enforce_limit(self.config_for_cb.borrow().max_visible_blocks as usize);
-        let open = {
-            let mut marker = self.legacy_surface().zone_marker.borrow_mut();
-            marker.begin_zone(zone_id);
-            marker.open_bytes()
-        };
-        if let Some(open) = open {
-            self.legacy_surface().vte.feed(&open);
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            UnifiedSurface::Shared(terminal) => {
+                let transcript = terminal.transcript().expect("Unified transcript");
+
+                transcript.begin_prompt(zone_id);
+                self.chrome.begin_shared_zone(
+                    zone_id,
+                    self.config_for_cb.borrow().max_visible_blocks as usize,
+                );
+                return;
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            UnifiedSurface::Legacy(_) => {
+                self.chrome.begin_zone(zone_id, &self.legacy_surface().vte);
+                self.chrome
+                    .enforce_limit(self.config_for_cb.borrow().max_visible_blocks as usize);
+                let open = {
+                    let mut marker = self.legacy_surface().zone_marker.borrow_mut();
+                    marker.begin_zone(zone_id);
+                    marker.open_bytes()
+                };
+                if let Some(open) = open {
+                    self.legacy_surface().vte.feed(&open);
+                }
+            }
         }
     }
 
@@ -10529,18 +10686,26 @@ impl RenderBackend for UnifiedBackend {
     }
 
     fn close_prompt_zone(&self, zone_id: Option<u64>) {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(transcript) = self.transcript() {
-            transcript.begin_output(zone_id);
-            return;
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            UnifiedSurface::Shared(terminal) => {
+                let transcript = terminal.transcript().expect("Unified transcript");
+
+                transcript.begin_output(zone_id);
+                return;
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            UnifiedSurface::Legacy(_) => {
+                close_zone_marker(&self.legacy_surface().zone_marker, zone_id, |bytes| {
+                    self.legacy_surface().vte.feed(bytes)
+                });
+            }
         }
-        close_zone_marker(&self.legacy_surface().zone_marker, zone_id, |bytes| {
-            self.legacy_surface().vte.feed(bytes)
-        });
     }
 
     fn erase_scrollback(&self) {
-        if let Some(legacy) = &self.legacy {
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        if let Some(legacy) = self.legacy_surface_opt() {
             self.chrome.erase_scrollback(&legacy.vte);
             legacy.image_layer.set_row_epoch(self.chrome.row_epoch());
         }
@@ -10550,24 +10715,24 @@ impl RenderBackend for UnifiedBackend {
         self.chrome.erase_display();
         self.kitty_assembler.borrow_mut().reset();
         self.kitty_pending_admission.borrow_mut().take();
-        if let Some(legacy) = &self.legacy {
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        if let Some(legacy) = self.legacy_surface_opt() {
             legacy.image_layer.hard_reset();
             legacy.image_layer.set_row_epoch(self.chrome.row_epoch());
         }
     }
 
     fn hard_reset(&self) {
-        if let Some(legacy) = &self.legacy {
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        if let Some(legacy) = self.legacy_surface_opt() {
             legacy.zone_marker.borrow_mut().close_zone(None);
         }
         self.chrome.clear_authority();
-        find::invalidate_find_state(
-            self.find_state_for_cb.as_ref(),
-            self.legacy.as_ref().map(|legacy| &legacy.vte),
-        );
+        self.invalidate_find();
         self.kitty_assembler.borrow_mut().reset();
         self.kitty_pending_admission.borrow_mut().take();
-        if let Some(legacy) = &self.legacy {
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        if let Some(legacy) = self.legacy_surface_opt() {
             legacy.image_layer.hard_reset();
             legacy.image_layer.set_row_epoch(self.chrome.row_epoch());
         }
@@ -10592,19 +10757,24 @@ impl RenderBackend for UnifiedBackend {
     }
 
     fn sync_geometry_to_pty(&self) {
-        #[cfg(anvil_shared_terminal)]
-        if self.shared_active.is_some() {
-            self.layout_active_surface();
-            self.pty_winsize.kick_settle();
-            return;
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            UnifiedSurface::Shared(_terminal) => {
+                self.layout_active_surface();
+                self.pty_winsize.kick_settle();
+                return;
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            UnifiedSurface::Legacy(_) => {
+                sync_active_to_pty(
+                    &self.layout_active_surface,
+                    &self.legacy_surface().vte,
+                    &self.block_scroll_rc,
+                    &self.pty_for_init,
+                    &self.pty_winsize,
+                );
+            }
         }
-        sync_active_to_pty(
-            &self.layout_active_surface,
-            &self.legacy_surface().vte,
-            &self.block_scroll_rc,
-            &self.pty_for_init,
-            &self.pty_winsize,
-        );
     }
 
     fn layout_active_surface(&self) {
@@ -10624,46 +10794,67 @@ impl RenderBackend for UnifiedBackend {
     }
 
     fn scroll_to_record(&self, block_id: u64) -> bool {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(transcript) = self.transcript() {
-            return transcript.reveal_zone(block_id);
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            UnifiedSurface::Shared(terminal) => {
+                let transcript = terminal.transcript().expect("Unified transcript");
+
+                return transcript.reveal_zone(block_id);
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            UnifiedSurface::Legacy(_) => {
+                // Chrome only answers with a row it proved at the current epoch; any
+                // doubt is `None` and this jump honestly fails.
+                let Some(value) = self
+                    .chrome
+                    .proven_zone_scroll_value(&self.legacy_surface().vte, block_id)
+                else {
+                    return false;
+                };
+                let Some(adjustment) =
+                    gtk::prelude::ScrollableExt::vadjustment(&self.legacy_surface().vte)
+                else {
+                    return false;
+                };
+                adjustment.set_value(value);
+                self.legacy_surface().vte.grab_focus();
+                true
+            }
         }
-        // Chrome only answers with a row it proved at the current epoch; any
-        // doubt is `None` and this jump honestly fails.
-        let Some(value) = self
-            .chrome
-            .proven_zone_scroll_value(&self.legacy_surface().vte, block_id)
-        else {
-            return false;
-        };
-        let Some(adjustment) = gtk::prelude::ScrollableExt::vadjustment(&self.legacy_surface().vte)
-        else {
-            return false;
-        };
-        adjustment.set_value(value);
-        self.legacy_surface().vte.grab_focus();
-        true
     }
 
     fn can_scroll_to_record(&self, block_id: u64) -> bool {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(transcript) = self.transcript() {
-            return transcript.zone_scroll_row(block_id).is_some();
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            UnifiedSurface::Shared(terminal) => {
+                let transcript = terminal.transcript().expect("Unified transcript");
+
+                return transcript.zone_scroll_row(block_id).is_some();
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            UnifiedSurface::Legacy(_) => {
+                // The same proof, read only: a hit is labelled reachable exactly when
+                // chrome can already name the row it would scroll to.
+                self.chrome
+                    .proven_zone_scroll_value(&self.legacy_surface().vte, block_id)
+                    .is_some()
+            }
         }
-        // The same proof, read only: a hit is labelled reachable exactly when
-        // chrome can already name the row it would scroll to.
-        self.chrome
-            .proven_zone_scroll_value(&self.legacy_surface().vte, block_id)
-            .is_some()
     }
 
     fn record_scroll_value(&self, block_id: u64) -> Option<f64> {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(transcript) = self.transcript() {
-            return transcript.zone_scroll_row(block_id).map(|row| row as f64);
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            UnifiedSurface::Shared(terminal) => {
+                let transcript = terminal.transcript().expect("Unified transcript");
+
+                return transcript.zone_scroll_row(block_id).map(|row| row as f64);
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            UnifiedSurface::Legacy(_) => self
+                .chrome
+                .proven_zone_scroll_value(&self.legacy_surface().vte, block_id),
         }
-        self.chrome
-            .proven_zone_scroll_value(&self.legacy_surface().vte, block_id)
     }
 
     fn completed_search_surfaces(
@@ -10671,114 +10862,127 @@ impl RenderBackend for UnifiedBackend {
         max_bytes: usize,
         deadline_exhausted: &mut dyn FnMut() -> bool,
     ) -> BackendSearchBatch {
-        #[cfg(anvil_shared_terminal)]
-        if self.transcript().is_some() {
-            return BackendSearchBatch {
-                surfaces: Vec::new(),
-                incomplete: false,
-                native_fallback: None,
-            };
-        }
-        let native_fallback = || BackendNativeSearchFallback {
-            block_id: 0,
-            block_index: 0,
-            is_output: true,
-            is_live: true,
-            terminal: self.legacy_surface().vte.clone(),
-        };
-        if max_bytes == 0 || deadline_exhausted() {
-            return BackendSearchBatch {
-                surfaces: Vec::new(),
-                incomplete: true,
-                native_fallback: Some(native_fallback()),
-            };
-        }
-        let Some(bounds) = self.chrome.trusted_ring_bounds(&self.legacy_surface().vte) else {
-            return BackendSearchBatch {
-                surfaces: Vec::new(),
-                incomplete: true,
-                native_fallback: Some(native_fallback()),
-            };
-        };
-        let (cursor_col, _cursor_row) = self.legacy_surface().vte.cursor_position();
-        let columns = self
-            .legacy_surface()
-            .vte
-            .column_count()
-            .max(cursor_col)
-            .max(1);
-        let started = std::time::Instant::now();
-        let captured_windows = {
-            let capture_deadline_exhausted =
-                || deadline_exhausted() || started.elapsed() >= VTE_SEARCH_CAPTURE_TIME_LIMIT;
-            capture_vte_search_windows_bounded(
-                bounds.retained_start,
-                bounds.retained_end_exclusive,
-                bounds.viewport_top,
-                columns,
-                max_bytes,
-                capture_deadline_exhausted,
-                |span| {
-                    capture_vte_text_range(
-                        &self.legacy_surface().vte,
-                        span.start_row,
-                        0,
-                        span.end_row,
-                        span.end_col,
+        #[cfg(not(any(anvil_vte_oracle, anvil_legacy_renderer)))]
+        let _ = (max_bytes, deadline_exhausted);
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            UnifiedSurface::Shared(_) => {
+                return BackendSearchBatch {
+                    surfaces: Vec::new(),
+                    incomplete: false,
+                    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+                    native_fallback: None,
+                };
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            UnifiedSurface::Legacy(_) => {
+                let native_fallback = || BackendNativeSearchFallback {
+                    block_id: 0,
+                    block_index: 0,
+                    is_output: true,
+                    is_live: true,
+                    terminal: self.legacy_surface().vte.clone(),
+                };
+                if max_bytes == 0 || deadline_exhausted() {
+                    return BackendSearchBatch {
+                        surfaces: Vec::new(),
+                        incomplete: true,
+                        native_fallback: Some(native_fallback()),
+                    };
+                }
+                let Some(bounds) = self.chrome.trusted_ring_bounds(&self.legacy_surface().vte)
+                else {
+                    return BackendSearchBatch {
+                        surfaces: Vec::new(),
+                        incomplete: true,
+                        native_fallback: Some(native_fallback()),
+                    };
+                };
+                let (cursor_col, _cursor_row) = self.legacy_surface().vte.cursor_position();
+                let columns = self
+                    .legacy_surface()
+                    .vte
+                    .column_count()
+                    .max(cursor_col)
+                    .max(1);
+                let started = std::time::Instant::now();
+                let captured_windows = {
+                    let capture_deadline_exhausted = || {
+                        deadline_exhausted() || started.elapsed() >= VTE_SEARCH_CAPTURE_TIME_LIMIT
+                    };
+                    capture_vte_search_windows_bounded(
+                        bounds.retained_start,
+                        bounds.retained_end_exclusive,
+                        bounds.viewport_top,
+                        columns,
+                        max_bytes,
+                        capture_deadline_exhausted,
+                        |span| {
+                            capture_vte_text_range(
+                                &self.legacy_surface().vte,
+                                span.start_row,
+                                0,
+                                span.end_row,
+                                span.end_col,
+                            )
+                        },
                     )
-                },
-            )
-        };
-        let deadline_limited =
-            deadline_exhausted() || started.elapsed() >= VTE_SEARCH_CAPTURE_TIME_LIMIT;
-        let has_older_history = bounds.retained_start < bounds.viewport_top;
-        let history_complete = !has_older_history
-            || captured_windows
-                .oldest_history
-                .as_ref()
-                .is_some_and(|capture| !capture.incomplete);
-        let incomplete =
-            deadline_limited || captured_windows.viewport_to_tail.incomplete || !history_complete;
-        let scanned_work = captured_windows.viewport_to_tail.work_cells
-            + captured_windows
-                .oldest_history
-                .as_ref()
-                .map_or(0, |capture| capture.work_cells);
-        let retained_bytes = captured_windows.viewport_to_tail.text.len()
-            + captured_windows
-                .oldest_history
-                .as_ref()
-                .map_or(0, |capture| capture.text.len());
-        let scanned_bytes = scanned_work.max(retained_bytes);
-        let mut windows = vec![BackendSearchWindow {
-            text: captured_windows.viewport_to_tail.text,
-            incomplete: incomplete
-                && (deadline_limited
+                };
+                let deadline_limited =
+                    deadline_exhausted() || started.elapsed() >= VTE_SEARCH_CAPTURE_TIME_LIMIT;
+                let has_older_history = bounds.retained_start < bounds.viewport_top;
+                let history_complete = !has_older_history
+                    || captured_windows
+                        .oldest_history
+                        .as_ref()
+                        .is_some_and(|capture| !capture.incomplete);
+                let incomplete = deadline_limited
                     || captured_windows.viewport_to_tail.incomplete
-                    || has_older_history),
-            initial_wrap: false,
-        }];
-        if let Some(history) = captured_windows.oldest_history {
-            windows.push(BackendSearchWindow {
-                text: history.text,
-                incomplete: incomplete && (deadline_limited || history.incomplete),
-                initial_wrap: true,
-            });
-        }
-        BackendSearchBatch {
-            surfaces: vec![BackendSearchSurface {
-                block_id: 0,
-                block_index: 0,
-                is_output: true,
-                is_live: true,
-                windows,
-                scanned_bytes,
-                reset_cursor: true,
-                presentation: TerminalTextSurface::Native(self.legacy_surface().vte.clone()),
-                render_stamp: blocks::NEUTRAL_RENDER_STAMP,
-            }],
-            incomplete,
-            native_fallback: incomplete.then(native_fallback),
+                    || !history_complete;
+                let scanned_work = captured_windows.viewport_to_tail.work_cells
+                    + captured_windows
+                        .oldest_history
+                        .as_ref()
+                        .map_or(0, |capture| capture.work_cells);
+                let retained_bytes = captured_windows.viewport_to_tail.text.len()
+                    + captured_windows
+                        .oldest_history
+                        .as_ref()
+                        .map_or(0, |capture| capture.text.len());
+                let scanned_bytes = scanned_work.max(retained_bytes);
+                let mut windows = vec![BackendSearchWindow {
+                    text: captured_windows.viewport_to_tail.text,
+                    incomplete: incomplete
+                        && (deadline_limited
+                            || captured_windows.viewport_to_tail.incomplete
+                            || has_older_history),
+                    initial_wrap: false,
+                }];
+                if let Some(history) = captured_windows.oldest_history {
+                    windows.push(BackendSearchWindow {
+                        text: history.text,
+                        incomplete: incomplete && (deadline_limited || history.incomplete),
+                        initial_wrap: true,
+                    });
+                }
+                BackendSearchBatch {
+                    surfaces: vec![BackendSearchSurface {
+                        block_id: 0,
+                        block_index: 0,
+                        is_output: true,
+                        is_live: true,
+                        windows,
+                        scanned_bytes,
+                        reset_cursor: true,
+                        presentation: TerminalTextSurface::Native(
+                            self.legacy_surface().vte.clone(),
+                        ),
+                        render_stamp: blocks::NEUTRAL_RENDER_STAMP,
+                    }],
+                    incomplete,
+                    native_fallback: incomplete.then(native_fallback),
+                }
+            }
         }
     }
 
@@ -10850,22 +11054,31 @@ impl RenderBackend for UnifiedBackend {
     }
 
     fn scroll_surface_lines(&self, lines: i32) -> bool {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            let adjustment = terminal.scrollback();
-            let bottom = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
-            adjustment.set_value(
-                (adjustment.value() + f64::from(lines)).clamp(adjustment.lower(), bottom),
-            );
-            return true;
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            UnifiedSurface::Shared(terminal) => {
+                let adjustment = terminal.scrollback();
+                let bottom = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+                adjustment.set_value(
+                    (adjustment.value() + f64::from(lines)).clamp(adjustment.lower(), bottom),
+                );
+                return true;
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            UnifiedSurface::Legacy(_) => {
+                let Some(adj) =
+                    gtk::prelude::ScrollableExt::vadjustment(&self.legacy_surface().vte)
+                else {
+                    return true;
+                };
+                let step = adj.step_increment().max(1.0);
+                let max_value = (adj.upper() - adj.page_size()).max(adj.lower());
+                adj.set_value(
+                    (adj.value() + step * f64::from(lines)).clamp(adj.lower(), max_value),
+                );
+                true
+            }
         }
-        let Some(adj) = gtk::prelude::ScrollableExt::vadjustment(&self.legacy_surface().vte) else {
-            return true;
-        };
-        let step = adj.step_increment().max(1.0);
-        let max_value = (adj.upper() - adj.page_size()).max(adj.lower());
-        adj.set_value((adj.value() + step * f64::from(lines)).clamp(adj.lower(), max_value));
-        true
     }
 
     fn debug_name(&self) -> &'static str {
@@ -10887,10 +11100,7 @@ impl RenderBackend for UnifiedBackend {
         record: &CompletedCommandRecord,
         payload: &dyn BlockRenderPayloadAccessor,
     ) {
-        find::invalidate_find_state(
-            self.find_state_for_cb.as_ref(),
-            self.legacy.as_ref().map(|legacy| &legacy.vte),
-        );
+        self.invalidate_find();
         let max_zones = self.config_for_cb.borrow().max_visible_blocks as usize;
         // The engine keeps the raw ring alive through the whole finalize
         // fan-out, so this bounded read still sees the command's bytes. No
@@ -10906,35 +11116,42 @@ impl RenderBackend for UnifiedBackend {
             retired
         };
         prune_retired_record_bookmarks(&self.bookmarks, &retired_record_ids);
-        #[cfg(anvil_shared_terminal)]
-        if let Some(transcript) = self.transcript() {
-            transcript.retire(&retired_record_ids);
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            UnifiedSurface::Shared(terminal) => {
+                let transcript = terminal.transcript().expect("Unified transcript");
+
+                transcript.retire(&retired_record_ids);
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            UnifiedSurface::Legacy(_) => {
+                self.chrome.retire_ids(&retired_record_ids);
+                self.chrome.enforce_limit(max_zones);
+                self.chrome
+                    .record_completed(unified_chrome::ZoneChromeRecord {
+                        id: record.id,
+                        exit_code: record.exit_code,
+                        duration_ms: record.duration_ms,
+                        is_background: record.is_background,
+                        lifecycle_health: record.lifecycle_health(),
+                    });
+                log::debug!(
+                    "unified zone {} recorded: exit={:?} duration_ms={:?} background={} zones={}",
+                    record.id,
+                    record.exit_code,
+                    record.duration_ms,
+                    record.is_background,
+                    self.zones.borrow().records.len(),
+                );
+                self.kitty_assembler.borrow_mut().reset_in_flight();
+                self.kitty_pending_admission.borrow_mut().take();
+                if !record.is_background && self.user_scrolled_up.get() {
+                    self.unread_count
+                        .set(self.unread_count.get().saturating_add(1));
+                }
+                self.navigation.request_refresh();
+            }
         }
-        self.chrome.retire_ids(&retired_record_ids);
-        self.chrome.enforce_limit(max_zones);
-        self.chrome
-            .record_completed(unified_chrome::ZoneChromeRecord {
-                id: record.id,
-                exit_code: record.exit_code,
-                duration_ms: record.duration_ms,
-                is_background: record.is_background,
-                lifecycle_health: record.lifecycle_health(),
-            });
-        log::debug!(
-            "unified zone {} recorded: exit={:?} duration_ms={:?} background={} zones={}",
-            record.id,
-            record.exit_code,
-            record.duration_ms,
-            record.is_background,
-            self.zones.borrow().records.len(),
-        );
-        self.kitty_assembler.borrow_mut().reset_in_flight();
-        self.kitty_pending_admission.borrow_mut().take();
-        if !record.is_background && self.user_scrolled_up.get() {
-            self.unread_count
-                .set(self.unread_count.get().saturating_add(1));
-        }
-        self.navigation.request_refresh();
     }
 
     // The block chrome is permanently absent. The organism overlay still has
@@ -10942,7 +11159,8 @@ impl RenderBackend for UnifiedBackend {
     fn enter_alt_screen_chrome(&self) {
         self.navigation.set_suspended(true);
         self.chrome.set_alt_screen(true);
-        if let Some(legacy) = &self.legacy {
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        if let Some(legacy) = self.legacy_surface_opt() {
             legacy.image_layer.set_alt_screen(true);
         }
         let active = self.active_rc.borrow();
@@ -10953,7 +11171,8 @@ impl RenderBackend for UnifiedBackend {
     fn exit_alt_screen_chrome(&self) {
         self.navigation.set_suspended(false);
         self.chrome.set_alt_screen(false);
-        if let Some(legacy) = &self.legacy {
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        if let Some(legacy) = self.legacy_surface_opt() {
             legacy.image_layer.set_alt_screen(false);
         }
         self.active_rc.borrow().set_live_organism_alt_screen(false);
@@ -10973,7 +11192,8 @@ impl RenderBackend for UnifiedBackend {
             .kitty_assembler
             .borrow_mut()
             .feed_at(payload, self.kitty_cursor());
-        if let Some(legacy) = &self.legacy {
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        if let Some(legacy) = self.legacy_surface_opt() {
             legacy.image_layer.set_row_epoch(self.chrome.row_epoch());
         }
         match outcome {
@@ -11015,6 +11235,7 @@ impl RenderBackend for UnifiedBackend {
             return;
         };
         match pending {
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             PendingUnifiedImage::Vte(pending) => {
                 let zone_reopen = self.legacy_surface().zone_marker.borrow().open_bytes();
                 self.legacy_surface()
@@ -11024,8 +11245,7 @@ impl RenderBackend for UnifiedBackend {
             #[cfg(anvil_shared_terminal)]
             PendingUnifiedImage::Shared(pending) => {
                 if !self
-                    .shared_active
-                    .as_ref()
+                    .shared_surface()
                     .is_some_and(|terminal| terminal.admit_inline_image(pending))
                 {
                     log::debug!("Unified image reservation expired before admission");
@@ -11050,44 +11270,56 @@ impl RenderBackend for UnifiedBackend {
     }
 
     fn schedule_anchor_settle(&self, args: AnchorSettleArgs) {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            args.ready.set(terminal.cursor().is_some());
-            return;
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            UnifiedSurface::Shared(terminal) => {
+                args.ready.set(terminal.cursor().is_some());
+                return;
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            UnifiedSurface::Legacy(_legacy) => {
+                schedule_prompt_anchor_settle(args);
+            }
         }
-        schedule_prompt_anchor_settle(args);
     }
 
     fn cursor_and_rows(&self) -> ((i64, i64), i64) {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            return (terminal.cursor_position(), terminal.row_count());
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            UnifiedSurface::Shared(terminal) => {
+                return (terminal.cursor_position(), terminal.row_count());
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            UnifiedSurface::Legacy(legacy) => {
+                (legacy.vte.cursor_position(), legacy.vte.row_count())
+            }
         }
-        (
-            self.legacy_surface().vte.cursor_position(),
-            self.legacy_surface().vte.row_count(),
-        )
     }
 
     fn cursor_position_report(&self) -> (i64, i64) {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            return terminal.cursor_position();
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            UnifiedSurface::Shared(terminal) => {
+                return terminal.cursor_position();
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            UnifiedSurface::Legacy(legacy) => {
+                let (col, row) = legacy.vte.cursor_position();
+                let top_row = gtk::prelude::ScrollableExt::vadjustment(&legacy.vte)
+                    .map(|adjustment| adjustment.value() as i64)
+                    .unwrap_or(0);
+                (
+                    col,
+                    screen_relative_cpr_row(row, top_row, legacy.vte.row_count()),
+                )
+            }
         }
-        let (col, row) = self.legacy_surface().vte.cursor_position();
-        let top_row = gtk::prelude::ScrollableExt::vadjustment(&self.legacy_surface().vte)
-            .map(|adjustment| adjustment.value() as i64)
-            .unwrap_or(0);
-        (
-            col,
-            screen_relative_cpr_row(row, top_row, self.legacy_surface().vte.row_count()),
-        )
     }
 
     fn replies_through_commit(&self) -> bool {
         #[cfg(anvil_shared_terminal)]
         {
-            self.shared_active.is_none()
+            self.shared_surface().is_none()
         }
         #[cfg(not(anvil_shared_terminal))]
         {
@@ -11096,11 +11328,14 @@ impl RenderBackend for UnifiedBackend {
     }
 
     fn live_surface_answers_query(&self, query: KeyboardProtocolQuery) -> bool {
-        #[cfg(anvil_shared_terminal)]
-        if self.shared_active.is_some() {
-            return true;
+        #[cfg(not(any(anvil_vte_oracle, anvil_legacy_renderer)))]
+        let _ = query;
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            UnifiedSurface::Shared(_) => true,
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            UnifiedSurface::Legacy(_) => vte_answers_query_natively(query),
         }
-        vte_answers_query_natively(query)
     }
 
     /// Unified does no compact/full grid churn, so ring-coordinate anchors are
@@ -11115,19 +11350,25 @@ impl RenderBackend for UnifiedBackend {
     }
 
     fn grid_cols(&self) -> i64 {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            return i64::from(terminal.grid_size().0).max(20);
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            UnifiedSurface::Shared(terminal) => {
+                return i64::from(terminal.grid_size().0).max(20);
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            UnifiedSurface::Legacy(legacy) => legacy.vte.column_count().max(20),
         }
-        self.legacy_surface().vte.column_count().max(20)
     }
 
     fn live_column_count(&self) -> i64 {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            return i64::from(terminal.grid_size().0);
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            UnifiedSurface::Shared(terminal) => {
+                return i64::from(terminal.grid_size().0);
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            UnifiedSurface::Legacy(legacy) => legacy.vte.column_count(),
         }
-        self.legacy_surface().vte.column_count()
     }
 
     fn capture_text_range(
@@ -11137,15 +11378,18 @@ impl RenderBackend for UnifiedBackend {
         end_row: i64,
         end_col: i64,
     ) -> Option<String> {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            return terminal.capture((start_col, start_row), (end_col, end_row));
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            UnifiedSurface::Shared(terminal) => {
+                return terminal.capture((start_col, start_row), (end_col, end_row));
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            UnifiedSurface::Legacy(legacy) => legacy
+                .vte
+                .text_range_format(vte4::Format::Text, start_row, start_col, end_row, end_col)
+                .0
+                .map(|text| text.to_string()),
         }
-        self.legacy_surface()
-            .vte
-            .text_range_format(vte4::Format::Text, start_row, start_col, end_row, end_col)
-            .0
-            .map(|text| text.to_string())
     }
 }
 
@@ -11156,12 +11400,13 @@ impl ReaderCtx {
     fn install(
         self,
         pty: &Rc<OwnedPty>,
-        live_vte: Option<&Terminal>,
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))] live_vte: Option<&Terminal>,
         first_pty_output: Rc<jterm_core::pty_reader::FirstPtyOutput>,
     ) -> std::io::Result<()> {
         // Installed ahead of the live VTE's own commit handler (TermView::new
         // connects that one later), so the hold reads the CPR ledger before
         // the handler settles a matched report.
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(terminal) = live_vte {
             self.selection_feed_hold
                 .install_vte_hooks(terminal, self.cpr_outstanding_rc.clone());
@@ -11230,6 +11475,7 @@ impl ReaderCtx {
 /// publishers shared [`PtyWinsize::sent`], the tick compared against a private
 /// copy that had never seen the sync's value, and skipped exactly that
 /// correction.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn sync_active_to_pty(
     layout_active_surface: &Rc<dyn Fn()>,
     vte: &Terminal,
@@ -11337,6 +11583,7 @@ fn next_winsize_to_publish(sent: (u16, u16), sample: (u16, u16)) -> Option<(u16,
     (sample.0 > 0 && sample.1 > 0 && sample != sent).then_some(sample)
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn pty_grid_size(vte: &Terminal, scroll: &ScrolledWindow) -> (u16, u16) {
     let cols = vte.column_count().max(1) as u16;
     let rows = viewport_rows_for(vte, scroll)
@@ -11371,6 +11618,7 @@ fn active_card_vchrome_for_classes(has: impl Fn(&str) -> bool) -> i32 {
     active_card_vchrome_px(has("block-fullscreen"), has("block-compact"))
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
     let cell_h = (vte.char_height() as i32).max(1);
     let page =
@@ -11522,6 +11770,7 @@ fn live_visible_rows_for_measurement(
 /// large PTY chunk is reflected by cursor/text queries; the immediate layout is
 /// still useful for streaming output, while this frame pass observes the final
 /// state without requiring another keypress to trigger a redraw.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn schedule_live_layout_settle(
     terminal: &Terminal,
     pending: &Rc<Cell<bool>>,
@@ -11560,6 +11809,7 @@ fn schedule_live_layout_settle(
 /// VTE's absolute row counter — `Ring::reset` returns `m_end` unchanged, so
 /// rows climb for the life of the pane and every card after the first
 /// screenful would measure as a full viewport.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn live_content_extent(
     vte: &Terminal,
     origin: &Cell<Option<i64>>,
@@ -11623,6 +11873,7 @@ fn live_content_extent(
 /// same last drawn row in absolute coordinates. The cursor can be above a
 /// footer or below the last text on an empty input line, so probe both sides.
 /// This is only needed while the running card is shorter than the viewport.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn displayed_live_origin(vte: &Terminal) -> Option<i64> {
     // The snapshot is the user's displayed viewport, but the cursor belongs
     // to the active screen. Never combine them while the user reads history.
@@ -11671,6 +11922,7 @@ fn live_visible_baseline_origin(cursor_row: i64, visible_rows: i64) -> i64 {
 /// content: `get_text` ends a segment per PARAGRAPH, not per screen row (it
 /// appends a newline only when the row is not soft-wrapped), so a single
 /// range query cannot be indexed by screen row at all.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn lowest_drawn_screen_row(vte: &Terminal, origin: i64, from: i64, grid_rows: i64) -> Option<i64> {
     let cols = vte.column_count().max(1);
     let mut row = grid_rows - 1;
@@ -11723,6 +11975,7 @@ fn lowest_drawn_screen_row(vte: &Terminal, origin: i64, from: i64, grid_rows: i6
 /// first, and the clear queued behind it moves the top down past those rows. A
 /// shell's own Ctrl+L at the prompt moves it again. The displayed text needs no
 /// anchor at all.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn prompt_area_rows(vte: &Terminal) -> i64 {
     vte.text_format(vte4::Format::Text).map_or(1, |text| {
         drawn_rows_in_displayed_text(&text, vte.row_count())
@@ -12119,7 +12372,9 @@ struct KeyCtx {
     pty_for_key: Rc<OwnedPty>,
     live_for_key: glib::WeakRef<gtk::Widget>,
     row_height_for_key: Rc<dyn Fn() -> f64>,
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     running_cmd_for_key: Rc<RefCell<String>>,
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     native_transcript_for_key: NativeTranscriptScroll,
     bracketed_paste_for_key: Rc<Cell<bool>>,
     finished_blocks_for_key: Rc<RefCell<Vec<FinishedBlock>>>,
@@ -12170,7 +12425,9 @@ impl KeyCtx {
             pty_for_key,
             live_for_key,
             row_height_for_key,
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             running_cmd_for_key,
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             native_transcript_for_key,
             bracketed_paste_for_key,
             finished_blocks_for_key,
@@ -12290,18 +12547,19 @@ impl KeyCtx {
 
             // Warp pages and jumps through block history locally. While a command
             // or fullscreen/raw terminal owns the viewport, forward these keys to it.
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             if let Some(terminal) = live.downcast_ref::<Terminal>().filter(|_| {
                 !ctrl
-                && !shift
-                && !alt
-                && !modifiers.intersects(
-                    gtk::gdk::ModifierType::SUPER_MASK | gtk::gdk::ModifierType::META_MASK,
-                )
-                && native_transcript_for_key.owns_session(&running_cmd_for_key.borrow())
-                && matches!(
-                    keyval,
-                    Key::Page_Up | Key::Page_Down | Key::KP_Page_Up | Key::KP_Page_Down
-                )
+                    && !shift
+                    && !alt
+                    && !modifiers.intersects(
+                        gtk::gdk::ModifierType::SUPER_MASK | gtk::gdk::ModifierType::META_MASK,
+                    )
+                    && native_transcript_for_key.owns_session(&running_cmd_for_key.borrow())
+                    && matches!(
+                        keyval,
+                        Key::Page_Up | Key::Page_Down | Key::KP_Page_Up | Key::KP_Page_Down
+                    )
             }) {
                 live_keys_for_key.last_key.set(None);
                 native_transcript_for_key.page(
@@ -12894,14 +13152,20 @@ impl TermView {
     fn shared_active_requested(mode: &crate::config::TerminalMode) -> bool {
         use crate::config::TerminalMode;
 
-        let override_name = match mode {
-            TerminalMode::Block | TerminalMode::Chat => "JTERM_SHARED_ACTIVE_TERMINAL",
-            TerminalMode::Unified => "JTERM_SHARED_TRANSCRIPT",
-            TerminalMode::Vte => return false,
-        };
-        // The prepared PTY owns the local endpoint while the bridge resolves
-        // the program and working directory in the host environment.
-        std::env::var_os(override_name).is_none_or(|value| value == "1")
+        #[cfg(not(test))]
+        return *mode != TerminalMode::Vte;
+
+        #[cfg(test)]
+        {
+            let override_name = match mode {
+                TerminalMode::Block | TerminalMode::Chat => "JTERM_SHARED_ACTIVE_TERMINAL",
+                TerminalMode::Unified => "JTERM_SHARED_TRANSCRIPT",
+                TerminalMode::Vte => return false,
+            };
+            // The prepared PTY owns the local endpoint while the bridge resolves
+            // the program and working directory in the host environment.
+            std::env::var_os(override_name).is_none_or(|value| value == "1")
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -13010,6 +13274,15 @@ impl TermView {
             block_scroll.set_policy(gtk::PolicyType::External, gtk::PolicyType::External);
         }
         block_scroll.set_child(Some(&block_list));
+        if chat_mode {
+            // Chat moves its live editor between the fixed composer and a
+            // running card. Restoring keyboard focus must not make GTK scroll
+            // the independent transcript to that card; ScrollDebouncer owns
+            // follow mode and explicit return-to-live navigation.
+            if let Some(viewport) = block_scroll.child().and_downcast::<gtk::Viewport>() {
+                viewport.set_scroll_to_focus(false);
+            }
+        }
         block_scroll.add_css_class("block-scroll");
         // A focusable ScrolledWindow steals keyboard focus from the live VTE
         // child (cursor goes hollow, keystrokes never reach the terminal). Make
@@ -13034,7 +13307,8 @@ impl TermView {
             #[cfg(anvil_shared_terminal)]
             shared_active.clone(),
         )));
-        let active_vte = active.borrow().active_vte.clone();
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        let active_vte = active.borrow().legacy_terminal().cloned();
         let live_focus = active.borrow().focus_widget();
         let block_live_chrome = (*mode == crate::config::TerminalMode::Block).then(|| {
             let chrome = block_reference::LiveChrome::new();
@@ -13447,6 +13721,7 @@ impl TermView {
         }
 
         // Store child PID on the live VTE so kill_all_terminal_children can find it
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(terminal) = &active_vte {
             unsafe {
                 terminal.set_data::<i32>("child-pid", pty.pid_i32());
@@ -13463,6 +13738,7 @@ impl TermView {
         // the fallback authority; ordinary unintegrated shells stay untouched.
 
         let native_transcript_scroll = NativeTranscriptScroll::new(bstate.clone(), direct_cli);
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(terminal) = &active_vte {
             native_transcript_scroll.install(terminal);
         }
@@ -13681,29 +13957,38 @@ impl TermView {
             // TermView.  Keep every widget edge weak so closing a pane cannot
             // form signal -> callback -> ancestor/terminal reference cycles.
             let holder = active.borrow().widget().downgrade();
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             let vte = active_vte.as_ref().map(Terminal::downgrade);
             let scroll = block_scroll.downgrade();
             let bstate = bstate.clone();
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             let typed_cmd = typed_cmd.clone();
             let finished_for_layout = finished_blocks_rc.clone();
             let block_data_for_layout = block_data_rc.clone();
             let failure_marker_redraw_for_layout = failure_marker_redraw.clone();
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             let last_size_target: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
             let last_output_layout: Rc<Cell<FinishedLayoutKey>> = Rc::new(Cell::new((-1, -1, -1)));
             // High-water content extent of the command running now. Owned by
             // ActiveBlock so that `reset_active` — the one funnel every reset
             // path goes through — clears it for the next command.
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             let live_rows_high_water = active.borrow().live_extent_rows();
             // Origin for the extent measurement, re-based by the same
             // `reset_active` funnel that clears the high-water.
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             let live_cursor_origin = active.borrow().live_cursor_origin();
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             let live_cursor_high = active.borrow().live_cursor_high();
             // The engine-owned capture gates coherent growth after
             // CommandStart. Empty means every VTE sample is still provisional;
             // only the separate parser-barrier flag authorizes a full card.
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             let live_output_for_layout = live_raw_output.clone();
             let live_force_full_for_layout = live_extent_force_full.clone();
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             let live_origin_for_layout = live_cursor_origin.clone();
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             let live_cursor_high_for_layout = live_cursor_high.clone();
             // Weak: ActiveBlock owns the VTE that retains this callback.
             let active_for_layout = Rc::downgrade(&active);
@@ -13721,6 +14006,8 @@ impl TermView {
                 let Some(active_block) = active_for_layout.upgrade() else {
                     return;
                 };
+                #[cfg(not(any(anvil_vte_oracle, anvil_legacy_renderer)))]
+                let _ = holder;
                 // Re-fit blocks that are already on screen to a resized pane.
                 // Cards that scrolled off and back re-fit themselves on map.
                 let fit_finished_outputs = |cell_h| {
@@ -13779,208 +14066,213 @@ impl TermView {
                     }
                     return;
                 }
-                let Some(vte) = vte.as_ref().and_then(glib::WeakRef::upgrade) else {
-                    return;
-                };
-                let cell_h = (vte.char_height() as i32).max(1);
-                let Some(viewport_rows) = viewport_rows_for(&vte, &scroll) else {
-                    return;
-                };
-                let cols = vte.column_count().max(1);
-                let state = bstate.get();
-                holder.set_visible(true);
-                // With the previous command's scrollback deliberately kept, the
-                // prompt sits at the bottom of the ring rather than the top of a
-                // cleared screen.
-                let prompt_at_grid_top = active_block
-                    .try_borrow()
-                    .map(|live| !live.preserve_live_scrollback())
-                    .unwrap_or(false);
-                if matches!(
-                    state,
-                    BlockState::CollectingOutput | BlockState::PostCommand
-                ) {
-                    // The grid stays a full viewport: `pty_grid_size` told the
-                    // child that is its winsize, and an application that repaints
-                    // by absolute row without taking the alternate screen (`top`,
-                    // `watch`, a plain `clear`) needs every one of those rows to
-                    // draw into.
-                    let target = (cols, viewport_rows);
-                    if last_size_target.get() != target {
-                        vte.set_size(cols, viewport_rows);
-                        last_size_target.set(target);
-                    }
-                    // The card, though, is only as tall as the output so far, so
-                    // the blocks above stay on screen and the history pans up a
-                    // row at a time instead of being shoved off by a page-tall
-                    // reservation the command may never fill.
-                    let output_started = !live_output_for_layout.borrow().is_empty();
-                    let extent = if prompt_at_grid_top {
-                        live_content_extent(
-                            &vte,
-                            &live_origin_for_layout,
-                            &live_cursor_high_for_layout,
+                #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+                {
+                    let Some(vte) = vte.as_ref().and_then(|weak| weak.upgrade()) else {
+                        return;
+                    };
+                    let cell_h = (vte.char_height() as i32).max(1);
+                    let Some(viewport_rows) = viewport_rows_for(&vte, &scroll) else {
+                        return;
+                    };
+                    let cols = vte.column_count().max(1);
+                    let state = bstate.get();
+                    holder.set_visible(true);
+                    // With the previous command's scrollback deliberately kept, the
+                    // prompt sits at the bottom of the ring rather than the top of a
+                    // cleared screen.
+                    let prompt_at_grid_top = active_block
+                        .try_borrow()
+                        .map(|live| !live.preserve_live_scrollback())
+                        .unwrap_or(false);
+                    if matches!(
+                        state,
+                        BlockState::CollectingOutput | BlockState::PostCommand
+                    ) {
+                        // The grid stays a full viewport: `pty_grid_size` told the
+                        // child that is its winsize, and an application that repaints
+                        // by absolute row without taking the alternate screen (`top`,
+                        // `watch`, a plain `clear`) needs every one of those rows to
+                        // draw into.
+                        let target = (cols, viewport_rows);
+                        if last_size_target.get() != target {
+                            vte.set_size(cols, viewport_rows);
+                            last_size_target.set(target);
+                        }
+                        // The card, though, is only as tall as the output so far, so
+                        // the blocks above stay on screen and the history pans up a
+                        // row at a time instead of being shoved off by a page-tall
+                        // reservation the command may never fill.
+                        let output_started = !live_output_for_layout.borrow().is_empty();
+                        let extent = if prompt_at_grid_top {
+                            live_content_extent(
+                                &vte,
+                                &live_origin_for_layout,
+                                &live_cursor_high_for_layout,
+                                output_started,
+                                live_rows_high_water.get(),
+                            )
+                        } else {
+                            None
+                        };
+                        let (visible_rows, next_high_water) = live_visible_rows_for_layout(
+                            !prompt_at_grid_top,
+                            extent,
+                            output_started,
+                            live_force_full_for_layout.get(),
+                            live_rows_high_water.get(),
+                            viewport_rows,
+                        );
+                        // Rows below the cursor-derived extent that already hold
+                        // text belong to the card too (see `lowest_drawn_screen_row`).
+                        let (visible_rows, next_high_water) = match live_origin_for_layout.get() {
+                            Some(origin)
+                                if prompt_at_grid_top
+                                    && output_started
+                                    && next_high_water < viewport_rows =>
+                            {
+                                match lowest_drawn_screen_row(
+                                    &vte,
+                                    origin,
+                                    next_high_water,
+                                    viewport_rows,
+                                ) {
+                                    Some(lowest) => {
+                                        let high_water = next_high_water.max(lowest + 1);
+                                        (live_visible_rows(high_water, viewport_rows), high_water)
+                                    }
+                                    None => (visible_rows, next_high_water),
+                                }
+                            }
+                            _ => (visible_rows, next_high_water),
+                        };
+                        log::trace!(
+                            target: "anvil::live_card",
+                            "cursor_row={} origin={:?} cursor_high={} extent={:?} output_started={} high_water={} -> visible_rows={} viewport_rows={} grid_rows={}",
+                            vte.cursor_position().1,
+                            live_origin_for_layout.get(),
+                            live_cursor_high_for_layout.get(),
+                            extent,
                             output_started,
                             live_rows_high_water.get(),
-                        )
-                    } else {
-                        None
-                    };
-                    let (visible_rows, next_high_water) = live_visible_rows_for_layout(
-                        !prompt_at_grid_top,
-                        extent,
-                        output_started,
-                        live_force_full_for_layout.get(),
-                        live_rows_high_water.get(),
-                        viewport_rows,
-                    );
-                    // Rows below the cursor-derived extent that already hold
-                    // text belong to the card too (see `lowest_drawn_screen_row`).
-                    let (visible_rows, next_high_water) = match live_origin_for_layout.get() {
-                        Some(origin)
-                            if prompt_at_grid_top
-                                && output_started
-                                && next_high_water < viewport_rows =>
+                            visible_rows,
+                            viewport_rows,
+                            vte.row_count(),
+                        );
+                        // Chat's composer can be a single native input row. The
+                        // legacy Block floor of six rows must not expand it at
+                        // CommandStart before any new output exists. Retain every
+                        // proven row and preserve full-screen/scrollback fallback.
+                        let visible_rows = if docked_input
+                            && prompt_at_grid_top
+                            && !live_force_full_for_layout.get()
                         {
-                            match lowest_drawn_screen_row(
-                                &vte,
-                                origin,
-                                next_high_water,
-                                viewport_rows,
-                            ) {
-                                Some(lowest) => {
-                                    let high_water = next_high_water.max(lowest + 1);
-                                    (live_visible_rows(high_water, viewport_rows), high_water)
-                                }
-                                None => (visible_rows, next_high_water),
-                            }
+                            next_high_water.clamp(1, viewport_rows.max(1))
+                        } else {
+                            visible_rows
+                        };
+                        live_rows_high_water.set(next_high_water);
+                        holder.set_height_request(
+                            (visible_rows as i32) * cell_h + blocks::terminal_vertical_insets(&vte),
+                        );
+                        if let Ok(active_block) = active_block.try_borrow() {
+                            active_block.set_live_geometry(cell_h, viewport_rows, visible_rows);
                         }
-                        _ => (visible_rows, next_high_water),
+                        fit_finished_outputs(cell_h);
+                        return;
+                    }
+                    // Not running: the prompt, an alternate-screen app or the raw
+                    // fallback. The next command starts from the prompt's height
+                    // again, and an alternate-screen visit inside a running command
+                    // hands back the height the command had reached (see
+                    // `high_water_after_idle_layout`).
+                    let input_rows = || {
+                        // Must NOT use cursor_position().1 here: it's the absolute
+                        // scrollback row and climbs without bound across the
+                        // session.
+                        1 + typed_cmd.borrow().bytes().filter(|&b| b == b'\n').count() as i64
                     };
-                    log::trace!(
-                        target: "anvil::live_card",
-                        "cursor_row={} origin={:?} cursor_high={} extent={:?} output_started={} high_water={} -> visible_rows={} viewport_rows={} grid_rows={}",
-                        vte.cursor_position().1,
-                        live_origin_for_layout.get(),
-                        live_cursor_high_for_layout.get(),
-                        extent,
-                        output_started,
-                        live_rows_high_water.get(),
-                        visible_rows,
-                        viewport_rows,
-                        vte.row_count(),
+                    // Between prompts the live cell collapses to fit the typed
+                    // command (warp-style compact input) — but the shell owns more
+                    // of the screen than the command line whenever it draws below
+                    // the input: a completion menu, an AI explanation, a two-line
+                    // prompt. The card grows to cover that and shrinks again when
+                    // the overlay closes.
+                    //
+                    // With the previous command's scrollback kept (see
+                    // `prompt_at_grid_top` above), the card shows the grid's *first*
+                    // rows, so there the grid stays pinned to the card as it always
+                    // was.
+                    let idle = matches!(
+                        state,
+                        BlockState::Idle
+                            | BlockState::CollectingPrompt
+                            | BlockState::AwaitingCommand
                     );
-                    // Chat's composer can be a single native input row. The
-                    // legacy Block floor of six rows must not expand it at
-                    // CommandStart before any new output exists. Retain every
-                    // proven row and preserve full-screen/scrollback fallback.
-                    let visible_rows = if docked_input
-                        && prompt_at_grid_top
-                        && !live_force_full_for_layout.get()
-                    {
-                        next_high_water.clamp(1, viewport_rows.max(1))
+                    // A real terminal's grid is the viewport, always: that is the
+                    // winsize `pty_grid_size` gave the child, and every row of it is
+                    // one the shell may draw into. While an alt-screen app owns the
+                    // screen, or while we fall back to raw VTE (no OSC-133), the
+                    // card is that grid too. Normal command output is rendered into
+                    // the running block above, so the live input cell can still stay
+                    // compact — it is only the visible height that collapses.
+                    let compact_rows = if block_mode {
+                        chat::block_composer_rows
+                    } else if docked_input {
+                        chat::composer_rows
                     } else {
-                        visible_rows
+                        compact_card_rows
                     };
-                    live_rows_high_water.set(next_high_water);
+                    let grid_rows = if idle && !prompt_at_grid_top {
+                        compact_rows(input_rows(), 1, viewport_rows)
+                    } else {
+                        viewport_rows
+                    };
+                    let card_rows = if idle {
+                        let drawn = if prompt_at_grid_top {
+                            prompt_area_rows(&vte)
+                        } else {
+                            1
+                        };
+                        compact_rows(input_rows(), drawn, viewport_rows)
+                    } else {
+                        grid_rows
+                    };
+                    let grid_rows = if docked_input && idle && !prompt_at_grid_top {
+                        grid_rows.max(card_rows)
+                    } else {
+                        grid_rows
+                    };
+                    // Preserve the compact input height across CommandStart. VTE's
+                    // cursor/adjustment pair may still describe different grid
+                    // generations until the first real output arrives, so the
+                    // running branch needs a trustworthy baseline of its own.
+                    live_rows_high_water.set(high_water_after_idle_layout(
+                        state,
+                        live_rows_high_water.get(),
+                        card_rows,
+                    ));
+                    // Drive the VTE grid directly. `set_height_request` only sets a
+                    // *minimum*, so it cannot shrink a VTE whose natural height
+                    // (row_count * char_height) is larger — the cell would stay
+                    // full-height. `set_size` sets the preferred grid, shrinking the
+                    // VTE's natural height so the (non-expanding) holder collapses to
+                    // it. The resize settle tick then follows row_count up/down.
+                    let target = (cols, grid_rows);
+                    if last_size_target.get() != target {
+                        vte.set_size(cols, grid_rows);
+                        last_size_target.set(target);
+                    }
                     holder.set_height_request(
-                        (visible_rows as i32) * cell_h + blocks::terminal_vertical_insets(&vte),
+                        (card_rows as i32) * cell_h + blocks::terminal_vertical_insets(&vte),
                     );
-                    if let Ok(active_block) = active_block.try_borrow() {
-                        active_block.set_live_geometry(cell_h, viewport_rows, visible_rows);
+                    // Same clip the running card uses: the grid keeps every row the
+                    // child was promised while the card shows the prompt area only.
+                    if let Ok(live) = active_block.try_borrow() {
+                        live.set_live_geometry(cell_h, grid_rows, card_rows);
                     }
                     fit_finished_outputs(cell_h);
-                    return;
                 }
-                // Not running: the prompt, an alternate-screen app or the raw
-                // fallback. The next command starts from the prompt's height
-                // again, and an alternate-screen visit inside a running command
-                // hands back the height the command had reached (see
-                // `high_water_after_idle_layout`).
-                let input_rows = || {
-                    // Must NOT use cursor_position().1 here: it's the absolute
-                    // scrollback row and climbs without bound across the
-                    // session.
-                    1 + typed_cmd.borrow().bytes().filter(|&b| b == b'\n').count() as i64
-                };
-                // Between prompts the live cell collapses to fit the typed
-                // command (warp-style compact input) — but the shell owns more
-                // of the screen than the command line whenever it draws below
-                // the input: a completion menu, an AI explanation, a two-line
-                // prompt. The card grows to cover that and shrinks again when
-                // the overlay closes.
-                //
-                // With the previous command's scrollback kept (see
-                // `prompt_at_grid_top` above), the card shows the grid's *first*
-                // rows, so there the grid stays pinned to the card as it always
-                // was.
-                let idle = matches!(
-                    state,
-                    BlockState::Idle | BlockState::CollectingPrompt | BlockState::AwaitingCommand
-                );
-                // A real terminal's grid is the viewport, always: that is the
-                // winsize `pty_grid_size` gave the child, and every row of it is
-                // one the shell may draw into. While an alt-screen app owns the
-                // screen, or while we fall back to raw VTE (no OSC-133), the
-                // card is that grid too. Normal command output is rendered into
-                // the running block above, so the live input cell can still stay
-                // compact — it is only the visible height that collapses.
-                let compact_rows = if block_mode {
-                    chat::block_composer_rows
-                } else if docked_input {
-                    chat::composer_rows
-                } else {
-                    compact_card_rows
-                };
-                let grid_rows = if idle && !prompt_at_grid_top {
-                    compact_rows(input_rows(), 1, viewport_rows)
-                } else {
-                    viewport_rows
-                };
-                let card_rows = if idle {
-                    let drawn = if prompt_at_grid_top {
-                        prompt_area_rows(&vte)
-                    } else {
-                        1
-                    };
-                    compact_rows(input_rows(), drawn, viewport_rows)
-                } else {
-                    grid_rows
-                };
-                let grid_rows = if docked_input && idle && !prompt_at_grid_top {
-                    grid_rows.max(card_rows)
-                } else {
-                    grid_rows
-                };
-                // Preserve the compact input height across CommandStart. VTE's
-                // cursor/adjustment pair may still describe different grid
-                // generations until the first real output arrives, so the
-                // running branch needs a trustworthy baseline of its own.
-                live_rows_high_water.set(high_water_after_idle_layout(
-                    state,
-                    live_rows_high_water.get(),
-                    card_rows,
-                ));
-                // Drive the VTE grid directly. `set_height_request` only sets a
-                // *minimum*, so it cannot shrink a VTE whose natural height
-                // (row_count * char_height) is larger — the cell would stay
-                // full-height. `set_size` sets the preferred grid, shrinking the
-                // VTE's natural height so the (non-expanding) holder collapses to
-                // it. The resize settle tick then follows row_count up/down.
-                let target = (cols, grid_rows);
-                if last_size_target.get() != target {
-                    vte.set_size(cols, grid_rows);
-                    last_size_target.set(target);
-                }
-                holder.set_height_request(
-                    (card_rows as i32) * cell_h + blocks::terminal_vertical_insets(&vte),
-                );
-                // Same clip the running card uses: the grid keeps every row the
-                // child was promised while the card shows the prompt area only.
-                if let Ok(live) = active_block.try_borrow() {
-                    live.set_live_geometry(cell_h, grid_rows, card_rows);
-                }
-                fit_finished_outputs(cell_h);
             })
         };
         // Unified has one layout state: a viewport-sized surface for prompts,
@@ -13989,8 +14281,10 @@ impl TermView {
             #[cfg(anvil_shared_terminal)]
             let sent = pty_winsize.sent.clone();
             let holder = active.borrow().widget().downgrade();
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             let vte = active_vte.as_ref().map(Terminal::downgrade);
             let scroll = block_scroll.downgrade();
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             let last_size_target: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
             let active_for_layout = Rc::downgrade(&active);
             Rc::new(move || {
@@ -14002,7 +14296,7 @@ impl TermView {
                 };
                 #[cfg(anvil_shared_terminal)]
                 if let Ok(active) = active_block.try_borrow() {
-                    if let Some(terminal) = &active.shared_active {
+                    if let Some(terminal) = active.shared_terminal() {
                         holder.set_visible(true);
                         if let Some(grid) =
                             active.layout_shared_unified(terminal, scroll.width(), scroll.height())
@@ -14011,29 +14305,32 @@ impl TermView {
                         }
                         return;
                     }
+                };
+                #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+                {
+                    let Some(vte) = vte.as_ref().and_then(|weak| weak.upgrade()) else {
+                        return;
+                    };
+                    let cell_h = (vte.char_height() as i32).max(1);
+                    let Some(viewport_rows) = viewport_rows_for(&vte, &scroll) else {
+                        return;
+                    };
+                    let target = (vte.column_count().max(1), viewport_rows);
+                    holder.set_visible(true);
+                    if last_size_target.get() != target {
+                        vte.set_size(target.0, target.1);
+                        last_size_target.set(target);
+                    }
+                    holder.set_height_request(
+                        (viewport_rows as i32) * cell_h + blocks::terminal_vertical_insets(&vte),
+                    );
+                    // Unified has one surface and one height; the clip is a no-op
+                    // here, but the terminal still needs its size request or the
+                    // Fixed would allocate it its bare minimum.
+                    if let Ok(live) = active_block.try_borrow() {
+                        live.set_live_geometry(cell_h, viewport_rows, viewport_rows);
+                    };
                 }
-                let Some(vte) = vte.as_ref().and_then(glib::WeakRef::upgrade) else {
-                    return;
-                };
-                let cell_h = (vte.char_height() as i32).max(1);
-                let Some(viewport_rows) = viewport_rows_for(&vte, &scroll) else {
-                    return;
-                };
-                let target = (vte.column_count().max(1), viewport_rows);
-                holder.set_visible(true);
-                if last_size_target.get() != target {
-                    vte.set_size(target.0, target.1);
-                    last_size_target.set(target);
-                }
-                holder.set_height_request(
-                    (viewport_rows as i32) * cell_h + blocks::terminal_vertical_insets(&vte),
-                );
-                // Unified has one surface and one height; the clip is a no-op
-                // here, but the terminal still needs its size request or the
-                // Fixed would allocate it its bare minimum.
-                if let Ok(live) = active_block.try_borrow() {
-                    live.set_live_geometry(cell_h, viewport_rows, viewport_rows);
-                };
             })
         };
         let layout_active_surface: Rc<dyn Fn()> = if unified {
@@ -14060,6 +14357,7 @@ impl TermView {
         };
 
         let contents_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(active_vte) = &active_vte {
             // Drive sizing from the data path (contents changed: prompt printed,
             // user typing, output streaming, alt-screen toggle), and follow the
@@ -14126,6 +14424,7 @@ impl TermView {
         // Bell signal is delivered natively by VTE — no need to scan the byte
         // stream for BEL ourselves (and disambiguate it from OSC string
         // terminators). VTE already does that disambiguation inside its parser.
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(active_vte) = &active_vte {
             let bell_cbs = bell_callbacks.clone();
             active_vte.connect_bell(move |_| {
@@ -14215,7 +14514,9 @@ impl TermView {
         let kitty_pusher: Rc<Cell<Option<i32>>> = Rc::new(Cell::new(None));
         let live_keys: Rc<LiveKeyRecord> = Rc::new(LiveKeyRecord::default());
         let agent_prompt_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         let chat_send_intent: Rc<Cell<Option<chat::SendIntent>>> = Rc::new(Cell::new(None));
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(active_vte) = active_vte.as_ref().filter(|_| docked_input) {
             chat::connect_submit(
                 &chat_send,
@@ -14300,13 +14601,18 @@ impl TermView {
         let verified_submission_source_id: Rc<RefCell<Option<glib::SourceId>>> =
             Rc::new(RefCell::new(None));
         let submission_surface_owner: Rc<dyn SubmissionSurface> = {
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             let vte_surface = || {
                 Rc::new(VteSubmissionSurface {
                     vte: active_vte.as_ref().expect("legacy live terminal").clone(),
                     rebase_on_row_delta: rebase_prompt_anchor_on_row_delta,
                 }) as Rc<dyn SubmissionSurface>
             };
-            #[cfg(anvil_shared_terminal)]
+            #[cfg(not(any(anvil_vte_oracle, anvil_legacy_renderer)))]
+            {
+                shared_active.clone().expect("shared submission surface")
+            }
+            #[cfg(all(anvil_shared_terminal, any(anvil_vte_oracle, anvil_legacy_renderer)))]
             {
                 shared_active
                     .clone()
@@ -14372,6 +14678,7 @@ impl TermView {
                 }
             })
         };
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(active_vte) = &active_vte {
             let dispatch = cwd_from_uri.clone();
             active_vte.connect_current_directory_uri_notify(move |vte| {
@@ -14381,6 +14688,7 @@ impl TermView {
             });
         }
 
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(active_vte) = &active_vte {
             let title_cbs = title_callbacks.clone();
             active_vte.connect_window_title_changed(move |vte| {
@@ -14473,7 +14781,6 @@ impl TermView {
             Rc::new(RefCell::new(None));
         {
             let active_rc = active.clone();
-            let active_vte_rc = active_vte.clone();
             let bstate_rc = bstate.clone();
             let typed_cmd_rc = typed_cmd.clone();
             let prompt_end_pos_rc = prompt_end_pos.clone();
@@ -14516,55 +14823,87 @@ impl TermView {
             // This is the only reader-path mode switch. The PTY, parser,
             // lifecycle engine and all state above and below it are shared.
             let backend: Rc<dyn RenderBackend> = if unified {
-                let zone_marker = active_vte_rc
-                    .as_ref()
-                    .map(|_| Rc::new(RefCell::new(ZoneMarkerInjector::from_system_entropy())));
-                let marker_nonce = zone_marker
-                    .as_ref()
-                    .and_then(|marker| marker.borrow().nonce());
-                let image_layer_slot: Rc<RefCell<Option<unified_images::UnifiedImageLayer>>> =
-                    Rc::new(RefCell::new(None));
-                let chrome_authority = Rc::new(RefCell::new(
-                    unified_chrome::ZoneChromeAuthority::new(marker_nonce),
-                ));
+                let live_surface = active_rc.borrow().surface.clone();
+                #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+                let zone_marker = match &live_surface {
+                    blocks::ActiveSurface::Legacy(_) => Some(Rc::new(RefCell::new(
+                        ZoneMarkerInjector::from_system_entropy(),
+                    ))),
+                    #[cfg(anvil_shared_terminal)]
+                    blocks::ActiveSurface::Shared(_) => None,
+                };
+                #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+                let image_layer_slot: Rc<
+                    RefCell<Option<unified_images::UnifiedImageLayer>>,
+                > = Rc::new(RefCell::new(None));
+                #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                 let image_layer_for_retention = Rc::downgrade(&image_layer_slot);
-                let chrome = unified_chrome::UnifiedChrome::new(
-                    active_vte_rc.as_ref(),
-                    &active_rc.borrow().unified_chrome_surface,
-                    chrome_authority,
-                    config_for_cb.clone(),
+                #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+                let retained_floor_observer: unified_chrome::RetainedFloorObserver =
                     Rc::new(move |proof| {
                         if let Some(slot) = image_layer_for_retention.upgrade() {
                             if let Some(layer) = slot.borrow().as_ref() {
                                 layer.retire_before(proof);
                             }
                         }
-                    }),
+                    });
+                let chrome = match &live_surface {
                     #[cfg(anvil_shared_terminal)]
-                    shared_active.as_ref(),
-                );
-                let legacy = active_vte_rc.zip(zone_marker).map(|(vte, zone_marker)| {
-                    let image_layer = unified_images::UnifiedImageLayer::new(
-                        &vte,
-                        &active_rc.borrow().unified_image_surface,
-                        marker_nonce,
-                        chrome.image_row_projection(),
-                    );
-                    *image_layer_slot.borrow_mut() = Some(image_layer.clone());
-                    LegacyUnifiedSurface {
-                        vte,
-                        zone_marker,
-                        image_layer,
-                        _image_layer_slot_owner: image_layer_slot,
+                    blocks::ActiveSurface::Shared(terminal) => {
+                        unified_chrome::UnifiedChrome::for_shared(
+                            &active_rc.borrow().unified_chrome_surface,
+                            Rc::new(RefCell::new(unified_chrome::ZoneChromeAuthority::new(None))),
+                            config_for_cb.clone(),
+                            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+                            retained_floor_observer.clone(),
+                            terminal,
+                        )
                     }
-                });
+                    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+                    blocks::ActiveSurface::Legacy(terminal) => {
+                        let nonce = zone_marker
+                            .as_ref()
+                            .and_then(|marker| marker.borrow().nonce());
+                        unified_chrome::UnifiedChrome::new(
+                            Some(terminal),
+                            &active_rc.borrow().unified_chrome_surface,
+                            Rc::new(RefCell::new(unified_chrome::ZoneChromeAuthority::new(
+                                nonce,
+                            ))),
+                            config_for_cb.clone(),
+                            retained_floor_observer.clone(),
+                            #[cfg(anvil_shared_terminal)]
+                            None,
+                        )
+                    }
+                };
+                let surface = match live_surface {
+                    #[cfg(anvil_shared_terminal)]
+                    blocks::ActiveSurface::Shared(terminal) => UnifiedSurface::Shared(terminal),
+                    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+                    blocks::ActiveSurface::Legacy(vte) => {
+                        let zone_marker = zone_marker.expect("legacy zone marker");
+                        let marker_nonce = zone_marker.borrow().nonce();
+                        let image_layer = unified_images::UnifiedImageLayer::new(
+                            &vte,
+                            &active_rc.borrow().unified_image_surface,
+                            marker_nonce,
+                            chrome.image_row_projection(),
+                        );
+                        *image_layer_slot.borrow_mut() = Some(image_layer.clone());
+                        UnifiedSurface::Legacy(LegacyUnifiedSurface {
+                            vte,
+                            zone_marker,
+                            image_layer,
+                            _image_layer_slot_owner: image_layer_slot,
+                        })
+                    }
+                };
                 active_rc.borrow().unified_chrome_surface.set_visible(true);
                 Rc::new(UnifiedBackend {
                     #[cfg(anvil_shared_terminal)]
-                    shared_active: shared_active.clone(),
-                    #[cfg(anvil_shared_terminal)]
                     shared_cwd: shared_active.as_ref().map(|_| cwd_from_uri.clone()),
-                    legacy,
+                    surface,
                     navigation: unified_navigation
                         .as_ref()
                         .expect("Unified navigation")
@@ -14587,12 +14926,11 @@ impl TermView {
                     kitty_pending_admission: RefCell::new(None),
                 })
             } else {
+                let surface = active_rc.borrow().surface.clone();
                 Rc::new(BlockBackend {
                     chat_running: docked_input.then(|| chat_running.clone()),
                     active_rc,
-                    active_vte: active_vte_rc,
-                    #[cfg(anvil_shared_terminal)]
-                    shared_active: shared_active.clone(),
+                    surface,
                     #[cfg(anvil_shared_terminal)]
                     shared_cwd: shared_active.as_ref().map(|_| cwd_from_uri.clone()),
                     // Same construction-time policy passed to the submission
@@ -14730,7 +15068,12 @@ impl TermView {
                 selection_feed_hold: selection_feed_hold.clone(),
                 watch_reader: watch_reader.clone(),
             }
-            .install(&pty, active_vte.as_ref(), first_pty_output.clone())?;
+            .install(
+                &pty,
+                #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+                active_vte.as_ref(),
+                first_pty_output.clone(),
+            )?;
 
             // Shells without OSC 133 never emit PromptEnd, so the normal
             // integration-driven replay path above would leave startup/session
@@ -15310,15 +15653,20 @@ impl TermView {
             let selection_anchor_id_for_commit = selection_anchor_id.clone();
             let human_input_for_commit = human_input_callbacks.clone();
             let kitty_flags_for_commit = kitty_flags.clone();
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             let kitty_pusher_for_commit = kitty_pusher.clone();
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             let live_keys_for_commit = live_keys.clone();
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             let cpr_outstanding_for_commit = cpr_outstanding.clone();
             let unified_for_commit = unified;
+            let chat_mode_for_commit = chat_mode;
             let user_scrolled_up_for_commit = user_scrolled_up.clone();
             let debouncer_for_commit = scroll_debouncer.clone();
             let scroll_for_commit = block_scroll.downgrade();
             let fab_for_commit = jump_fab.downgrade();
             let unread_for_commit = unread_count.clone();
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             let chat_send_for_commit = chat_send_intent.clone();
             let prompt_generation_for_commit = agent_prompt_generation.clone();
             let state_after_write = bstate_for_commit.clone();
@@ -15336,6 +15684,11 @@ impl TermView {
                 // FAB while its scrollback is still parked above the prompt.
                 if user_scrolled_up_for_commit.get()
                     && !unified_for_commit
+                    // Chat's ready prompt is already visible in its fixed dock.
+                    // Input there must not discard an independent transcript
+                    // reading position before a command takes the same PTY.
+                    && !(chat_mode_for_commit
+                        && state_after_write.get() == BlockState::AwaitingCommand)
                     && state_after_write.get() != BlockState::AltScreen
                 {
                     if let (Some(scroll), Some(fab)) =
@@ -15456,6 +15809,7 @@ impl TermView {
                 }
             }
 
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             if let Some(active_vte) = &active_vte {
                 active_vte.connect_commit(move |terminal, text, _size| {
                     let submission_pending = armed_agent_execution_for_commit.borrow().is_some()
@@ -15702,7 +16056,9 @@ impl TermView {
                             .map_or(1.0, |active| f64::from(active.borrow().live_cell_size().1))
                     })
                 },
+                #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                 running_cmd_for_key: running_cmd.clone(),
+                #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                 native_transcript_for_key: native_transcript_scroll.clone(),
                 bracketed_paste_for_key: bracketed_paste.clone(),
                 finished_blocks_for_key,
@@ -15735,6 +16091,7 @@ impl TermView {
 
             let key_ctrl = gtk::EventControllerKey::new();
             key_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             if let Some(terminal) = &active_vte {
                 key_ctx.connect(&key_ctrl, KeyScope::LiveSurface);
                 terminal.add_controller(key_ctrl);
@@ -15769,6 +16126,7 @@ impl TermView {
         // A plain click in the live prompt places the shell's edit cursor
         // there, the way an editor would, instead of making the user walk an
         // arrow key across a long command.
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(active_vte) = &active_vte {
             crate::terminal::click_cursor::install(
                 active_vte,
@@ -15806,6 +16164,7 @@ impl TermView {
         // - alt-screen + mouse mode + !scroll_reporting_enabled → swallow wheel
         //   (user has opted out of mouse-driven paging).
         // - otherwise → let the event bubble to block_scroll for normal scroll.
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(active_vte) = &active_vte {
             // Track pointer position over the live VTE in cell coordinates so
             // wheel events emitted below can include accurate col/row.
@@ -16043,6 +16402,7 @@ impl TermView {
         // mid-settle cannot form signal -> callback -> widget cycles; Drop
         // removes an installed tick via `resize_tick_id`.
         let resize_tick_id: Rc<RefCell<Option<gtk::TickCallbackId>>> = Rc::new(RefCell::new(None));
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         let resize_legacy: Rc<dyn Fn()> = {
             let pty_for_resize = pty.clone();
             let scroll_for_resize = block_scroll.downgrade();
@@ -16153,7 +16513,14 @@ impl TermView {
                 });
             })
         } else {
-            resize_legacy
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            {
+                resize_legacy
+            }
+            #[cfg(not(any(anvil_vte_oracle, anvil_legacy_renderer)))]
+            {
+                panic!("shared resize owner")
+            }
         };
         #[cfg(not(anvil_shared_terminal))]
         let resize_kick = resize_legacy;
@@ -16182,6 +16549,7 @@ impl TermView {
             block_onboarding,
             unified_navigation,
             notice_dock,
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             active_vte,
             contents_generation,
             active,
@@ -16553,7 +16921,7 @@ impl TermView {
         let (width, height) = active.live_surface_size();
         let visible_height = active.live_visible_height_px().min(height);
         #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &active.shared_active {
+        if let Some(terminal) = active.shared_terminal() {
             let last_row = (visible_height / cell_height).saturating_sub(1).max(0);
             let cursor = terminal.embedded().painted_primary_cursor_row();
             return LiveOrganismSurfaceMetrics {
@@ -16566,26 +16934,33 @@ impl TermView {
                 cursor_row: cursor.map_or(last_row, |row| (row as i32).min(last_row)),
             };
         }
-        LiveOrganismSurfaceMetrics {
-            width,
-            height: visible_height,
-            cell_width,
-            cell_height,
-            right_gutter: LIVE_ORGANISM_RIGHT_GUTTER,
-            alt_screen: active.live_organism_alt_screen(),
-            cursor_row: {
-                let terminal = active.legacy_surface();
-                let (_, cursor_row) = terminal.cursor_position();
-                let top_row = gtk::prelude::ScrollableExt::vadjustment(terminal)
-                    .map(|adjustment| adjustment.value().floor() as i64)
-                    .unwrap_or(0);
-                let cell_height = terminal.char_height().max(1);
-                let visible_rows =
-                    ((visible_height as i64) / cell_height).clamp(1, terminal.row_count().max(1));
-                cursor_row
-                    .saturating_sub(top_row)
-                    .clamp(0, visible_rows.saturating_sub(1)) as i32
-            },
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        {
+            LiveOrganismSurfaceMetrics {
+                width,
+                height: visible_height,
+                cell_width,
+                cell_height,
+                right_gutter: LIVE_ORGANISM_RIGHT_GUTTER,
+                alt_screen: active.live_organism_alt_screen(),
+                cursor_row: {
+                    let terminal = active.legacy_surface();
+                    let (_, cursor_row) = terminal.cursor_position();
+                    let top_row = gtk::prelude::ScrollableExt::vadjustment(terminal)
+                        .map(|adjustment| adjustment.value().floor() as i64)
+                        .unwrap_or(0);
+                    let cell_height = terminal.char_height().max(1);
+                    let visible_rows = ((visible_height as i64) / cell_height)
+                        .clamp(1, terminal.row_count().max(1));
+                    cursor_row
+                        .saturating_sub(top_row)
+                        .clamp(0, visible_rows.saturating_sub(1)) as i32
+                },
+            }
+        }
+        #[cfg(not(any(anvil_vte_oracle, anvil_legacy_renderer)))]
+        {
+            unreachable!("shared live organism surface")
         }
     }
 
@@ -16881,7 +17256,7 @@ impl TermView {
     pub(crate) fn uses_shared_active_terminal(&self) -> bool {
         #[cfg(anvil_shared_terminal)]
         {
-            self.active.borrow().shared_active.is_some()
+            self.active.borrow().shared_terminal().is_some()
         }
         #[cfg(not(anvil_shared_terminal))]
         {
@@ -16889,11 +17264,13 @@ impl TermView {
         }
     }
 
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     pub(crate) fn legacy_terminal(&self) -> Option<&Terminal> {
         self.active_vte.as_ref()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, anvil_vte_oracle))]
     pub(crate) fn vte(&self) -> &Terminal {
         self.legacy_terminal().expect("legacy terminal fixture")
     }
@@ -17633,6 +18010,7 @@ impl TermView {
         // and Undo or Drop retries it with the pane's then-current state.
         self.arm_history_explicit_replace();
         self.clear_find();
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(terminal) = self.legacy_terminal() {
             terminal.unselect_all();
         }
@@ -18414,18 +18792,19 @@ impl TermView {
     }
 
     pub(crate) fn set_scrollback_lines(&self, lines: i64) {
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(terminal) = self.legacy_terminal() {
             terminal.set_scrollback_lines(lines);
         }
         #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = self.active.borrow().shared_active.as_ref() {
+        if let Some(terminal) = self.active.borrow().shared_terminal() {
             terminal.set_history_row_limit(usize::try_from(lines).unwrap_or(usize::MAX));
         }
     }
 
     fn finished_snapshot_colors(&self) -> DynamicColors {
         #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.active.borrow().shared_active {
+        if let Some(terminal) = self.active.borrow().shared_terminal() {
             return terminal.output_colors();
         }
         self.dynamic_colors.get()
@@ -18434,14 +18813,16 @@ impl TermView {
     pub fn apply_theme(&self) {
         clear_dynamic_colors(&self.dynamic_colors);
         let config = self.config.borrow();
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(terminal) = self.legacy_terminal() {
             apply_theme_to_vte(terminal, &config);
         }
         #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.active.borrow().shared_active {
+        if let Some(terminal) = self.active.borrow().shared_terminal() {
             terminal.update_theme(&config, config.default_font_scale);
         }
         for block in self.finished_blocks.borrow().iter() {
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             if let Some(terminal) = &block.command_vte {
                 apply_snapshot_theme_to_vte(terminal, &config);
             }
@@ -18451,6 +18832,7 @@ impl TermView {
                 command.set_terminal_background(config.background);
                 command.set_background(None);
             }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             if let Some(terminal) = &block.output_vte {
                 apply_snapshot_theme_to_vte(terminal, &config);
             }
@@ -18471,10 +18853,12 @@ impl TermView {
     /// into the config would persist a family list the user never chose.
     pub fn set_font(&self, desc: &str) {
         let font_desc = crate::font::terminal_font_description(desc, &self.config.borrow());
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(terminal) = self.legacy_terminal() {
             terminal.set_font(Some(&font_desc));
         }
         for block in self.finished_blocks.borrow().iter() {
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             if let Some(terminal) = &block.command_vte {
                 terminal.set_font(Some(&font_desc));
             }
@@ -18482,6 +18866,7 @@ impl TermView {
             if let Some(command) = &block.command_document {
                 command.set_font(&font_desc);
             }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             if let Some(terminal) = &block.output_vte {
                 terminal.set_font(Some(&font_desc));
             }
@@ -18493,7 +18878,7 @@ impl TermView {
         // Update config and regenerate CSS with new font
         self.config.borrow_mut().font_desc = desc.to_string();
         #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.active.borrow().shared_active {
+        if let Some(terminal) = self.active.borrow().shared_terminal() {
             let config = self.config.borrow();
             terminal.update_theme(&config, config.default_font_scale);
         }
@@ -18509,10 +18894,12 @@ impl TermView {
 
     /// Update font scale for VTE terminal and block view CSS.
     pub fn set_font_scale(&self, scale: f64) {
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(terminal) = self.legacy_terminal() {
             terminal.set_font_scale(scale);
         }
         for block in self.finished_blocks.borrow().iter() {
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             if let Some(terminal) = &block.command_vte {
                 terminal.set_font_scale(scale);
             }
@@ -18520,6 +18907,7 @@ impl TermView {
             if let Some(command) = &block.command_document {
                 command.set_font_scale(scale);
             }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             if let Some(terminal) = &block.output_vte {
                 terminal.set_font_scale(scale);
             }
@@ -18530,7 +18918,7 @@ impl TermView {
         }
         self.config.borrow_mut().default_font_scale = scale;
         #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.active.borrow().shared_active {
+        if let Some(terminal) = self.active.borrow().shared_terminal() {
             let config = self.config.borrow();
             terminal.update_theme(&config, config.default_font_scale);
         }
@@ -18602,18 +18990,18 @@ impl TermView {
 
     /// The rendered pane's current PTY geometry, for the status bar.
     pub fn grid_size(&self) -> (i64, i64) {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = self
-            .pty_winsize
-            .shared
-            .as_ref()
-            .and_then(std::rc::Weak::upgrade)
-        {
-            let (cols, rows) = terminal.grid_size();
-            return (i64::from(cols), i64::from(rows));
+        let active = self.active.borrow();
+        match &active.surface {
+            #[cfg(anvil_shared_terminal)]
+            blocks::ActiveSurface::Shared(terminal) => {
+                let (columns, rows) = terminal.grid_size();
+                (i64::from(columns), i64::from(rows))
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            blocks::ActiveSurface::Legacy(terminal) => {
+                (terminal.column_count(), terminal.row_count())
+            }
         }
-        let terminal = self.legacy_terminal().expect("legacy live terminal");
-        (terminal.column_count(), terminal.row_count())
     }
 
     /// Collect a snapshot of internal runtime state for the debug dashboard.
@@ -18879,14 +19267,14 @@ pub(crate) struct BlockAgentEvidence {
 }
 
 /// Nonexecuting PTY fixture shared with the organism's display regressions.
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 pub(crate) fn organism_settings_test_view() -> Rc<TermView> {
     organism_settings_test_view_for_mode(crate::config::TerminalMode::Block, None)
 }
 
 /// Select the actual production constructor layout, rather than relabeling a
 /// Block fixture as Chat. The spawner alone is replaced by a raw recorder.
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 pub(crate) fn organism_settings_test_view_for_mode(
     mode: crate::config::TerminalMode,
     font_desc: Option<&str>,
@@ -18924,12 +19312,12 @@ pub(crate) fn organism_settings_test_view_for_mode(
 
 /// Keep only the recorder alive after the pane/runtime are dropped, so the
 /// unmount drain can still prove that no stale callback wrote terminal bytes.
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 pub(crate) fn organism_settings_test_recorder(view: &TermView) -> Rc<OwnedPty> {
     view.pty.clone()
 }
 
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 pub(crate) fn organism_settings_test_read_at(view: &TermView, value: f64) {
     let current = view.block_scroll.vadjustment().value();
     view.scroll_debouncer
@@ -18939,7 +19327,7 @@ pub(crate) fn organism_settings_test_read_at(view: &TermView, value: f64) {
 // The nonexecuting display fixture has no shell to emit PromptEnd. Seed its
 // authenticated boundary fields against the actual native editor; ReaderHarness
 // separately exercises real A/B/C/RIS dispatch and the anchor-settle backend.
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 pub(crate) fn organism_settings_test_clean_prompt(view: &TermView) {
     let ctx = &view.verified_submission;
     let surface = ctx.surface.upgrade().expect("live fixture surface");
@@ -18956,7 +19344,7 @@ pub(crate) fn organism_settings_test_clean_prompt(view: &TermView) {
     );
 }
 
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 pub(crate) fn organism_settings_test_reviewed_invalidation(view: &TermView) {
     let ctx = &view.verified_submission;
     let notices = Rc::new(Cell::new(0));
@@ -18975,7 +19363,7 @@ pub(crate) fn organism_settings_test_reviewed_invalidation(view: &TermView) {
     assert_eq!(notices.get(), 1, "cancellation is not prompt restoration");
 }
 
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 pub(crate) fn organism_settings_test_running(view: &TermView, running: bool) {
     view.bstate.set(if running {
         BlockState::CollectingOutput
@@ -18984,24 +19372,24 @@ pub(crate) fn organism_settings_test_running(view: &TermView, running: bool) {
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 pub(crate) fn organism_settings_test_onboarding(view: &TermView) -> bool {
     view.block_onboarding.is_visible()
 }
 
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 pub(crate) fn organism_settings_test_first_command(view: &TermView) {
     view.block_onboarding.human_input_observed();
     view.block_onboarding.finished_block_observed();
 }
 
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 pub(crate) fn organism_settings_test_pty_bytes(view: &TermView) -> Vec<u8> {
     view.pty
         .drain_test_slave(std::time::Duration::from_millis(40))
 }
 
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 mod tests {
     include!("selection_folding_tests.rs");
     include!("unified_navigation_tests.rs");
@@ -21377,6 +21765,7 @@ mod tests {
     }
 
     impl RenderBackend for RecordingBackend {
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         fn feed_legacy(&self, bytes: &[u8]) {
             self.marker_trace
                 .borrow_mut()
@@ -21466,6 +21855,7 @@ mod tests {
             super::BackendSearchBatch {
                 surfaces: Vec::new(),
                 incomplete: false,
+                #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                 native_fallback: None,
             }
         }
@@ -22693,7 +23083,7 @@ mod tests {
     #[test]
     fn prompt_evidence_invalidation_has_only_post_mutation_loss_hooks() {
         let source = include_str!("mod.rs");
-        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let production = source.split("#[cfg(all(test, anvil_vte_oracle))]\nmod tests").next().unwrap();
         let compact: String = production.chars().filter(|c| !c.is_whitespace()).collect();
         assert_eq!(
             compact
@@ -27588,7 +27978,11 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
     #[test]
     fn command_finalize_prefers_vte_capture_for_edited_or_recalled_input() {
         assert_eq!(
-            finished_command("git status --short", "git status", CommandTextSource::Screen),
+            finished_command(
+                "git status --short",
+                "git status",
+                CommandTextSource::Screen
+            ),
             "git status --short"
         );
         let reported = "  git status --short \t\n";
@@ -28739,7 +29133,9 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
                         .map_or(1.0, |terminal| terminal.char_height() as f64)
                 })
             },
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             running_cmd_for_key: Rc::new(RefCell::new(String::new())),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             native_transcript_for_key: super::NativeTranscriptScroll::new(
                 harness.bstate.clone(),
                 false,
@@ -31106,10 +31502,10 @@ started_at_ms=1700000000000;cmdline_url=echo%20stamped\x07",
 #[cfg(test)]
 mod fold_geometry_tests;
 
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 mod search_navigation_tests;
 
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 mod incremental_find_tests;
 
 impl TermView {
@@ -31129,11 +31525,11 @@ mod command_reuse_menu_label_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 mod more_menu_tests;
 
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 mod readline_preservation_tests;
 
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 mod native_ack_tests;

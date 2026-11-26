@@ -209,6 +209,7 @@ impl InlineResize {
 
     /// A deferred sample keeps the frame-clock observer running. It samples
     /// the absolute geometry again before sending, so a newer size replaces it.
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     pub(super) fn defer_layout(
         &self,
         pty: &OwnedPty,

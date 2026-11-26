@@ -224,6 +224,7 @@ fn first_openable_link(candidates: impl IntoIterator<Item = Option<String>>) -> 
 /// the click must open exactly what the tooltip said — not a URL-looking
 /// label's prefix (`https://github.com/org/…/pull/123` matches only up to
 /// the ellipsis). Plain-text URLs without OSC 8 go through the regex.
+#[cfg(anvil_legacy_renderer)]
 pub(crate) fn openable_link_at(terminal: &vte4::Terminal, x: f64, y: f64) -> Option<String> {
     use vte4::TerminalExt;
 
@@ -251,6 +252,7 @@ fn hyperlink_tooltip(uri: &str) -> String {
 /// Show the target of the OSC 8 link under the pointer as the VTE's tooltip.
 /// Only a target the opener would accept is shown, and the tooltip is cleared
 /// only when this handler set it.
+#[cfg(anvil_legacy_renderer)]
 pub(crate) fn show_hyperlink_target_on_hover(terminal: &vte4::Terminal) {
     use vte4::TerminalExt;
 
@@ -611,6 +613,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires DISPLAY"]
+    #[cfg(anvil_vte_oracle)]
     fn a_real_vte_opens_an_osc8_link_whose_label_is_not_a_url() {
         use gtk::prelude::*;
         use relm4::gtk;

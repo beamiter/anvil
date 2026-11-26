@@ -6,6 +6,7 @@ use jterm_core::chat_mode::{resolve_surface, ChatSessionState, ChatSurface};
 use relm4::gtk;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use vte4::{Terminal, TerminalExt};
 
 pub(super) const CONTROLS_HEIGHT: i32 = 28;
@@ -237,15 +238,16 @@ pub(super) fn layout(
             return;
         };
         let target = running.presentation_surface(state.get());
-        let (holder, clip, terminal, focus_widget) = {
+        let (holder, clip, focus_widget) = {
             let active = active.borrow();
             (
                 active.widget().clone(),
                 active.live_clip(),
-                active.active_vte.clone(),
                 active.focus_widget(),
             )
         };
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        let terminal = active.borrow().legacy_terminal().cloned();
         let in_transcript = target == ChatSurface::Running;
         if !in_transcript {
             if let Some(header) = holder
@@ -340,6 +342,7 @@ pub(super) fn layout(
             holder.add_css_class("chat-empty-anchor");
         }
         block_layout();
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(terminal) = terminal.filter(|terminal| native && terminal.parent().is_some()) {
             if let Some(scroll) = transcript.child().and_downcast::<gtk::ScrolledWindow>() {
                 if let Some(rows) = super::viewport_rows_for(&terminal, &scroll) {
@@ -586,6 +589,7 @@ pub(super) struct SendIntent {
     pub foreground: i32,
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 pub(super) fn connect_submit(
     button: &gtk::Button,
     state: &Rc<Cell<BlockState>>,
@@ -681,7 +685,7 @@ fn submit_allowed(state: BlockState, shell_foreground: Option<bool>) -> bool {
     surface(state).allows_submit_affordance() && shell_foreground == Some(true)
 }
 
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 mod tests {
     use super::*;
 

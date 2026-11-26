@@ -11,6 +11,7 @@ use crate::{
 use gtk::prelude::*;
 use jterm_core::developer_workspace as tokens;
 use relm4::{gtk, ComponentSender};
+#[cfg(anvil_legacy_renderer)]
 use vte4::TerminalExt;
 
 const COMPOSER_CONTROL_HEIGHT: f32 = 22.0;
@@ -762,6 +763,7 @@ pub(crate) fn composer_tools(
             }
             None
         }
+        #[cfg(anvil_legacy_renderer)]
         fn log_visible_terminals(widget: &gtk::Widget, visible: bool) {
             if let Ok(terminal) = widget.clone().downcast::<vte4::Terminal>() {
                 if terminal.is_mapped() {
@@ -776,6 +778,7 @@ pub(crate) fn composer_tools(
                 child = widget.next_sibling();
             }
         }
+        #[cfg(anvil_legacy_renderer)]
         log_visible_terminals(&current, popover.is_visible());
         if let Some(scroll) = find_scroll(&current) {
             let adjustment = scroll.vadjustment();
@@ -3728,6 +3731,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires isolated X11 DISPLAY and xdotool; actual sidebar drags and Block PTY"]
+    #[cfg(anvil_vte_oracle)]
     fn native_sidebar_drags_keep_preferences_and_terminal_draft_through_responsive_clamps() {
         crate::child_env::capture_inherited_environment().expect("fixture child environment");
         gtk::init().expect("GTK display");

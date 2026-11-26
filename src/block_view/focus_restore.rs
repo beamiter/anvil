@@ -251,7 +251,7 @@ pub(crate) fn bind_persistent_menu_focus(button: &gtk::MenuButton, popover: &gtk
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 mod tests {
     use super::super::{BlockState, TermView};
     use super::*;
@@ -288,6 +288,7 @@ mod tests {
             .is_some_and(|focus| focus == *widget || focus.is_ancestor(widget))
     }
 
+    #[cfg(anvil_vte_oracle)]
     fn fixture(mode: TerminalMode) -> (Rc<TermView>, Window, gtk::Box, Vec<Widget>) {
         static CHILD_ENV: std::sync::Once = std::sync::Once::new();
         CHILD_ENV.call_once(|| {

@@ -7,14 +7,18 @@ use relm4::gtk;
 use relm4::gtk::prelude::*;
 use relm4::prelude::Controller;
 use relm4::ComponentController;
+#[cfg(anvil_legacy_renderer)]
 use vte4::TerminalExt;
 
 use crate::config::{self, TerminalMode};
 use crate::process;
-use crate::terminal::{self, BlockTerminal, VteInput, VteTerminal};
+#[cfg(anvil_legacy_renderer)]
+use crate::terminal::VteTerminal;
+use crate::terminal::{self, BlockTerminal, VteInput};
 
 /// Backend-neutral controller used by pane-management code.
 pub(crate) enum TermCtl {
+    #[cfg(anvil_legacy_renderer)]
     Vte(Controller<VteTerminal>),
     Block(Controller<BlockTerminal>),
     #[cfg(anvil_shared_terminal)]
@@ -31,6 +35,7 @@ impl TermCtl {
 
     pub(crate) fn emit(&self, msg: VteInput) {
         match self {
+            #[cfg(anvil_legacy_renderer)]
             Self::Vte(controller) => controller.emit(msg),
             Self::Block(controller) => controller.emit(msg),
             #[cfg(anvil_shared_terminal)]
@@ -38,10 +43,12 @@ impl TermCtl {
         }
     }
 
+    #[cfg(anvil_legacy_renderer)]
     pub(crate) fn vte_companion(
         &self,
     ) -> Option<std::rc::Rc<crate::organism_ui::vte_surface::VteCompanion>> {
         match self {
+            #[cfg(anvil_legacy_renderer)]
             Self::Vte(controller) => Some(controller.model().companion()),
             _ => None,
         }
@@ -49,6 +56,7 @@ impl TermCtl {
 
     pub(crate) fn widget(&self) -> gtk::Widget {
         match self {
+            #[cfg(anvil_legacy_renderer)]
             Self::Vte(controller) => controller.widget().clone().upcast(),
             Self::Block(controller) => controller.widget().clone().upcast(),
             #[cfg(anvil_shared_terminal)]
@@ -64,6 +72,7 @@ impl TermCtl {
             Self::Block(controller) => controller.model().launch_error().map(str::to_owned),
             #[cfg(anvil_shared_terminal)]
             Self::Shared(view) => view.launch_error().map(str::to_owned),
+            #[cfg(anvil_legacy_renderer)]
             _ => None,
         }
     }
@@ -182,15 +191,23 @@ impl TermCtl {
     }
 
     pub(crate) fn has_pending_launch(&self) -> bool {
-        matches!(self, Self::Vte(_))
+        #[cfg(anvil_legacy_renderer)]
+        {
+            matches!(self, Self::Vte(_))
+        }
+        #[cfg(not(anvil_legacy_renderer))]
+        {
+            false
+        }
     }
 
-    /// Grid size (cols, rows) of this pane's live VTE. `(0, 0)` means unknown
+    /// Grid size (cols, rows) of this pane's live terminal. `(0, 0)` means unknown
     /// (e.g. a Block pane whose PTY failed to start), which the bottom bar
     /// renders as no segment at all.
     pub(crate) fn grid_size(&self) -> (u16, u16) {
         let clamp = |count: i64| count.clamp(0, u16::MAX as i64) as u16;
         match self {
+            #[cfg(anvil_legacy_renderer)]
             Self::Vte(controller) => {
                 let model = controller.model();
                 let terminal = model.terminal();
@@ -300,6 +317,7 @@ impl Pane {
                 .model()
                 .term_view()
                 .map(|view| view.child_lifecycle().into()),
+            #[cfg(anvil_legacy_renderer)]
             TermCtl::Vte(controller) => {
                 crate::gtk_process::vte_cleanup(controller.model().terminal())
             }
@@ -317,6 +335,7 @@ impl Pane {
                     |view| view.close_blocker(),
                 )
             }),
+            #[cfg(anvil_legacy_renderer)]
             TermCtl::Vte(controller) => {
                 crate::gtk_process::vte_blocker(controller.model().terminal(), foreground)
             }
@@ -331,6 +350,7 @@ impl Pane {
                 || Box::new(|| true) as Box<dyn Fn() -> bool>,
                 |view| view.withdrawal_work_probe(),
             ),
+            #[cfg(anvil_legacy_renderer)]
             TermCtl::Vte(controller) => {
                 crate::gtk_process::vte_withdrawal_work_probe(controller.model().terminal())
             }

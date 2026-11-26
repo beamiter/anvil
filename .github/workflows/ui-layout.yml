@@ -62,7 +62,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Compile application tests
-        run: cargo test --locked --bin anvil --no-run
+        run: python3 tools/vte-oracle/run.py test --locked --bin anvil --no-run
 
       - name: Check composer budget and native message geometry
         env:
@@ -79,7 +79,7 @@ jobs:
             workspace_conversation::tests::user_capsules_follow_reading_edge_and_wrap_in_narrow_windows
             block_view::chat::tests::chat_completion_never_expands_between_shell_markers
           )
-          listed_tests="$(cargo test --locked --bin anvil -- --list --include-ignored)"
+          listed_tests="$(python3 tools/vte-oracle/run.py test --locked --bin anvil -- --list --include-ignored)"
           failed=0
           for test_name in "${tests[@]}"; do
             if ! grep -Fxq "${test_name}: test" <<< "$listed_tests"; then
@@ -88,7 +88,7 @@ jobs:
               continue
             fi
             if ! dbus-run-session -- xvfb-run --auto-servernum \
-              cargo test --locked --bin anvil "$test_name" \
+              python3 tools/vte-oracle/run.py test --locked --bin anvil "$test_name" \
               -- --exact --include-ignored --test-threads=1; then
               failed=1
             fi

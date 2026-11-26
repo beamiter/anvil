@@ -45,23 +45,23 @@ jobs:
           sudo apt-get install -y -qq pkg-config libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev libpcre2-dev xvfb dbus-x11 vim-nox ripgrep
       - run: cargo fmt --all -- --check
       - run: cargo check --quiet --locked --all-targets
-      - run: cargo test --quiet --locked vim9 -- --test-threads=1
+      - run: python3 tools/vte-oracle/run.py test --quiet --locked vim9 -- --test-threads=1
       - name: Exercise real GTK snapshot and source coordinates
-        run: dbus-run-session -- xvfb-run -a cargo test --quiet --locked native_pixel_snapshot_and_source_hit_round_trip -- --ignored --test-threads=1
+        run: dbus-run-session -- xvfb-run -a python3 tools/vte-oracle/run.py test --quiet --locked native_pixel_snapshot_and_source_hit_round_trip -- --ignored --test-threads=1
       - name: Preserve blank-run decorations without shaping spaces
-        run: dbus-run-session -- xvfb-run -a cargo test --quiet --locked space_only_runs_skip_layouts_but_keep_decoration_pixels -- --ignored --test-threads=1
+        run: dbus-run-session -- xvfb-run -a python3 tools/vte-oracle/run.py test --quiet --locked space_only_runs_skip_layouts_but_keep_decoration_pixels -- --ignored --test-threads=1
       - name: Preserve background layers while eliding redundant fills
-        run: dbus-run-session -- xvfb-run -a cargo test --quiet --locked native_background_layers_keep_ink_and_peer_split_clip -- --ignored --test-threads=1
+        run: dbus-run-session -- xvfb-run -a python3 tools/vte-oracle/run.py test --quiet --locked native_background_layers_keep_ink_and_peer_split_clip -- --ignored --test-threads=1
       - name: Exercise native completion elevation and clipping
-        run: dbus-run-session -- xvfb-run -a cargo test --quiet --locked native_completion_elevation_preserves_rows_and_clips_to_widget -- --ignored --test-threads=1
+        run: dbus-run-session -- xvfb-run -a python3 tools/vte-oracle/run.py test --quiet --locked native_completion_elevation_preserves_rows_and_clips_to_widget -- --ignored --test-threads=1
       - name: Exercise native popup layering and split gaps
-        run: dbus-run-session -- xvfb-run -a cargo test --quiet --locked native_popups_cover_split_gaps_and_obey_vim_zindex -- --ignored --test-threads=1
+        run: dbus-run-session -- xvfb-run -a python3 tools/vte-oracle/run.py test --quiet --locked native_popups_cover_split_gaps_and_obey_vim_zindex -- --ignored --test-threads=1
       - name: Skip invisible ink while preserving italic overhang
-        run: dbus-run-session -- xvfb-run -a cargo test --quiet --locked clipped_ink_skips_shaping_but_retains_italic_overhang -- --ignored --test-threads=1
+        run: dbus-run-session -- xvfb-run -a python3 tools/vte-oracle/run.py test --quiet --locked clipped_ink_skips_shaping_but_retains_italic_overhang -- --ignored --test-threads=1
       - name: Retain overlays across cursor frames and refresh changed paint context
-        run: dbus-run-session -- xvfb-run -a cargo test --quiet --locked retained_overlays_reuse_blink_frames_then_refresh_theme_contents_and_pango -- --ignored --test-threads=1
+        run: dbus-run-session -- xvfb-run -a python3 tools/vte-oracle/run.py test --quiet --locked retained_overlays_reuse_blink_frames_then_refresh_theme_contents_and_pango -- --ignored --test-threads=1
       - name: Exercise native popup input ownership
-        run: dbus-run-session -- xvfb-run -a cargo test --quiet --locked native_popup_input_never_targets_underlying_source -- --ignored --test-threads=1
+        run: dbus-run-session -- xvfb-run -a python3 tools/vte-oracle/run.py test --quiet --locked native_popup_input_never_targets_underlying_source -- --ignored --test-threads=1
 
       - name: Exercise virtual text property repaint and removal
-        run: dbus-run-session -- xvfb-run -a cargo test --quiet --locked native_virtual_text_repaints_without_a_source_edit -- --ignored --test-threads=1
+        run: dbus-run-session -- xvfb-run -a python3 tools/vte-oracle/run.py test --quiet --locked native_virtual_text_repaints_without_a_source_edit -- --ignored --test-threads=1

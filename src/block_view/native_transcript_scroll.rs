@@ -1,12 +1,16 @@
 //! Motion for a still-running inline CLI's native VTE history. Coordinates are
 //! logical pixels; VTE's public adjustment remains in terminal rows.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use super::scroll::ScrollDebouncer;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use gtk::prelude::*;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use gtk::{glib, ScrolledWindow};
 use jterm_core::transcript_canvas::CanvasMotion;
 use relm4::gtk;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use vte4::{Terminal, TerminalExt};
 
 #[derive(Clone)]
@@ -50,6 +54,7 @@ impl NativeTranscriptScroll {
                 ))
     }
 
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     pub(super) fn install(&self, terminal: &Terminal) {
         let this = self.clone();
         terminal.connect_unmap(move |_| this.cancel());
@@ -69,6 +74,7 @@ impl NativeTranscriptScroll {
     /// Return only the distance beyond the native history's edge. Use the
     /// queued destination for consumption so a second wheel event extends the
     /// same trajectory instead of replaying its still-unpresented distance.
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     pub(super) fn scroll_pixels(&self, terminal: &Terminal, delta: f64, direct: bool) -> f64 {
         if !delta.is_finite() || delta == 0.0 {
             return 0.0;
@@ -120,6 +126,7 @@ impl NativeTranscriptScroll {
         }
     }
 
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     pub(super) fn wheel(
         &self,
         terminal: &Terminal,
@@ -146,6 +153,7 @@ impl NativeTranscriptScroll {
         }
     }
 
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     pub(super) fn page(
         &self,
         terminal: &Terminal,
@@ -179,6 +187,7 @@ impl NativeTranscriptScroll {
         }
     }
 
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     fn start_clock(&self, terminal: &Terminal) {
         if self.tick.borrow().is_some()
             || !terminal.is_mapped()
@@ -240,6 +249,7 @@ impl NativeTranscriptScroll {
 
 /// Conventional VTE task/resume panes have no shell lifecycle reducer. Enable
 /// only from exact CLI launch argv or the provider-owned task/resume callsite.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 pub(crate) fn install_inline_cli_reading(terminal: &Terminal) {
     if std::env::var_os("JTERM_AGENT_SCROLLBACK").as_deref() == Some(std::ffi::OsStr::new("0"))
         || terminal.has_css_class("inline-agent-reading")
@@ -322,12 +332,14 @@ pub(crate) fn install_inline_cli_reading(terminal: &Terminal) {
     terminal.add_controller(wheel);
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn native_history_available(terminal: &Terminal) -> bool {
     terminal.vadjustment().is_some_and(|adjustment| {
         adjustment.upper() - adjustment.lower() > adjustment.page_size() + 1e-7
     })
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn visible_terminal_height(terminal: &Terminal, outer: &ScrolledWindow) -> f64 {
     let mut top = 0.0_f64;
     let mut bottom = outer.vadjustment().page_size().max(1.0);
@@ -452,6 +464,7 @@ mod tests {
     }
     #[test]
     #[ignore = "requires a display; run this test alone under Xvfb"]
+    #[cfg(anvil_vte_oracle)]
     fn conventional_vte_pages_locally_preserves_streaming_reader_and_yields_to_alt_screen() {
         gtk::init().expect("GTK display for native VTE reading acceptance");
         let terminal = Terminal::new();

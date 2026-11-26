@@ -21,6 +21,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk::prelude::*;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use vte4::TerminalExt;
 
 use super::selection_hold::{feed_hold_eligible, SelectionFeedHold};
@@ -113,6 +114,7 @@ impl std::io::Write for SelectionWriter {
     }
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn capture_surface_text(
     vte: &vte4::Terminal,
     max_bytes: usize,
@@ -541,6 +543,8 @@ impl CrossSelection {
                 }
             };
             match surface {
+                #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+                #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                 TerminalTextSurface::Native(terminal) => {
                     let weak = Rc::downgrade(self);
                     let contents = terminal.connect_contents_changed(move |_| {
@@ -716,6 +720,7 @@ impl CrossSelection {
             return writer.into_text(result.is_ok());
         }
         match surface {
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             TerminalTextSurface::Native(terminal) => {
                 capture_surface_text(terminal, max_bytes, deadline)
             }
@@ -806,7 +811,7 @@ fn widget_contains(haystack: &impl IsA<gtk::Widget>, needle: &gtk::Widget) -> bo
     false
 }
 
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 mod tests {
     use super::gtk;
     use super::{append_selected_text, drag_surface_indices, CrossSelection, TerminalTextSurface};
@@ -903,8 +908,8 @@ mod tests {
             let terminal = view
                 .active
                 .borrow()
-                .shared_active
-                .clone()
+                .shared_terminal()
+                .cloned()
                 .expect("shared active renderer");
             let screen = terminal.screen().clone();
             let chrome = view.active.borrow().unified_chrome_surface.clone();
@@ -925,8 +930,7 @@ mod tests {
                     && view
                         .active
                         .borrow()
-                        .shared_active
-                        .as_ref()
+                        .shared_terminal()
                         .is_some_and(|current| Rc::ptr_eq(current, &terminal))
                     && view.pid_i32() == pid
                     && view.pty_fd_i32() == fd
@@ -1280,10 +1284,7 @@ mod tests {
                 multiline.text(&multiline.start_iter(), &multiline.end_iter(), false),
                 "echo https://example.test\n./src/file.rs"
             );
-            assert!(
-                finished[2].output_vte.is_some(),
-                "unsupported blinking output stays on VTE"
-            );
+            assert_eq!(finished[2].output_vte.is_none(), document_output);
             assert_eq!(finished[1].output_vte.is_none(), document_output);
             let first = &finished[0];
             if document_output {
@@ -1615,7 +1616,15 @@ mod tests {
 
         retained.cmd_markup = Some("\x1b[32ma different title\x1b[0m".into());
         let fallback = super::super::FinishedBlock::from_retained(&retained, &config, 80, None);
-        assert!(fallback.command_vte.is_some());
+        assert!(fallback.command_vte.is_none());
+        assert_eq!(
+            fallback
+                .command_surface()
+                .unwrap()
+                .document_text()
+                .as_deref(),
+            Some(retained.cmd.as_str())
+        );
         assert_eq!(fallback.output_vte.is_none(), document_output);
         if document_output {
             let (mut retained, mut record_ids) = {
@@ -1787,6 +1796,7 @@ mod tests {
         let cross = CrossSelection::install(
             &scroll,
             Rc::new(RefCell::new(vec![card.clone()])),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             TerminalTextSurface::Native(active.clone()),
             selected,
             Rc::new(Cell::new(Some(41))),

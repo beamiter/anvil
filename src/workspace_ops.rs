@@ -822,6 +822,12 @@ impl AppModel {
         self.next_id += 1;
         let pane_id = self.next_pane_id;
         self.next_pane_id += 1;
+        if let TermCtl::Shared(view) = &terminal {
+            let sender = sender.clone();
+            view.set_find_status_handler(move |status| {
+                sender.input(AppMsg::SearchStatus(pane_id, status))
+            });
+        }
         let frame = pane_header::PaneFrame::new(&terminal.widget());
         let pane = Pane {
             terminal,
@@ -934,6 +940,7 @@ impl AppModel {
         if let Some((_, pane_id)) =
             self.add_hosted_attachment_tab(request.title.clone(), plan.clone(), sender)
         {
+            #[cfg(anvil_legacy_renderer)]
             if let Some(pane) = self
                 .tabs
                 .iter()
@@ -1039,6 +1046,7 @@ impl AppModel {
         )?;
         let tab = self.tabs.iter_mut().find(|tab| tab.id == tab_id)?;
         let pane = tab.panes.iter_mut().find(|pane| pane.id == pane_id)?;
+        #[cfg(anvil_legacy_renderer)]
         if identity.role == crate::agent_task::TaskTerminalRole::Agent {
             if let TermCtl::Vte(controller) = &pane.terminal {
                 crate::block_view::install_inline_cli_reading(controller.model().terminal());
@@ -1159,10 +1167,12 @@ impl AppModel {
         let mut restored_remote = None;
         let root_widget =
             self.build_pane_layout(&saved.layout, id, &mut panes, &mut restored_remote, sender);
+        let restored_dividers = crate::pane_restore::RestoredPaneDividers::capture(&root_widget);
         let holder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         holder.set_hexpand(true);
         holder.set_vexpand(true);
         holder.append(&root_widget);
+        restored_dividers.schedule(&root_widget);
         self.stack.add_named(&holder, Some(&id.to_string()));
         let tab = Tab {
             holder,
@@ -1408,8 +1418,7 @@ impl AppModel {
             let pane = tab.panes.iter().find(|p| p.widget() == *widget);
             let (mode, cwd, cwd_external, remote_name, sid, history_id, cmds) = match pane {
                 Some(p) => {
-                    let remote =
-                        tab.remote.as_ref().filter(|remote| remote.pane_id == p.id);
+                    let remote = tab.remote.as_ref().filter(|remote| remote.pane_id == p.id);
                     if remote.is_some_and(RemoteConn::is_temporary) {
                         return session::PaneLayout::empty_leaf();
                     }
@@ -1880,7 +1889,10 @@ impl AppModel {
         host: &config::RemoteHost,
         sender: &ComponentSender<AppModel>,
     ) {
-        self.add_remote_connection(RemoteConn::temporary(host.clone(), self.next_pane_id), sender);
+        self.add_remote_connection(
+            RemoteConn::temporary(host.clone(), self.next_pane_id),
+            sender,
+        );
     }
 
     fn add_remote_connection(

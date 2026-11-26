@@ -2,6 +2,7 @@
 use gtk::{glib, prelude::*, subclass::prelude::*};
 use relm4::gtk;
 use std::cell::{Cell, RefCell};
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use vte4::{Terminal, TerminalExt};
 
 mod imp {
@@ -10,6 +11,7 @@ mod imp {
     #[derive(Default)]
     pub struct CommandRow {
         pub content: gtk::Box,
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         pub terminal: glib::WeakRef<Terminal>,
         #[cfg(anvil_shared_terminal)]
         pub document: RefCell<Option<jterm_gtk_view::FinishedTextView>>,
@@ -57,69 +59,75 @@ mod imp {
         #[allow(deprecated)]
         fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
             let measured = self.content.measure(orientation, for_size);
-            let Some(terminal) = self.terminal.upgrade() else {
-                #[cfg(anvil_shared_terminal)]
-                if orientation == gtk::Orientation::Horizontal {
-                    if let Some(document) = self.document.borrow().as_ref() {
-                        return (
-                            measured.0,
-                            measured.1.max(document.natural_width()),
-                            measured.2,
-                            measured.3,
-                        );
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            if let Some(terminal) = self.terminal.upgrade() {
+                return {
+                    if self.columns.get() == 0 {
+                        return measured;
                     }
-                }
-                return measured;
-            };
-            if self.columns.get() == 0 {
-                return measured;
-            }
-            if orientation == gtk::Orientation::Vertical {
-                let cell = terminal.char_width().max(1) as i32;
-                let allocated = self.allocated_width.get();
-                let width = if allocated > 0 { allocated } else { for_size };
-                let other = self
-                    .content
-                    .measure(gtk::Orientation::Horizontal, -1)
-                    .0
-                    .saturating_sub(terminal.measure(gtk::Orientation::Horizontal, -1).0);
-                let columns = if width > 0 {
-                    self.columns
-                        .get()
-                        .min(i64::from(((width - other).max(0) / cell).max(2)))
-                } else {
-                    self.columns.get()
+                    if orientation == gtk::Orientation::Vertical {
+                        let cell = terminal.char_width().max(1) as i32;
+                        let allocated = self.allocated_width.get();
+                        let width = if allocated > 0 { allocated } else { for_size };
+                        let other = self
+                            .content
+                            .measure(gtk::Orientation::Horizontal, -1)
+                            .0
+                            .saturating_sub(terminal.measure(gtk::Orientation::Horizontal, -1).0);
+                        let columns = if width > 0 {
+                            self.columns
+                                .get()
+                                .min(i64::from(((width - other).max(0) / cell).max(2)))
+                        } else {
+                            self.columns.get()
+                        };
+                        let rows = super::super::blocks::output_visual_row_count(
+                            &self.command.borrow(),
+                            columns,
+                        );
+                        let height = super::super::alt_screen::finished_vte_height_px(
+                            rows,
+                            terminal.char_height().max(1) as i32,
+                        ) + super::super::blocks::terminal_vertical_insets(&terminal);
+                        return (height, height, -1, -1);
+                    }
+                    // Preserve the prompt chevron and CSS insets, replacing only the
+                    // terminal's grid-dependent width with the command's text width.
+                    let (minimum, natural, ..) = terminal.measure(orientation, for_size);
+                    let style = terminal.style_context();
+                    let padding = style.padding();
+                    let border = style.border();
+                    let insets = i32::from(
+                        padding.left() + padding.right() + border.left() + border.right(),
+                    ) + terminal.margin_start()
+                        + terminal.margin_end();
+                    let cell = terminal.char_width().max(1) as i32;
+                    let target = (self.columns.get().min(i32::MAX as i64) as i32)
+                        .saturating_mul(cell)
+                        .saturating_add(insets);
+                    let min = measured.0.saturating_sub(minimum) + cell.saturating_mul(2) + insets;
+                    let nat = measured.1.saturating_sub(natural).saturating_add(target);
+                    (min, nat.max(min), -1, -1)
                 };
-                let rows =
-                    super::super::blocks::output_visual_row_count(&self.command.borrow(), columns);
-                let height = super::super::alt_screen::finished_vte_height_px(
-                    rows,
-                    terminal.char_height().max(1) as i32,
-                ) + super::super::blocks::terminal_vertical_insets(&terminal);
-                return (height, height, -1, -1);
             }
-            // Preserve the prompt chevron and CSS insets, replacing only the
-            // terminal's grid-dependent width with the command's text width.
-            let (minimum, natural, ..) = terminal.measure(orientation, for_size);
-            let style = terminal.style_context();
-            let padding = style.padding();
-            let border = style.border();
-            let insets =
-                i32::from(padding.left() + padding.right() + border.left() + border.right())
-                    + terminal.margin_start()
-                    + terminal.margin_end();
-            let cell = terminal.char_width().max(1) as i32;
-            let target = (self.columns.get().min(i32::MAX as i64) as i32)
-                .saturating_mul(cell)
-                .saturating_add(insets);
-            let min = measured.0.saturating_sub(minimum) + cell.saturating_mul(2) + insets;
-            let nat = measured.1.saturating_sub(natural).saturating_add(target);
-            (min, nat.max(min), -1, -1)
+            #[cfg(anvil_shared_terminal)]
+            if orientation == gtk::Orientation::Horizontal {
+                if let Some(document) = self.document.borrow().as_ref() {
+                    return (
+                        measured.0,
+                        measured.1.max(document.natural_width()),
+                        measured.2,
+                        measured.3,
+                    );
+                }
+            }
+            measured
         }
 
         fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
             let width_changed = self.allocated_width.replace(width) != width;
             if width_changed {
+                #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                 if let Some(terminal) = self.terminal.upgrade() {
                     let cell = terminal.char_width().max(1) as i32;
                     let other = self
@@ -178,6 +186,7 @@ impl CommandRow {
     }
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 pub(super) fn fit(row: &CommandRow, terminal: &Terminal, columns: i64, command: &str) {
     row.imp().terminal.set(Some(terminal));
     row.imp().columns.set(columns.max(2));

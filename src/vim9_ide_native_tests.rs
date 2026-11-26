@@ -219,7 +219,7 @@ fn native_vim9_edit_save_build_and_modified_close() {
                 frame
                     .runs
                     .iter()
-                    .filter(|run| run.line == 1)
+                    .filter(|run| run.line == 1 && run.byte_end > run.byte_start)
                     .map(|run| run.text.as_str())
                     .collect::<String>()
                     == "中文before"
@@ -305,7 +305,7 @@ fn native_vim9_edit_save_build_and_modified_close() {
                         && frame
                             .runs
                             .iter()
-                            .filter(|run| run.line == 1)
+                            .filter(|run| run.line == 1 && run.byte_end > run.byte_start)
                             .map(|run| run.text.as_str())
                             .collect::<String>()
                             == "beforeKEY"
@@ -323,7 +323,7 @@ fn native_vim9_edit_save_build_and_modified_close() {
                     && frame
                         .runs
                         .iter()
-                        .filter(|run| run.line == 1)
+                        .filter(|run| run.line == 1 && run.byte_end > run.byte_start)
                         .map(|run| run.text.as_str())
                         .collect::<String>()
                         == "before"
@@ -344,7 +344,7 @@ fn native_vim9_edit_save_build_and_modified_close() {
                         && frame
                             .runs
                             .iter()
-                            .filter(|run| run.line == 1)
+                            .filter(|run| run.line == 1 && run.byte_end > run.byte_start)
                             .map(|run| run.text.as_str())
                             .collect::<String>()
                             == "NATIVE before"

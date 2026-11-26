@@ -5,12 +5,14 @@ mod inspector;
 #[cfg(test)]
 mod surface_adapter_trace;
 mod surface_time;
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 mod surface_time_adapter_tests;
 use surface_time::{input_retreat_remaining, HUMAN_INPUT_RETREAT};
 #[cfg(all(test, target_os = "linux"))]
 mod surface_probe;
+#[cfg(anvil_legacy_renderer)]
 pub(crate) mod vte_surface;
+pub(crate) const ORDINARY_HELLO_UNAVAILABLE: &str = "Hello is unavailable in traditional VTE: command activity and alternate-screen state cannot be verified.";
 mod watch_adapter;
 use watch_adapter::WatchAdapter;
 
@@ -4566,6 +4568,9 @@ impl OrganismHub {
         } else {
             view.widget().remove_css_class("eva-remote-surface");
         }
+        if !remote && crate::eva_companion::shared_mode_requested() {
+            crate::eva_companion::observe_shell_view(view);
+        }
         if remote || crate::eva_companion::shared_mode_requested() {
             return;
         }
@@ -5900,6 +5905,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(anvil_vte_oracle)]
     fn explanation_wiring_tracks_body_retirement_and_transient_dock_cards() {
         let source = include_str!("organism_ui.rs");
         let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
@@ -5942,6 +5948,7 @@ mod tests {
     /// Source wiring only: the real callbacks must retire the sticky form
     /// synchronously, while the ordinary frame retains ownership of recovery.
     #[test]
+    #[cfg(anvil_vte_oracle)]
     fn input_and_alt_screen_callbacks_hide_sticky_before_the_next_frame() {
         let source = include_str!("organism_ui.rs");
         let input = source
@@ -6449,6 +6456,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires DISPLAY"]
+    #[cfg(anvil_vte_oracle)]
     fn live_settings_reuse_body_preserve_focus_and_stop_disabled_timers() {
         gtk::init().expect("gtk display");
         relm4::adw::init().expect("same native fixture adwaita window");

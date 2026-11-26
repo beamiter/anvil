@@ -1,12 +1,18 @@
+// Inline application fixtures retain the historical renderer only in the
+// independently locked source-overlay oracle. Standalone integration targets
+// and ordinary production binaries use the VTE-free manifest.
+#![cfg(any(not(test), anvil_vte_oracle))]
 #![allow(dead_code)]
 
 mod composer_geometry;
+mod pane_restore;
 
 mod agent_cli;
 #[cfg(test)]
 mod delimited_reference;
 mod gtk_presentation;
 mod gtk_process;
+#[cfg(anvil_legacy_renderer)]
 mod gtk_spawn;
 mod immersive_command;
 mod vte_reference;
@@ -103,6 +109,7 @@ mod top_bar;
 mod vim9_buffer_labels;
 mod vim9_ide;
 mod vim9_zoom;
+#[cfg(anvil_vte_oracle)]
 mod vte_pty;
 mod workflow_ops;
 mod workflows;
@@ -149,9 +156,9 @@ use std::rc::Rc;
 use app_msg::AppMsg;
 use config::{choose_shell_argv, config_file_path, load_config, Config, TerminalMode, Theme};
 use keybindings::{chord_from_gdk, Action, Direction, KeybindingMap};
-use terminal::{
-    default_tab_title, BlockTerminal, InitialCommands, VteInit, VteInput, VteOutput, VteTerminal,
-};
+#[cfg(anvil_legacy_renderer)]
+use terminal::VteTerminal;
+use terminal::{default_tab_title, BlockTerminal, InitialCommands, VteInit, VteInput, VteOutput};
 use workspace::{ConnStatus, Pane, RemoteConn, Tab, TermCtl, ZoomState};
 
 const FONT_STEP: f64 = 0.025;
@@ -524,7 +531,7 @@ struct AppModel {
     /// Right-side stack holding the AI Chats panel and the agent Tasks panel;
     /// it is the `ai_paned` end child, so both share the persisted width.
     side_stack: gtk::Stack,
-    preview_tree_file: Option<Box<dyn Fn(std::path::PathBuf)>>,
+    preview_tree_file: Option<Box<dyn Fn(std::path::PathBuf, Option<local_preview::RemoteSource>)>>,
     tasks_panel: Controller<dialogs::tasks_panel::TasksPanelModel>,
     tasks_panel_visible: std::cell::Cell<bool>,
     /// Native Codex agent task domain: the reducer, the app-server runtime,
@@ -588,7 +595,8 @@ enum SharedPaneKind<'a> {
 fn shared_explicit_command_admitted() -> bool {
     #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
     {
-        host::bridge_available() && jterm_gtk_view::RuntimeShell::admits_explicit_command(false)
+        host::bridge_available()
+            && (!cfg!(test) || jterm_gtk_view::RuntimeShell::admits_explicit_command(false))
     }
     #[cfg(not(all(anvil_shared_terminal, target_os = "linux")))]
     {
@@ -699,8 +707,11 @@ fn create_pane(
         VteOutput::FixBlockWithAgent => AppMsg::FixBlockWithAgent(pane_id),
     };
     #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
-    let shared =
-        shared_kind.and_then(|kind| setup_shared_pane(kind, &init, tab_id, pane_id, sender));
+    let shared = {
+        #[cfg(not(anvil_vte_oracle))]
+        let shared_kind = shared_kind.or(Some(SharedPaneKind::ExplicitCommand));
+        shared_kind.and_then(|kind| setup_shared_pane(kind, &init, tab_id, pane_id, sender))
+    };
     #[cfg(not(all(anvil_shared_terminal, target_os = "linux")))]
     let shared: Option<TermCtl> = {
         let _ = shared_kind;
@@ -717,12 +728,25 @@ fn create_pane(
             }
             TermCtl::Block(controller)
         }
+        #[cfg(not(anvil_legacy_renderer))]
+        TerminalMode::Vte => TermCtl::Shared(shared_terminal::SharedTerminal::unavailable(
+            init.config.clone(),
+            "The selected terminal launch could not be prepared.",
+        )),
+        #[cfg(anvil_legacy_renderer)]
         TerminalMode::Vte => TermCtl::Vte(
             VteTerminal::builder()
                 .launch(init)
                 .forward(sender.input_sender(), forward),
         ),
     });
+    #[cfg(anvil_shared_terminal)]
+    if let TermCtl::Shared(view) = &terminal {
+        crate::eva_companion::tag_pane(&view.widget);
+        if cwd_external {
+            view.widget.add_css_class("eva-remote-surface");
+        }
+    }
     let frame = pane_header::PaneFrame::new(&terminal.widget());
     // The header is this pane's drag handle and its frame is a typed workspace
     // drop zone. Ids, not indices, cross the drag boundary: pane and tab
@@ -804,8 +828,9 @@ fn setup_shared_pane(
     sender: &ComponentSender<AppModel>,
 ) -> Option<TermCtl> {
     if !matches!(init.mode, TerminalMode::Vte)
-        || init.working_directory_external
-        || (!matches!(kind, SharedPaneKind::Task { .. }) && !init.env_extra.is_empty())
+        || (cfg!(test)
+            && (init.working_directory_external
+                || (!matches!(kind, SharedPaneKind::Task { .. }) && !init.env_extra.is_empty())))
     {
         return None;
     }
@@ -813,8 +838,11 @@ fn setup_shared_pane(
         SharedPaneKind::ConfiguredShell => shared_terminal::SharedTerminal::open_for_pane(
             init.config.clone(),
             &init.shell_argv,
-            init.working_directory.as_deref(),
+            init.working_directory
+                .as_deref()
+                .filter(|_| !init.working_directory_external),
             init.session_id.as_deref()?,
+            &init.env_extra,
         ),
         SharedPaneKind::HostedAttachment => {
             if !init.initial_commands.as_slice().is_empty() {
@@ -829,7 +857,10 @@ fn setup_shared_pane(
         SharedPaneKind::ExplicitCommand => shared_terminal::SharedTerminal::open_explicit(
             init.config.clone(),
             &init.shell_argv,
-            init.working_directory.as_deref(),
+            init.working_directory
+                .as_deref()
+                .filter(|_| !init.working_directory_external),
+            &init.env_extra,
         ),
         SharedPaneKind::Task {
             pinned_directory,
@@ -843,7 +874,12 @@ fn setup_shared_pane(
             inline_agent,
         ),
     }?;
+    let find_sender = sender.clone();
+    view.set_find_status_handler(move |status| {
+        find_sender.input(AppMsg::SearchStatus(pane_id, status))
+    });
     let configured_shell = matches!(kind, SharedPaneKind::ConfiguredShell);
+    let track_local_cwd = configured_shell && !init.working_directory_external;
     if !configured_shell {
         sender.input(
             view.launch_error()
@@ -863,7 +899,7 @@ fn setup_shared_pane(
         pane.set_event_handler(move |event| match event {
             jterm_gtk_view::PaneEvent::Output => {
                 sender_for_events.input(AppMsg::Activity(pane_id));
-                if !configured_shell || cwd_pending.replace(true) {
+                if !track_local_cwd || cwd_pending.replace(true) {
                     return;
                 }
                 let runtime = runtime.clone();
@@ -897,13 +933,17 @@ fn setup_shared_pane(
             }
             jterm_gtk_view::PaneEvent::Bell => sender_for_events.input(AppMsg::Bell(pane_id)),
         });
+        let detached_focus_sender = sender.clone();
+        view.connect_detached_focus(move || {
+            detached_focus_sender.input(AppMsg::PaneFocused(tab_id, pane_id));
+        });
         let sender = sender.clone();
         pane.screen().connect_has_focus_notify(move |screen| {
             if screen.has_focus() {
                 sender.input(AppMsg::PaneFocused(tab_id, pane_id));
             }
         });
-        if configured_shell {
+        if configured_shell || !init.initial_commands.as_slice().is_empty() {
             pane.schedule_initial_commands(init.initial_commands.as_slice());
         }
     }
@@ -1491,11 +1531,12 @@ impl SimpleComponent for AppModel {
             .launch(root.clone())
             .detach();
         let workflow_dialog = dialogs::workflow::WorkflowModel::builder()
-            .launch(root.clone())
+            .launch((root.clone(), kbmap.clone()))
             .forward(sender.input_sender(), |output| match output {
                 dialogs::workflow::WorkflowOutput::Command { pane_id, command } => {
                     AppMsg::WorkflowInsertCommand { pane_id, command }
                 }
+                dialogs::workflow::WorkflowOutput::NavigateTab(action) => AppMsg::Action(action),
             });
         let initial_ai_panel_visible =
             config.borrow().ai_enabled && config.borrow().ai_panel_visible && !init.safe_mode;
@@ -2583,8 +2624,17 @@ impl SimpleComponent for AppModel {
                     // that result; a second app-level pass would discard the
                     // per-pane token and make opaque Flatpak host shells look
                     // external again.
-                    self.tabs[ti].panes[pi].cwd_external = managed_remote || external;
-                    self.tabs[ti].panes[pi].cwd = Some(path.clone());
+                    let pane = &mut self.tabs[ti].panes[pi];
+                    pane.cwd_external = managed_remote || external;
+                    pane.cwd = Some(path.clone());
+                    #[cfg(anvil_shared_terminal)]
+                    if let TermCtl::Shared(view) = &pane.terminal {
+                        if pane.cwd_external {
+                            view.widget.add_css_class("eva-remote-surface");
+                        } else {
+                            view.widget.remove_css_class("eva-remote-surface");
+                        }
+                    }
                     if self.tabs[ti].panes.len() > 1 {
                         self.refresh_pane_headers(ti);
                     }
@@ -3014,11 +3064,41 @@ impl SimpleComponent for AppModel {
                 }
             }
             AppMsg::FileTreePreview { path, intent } => {
-                if !self.file_tree_location.borrow().is_remote()
-                    && self.file_tree_intent_is_current(&intent)
-                {
+                if self.file_tree_intent_is_current(&intent) {
+                    let location = self.file_tree_location.borrow().clone();
+                    let source = if location.is_remote() {
+                        let host = match remote_fs::preview_host(
+                            &location,
+                            &self.config.borrow().remote_hosts,
+                        ) {
+                            Ok(host) => host,
+                            Err(error) => {
+                                self.show_toast(&error.to_string());
+                                return;
+                            }
+                        };
+                        let config = self.config.clone();
+                        let current_location = self.file_tree_location.clone();
+                        let content_revision = self.file_tree_content_revision.clone();
+                        let scan_generation = self.file_tree_scan_generation.clone();
+                        let intent = (*intent).clone();
+                        Some(local_preview::RemoteSource {
+                            host,
+                            is_current: Rc::new(move || {
+                                file_tree::file_tree_user_intent_is_current(
+                                    &intent,
+                                    content_revision.get(),
+                                    scan_generation.get(),
+                                    &current_location.borrow(),
+                                    &config.borrow().remote_hosts,
+                                )
+                            }),
+                        })
+                    } else {
+                        None
+                    };
                     if let Some(preview) = &self.preview_tree_file {
-                        preview(path);
+                        preview(path, source);
                     }
                 } else {
                     self.show_toast("Files changed. Reopen the file menu to preview.");
@@ -3195,7 +3275,7 @@ impl SimpleComponent for AppModel {
                 self.set_vte_companion_expanded(pane_id, expanded);
             }
             AppMsg::WorkflowInsertCommand { pane_id, command } => {
-                self.insert_workflow_command(pane_id, &command);
+                self.insert_workflow_command(pane_id, &command, &sender);
             }
             AppMsg::FileTreeGotoCwd => self.file_tree_goto_current_cwd(&sender),
             AppMsg::FileTreeGoUp => self.file_tree_go_up(&sender),

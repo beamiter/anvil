@@ -53,6 +53,10 @@ elif [[ ! -r /etc/dbus-1/session.conf ]]; then
 fi
 
 tests=(
+    block_view::blocks::tests::completed_output_keeps_full_capture_and_restores_projection_notices
+    block_view::blocks::tests::completed_output_uses_shared_documents_for_blink_edits_and_empty_control_streams
+    block_view::blocks::tests::completed_headings_keep_large_blank_and_control_bearing_commands_as_documents
+    shared_terminal::tests::configured_standalone_shell_uses_runtime_beyond_probe_profile
     local_preview::tests::mapped_preview_jumps_reloads_and_retires_the_page
     vte_reference::tests::mapped_url_rows_cannot_retarget_the_origin_or_bypass_osc8
     vte_reference::tests::mapped_vte_blocks_ambiguous_paths_and_preserves_native_selection
@@ -220,7 +224,7 @@ export LIBGL_ALWAYS_SOFTWARE=1
 export NO_AT_BRIDGE=1
 export GTK_A11Y=none
 
-listed_tests="$(cargo test --locked -- --ignored --list)"
+listed_tests="$(python3 tools/vte-oracle/run.py test --locked -- --ignored --list)"
 for test_name in "${tests[@]}"; do
     if ! grep -Fqx -- "${test_name}: test" <<<"${listed_tests}"; then
         printf 'Error: GTK display regression is not registered: %s\n' "${test_name}" >&2
@@ -270,14 +274,14 @@ for test_name in "${tests[@]}"; do
     G_DEBUG="${fixture_g_debug}" GTK_IM_MODULE="${fixture_im_module}" GTK_A11Y="${fixture_a11y}" run_case "${test_name}" \
         dbus-run-session "${dbus_run_args[@]}" -- \
         xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
-        cargo test --locked "${test_name}" -- --ignored --exact --nocapture
+        python3 tools/vte-oracle/run.py test --locked "${test_name}" -- --ignored --exact --nocapture
     if [[ "${test_name}" == block_view::tests::held_enter_history_recall_does_not_submit_the_recalled_command ]]; then
         for mode in review-mouse-only-fresh review-mouse-only-keypad-fresh review-mouse-only-keypad-pane-fresh; do
             ANVIL_ENTER_MODE="${mode}" ANVIL_QA_PREWARM_ENTER=1 ANVIL_QA_INHERITED_ENTER=1 \
                 run_case "${test_name} (settled release then outside-focus Enter: ${mode})" \
                 dbus-run-session "${dbus_run_args[@]}" -- \
                 xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
-                cargo test --locked "${test_name}" -- --ignored --exact --nocapture
+                python3 tools/vte-oracle/run.py test --locked "${test_name}" -- --ignored --exact --nocapture
         done
     fi
     if [[ "${test_name}" == enter_ownership::tests::queued_review_write_claims_enter_at_both_backend_boundaries ]]; then
@@ -287,24 +291,24 @@ for test_name in "${tests[@]}"; do
                     run_case "${test_name} (file-drop Enter ownership: inherited=${inherited} dual=${dual})" \
                     dbus-run-session "${dbus_run_args[@]}" -- \
                     xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
-                    cargo test --locked "${test_name}" -- --ignored --exact --nocapture
+                    python3 tools/vte-oracle/run.py test --locked "${test_name}" -- --ignored --exact --nocapture
             done
         done
         ANVIL_QA_FILE_DROP=1 ANVIL_QA_FRESH_ENTER=1 \
             run_case "${test_name} (file-drop fresh Enter after release)" \
             dbus-run-session "${dbus_run_args[@]}" -- \
             xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
-            cargo test --locked "${test_name}" -- --ignored --exact --nocapture
+            python3 tools/vte-oracle/run.py test --locked "${test_name}" -- --ignored --exact --nocapture
         ANVIL_QA_DUAL_ENTER=1 run_case "${test_name} (simultaneous main/keypad Enter ownership)" \
             dbus-run-session "${dbus_run_args[@]}" -- \
             xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
-            cargo test --locked "${test_name}" -- --ignored --exact --nocapture
+            python3 tools/vte-oracle/run.py test --locked "${test_name}" -- --ignored --exact --nocapture
         for dual in 0 1; do
             ANVIL_QA_INHERITED_ENTER=1 ANVIL_QA_DUAL_ENTER="${dual}" \
                 run_case "${test_name} (outside-origin Enter: dual=${dual})" \
                 dbus-run-session "${dbus_run_args[@]}" -- \
                 xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -nolisten tcp' \
-                cargo test --locked "${test_name}" -- --ignored --exact --nocapture
+                python3 tools/vte-oracle/run.py test --locked "${test_name}" -- --ignored --exact --nocapture
         done
     fi
 done

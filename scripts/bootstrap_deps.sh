@@ -3,9 +3,9 @@
 #
 # `cargo install --path .` (and a plain `cargo build`) needs the GTK 4 stack
 # resolved through pkg-config: glib-2.0 >= 2.80, pango >= 1.52, graphene,
-# gtk4 (>= 4.14), libadwaita-1 (>= 1.5), vte-2.91-gtk4 (>= 0.76), and pcre2.
+# gtk4 (>= 4.14), libadwaita-1 (>= 1.5), and pcre2.
 # Many stable distributions (for example Ubuntu 22.04) ship these too old or
-# omit the GTK 4 build of VTE entirely, so the crate build scripts fail with
+# have older GTK libraries, so the crate build scripts fail with
 # "was not found" / "but version of X is <old>" errors.
 #
 # This script makes `cargo install --path .` reproducible in two ways:
@@ -30,12 +30,11 @@ CHECK_ONLY=0
 DO_INSTALL_CRATE=0
 
 # Minimum pkg-config module versions the crate graph requires. Keep these in
-# sync with the feature flags in Cargo.toml (relm4 gnome_46, vte4 v0_76).
+# sync with the feature flags in Cargo.toml (relm4 gnome_46).
 readonly REQ_GLIB="2.80"
 readonly REQ_PANGO="1.52"
 readonly REQ_GTK4="4.14"
 readonly REQ_ADW="1.5"
-readonly REQ_VTE="0.76"
 
 usage() {
     cat <<'USAGE'
@@ -256,19 +255,19 @@ system_packages() {
         apt)
             printf '%s' "build-essential pkg-config libglib2.0-dev \
                 libpango1.0-dev libgtk-4-dev libadwaita-1-dev \
-                libvte-2.91-gtk4-dev libpcre2-dev"
+                libpcre2-dev"
             ;;
         dnf)
             printf '%s' "gcc pkgconf-pkg-config glib2-devel pango-devel \
-                gtk4-devel libadwaita-devel vte291-gtk4-devel pcre2-devel"
+                gtk4-devel libadwaita-devel pcre2-devel"
             ;;
         pacman)
             printf '%s' "base-devel pkgconf glib2 pango gtk4 libadwaita \
-                vte4 pcre2"
+                pcre2"
             ;;
         zypper)
             printf '%s' "gcc pkgconf-pkg-config glib2-devel pango-devel \
-                gtk4-devel libadwaita-devel vte-devel pcre2-devel"
+                gtk4-devel libadwaita-devel pcre2-devel"
             ;;
         *)
             return 1
@@ -339,7 +338,6 @@ verify_system_deps() {
     check_module "graphene-gobject-1.0" || ok=1
     check_module "gtk4" "${REQ_GTK4}" || ok=1
     check_module "libadwaita-1" "${REQ_ADW}" || ok=1
-    check_module "vte-2.91-gtk4" "${REQ_VTE}" || ok=1
     check_module "libpcre2-8" || ok=1
     return "${ok}"
 }
@@ -360,8 +358,7 @@ run_system_backend() {
         install_system_packages "${mgr}"
         verify_system_deps ||
             die "dependencies still unsatisfied after install. On older \
-distributions (e.g. Ubuntu 22.04) the packaged GTK/VTE are too old or omit \
-vte-2.91-gtk4; use '--backend nix' instead."
+distributions (e.g. Ubuntu 22.04) the packaged GTK libraries are too old; use '--backend nix' instead."
     fi
 
     ((CHECK_ONLY == 1)) && return 0

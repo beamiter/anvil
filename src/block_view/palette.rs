@@ -11,7 +11,6 @@ use gtk::{glib, Orientation, ScrolledWindow};
 use relm4::gtk;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use vte4::Terminal;
 
 use crate::pty::OwnedPty;
 
@@ -64,7 +63,7 @@ pub(crate) fn show_command_palette(
     typed_cmd: Rc<RefCell<String>>,
     pty_synced: Rc<Cell<bool>>,
     bracketed_paste: Rc<Cell<bool>>,
-    live_vte: Terminal,
+    live_focus: gtk::Widget,
 ) {
     let popover = gtk::Popover::new();
     popover.set_parent(parent);
@@ -210,9 +209,9 @@ pub(crate) fn show_command_palette(
             // history). Re-pin to the bottom so the user lands back on the prompt
             // with the recalled command.
             let scroll = scroll.clone();
-            let live_vte = live_vte.clone();
+            let live_focus = live_focus.clone();
             glib::idle_add_local_once(move || {
-                live_vte.grab_focus();
+                live_focus.grab_focus();
                 let adj = scroll.vadjustment();
                 adj.set_value((adj.upper() - adj.page_size()).max(adj.lower()));
             });

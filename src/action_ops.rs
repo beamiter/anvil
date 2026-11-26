@@ -78,11 +78,6 @@ impl AppModel {
     }
 
     pub(crate) fn toggle_search(&mut self) {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(TermCtl::Shared(view)) = self.active_terminal() {
-            view.toggle_history_search();
-            return;
-        }
         self.search.emit(search::SearchMsg::Toggle);
     }
 
@@ -118,6 +113,9 @@ impl AppModel {
         }
         // Clone out of the component model before native setters can reenter.
         // No second queued command may outlive this current-pane validation.
+        #[cfg(not(anvil_legacy_renderer))]
+        let _ = expanded;
+        #[cfg(anvil_legacy_renderer)]
         if let Some(companion) = pane.terminal.vte_companion() {
             companion.set_expanded(expanded);
         }
@@ -151,7 +149,7 @@ impl AppModel {
             return;
         }
         let Some(view) = pane.terminal.term_view() else {
-            self.show_toast(crate::organism_ui::vte_surface::HELLO_UNAVAILABLE);
+            self.show_toast(crate::organism_ui::ORDINARY_HELLO_UNAVAILABLE);
             return;
         };
         if let Err(message) = self.organism_hub.say_hello(&view) {

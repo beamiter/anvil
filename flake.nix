@@ -34,8 +34,8 @@
               # then run `nix flake check --no-write-lock-file` and copy `got:`.
               # Full revisions beside the hashes make a stale repin conspicuous.
               outputHashes = {
-                # git+https://github.com/beamiter/jterm_core.git?rev=7a32027258dfe5f05ec6eaa01b76b5d44396cbf6#7a32027258dfe5f05ec6eaa01b76b5d44396cbf6
-                "jterm_core-0.2.0" = "sha256-b5pCPcqUNEfyBN+1wP1uWmAvgZlDKP4nUtRbK5HMMYw=";
+                # git+https://github.com/beamiter/jterm_core.git?rev=06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e#06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e
+                "jterm_core-0.2.0" = "sha256-wl9nuwe8rHngycQsFVBOV3vkMeuLf5we2xx0Pj4WQBg=";
                 # git+https://github.com/beamiter/jagent.git?rev=f269c3c6afafcf9b6d60b3cccd741649fdb74576#f269c3c6afafcf9b6d60b3cccd741649fdb74576
                 "jagent-0.7.0" = "sha256-2PO6UiTrhwa2JUBznPTXFV42KxJ3H8qctBTg7WNxZfA=";
                 # git+https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa569540091524d637a7115b64c587b9177a55b
@@ -56,7 +56,6 @@
             buildInputs = with pkgs; [
               gtk4
               libadwaita
-              vte-gtk4
               pcre2
               fcitx5-gtk
             ];
@@ -143,6 +142,7 @@
               glib
               pkg-config
               libadwaita
+              # Independent historical renderer oracle only; not package inputs.
               vte
               vte-gtk4
               pcre2

@@ -855,11 +855,11 @@ fn decode_block_record(data: &[u8], prefer_compressed: bool) -> io::Result<(Bloc
         let decoded = decode_record(data, compressed, MAX_DECODED_RECORD_BYTES)?;
         let decoded_len = decoded.len();
         let block = decode_rkyv_block(&decoded).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid Block-history rkyv record",
-                )
-            })?;
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid Block-history rkyv record",
+            )
+        })?;
         Ok((block, decoded_len))
     };
 
@@ -2982,7 +2982,10 @@ mod tests {
         )
         .unwrap();
         done.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(!target.path.exists(), "the old view must give up its final write");
+        assert!(
+            !target.path.exists(),
+            "the old view must give up its final write"
+        );
     }
 
     #[test]
@@ -4345,7 +4348,10 @@ mod tests {
         persistence::enqueue(
             persistence::PersistenceKey::unique_for_path("history-test-gate", &path),
             "Hold the worker until both saves are queued",
-            move || wait.recv_timeout(Duration::from_secs(5)).map_err(io::Error::other),
+            move || {
+                wait.recv_timeout(Duration::from_secs(5))
+                    .map_err(io::Error::other)
+            },
         )
         .unwrap();
         let saves = vec![super::PlannedHistorySave {
@@ -4384,7 +4390,11 @@ mod tests {
         done.recv_timeout(Duration::from_secs(5)).unwrap();
 
         let reread = read_history_records(&path, false, 10, UndecodablePolicy::Reject).unwrap();
-        let commands: Vec<_> = reread.blocks.iter().map(|block| block.cmd.as_str()).collect();
+        let commands: Vec<_> = reread
+            .blocks
+            .iter()
+            .map(|block| block.cmd.as_str())
+            .collect();
         assert_eq!(commands, ["first-write", "second-write"]);
     }
 

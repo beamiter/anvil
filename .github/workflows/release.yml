@@ -32,7 +32,7 @@ jobs:
           if [[ -f "scripts/materialize-shared-core.sh" ]]; then
             bash "scripts/materialize-shared-core.sh"
           fi
-      - name: Install GTK and VTE development packages
+      - name: Install GTK and independent oracle development packages
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes \
@@ -57,11 +57,12 @@ jobs:
           fi
 
       - name: Run release tests
-        run: xvfb-run --auto-servernum cargo test --all-targets --features shared-terminal --locked --no-fail-fast
+        run: xvfb-run --auto-servernum python3 tools/vte-oracle/run.py test --all-targets --features shared-terminal --locked --no-fail-fast
 
       - name: Build optimized binary and bundle
         run: |
           cargo build --release --features shared-terminal --locked
+          python3 scripts/check-no-vte.py target/release/anvil
           bash scripts/package-release.sh target/release/anvil
           (cd target/dist && sha256sum --check ./*.sha256)
 

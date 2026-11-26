@@ -1,19 +1,32 @@
 pub mod alt;
 pub mod ansi;
 pub mod block;
+#[cfg(anvil_legacy_renderer)]
 pub mod click_cursor;
+mod contracts;
 mod cross_block_search;
 pub mod grid;
 pub mod kitty_graphics;
+#[cfg(anvil_legacy_renderer)]
+pub(crate) mod legacy_view;
 mod record_snapshot;
+mod search;
 pub mod select;
+mod title;
 pub mod url;
 mod url_recovery;
+#[cfg(anvil_legacy_renderer)]
 pub mod vte;
 
 pub use block::BlockTerminal;
-pub(crate) use vte::default_tab_title;
-pub use vte::{InitialCommands, NoticeUndo, PaneProbe, VteInit, VteInput, VteOutput, VteTerminal};
+pub(crate) use contracts::{ask_ai_empty_notice, copy_empty_notice};
+pub use contracts::{
+    InitialCommands, NoticeUndo, PaneProbe, TerminalInit as VteInit, TerminalInput as VteInput,
+    TerminalOutput as VteOutput,
+};
+pub(crate) use title::default_tab_title;
+#[cfg(anvil_legacy_renderer)]
+pub use vte::VteTerminal;
 
 pub(crate) const CWD_TOKEN_ENV: &str = "ANVIL_CWD_TOKEN";
 const CWD_AUTHORITY_PREFIX: &str = "anvil-";

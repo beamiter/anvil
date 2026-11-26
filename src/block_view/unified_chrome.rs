@@ -1,4 +1,5 @@
-//! Probe-driven block chrome for Unified's single persistent VTE.
+//! Authority-backed block chrome for Unified terminal views.
+//! Legacy OSC 8 probes calibrate row coordinates for the VTE renderer.
 //!
 //! OSC 8 is only an untrusted row locator. A URI becomes authoritative after
 //! its nonce and id match this pane's ordered active-marker table. Keeping that
@@ -8,23 +9,34 @@
 
 use gtk::prelude::*;
 use relm4::gtk;
-use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+use std::cell::Cell;
+use std::cell::RefCell;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use std::ops::Bound::{Excluded, Included};
 use std::rc::Rc;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use vte4::{Terminal, TerminalExt};
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 const URI_PREFIX: &str = "block://";
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 const NONCE_HEX_LEN: usize = 32;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 const GUTTER_X: f64 = 3.0;
 const GUTTER_WIDTH: f64 = 2.0;
 const BADGE_PAD_X: f64 = 5.0;
 const BADGE_PAD_Y: f64 = 2.0;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 const MAX_CACHED_HEADS: usize = 512;
 /// Marker-bearing zones are a short-lived addressing index, not history.
 /// Include the currently-open prompt in this hard cap so a shell that keeps
 /// opening zones cannot grow the authority table independently of records.
 const MAX_ACTIVE_ZONE_MARKERS: usize = 256;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 const DRAW_STATS_WINDOW: usize = 120;
 
 /// Opt-in draw timing, enabled by setting `ANVIL_UNIFIED_CHROME_STATS`.
@@ -32,11 +44,13 @@ const DRAW_STATS_WINDOW: usize = 120;
 /// honest scroll cost is the full draw-func duration, early-out frames
 /// included. Disabled means no `DrawStats` exists and the draw path only
 /// pays one `Option` check per frame.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 struct DrawStats {
     samples_us: RefCell<Vec<u32>>,
     draws: Cell<u64>,
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 impl DrawStats {
     fn from_env() -> Option<Rc<DrawStats>> {
         std::env::var_os("ANVIL_UNIFIED_CHROME_STATS").map(|_| {
@@ -69,11 +83,13 @@ impl DrawStats {
 
 /// Records on drop so every early `return` in the draw func is counted;
 /// skipping cheap frames would overstate the percentile.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 struct DrawTimerGuard {
     stats: Rc<DrawStats>,
     start: std::time::Instant,
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 impl Drop for DrawTimerGuard {
     fn drop(&mut self) {
         self.stats.record(self.start.elapsed());
@@ -81,6 +97,7 @@ impl Drop for DrawTimerGuard {
 }
 
 /// Nearest-rank percentile over an ascending-sorted, non-empty window.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn percentile_us(sorted: &[u32], pct: f64) -> u32 {
     if sorted.is_empty() {
         return 0;
@@ -90,6 +107,7 @@ fn percentile_us(sorted: &[u32], pct: f64) -> u32 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 struct ZoneRowSpan {
     row_epoch: u64,
     head: i64,
@@ -97,6 +115,7 @@ struct ZoneRowSpan {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 struct CalibrationAnchor {
     zone_id: u64,
     ring_row: i64,
@@ -212,6 +231,9 @@ impl ChromeColors {
 /// Marker authority for one pane. Records/history do not own this lifetime.
 #[derive(Debug)]
 pub(super) struct ZoneChromeAuthority {
+    // Retain the pane authority context when shared transcript rows supply
+    // trusted ids directly; legacy marker probes validate this nonce.
+    #[cfg_attr(not(any(anvil_vte_oracle, anvil_legacy_renderer)), allow(dead_code))]
     nonce: Option<[u8; 16]>,
     active: VecDeque<ZoneChromeRecord>,
     order_by_id: HashMap<u64, usize>,
@@ -220,10 +242,12 @@ pub(super) struct ZoneChromeAuthority {
     max_seen_id: Option<u64>,
     retirement_generation: u64,
     completed: HashSet<u64>,
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     row_spans: HashMap<u64, ZoneRowSpan>,
     /// Trusted head rows ordered independently of lifecycle id. This is the
     /// bounded predecessor index used when a viewport starts in the middle of
     /// a long zone; drawing must never scan history to rediscover that head.
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     heads_by_row: BTreeMap<(u64, i64), u64>,
     /// Set when bounded-ring capacity makes row survival unknowable until the
     /// next exact marker calibration supplies the retained floor.
@@ -239,7 +263,9 @@ impl ZoneChromeAuthority {
             max_seen_id: None,
             retirement_generation: 0,
             completed: HashSet::new(),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             row_spans: HashMap::new(),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             heads_by_row: BTreeMap::new(),
             eviction_quarantine: false,
         }
@@ -303,6 +329,7 @@ impl ZoneChromeAuthority {
             .collect();
         for id in retired {
             self.completed.remove(id);
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             self.remove_row_span(*id);
         }
         self.retirement_generation = self.retirement_generation.wrapping_add(1);
@@ -330,28 +357,33 @@ impl ZoneChromeAuthority {
 
     #[allow(dead_code)]
     pub(super) fn clear(&mut self) {
-        let had_authority = !self.active.is_empty()
-            || !self.order_by_id.is_empty()
-            || !self.completed.is_empty()
-            || !self.row_spans.is_empty()
-            || !self.heads_by_row.is_empty();
+        let had_authority =
+            !self.active.is_empty() || !self.order_by_id.is_empty() || !self.completed.is_empty();
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        let had_authority =
+            had_authority || !self.row_spans.is_empty() || !self.heads_by_row.is_empty();
         self.active.clear();
         self.order_by_id.clear();
         self.completed.clear();
-        self.row_spans.clear();
-        self.heads_by_row.clear();
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        {
+            self.row_spans.clear();
+            self.heads_by_row.clear();
+        }
         self.eviction_quarantine = false;
         if had_authority {
             self.retirement_generation = self.retirement_generation.wrapping_add(1);
         }
     }
 
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     fn remove_row_span(&mut self, id: u64) {
         if let Some(span) = self.row_spans.remove(&id) {
             self.heads_by_row.remove(&(span.row_epoch, span.head));
         }
     }
 
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     fn head_matches(&self, id: u64, row_epoch: u64, row: i64) -> bool {
         self.order_by_id.contains_key(&id)
             && self
@@ -360,6 +392,7 @@ impl ZoneChromeAuthority {
                 .is_some_and(|span| span.row_epoch == row_epoch && span.head == row)
     }
 
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     fn observe_head(&mut self, id: u64, row_epoch: u64, row: i64) {
         if !self.order_by_id.contains_key(&id) {
             return;
@@ -405,6 +438,7 @@ impl ZoneChromeAuthority {
         );
     }
 
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     fn zone_containing_row(&self, row_epoch: u64, row: i64) -> Option<u64> {
         let (&(epoch, head), &id) = self.heads_by_row.range(..=(row_epoch, row)).next_back()?;
         if epoch != row_epoch || !self.order_by_id.contains_key(&id) {
@@ -421,6 +455,7 @@ impl ZoneChromeAuthority {
         }
     }
 
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     fn retire_completed_before(&mut self, row_epoch: u64, cutoff: i64) -> Vec<u64> {
         let retired = self
             .active
@@ -438,10 +473,12 @@ impl ZoneChromeAuthority {
         retired
     }
 
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     fn retire_heads_before(&mut self, row_epoch: u64, retained_floor: i64) -> Vec<u64> {
         self.retire_heads_before_except(row_epoch, retained_floor, None)
     }
 
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     fn retire_heads_before_except(
         &mut self,
         row_epoch: u64,
@@ -471,6 +508,7 @@ impl ZoneChromeAuthority {
         self.eviction_quarantine = true;
     }
 
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     fn reconcile_calibrated_floor(&mut self, row_epoch: u64, retained_floor: i64) -> Vec<u64> {
         let quarantined = self.eviction_quarantine;
         let retired = self
@@ -509,6 +547,7 @@ impl ZoneChromeAuthority {
         self.completed.contains(&id)
     }
 
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     fn order(&self, id: u64) -> Option<usize> {
         self.order_by_id.get(&id).copied()
     }
@@ -516,6 +555,7 @@ impl ZoneChromeAuthority {
     /// The zone's trusted head span, only while the id itself still holds
     /// marker authority. Retirement removes both together, so a stale span
     /// can never answer for a retired id.
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     fn trusted_span(&self, id: u64) -> Option<ZoneRowSpan> {
         self.order_by_id.contains_key(&id).then_some(())?;
         self.row_spans.get(&id).copied()
@@ -525,6 +565,7 @@ impl ZoneChromeAuthority {
 /// Parse only the one canonical spelling emitted by `ZoneMarkerInjector`.
 /// Uppercase/non-hex nonces, leading-zero ids, suffixes and alternate URI
 /// spellings all fail closed before the authority lookup.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn parse_canonical_zone_uri(uri: &str) -> Option<([u8; 16], u64)> {
     let rest = uri.strip_prefix(URI_PREFIX)?;
     let bytes = rest.as_bytes();
@@ -548,6 +589,7 @@ fn parse_canonical_zone_uri(uri: &str) -> Option<([u8; 16], u64)> {
     Some((nonce, id_text.parse().ok()?))
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn lowercase_hex_value(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -557,6 +599,7 @@ fn lowercase_hex_value(byte: u8) -> Option<u8> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 struct ScanLayoutKey {
     columns: i64,
     ring_lower: i64,
@@ -569,6 +612,7 @@ struct ScanLayoutKey {
 /// cursor need not occupy the grid's physical last row. A canonical marker
 /// probe ties one visible adjustment row to its pre-feed ring-row anchor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 pub(super) struct ViewportProjection {
     /// `ring row - adjustment row`, proven by a canonical visible marker.
     pub(super) row_offset: i64,
@@ -581,11 +625,13 @@ pub(super) struct ViewportProjection {
 /// epoch is the only way an image may refresh its absolute row span after
 /// rewrap/reset invalidated the old coordinates.
 #[derive(Clone)]
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 pub(super) struct ImageRowProjection {
     projection: Rc<Cell<Option<ViewportProjection>>>,
     row_epoch: Rc<Cell<u64>>,
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 impl ImageRowProjection {
     pub(super) fn ring_row_at_probe_band(
         &self,
@@ -602,6 +648,7 @@ impl ImageRowProjection {
 }
 
 #[allow(clippy::too_many_arguments)] // each scalar is an independently fail-closed proof input
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn projection_from_calibration_anchor<'a>(
     anchor: CalibrationAnchor,
     expected_epoch: u64,
@@ -662,12 +709,14 @@ fn projection_from_calibration_anchor<'a>(
 }
 
 #[derive(Default, Debug)]
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 struct KnownHeadCache {
     layout: Option<ScanLayoutKey>,
     retirement_generation: u64,
     heads: BTreeMap<i64, u64>,
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 impl KnownHeadCache {
     fn prepare(&mut self, layout: ScanLayoutKey, authority: &ZoneChromeAuthority) {
         if self.layout != Some(layout) {
@@ -684,6 +733,7 @@ impl KnownHeadCache {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 struct VisibleZoneLine {
     visible_row: usize,
     absolute_row: i64,
@@ -695,6 +745,7 @@ struct VisibleZoneLine {
 /// plus at most one bounded widening query per zone whose first row starts
 /// past column 0. No history-sized fallback or retry is permitted on the
 /// drawing path.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn scan_visible_rows<'a>(
     layout: ScanLayoutKey,
     top_absolute_row: i64,
@@ -717,6 +768,7 @@ fn scan_visible_rows<'a>(
 /// for the row immediately above an observed transition, and only when that
 /// row's own column-0 probe found nothing — at most one extra query per new
 /// zone in steady state.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn scan_visible_rows_with<'a>(
     layout: ScanLayoutKey,
     top_absolute_row: i64,
@@ -835,25 +887,32 @@ fn scan_visible_rows_with<'a>(
     result
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn badge_lands_on_blank_cells(row_tail: &str) -> bool {
     row_tail
         .chars()
         .all(|character| matches!(character, ' ' | '\t' | '\r' | '\n'))
 }
 
-fn badge_probe_start_col(start_col: i64) -> i64 {
-    // VTE may expose the second cell of a wide glyph as an empty range when a
-    // query begins on that continuation cell. Include its left neighbour and
-    // accept the harmless false-negative for an adjacent narrow glyph rather
-    // than painting over terminal content.
+/// Badge placement checks the preceding cell too, so a wide continuation
+/// cannot make a badge overlap a visible glyph body.
+fn badge_blank_check_start_col(start_col: i64) -> i64 {
     start_col.saturating_sub(1).max(0)
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+fn badge_probe_start_col(start_col: i64) -> i64 {
+    // VTE can report an empty range when its first cell is a continuation.
+    badge_blank_check_start_col(start_col)
+}
+
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn finite_floor_i64(value: f64) -> Option<i64> {
     (value.is_finite() && value >= i64::MIN as f64 && value <= i64::MAX as f64)
         .then(|| value.floor() as i64)
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn finite_ceil_i64(value: f64) -> Option<i64> {
     (value.is_finite() && value >= i64::MIN as f64 && value <= i64::MAX as f64)
         .then(|| value.ceil() as i64)
@@ -862,6 +921,7 @@ fn finite_ceil_i64(value: f64) -> Option<i64> {
 /// Pixel shift VTE applies for fractional fallback scrolling. Rounding at the
 /// pixel boundary mirrors VTE; flooring the row-valued adjustment directly
 /// picks the wrong cell whenever more than half a row is exposed.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 pub(super) fn scroll_shift_px(adjustment_value: f64, cell_height_px: i64) -> Option<i64> {
     if !adjustment_value.is_finite() || adjustment_value < 0.0 || cell_height_px <= 0 {
         return None;
@@ -875,6 +935,7 @@ pub(super) fn scroll_shift_px(adjustment_value: f64, cell_height_px: i64) -> Opt
 ///
 /// The doubled integer formula retains the half-cell centre without floating
 /// drift and works for odd cell heights as well as even ones.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 pub(super) fn adjustment_row_at_probe_band(
     adjustment_value: f64,
     band: i64,
@@ -890,6 +951,7 @@ pub(super) fn adjustment_row_at_probe_band(
     i64::try_from(row).ok()
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 pub(super) fn adjustment_row_y_px(
     adjustment_row: i64,
     adjustment_value: f64,
@@ -902,6 +964,7 @@ pub(super) fn adjustment_row_y_px(
     i64::try_from(y).ok().map(|y| y as f64)
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn invalidate_row_projection(
     projection: &Cell<Option<ViewportProjection>>,
     calibration_anchor: &Cell<Option<CalibrationAnchor>>,
@@ -915,6 +978,7 @@ fn invalidate_row_projection(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 pub(super) struct TrustedRingBounds {
     pub(super) row_epoch: u64,
     pub(super) retained_start: i64,
@@ -926,13 +990,16 @@ pub(super) struct TrustedRingBounds {
 /// chrome authority. Satellite layers (Kitty images) may retire only complete
 /// spans below this boundary; surface visibility is not retention evidence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 pub(super) struct RetainedFloorProof {
     pub(super) row_epoch: u64,
     pub(super) retained_floor: i64,
 }
 
-type RetainedFloorObserver = Rc<dyn Fn(RetainedFloorProof)>;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+pub(super) type RetainedFloorObserver = Rc<dyn Fn(RetainedFloorProof)>;
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn trusted_ring_bounds_from(
     projection: ViewportProjection,
     lower: f64,
@@ -963,6 +1030,7 @@ fn trusted_ring_bounds_from(
 /// must lie inside the retained ring. Any doubt is `None`: a record jump is
 /// exact or it does not happen.
 #[allow(clippy::too_many_arguments)] // keep every projection/bounds proof explicit at call sites
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn proven_zone_scroll_value_from(
     projection: ViewportProjection,
     current_epoch: u64,
@@ -990,6 +1058,7 @@ fn proven_zone_scroll_value_from(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 enum ProjectionDrift {
     Stable,
     ForwardTrim {
@@ -1005,11 +1074,13 @@ enum ProjectionDrift {
     Invalidate,
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn adjustment_may_be_at_scrollback_capacity(upper: f64, scrollback_lines: i64) -> Option<bool> {
     let upper = finite_ceil_i64(upper)?;
     Some(scrollback_lines >= 0 && upper >= scrollback_lines)
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn projection_drift_after_contents(
     projection: ViewportProjection,
     cursor_row: i64,
@@ -1090,7 +1161,7 @@ fn paint_badge(
     let badge_height = (extents.height() + BADGE_PAD_Y * 2.0).min(cell_height - 1.0);
     let badge_x = (f64::from(width) - badge_width - 6.0).max(content_x + cell_width);
     let start_col = (((badge_x - content_x) / cell_width).floor() as i64).clamp(0, columns);
-    if !blank_from(badge_probe_start_col(start_col)) {
+    if !blank_from(badge_blank_check_start_col(start_col)) {
         return;
     }
     let y = y + (cell_height - badge_height) / 2.0;
@@ -1129,18 +1200,25 @@ fn paint_badge(
 pub(super) struct UnifiedChrome {
     surface: gtk::DrawingArea,
     authority: Rc<RefCell<ZoneChromeAuthority>>,
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     projection: Rc<Cell<Option<ViewportProjection>>>,
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     calibration_anchor: Rc<Cell<Option<CalibrationAnchor>>>,
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     row_epoch: Rc<Cell<u64>>,
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     cache: Rc<RefCell<KnownHeadCache>>,
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     retained_floor_observer: RetainedFloorObserver,
 }
 
 impl UnifiedChrome {
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     pub(super) fn row_epoch(&self) -> u64 {
         self.row_epoch.get()
     }
 
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     pub(super) fn image_row_projection(&self) -> ImageRowProjection {
         ImageRowProjection {
             projection: self.projection.clone(),
@@ -1148,6 +1226,42 @@ impl UnifiedChrome {
         }
     }
 
+    #[cfg(anvil_shared_terminal)]
+    pub(super) fn for_shared(
+        surface: &gtk::DrawingArea,
+        authority: Rc<RefCell<ZoneChromeAuthority>>,
+        config: Rc<RefCell<super::Config>>,
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        retained_floor_observer: RetainedFloorObserver,
+        shared: &Rc<super::SharedActiveTerminal>,
+    ) -> Self {
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        let cache = Rc::new(RefCell::new(KnownHeadCache::default()));
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        let projection: Rc<Cell<Option<ViewportProjection>>> = Rc::new(Cell::new(None));
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        let calibration_anchor: Rc<Cell<Option<CalibrationAnchor>>> = Rc::new(Cell::new(None));
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        let row_epoch = Rc::new(Cell::new(1_u64));
+        let chrome = Self {
+            surface: surface.clone(),
+            authority: authority.clone(),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            projection: projection.clone(),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            calibration_anchor: calibration_anchor.clone(),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            row_epoch: row_epoch.clone(),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            cache: cache.clone(),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            retained_floor_observer: retained_floor_observer.clone(),
+        };
+        chrome.connect_shared(shared, config);
+        chrome
+    }
+
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     pub(super) fn new(
         terminal: Option<&Terminal>,
         surface: &gtk::DrawingArea,
@@ -1669,6 +1783,7 @@ impl UnifiedChrome {
         self.surface.queue_draw();
     }
 
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     pub(super) fn begin_zone(&self, id: u64, terminal: &Terminal) {
         let authoritative = {
             let mut authority = self.authority.borrow_mut();
@@ -1702,6 +1817,7 @@ impl UnifiedChrome {
 
     pub(super) fn clear_authority(&self) {
         self.authority.borrow_mut().clear();
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         invalidate_row_projection(
             &self.projection,
             &self.calibration_anchor,
@@ -1711,6 +1827,7 @@ impl UnifiedChrome {
         self.surface.queue_draw();
     }
 
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     pub(super) fn erase_scrollback(&self, terminal: &Terminal) {
         self.authority.borrow_mut().quarantine_eviction_drift();
         let Some(projection) = self.projection.get() else {
@@ -1769,6 +1886,7 @@ impl UnifiedChrome {
 
     pub(super) fn erase_display(&self) {
         self.authority.borrow_mut().quarantine_eviction_drift();
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         invalidate_row_projection(
             &self.projection,
             &self.calibration_anchor,
@@ -1779,6 +1897,7 @@ impl UnifiedChrome {
     }
 
     #[allow(dead_code)]
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     pub(super) fn trusted_ring_bounds(&self, terminal: &Terminal) -> Option<TrustedRingBounds> {
         let projection = self.projection.get()?;
         (projection.row_epoch == self.row_epoch.get()).then_some(())?;
@@ -1796,6 +1915,7 @@ impl UnifiedChrome {
     /// when any link in the proof chain (projection epoch, ring bounds, the
     /// zone's recorded span, retention of the head row) is missing. The
     /// caller must treat `None` as "no exact location", never guess one.
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     pub(super) fn proven_zone_scroll_value(
         &self,
         terminal: &Terminal,
@@ -1819,6 +1939,7 @@ impl UnifiedChrome {
     pub(super) fn set_alt_screen(&self, alt_screen: bool) {
         self.surface.set_visible(!alt_screen);
         if alt_screen {
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             invalidate_row_projection(
                 &self.projection,
                 &self.calibration_anchor,
@@ -1831,7 +1952,7 @@ impl UnifiedChrome {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 mod tests {
     use super::*;
 

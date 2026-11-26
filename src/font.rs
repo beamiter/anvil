@@ -592,6 +592,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires DISPLAY"]
+    #[cfg(anvil_vte_oracle)]
     fn window_text_tracks_terminal_size_on_startup_and_live_updates() {
         use relm4::prelude::*;
         use vte4::TerminalExt;
@@ -761,6 +762,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a GTK display"]
+    #[cfg(anvil_vte_oracle)]
     fn default_font_resolution_preserves_grid_and_configuration() {
         use vte4::TerminalExt;
         // A pre-GTK lookup must not poison the runtime availability cache.
@@ -957,6 +959,7 @@ mod tests {
     /// Needs a display, so it runs from `make test-display`.
     #[test]
     #[ignore = "requires a GTK display"]
+    #[cfg(anvil_vte_oracle)]
     fn a_real_vte_is_given_the_icon_family_behind_the_configured_one() {
         use vte4::TerminalExt;
 

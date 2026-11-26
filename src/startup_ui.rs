@@ -646,18 +646,16 @@ fn show_file_tree_context_menu(
     menu.add_css_class("menu");
 
     if let [(path, false)] = targets.as_slice() {
-        if !loc.is_remote() {
-            add_file_menu_item(
-                &menu,
-                "Preview file",
-                &popover,
-                sender,
-                AppMsg::FileTreePreview {
-                    path: path.clone(),
-                    intent: Box::new(menu_intent.clone()),
-                },
-            );
-        }
+        add_file_menu_item(
+            &menu,
+            "Preview file",
+            &popover,
+            sender,
+            AppMsg::FileTreePreview {
+                path: path.clone(),
+                intent: Box::new(menu_intent.clone()),
+            },
+        );
     }
 
     // Creating and renaming are single-target operations; insensitive under

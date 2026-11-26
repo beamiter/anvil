@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use vte4::Terminal;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use vte4::TerminalExt;
 
 /// A compact native reveal target. The preview is display-only and ellipsized;
@@ -751,11 +753,13 @@ pub(crate) struct FinishedBlock {
     compact: Rc<Cell<bool>>,
     pub(crate) prompt_text: String,
     /// Read-only VTE displaying the executed command when the card has one.
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     pub(crate) command_vte: Option<vte4::Terminal>,
     #[cfg(anvil_shared_terminal)]
     pub(crate) command_document: Option<jterm_gtk_view::FinishedTextView>,
     /// Read-only VTE displaying the captured output. Finished output takes its
     /// full natural height; scrolling belongs to the outer block canvas.
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     pub(crate) output_vte: Option<vte4::Terminal>,
     #[cfg(anvil_shared_terminal)]
     pub(crate) output_document: Option<jterm_gtk_view::FinishedOutputView>,
@@ -832,7 +836,9 @@ pub(crate) struct FinishedBlock {
     /// not prove that VTE already contains the right bytes or geometry.
     visual_rows_cache: Rc<Cell<Option<OutputVisualRowsCacheEntry>>>,
     displayed_generation: Rc<Cell<u64>>,
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     command_bytes: Rc<Vec<u8>>,
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     command_render_cols: Rc<Cell<i64>>,
     command_base_rows: i64,
     capture_rows: i64,
@@ -858,9 +864,11 @@ impl Clone for FinishedBlock {
             virtualized: self.virtualized.clone(),
             compact: self.compact.clone(),
             prompt_text: self.prompt_text.clone(),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             command_vte: self.command_vte.clone(),
             #[cfg(anvil_shared_terminal)]
             command_document: self.command_document.clone(),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             output_vte: self.output_vte.clone(),
             #[cfg(anvil_shared_terminal)]
             output_document: self.output_document.clone(),
@@ -900,7 +908,9 @@ impl Clone for FinishedBlock {
             render_stamp: self.render_stamp.clone(),
             visual_rows_cache: self.visual_rows_cache.clone(),
             displayed_generation: self.displayed_generation.clone(),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             command_bytes: self.command_bytes.clone(),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             command_render_cols: self.command_render_cols.clone(),
             command_base_rows: self.command_base_rows,
             capture_rows: self.capture_rows,
@@ -1241,6 +1251,7 @@ fn advance_displayed_generation(
 /// Finished VTEs follow their pixel allocation once a split becomes narrower
 /// than the columns recorded with the block. Row and height math must use that
 /// same width or map/refit passes alternate between two geometries.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn effective_render_cols(vte: &vte4::Terminal, recorded_cols: i64) -> i64 {
     clamp_render_cols(recorded_cols, vte.width() as i64, vte.char_width())
 }
@@ -1329,6 +1340,7 @@ fn fitted_output_rows_for_viewport(
 /// [`fitted_output_rows_for_viewport`] against the pane this block actually
 /// hangs in. Falls back to the caller's rows while the block has no
 /// `ScrolledWindow` ancestor yet (construction, before the card is inserted).
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn fitted_output_rows_for_widget(
     vte: &vte4::Terminal,
     fallback_rows: i64,
@@ -1348,6 +1360,7 @@ fn bounded_finished_viewport_rows(cols: i64, requested_rows: i64) -> i64 {
     bounded_finished_vte_geometry(cols, requested_rows.max(1), 0).1
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn pin_vte_to_top(vte: &vte4::Terminal) {
     if vte.search_get_regex().is_some() && vte.has_selection() {
         return;
@@ -1357,6 +1370,7 @@ fn pin_vte_to_top(vte: &vte4::Terminal) {
     }
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn settle_vte_to_top(vte: &vte4::Terminal) {
     pin_vte_to_top(vte);
     // `feed()` updates VTE's scrollback adjustment asynchronously. The
@@ -1457,7 +1471,7 @@ fn scroll_target(
     ((target - value).abs() > f64::EPSILON).then_some(target)
 }
 
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 mod tests {
     #[cfg(anvil_shared_terminal)]
     #[test]
@@ -1499,6 +1513,238 @@ mod tests {
     #[cfg(anvil_shared_terminal)]
     #[test]
     #[ignore = "requires an isolated native GTK display"]
+    fn completed_headings_keep_large_blank_and_control_bearing_commands_as_documents() {
+        gtk::init().expect("GTK display");
+        let commands = [
+            "long heading ".repeat(2000),
+            " \t\n ".to_owned(),
+            "printf \u{202e}visual\u{1b}control".to_owned(),
+            "printf \u{fff0}unknown".to_owned(),
+        ];
+        for mode in [
+            crate::config::TerminalMode::Block,
+            crate::config::TerminalMode::Chat,
+            crate::config::TerminalMode::Unified,
+        ] {
+            let mut config = crate::config::Config::safe_defaults();
+            config.terminal_mode = mode;
+            for command in &commands {
+                let mut precomputed = super::FinishedBlockPrecomputed::documents(&config, None);
+                // Exercise the production heading route in test builds whose
+                // default remains available as the historical VTE oracle.
+                precomputed.document_command = true;
+                let card = super::FinishedBlock::new_with_pool(
+                    1,
+                    "$ ",
+                    command,
+                    Some("\x1b[31munrelated legacy markup\x1b[0m"),
+                    "stored result",
+                    Some(0),
+                    &config,
+                    None,
+                    None,
+                    None,
+                    80,
+                    &[],
+                    "stored result".len(),
+                    None,
+                    precomputed,
+                );
+                let expected = jterm_core::review_input::safe_multiline_display(
+                    command,
+                    jterm_core::review_input::MAX_REVIEW_INPUT_BYTES,
+                );
+                assert!(card.command_vte.is_none());
+                assert_eq!(&card.cmd_text, command);
+                if command.trim().is_empty() {
+                    assert!(card.command_surface().is_none());
+                    continue;
+                }
+                assert_eq!(
+                    card.command_surface().unwrap().document_text().as_deref(),
+                    Some(expected.as_str())
+                );
+                let document = card.command_document.as_ref().unwrap();
+                assert!(!document.widget().is_editable());
+                let buffer = document.widget().buffer();
+                buffer.select_range(&buffer.start_iter(), &buffer.end_iter());
+                let (start, end) = buffer.selection_bounds().unwrap();
+                assert_eq!(buffer.text(&start, &end, true).as_str(), expected);
+            }
+        }
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    #[test]
+    #[ignore = "requires an isolated native GTK display"]
+    fn completed_output_uses_shared_documents_for_blink_edits_and_empty_control_streams() {
+        gtk::init().expect("GTK display");
+        for mode in [
+            crate::config::TerminalMode::Block,
+            crate::config::TerminalMode::Chat,
+            crate::config::TerminalMode::Unified,
+        ] {
+            let mut config = crate::config::Config::safe_defaults();
+            config.terminal_mode = mode;
+            for (raw, expected) in [
+                ("\x1b[5mblinking output\x1b[0m\r\n", "blinking output"),
+                ("discarded line\r\x1b[Kfinished value\r\n", "finished value"),
+                ("\x1b[31m\x1b[0m", ""),
+                ("\x1b[?9999h", ""),
+            ] {
+                let mut precomputed = super::FinishedBlockPrecomputed::documents(&config, None);
+                precomputed.document_command = true;
+                precomputed.document_output = true;
+                let card = super::FinishedBlock::new_with_pool(
+                    1,
+                    "$ ",
+                    "printf output",
+                    None,
+                    raw,
+                    Some(0),
+                    &config,
+                    None,
+                    None,
+                    None,
+                    80,
+                    &[],
+                    raw.len(),
+                    None,
+                    precomputed,
+                );
+                assert!(card.output_vte.is_none());
+                let surface = card.output_surface();
+                assert_eq!(
+                    surface.document_text().unwrap().trim_end_matches('\n'),
+                    expected
+                );
+                assert_eq!(card.full_output.borrow().as_str(), raw);
+                assert_eq!(card.copy_output_btn.get_sensitive(), !expected.is_empty());
+                assert_eq!(card.filter_btn.get_sensitive(), !expected.is_empty());
+                let projection = FinishedDocument::project_for_display(raw, (80, 0));
+                let output_container = std::iter::successors(
+                    card.output_document.as_ref().unwrap().widget().parent(),
+                    |widget| widget.parent(),
+                )
+                .find(|widget| widget.is::<gtk::Overlay>())
+                .expect("output container");
+                assert_eq!(
+                    output_container.get_visible(),
+                    !expected.is_empty() || projection.notice().is_some()
+                );
+                let document = card.output_document.as_ref().unwrap();
+                assert!(!document.text().widget().is_editable());
+                let buffer = document.text().widget().buffer();
+                if !expected.is_empty() {
+                    buffer.select_range(&buffer.start_iter(), &buffer.end_iter());
+                    let (start, end) = buffer.selection_bounds().unwrap();
+                    assert_eq!(
+                        buffer.text(&start, &end, true).trim_end_matches('\n'),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    #[test]
+    #[ignore = "requires an isolated native GTK display"]
+    fn completed_output_keeps_full_capture_and_restores_projection_notices() {
+        gtk::init().expect("GTK display");
+        let mut config = crate::config::Config::safe_defaults();
+        config.terminal_mode = crate::config::TerminalMode::Block;
+        let raw = format!("full-capture-prefix\r\n{}", "retained row\r\n".repeat(6000));
+        let projection = FinishedDocument::project_for_display(&raw, (80, 0));
+        assert!(
+            projection.clipped,
+            "fixture must exceed the bounded display"
+        );
+        let card = super::FinishedBlock::new_with_pool(
+            1,
+            "$ ",
+            "many rows",
+            None,
+            &raw,
+            Some(0),
+            &config,
+            None,
+            None,
+            None,
+            80,
+            &[],
+            raw.len(),
+            None,
+            super::FinishedBlockPrecomputed::documents(&config, None),
+        );
+        assert!(card.output_vte.is_none());
+        assert_eq!(
+            card.output_surface().document_text().unwrap(),
+            projection.document.archive.text
+        );
+        assert!(card.with_stripped_output(|text| text.contains("full-capture-prefix")));
+        assert_eq!(card.full_output.borrow().as_str(), raw);
+        let notice = card
+            .output_document
+            .as_ref()
+            .unwrap()
+            .widget()
+            .first_child()
+            .unwrap()
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        assert!(notice.is_visible());
+        assert_eq!(notice.label().as_str(), projection.notice().unwrap());
+        assert!(!card
+            .output_surface()
+            .document_text()
+            .unwrap()
+            .contains(projection.notice().unwrap()));
+
+        let replay = FinishedDocument::project_for_display(
+            "first\r\nsecond\r\n\x1b[1A\r\x1b[Kupdated",
+            (80, 24),
+        );
+        assert!(!replay.clipped);
+        let warning = replay
+            .notice()
+            .expect("cursor operations require a replay notice");
+        let frame = replay
+            .document
+            .attach(&replay.document.archive.text, b"owned record")
+            .into_owned();
+        let restored_document = jterm_core::screen_replay::FinishedHistoryFrame::read(&frame)
+            .document(&replay.document.archive.text)
+            .expect("saved projected document");
+        let mut retained = finished_block(Some(0));
+        retained.output = restored_document.archive.text.clone();
+        retained.finished_document = Some(std::sync::Arc::new(restored_document));
+        let restored = super::FinishedBlock::from_retained(&retained, &config, 80, None);
+        assert!(restored.output_vte.is_none());
+        let notice = restored
+            .output_document
+            .as_ref()
+            .unwrap()
+            .widget()
+            .first_child()
+            .unwrap()
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        assert!(notice.is_visible());
+        assert_eq!(notice.label().as_str(), warning);
+        assert_eq!(
+            restored.output_surface().document_text().unwrap(),
+            retained.output
+        );
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    #[test]
+    #[ignore = "requires an isolated native GTK display"]
     fn completed_image_cards_share_the_caption_and_keep_the_picture() {
         use gtk::prelude::*;
         use gtk::{gdk, glib};
@@ -1518,7 +1764,10 @@ mod tests {
         for (caption, expected) in [
             ("caption for plot\r\n", Some("caption for plot")),
             ("", Some("")),
-            ("\x1b[5mblinking caption\x1b[0m\r\n", None),
+            (
+                "\x1b[5mblinking caption\x1b[0m\r\n",
+                Some("blinking caption"),
+            ),
         ] {
             let card = super::FinishedBlock::new_with_pool(
                 1,
@@ -4134,6 +4383,7 @@ pub(crate) fn apply_finished_card_density(
     }
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn feed_snapshot_bytes(vte: &vte4::Terminal, bytes: &[u8]) {
     vte.feed(&snapshot_payload(bytes));
     // RIS and captured command bytes may both show a cursor. Every caller
@@ -4271,6 +4521,7 @@ pub(crate) fn output_render_stamp_for_test(
 /// long blocks keep that scrollback inside their configured viewport.
 // Keep the existing geometry arguments explicit; render_state only tracks ownership.
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 pub(crate) fn render_bytes_into_finished_vte(
     vte: &vte4::Terminal,
     text: &str,
@@ -4354,6 +4605,7 @@ fn stamp_change_needs_refeed(previous: RenderStamp, next: RenderStamp) -> bool {
 /// generous limit first so no `set_size` in either direction can trim the ring,
 /// then settle on the real one, which keeps screen + scrollback at exactly the
 /// same total the feed path left behind.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn rewindow_finished_vte(
     vte: &vte4::Terminal,
     cols: i64,
@@ -4983,6 +5235,7 @@ impl FinishedBlock {
         // Allocate every logical command row up front; VTE's post-feed pass
         // adds any further rows caused by soft wrapping or control sequences.
         let cmd_rows = cmd_bytes.iter().filter(|&&b| b == b'\n').count() as i64 + 1;
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         let command_cols = if chat {
             chat_command_columns(cmd, cols)
         } else {
@@ -4993,7 +5246,7 @@ impl FinishedBlock {
         // after the wrapped feed and discard its prefix before the command's
         // own settling pass expands it again (notably with the 12px default).
         #[cfg(anvil_shared_terminal)]
-        let command_document = if precomputed.document_command && !is_background {
+        let command_document = if (precomputed.document_command || !cfg!(test)) && !is_background {
             let font = crate::font::terminal_font_description(&config.font_desc, config);
             let display = jterm_core::review_input::safe_multiline_display(
                 cmd,
@@ -5011,21 +5264,31 @@ impl FinishedBlock {
                     &config.palette,
                 )
             });
-            let command = archival_command.or_else(|| {
-                let highlighted = if display == cmd && cmd_ansi.is_none_or(str::is_empty) {
-                    std::borrow::Cow::Borrowed(cmd_bytes.as_slice())
-                } else {
-                    std::borrow::Cow::Owned(highlight_command_to_ansi(&display).into_bytes())
-                };
-                jterm_gtk_view::FinishedTextView::command(
-                    &display,
-                    &highlighted,
-                    font,
-                    config.default_font_scale,
-                    config.foreground,
-                    &config.palette,
-                )
-            });
+            let command = archival_command
+                .or_else(|| {
+                    let highlighted = if display == cmd && cmd_ansi.is_none_or(str::is_empty) {
+                        std::borrow::Cow::Borrowed(cmd_bytes.as_slice())
+                    } else {
+                        std::borrow::Cow::Owned(highlight_command_to_ansi(&display).into_bytes())
+                    };
+                    jterm_gtk_view::FinishedTextView::command(
+                        &display,
+                        &highlighted,
+                        font.clone(),
+                        config.default_font_scale,
+                        config.foreground,
+                        &config.palette,
+                    )
+                })
+                .or_else(|| {
+                    Some(jterm_gtk_view::FinishedTextView::plain_command(
+                        &display,
+                        font,
+                        config.default_font_scale,
+                        config.foreground,
+                        &config.palette,
+                    ))
+                });
             command.inspect(|command| {
                 command.set_terminal_background(config.background);
                 command.set_background(precomputed.document_background.filter(|_| !chat));
@@ -5034,10 +5297,11 @@ impl FinishedBlock {
         } else {
             None
         };
-        #[cfg(anvil_shared_terminal)]
+        #[cfg(all(anvil_shared_terminal, any(anvil_vte_oracle, anvil_legacy_renderer)))]
         let uses_command_vte = !is_background && command_document.is_none();
         #[cfg(not(anvil_shared_terminal))]
         let uses_command_vte = !is_background;
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         let command_vte = uses_command_vte.then(|| {
             let terminal = create_finished_terminal(
                 config,
@@ -5053,6 +5317,7 @@ impl FinishedBlock {
             }
             terminal
         });
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         let command_render_cols = Rc::new(Cell::new(0_i64));
         // Defer feeds until the widget is actually mapped — VTE's internal
         // grid resize from set_size() doesn't take effect until the widget is
@@ -5060,6 +5325,7 @@ impl FinishedBlock {
         // width (the ls-output misalignment bug). connect_map fires once the
         // widget has been allocated, when the grid actually matches set_size.
         // One-shot: re-mapping during scroll must not re-feed.
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(command_vte) = &command_vte {
             let cmd_bytes_for_map = cmd_bytes.clone();
             let cols_for_map = command_cols.max(1);
@@ -5099,20 +5365,37 @@ impl FinishedBlock {
         let full_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
         let displayed_output: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let output_scrollable = output_rows > viewport_cap;
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         let initial_visible_rows = output_rows.min(viewport_cap).clamp(1, 32);
         #[cfg(anvil_shared_terminal)]
-        let output_archive =
-            if precomputed.document_output && (precomputed.document_command || is_background) {
-                precomputed.finished_document.clone().or_else(|| {
-                    FinishedDocument::capture(output, (cols.clamp(1, u16::MAX as i64) as u16, 0))
-                        .map(Arc::new)
-                })
-            } else {
-                None
-            };
+        let (output_archive, output_projection_clipped, output_projection_notice) = if !cfg!(test)
+            || (precomputed.document_output && (precomputed.document_command || is_background))
+        {
+            match precomputed.finished_document.clone() {
+                Some(document) => {
+                    let notice = document.projection_notice();
+                    (Some(document), false, notice)
+                }
+                None => {
+                    let projection = FinishedDocument::project_for_display(
+                        output,
+                        (cols.clamp(1, u16::MAX as i64) as u16, 0),
+                    );
+                    let notice = projection.notice();
+                    (
+                        Some(Arc::new(projection.document)),
+                        projection.clipped,
+                        notice,
+                    )
+                }
+            }
+        } else {
+            (None, false, None)
+        };
         #[cfg(anvil_shared_terminal)]
         let stripped_output = output_archive
             .as_ref()
+            .filter(|_| !output_projection_clipped)
             .map(|document| document.archive.text.clone());
         #[cfg(not(anvil_shared_terminal))]
         let stripped_output = None;
@@ -5133,12 +5416,18 @@ impl FinishedBlock {
             output.set_terminal_background(config.background);
             output.set_background(precomputed.document_background.filter(|_| !chat));
             output.install_links(crate::shared_terminal::SharedTerminal::document_links());
-            jterm_gtk_view::FinishedOutputView::new(output, viewport_cap, max_expanded_cap)
+            let view =
+                jterm_gtk_view::FinishedOutputView::new(output, viewport_cap, max_expanded_cap);
+            view.set_projection_notice(output_projection_notice);
+            view
         });
-        #[cfg(anvil_shared_terminal)]
+        #[cfg(all(anvil_shared_terminal, any(anvil_vte_oracle, anvil_legacy_renderer)))]
         let uses_output_vte = output_document.is_none();
+        #[cfg(all(anvil_shared_terminal, not(any(anvil_vte_oracle, anvil_legacy_renderer))))]
+        let uses_output_vte = false;
         #[cfg(not(anvil_shared_terminal))]
         let uses_output_vte = true;
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         let output_vte = uses_output_vte.then(|| {
             let output_vte = create_finished_terminal(
                 config,
@@ -5157,6 +5446,7 @@ impl FinishedBlock {
         // height. Survives unmap/remap so re-feeding picks the right cap.
         let expanded: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let render_stamp = Rc::new(RenderStampState::new(NEUTRAL_RENDER_STAMP));
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(output_vte) = &output_vte {
             let render_stamp = Rc::downgrade(&render_stamp);
             output_vte.connect_contents_changed(move |_| {
@@ -5176,6 +5466,7 @@ impl FinishedBlock {
             displayed_generation: 0,
             rows: output_rows,
         })));
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(output_vte) = &output_vte {
             let cols_for_map = cols.max(1);
             let cap_for_map = dynamic_viewport_rows.clone();
@@ -5271,6 +5562,7 @@ impl FinishedBlock {
         // updates the icon (expand ↔ compress). The map handler reads the
         // shared `expanded` flag so a re-feed after scroll-off/on respects it.
         expand_btn.set_visible(output_rows > viewport_cap);
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(output_vte) = &output_vte {
             let expand_for_btn = expanded.clone();
             let viewport_for_btn = dynamic_viewport_rows.clone();
@@ -5338,6 +5630,8 @@ impl FinishedBlock {
         // terminal's pixel width, so the card would re-wrap `ls` differently
         // from the live pane the user watched it in.
         let cmd_row = super::command_row::CommandRow::new();
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(terminal) = &command_vte {
             cmd_row.append(terminal);
             if chat {
@@ -5377,6 +5671,7 @@ impl FinishedBlock {
         // live card's scrollbar already rides its clip for the same reason.
         let output_box = gtk::Overlay::new();
         output_box.set_hexpand(true);
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(output_vte) = &output_vte {
             if reference_block {
                 let body =
@@ -5385,6 +5680,7 @@ impl FinishedBlock {
                 body.set_margin_start(16);
                 body.set_margin_end(16);
                 let gutter = super::block_reference::output_gutter(
+                    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                     output_vte,
                     full_output.clone(),
                     displayed_output.clone(),
@@ -5430,9 +5726,12 @@ impl FinishedBlock {
                 output_box.set_child(Some(output.widget()));
             }
         }
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         let output_adjustment = output_vte
             .as_ref()
             .and_then(|terminal| terminal.vadjustment());
+        #[cfg(all(anvil_shared_terminal, not(any(anvil_vte_oracle, anvil_legacy_renderer))))]
+        let output_adjustment = output_document.as_ref().map(|output| output.adjustment());
         let output_scrollbar =
             gtk::Scrollbar::new(Orientation::Vertical, output_adjustment.as_ref());
         output_scrollbar.add_css_class("block-output-scrollbar");
@@ -5523,10 +5822,18 @@ impl FinishedBlock {
         collapsed_summary.set_visible(false);
         content.append(&collapsed_summary);
 
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(terminal) = &output_vte {
-            crate::terminal::vte::setup_terminal_click_handler(terminal);
+            crate::terminal::legacy_view::setup_terminal_click_handler(terminal);
         }
 
+        #[cfg(anvil_shared_terminal)]
+        let has_output = output_archive.as_ref().map_or_else(
+            || !output.trim().is_empty(),
+            |document| !document.archive.text.trim().is_empty(),
+        );
+        #[cfg(not(anvil_shared_terminal))]
         let has_output = !output.trim().is_empty();
         let has_images = images_box.is_some();
         copy_output_btn.set_sensitive(has_output);
@@ -5535,7 +5842,11 @@ impl FinishedBlock {
             copy_output_btn.set_tooltip_text(Some("No text output to copy"));
             filter_btn.set_tooltip_text(Some("No text output to filter"));
         }
-        if !has_output {
+        #[cfg(anvil_shared_terminal)]
+        let has_projection_notice = output_projection_notice.is_some();
+        #[cfg(not(anvil_shared_terminal))]
+        let has_projection_notice = false;
+        if !has_output && !has_projection_notice {
             output_widget.set_visible(false);
         }
         // Image-only commands (`kitten icat` with no text output) still keep a
@@ -5654,19 +5965,24 @@ impl FinishedBlock {
                 Rc<dyn Fn()>,
             );
             type FilterRowBuilder = dyn Fn(&gtk::Box, &gtk::Widget) -> Option<FilterRowHandles>;
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             let output_vte = output_vte.as_ref().map(ObjectExt::downgrade);
             #[cfg(anvil_shared_terminal)]
             let output_document = output_document.clone();
             #[cfg(anvil_shared_terminal)]
             let output_archive = output_archive.clone();
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             let expand_btn = expand_btn.downgrade();
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             let output_scrollbar = output_scrollbar.downgrade();
             let collapsed_summary = collapsed_summary.downgrade();
             let original_preview = original_preview.clone();
             let build_filter_row: Rc<FilterRowBuilder> = {
                 let full_output = full_output.clone();
                 let displayed_output = displayed_output.clone();
+                #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                 let expanded = expanded.clone();
+                #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                 let dynamic_viewport_rows = dynamic_viewport_rows.clone();
                 let filter_enabled = filter_enabled.clone();
                 let render_stamp = render_stamp.clone();
@@ -5711,6 +6027,7 @@ impl FinishedBlock {
                     content.reorder_child_after(&filter_row, Some(cmd_row));
 
                     let apply = {
+                        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                         let output_vte = output_vte.clone();
                         #[cfg(anvil_shared_terminal)]
                         let output_document = output_document.clone();
@@ -5724,9 +6041,13 @@ impl FinishedBlock {
                         let invert_tg = invert_tg.downgrade();
                         let ctx_spin = ctx_spin.downgrade();
                         let filter_status = filter_status.downgrade();
+                        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                         let expand_btn = expand_btn.clone();
+                        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                         let output_scrollbar = output_scrollbar.clone();
+                        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                         let expanded = expanded.clone();
+                        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                         let dynamic_viewport_rows = dynamic_viewport_rows.clone();
                         let collapsed_summary = collapsed_summary.clone();
                         let original_preview = original_preview.clone();
@@ -5742,8 +6063,6 @@ impl FinishedBlock {
                                 Some(invert_tg),
                                 Some(ctx_spin),
                                 Some(filter_status),
-                                Some(expand_btn),
-                                Some(output_scrollbar),
                                 Some(collapsed_summary),
                             ) = (
                                 filter_entry.upgrade(),
@@ -5752,10 +6071,14 @@ impl FinishedBlock {
                                 invert_tg.upgrade(),
                                 ctx_spin.upgrade(),
                                 filter_status.upgrade(),
-                                expand_btn.upgrade(),
-                                output_scrollbar.upgrade(),
                                 collapsed_summary.upgrade(),
                             )
+                            else {
+                                return;
+                            };
+                            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+                            let (Some(expand_btn), Some(output_scrollbar)) =
+                                (expand_btn.upgrade(), output_scrollbar.upgrade())
                             else {
                                 return;
                             };
@@ -5823,6 +6146,29 @@ impl FinishedBlock {
                             } else {
                                 displayed_generation.get()
                             };
+                            let present_document = || {
+                                #[cfg(anvil_shared_terminal)]
+                                if display_changed {
+                                    if let (Some(output), Some(original)) =
+                                        (&output_document, output_archive.as_deref())
+                                    {
+                                        let document = archive_filter
+                                            .as_ref()
+                                            .and_then(|result| result.as_ref().ok())
+                                            .and_then(Option::as_ref)
+                                            .unwrap_or(&original.archive);
+                                        output.present_output(document);
+                                        render_stamp.replace(output_render_stamp(
+                                            cols,
+                                            shown_rows.max(1),
+                                            shown_rows.max(1),
+                                            generation,
+                                        ));
+                                    }
+                                }
+                                (false, false)
+                            };
+                            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                             let (can_expand, has_private_scroll) = if let Some(output_vte) =
                                 output_vte.as_ref().and_then(glib::WeakRef::upgrade)
                             {
@@ -5871,27 +6217,10 @@ impl FinishedBlock {
                                     shown_visual_rows > active_cap,
                                 )
                             } else {
-                                #[cfg(anvil_shared_terminal)]
-                                if display_changed {
-                                    if let (Some(output), Some(original)) =
-                                        (&output_document, output_archive.as_deref())
-                                    {
-                                        let document = archive_filter
-                                            .as_ref()
-                                            .and_then(|result| result.as_ref().ok())
-                                            .and_then(Option::as_ref)
-                                            .unwrap_or(&original.archive);
-                                        output.present_output(document);
-                                        render_stamp.replace(output_render_stamp(
-                                            cols,
-                                            shown_rows.max(1),
-                                            shown_rows.max(1),
-                                            generation,
-                                        ));
-                                    }
-                                }
-                                (false, false)
+                                present_document()
                             };
+                            #[cfg(all(anvil_shared_terminal, not(any(anvil_vte_oracle, anvil_legacy_renderer))))]
+                            present_document();
                             let has_query = filter_enabled.get() && !q.trim().is_empty();
                             if has_query {
                                 filter_status.set_visible(true);
@@ -5911,6 +6240,7 @@ impl FinishedBlock {
                                 filter_status.remove_css_class("block-filter-empty");
                                 filter_status.set_visible(false);
                             }
+                            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                             if output_vte
                                 .as_ref()
                                 .and_then(glib::WeakRef::upgrade)
@@ -6088,7 +6418,9 @@ impl FinishedBlock {
                 content: &content,
                 header: &header_row,
                 command: &cmd_row,
+                #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                 command_vte: command_vte.as_ref(),
+                #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                 command_text: cmd,
                 metadata: &metadata,
                 status,
@@ -6122,9 +6454,11 @@ impl FinishedBlock {
             virtualized: Rc::new(Cell::new(false)),
             compact: Rc::new(Cell::new(config.block_compact)),
             prompt_text: prompt.to_string(),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             command_vte,
             #[cfg(anvil_shared_terminal)]
             command_document,
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             output_vte,
             #[cfg(anvil_shared_terminal)]
             output_document,
@@ -6164,7 +6498,9 @@ impl FinishedBlock {
             render_stamp,
             visual_rows_cache,
             displayed_generation,
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             command_bytes: cmd_bytes,
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             command_render_cols,
             command_base_rows: cmd_rows,
             capture_rows,
@@ -6366,10 +6702,17 @@ impl FinishedBlock {
         if let Some(command) = &self.command_document {
             return Some(TerminalTextSurface::Document(command.widget().clone()));
         }
-        self.command_vte
-            .as_ref()
-            .cloned()
-            .map(TerminalTextSurface::Native)
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        {
+            self.command_vte
+                .as_ref()
+                .cloned()
+                .map(TerminalTextSurface::Native)
+        }
+        #[cfg(all(anvil_shared_terminal, not(any(anvil_vte_oracle, anvil_legacy_renderer))))]
+        {
+            None
+        }
     }
 
     pub(super) fn output_surface(&self) -> super::text_surface::TerminalTextSurface {
@@ -6378,15 +6721,22 @@ impl FinishedBlock {
         if let Some(output) = &self.output_document {
             return TerminalTextSurface::Document(output.text().widget().clone());
         }
-        TerminalTextSurface::Native(
-            self.output_vte
-                .as_ref()
-                .expect("completed output surface")
-                .clone(),
-        )
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        {
+            TerminalTextSurface::Native(
+                self.output_vte
+                    .as_ref()
+                    .expect("completed output surface")
+                    .clone(),
+            )
+        }
+        #[cfg(all(anvil_shared_terminal, not(any(anvil_vte_oracle, anvil_legacy_renderer))))]
+        {
+            panic!("a shared completed card must own its output document")
+        }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, anvil_vte_oracle))]
     pub(crate) fn output_vte_for_test(&self) -> &vte4::Terminal {
         self.output_vte
             .as_ref()
@@ -6420,7 +6770,7 @@ impl FinishedBlock {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, anvil_vte_oracle))]
     pub(crate) fn command_vte_for_test(&self) -> &vte4::Terminal {
         self.command_vte
             .as_ref()
@@ -6453,162 +6803,178 @@ impl FinishedBlock {
     /// [`fitted_output_rows_for_viewport`]. Virtualized (unmapped) cards are
     /// left alone; their own `connect_map` handler fits them on the way back in.
     pub(crate) fn refit_output_to_viewport(&self) -> Option<i32> {
-        #[cfg(anvil_shared_terminal)]
-        if self.output_document.is_some() {
-            return self.refit_output_document_height();
+        #[cfg(all(anvil_shared_terminal, not(any(anvil_vte_oracle, anvil_legacy_renderer))))]
+        {
+            self.refit_output_document_height()
         }
-        let output_vte = self.output_vte.as_ref()?;
-        #[cfg(test)]
-        super::alt_screen::trace_find_render(
-            &format!("output-refit-entry stamp={:?}", self.render_stamp()),
-            output_vte,
-        );
-        // This method is called for every retained block on a pane resize.
-        // Reject parked cards before borrowing their output or counting visual
-        // rows: `connect_map` recomputes the cap when a card becomes visible,
-        // while scanning an off-screen transcript cannot affect this frame.
-        if !output_vte.is_mapped() {
-            return None;
-        }
-        let cell_height = (output_vte.char_height() as i32).max(1);
-        let effective_cols = effective_render_cols(output_vte, self.cols);
-        let full = self.full_output.borrow();
-        let displayed = self.displayed_output.borrow();
-        let text = displayed.as_deref().unwrap_or(full.as_str());
-        let output_rows = cached_output_visual_row_count(
-            &self.visual_rows_cache,
-            text,
-            effective_cols,
-            self.displayed_generation.get(),
-        );
-        let fitted_rows = bounded_finished_viewport_rows(
-            effective_cols,
-            fitted_output_rows_for_widget(output_vte, self.viewport_cap, output_rows),
-        );
-        let generation = self.displayed_generation.get();
-        let (last_cols, ..) = self.render_stamp.get();
-        let geometry_changed =
-            last_cols != effective_cols || self.dynamic_viewport_rows.get() != fitted_rows;
-        let command_effective_cols = self.command_vte.as_ref().map_or(self.cols, |terminal| {
-            effective_render_cols(terminal, self.cols)
-        });
-        let command_needs_refit = self.command_vte.as_ref().filter(|terminal| {
-            terminal.is_mapped() && self.command_render_cols.get() != command_effective_cols
-        });
-        if !geometry_changed && command_needs_refit.is_none() {
-            return None;
-        }
-
-        self.dynamic_viewport_rows.set(fitted_rows);
-        // Pane sizing is authoritative over a manual expansion: a block expanded
-        // for the old geometry must not outlive it.
-        if self.expanded.replace(false) {
-            set_output_action_label(&self.expand_btn, "Expand block");
-        }
-        self.expand_btn.set_visible(output_rows > fitted_rows);
-        let stamp = output_render_stamp(effective_cols, output_rows, fitted_rows, generation);
-        let visible_rows = snapshot_visible_rows(output_rows, fitted_rows);
-        // Only re-feed when this pass would actually draw something different.
-        // A cap that changed without changing the rows on screen (the layout's
-        // first fitted pass over a short block always does this) leaves the
-        // snapshot as it is: re-feeding it in the same main-loop iteration as the
-        // map-time render is what made block output appear twice.
-        let previous_stamp = self.render_stamp.replace(stamp);
-        #[cfg(test)]
-        super::alt_screen::trace_find_render(
-            &format!("output-refit stamp={previous_stamp:?} -> {stamp:?}"),
-            output_vte,
-        );
-        if previous_stamp != stamp {
-            // Same columns and same displayed generation means VTE already
-            // holds exactly these bytes wrapped exactly this way; only the
-            // number of rows on screen moved. Re-window it instead of resetting
-            // and re-parsing the transcript.
-            if !stamp_change_needs_refeed(previous_stamp, stamp) {
-                rewindow_finished_vte(
-                    output_vte,
-                    effective_cols,
-                    visible_rows,
-                    self.capture_rows.max(output_rows),
-                    (output_rows <= fitted_rows).then_some(fitted_rows),
-                );
-            } else {
-                render_bytes_into_finished_vte(
-                    output_vte,
-                    text,
-                    effective_cols,
-                    output_rows,
-                    fitted_rows,
-                    self.capture_rows,
-                    output_rows <= fitted_rows,
-                    &self.render_stamp,
-                );
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        {
+            #[cfg(anvil_shared_terminal)]
+            if self.output_document.is_some() {
+                return self.refit_output_document_height();
             }
-        }
-        output_vte.set_height_request(finished_vte_height_px(visible_rows, cell_height));
-        self.output_scrollbar.set_visible(output_rows > fitted_rows);
-        output_vte.queue_allocate();
-
-        let command_text = String::from_utf8_lossy(self.command_bytes.as_slice());
-        let unbounded_command_rows = if self.is_background {
-            0
-        } else {
-            output_visual_row_count(&command_text, command_effective_cols)
-                .max(self.command_base_rows)
-        };
-        let (bounded_command_cols, bounded_command_rows, command_scrollback) =
-            bounded_finished_vte_geometry(command_effective_cols, unbounded_command_rows.max(1), 0);
-        if let Some(terminal) = command_needs_refit {
-            self.command_render_cols.set(bounded_command_cols);
-            terminal.set_size(bounded_command_cols, bounded_command_rows);
-            terminal.set_scrollback_lines(command_scrollback);
-            terminal.reset(true, true);
-            terminal.set_size(bounded_command_cols, bounded_command_rows);
-            terminal.set_scrollback_lines(command_scrollback);
-            feed_snapshot_bytes(terminal, self.command_bytes.as_slice());
-            settle_finished_terminal_after_feed(
-                terminal,
-                bounded_command_rows,
-                bounded_command_rows,
+            let output_vte = self.output_vte.as_ref()?;
+            #[cfg(test)]
+            super::alt_screen::trace_find_render(
+                &format!("output-refit-entry stamp={:?}", self.render_stamp()),
+                #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+                output_vte,
             );
-            terminal.set_height_request(finished_vte_height_px(bounded_command_rows, cell_height));
-        }
+            // This method is called for every retained block on a pane resize.
+            // Reject parked cards before borrowing their output or counting visual
+            // rows: `connect_map` recomputes the cap when a card becomes visible,
+            // while scanning an off-screen transcript cannot affect this frame.
+            if !output_vte.is_mapped() {
+                return None;
+            }
+            let cell_height = (output_vte.char_height() as i32).max(1);
+            let effective_cols = effective_render_cols(output_vte, self.cols);
+            let full = self.full_output.borrow();
+            let displayed = self.displayed_output.borrow();
+            let text = displayed.as_deref().unwrap_or(full.as_str());
+            let output_rows = cached_output_visual_row_count(
+                &self.visual_rows_cache,
+                text,
+                effective_cols,
+                self.displayed_generation.get(),
+            );
+            let fitted_rows = bounded_finished_viewport_rows(
+                effective_cols,
+                fitted_output_rows_for_widget(output_vte, self.viewport_cap, output_rows),
+            );
+            let generation = self.displayed_generation.get();
+            let (last_cols, ..) = self.render_stamp.get();
+            let geometry_changed =
+                last_cols != effective_cols || self.dynamic_viewport_rows.get() != fitted_rows;
+            let command_effective_cols = self.command_vte.as_ref().map_or(self.cols, |terminal| {
+                effective_render_cols(terminal, self.cols)
+            });
+            let command_needs_refit = self.command_vte.as_ref().filter(|terminal| {
+                terminal.is_mapped() && self.command_render_cols.get() != command_effective_cols
+            });
+            if !geometry_changed && command_needs_refit.is_none() {
+                return None;
+            }
 
-        let command_height_rows = if self.is_background {
-            0
-        } else {
-            bounded_command_rows
-        };
-        if self.widget.has_css_class("block-reference-card") {
-            return Some(super::block_reference::estimated_height(
-                cell_height,
-                command_height_rows,
-                if text.trim().is_empty() {
-                    0
+            self.dynamic_viewport_rows.set(fitted_rows);
+            // Pane sizing is authoritative over a manual expansion: a block expanded
+            // for the old geometry must not outlive it.
+            if self.expanded.replace(false) {
+                set_output_action_label(&self.expand_btn, "Expand block");
+            }
+            self.expand_btn.set_visible(output_rows > fitted_rows);
+            let stamp = output_render_stamp(effective_cols, output_rows, fitted_rows, generation);
+            let visible_rows = snapshot_visible_rows(output_rows, fitted_rows);
+            // Only re-feed when this pass would actually draw something different.
+            // A cap that changed without changing the rows on screen (the layout's
+            // first fitted pass over a short block always does this) leaves the
+            // snapshot as it is: re-feeding it in the same main-loop iteration as the
+            // map-time render is what made block output appear twice.
+            let previous_stamp = self.render_stamp.replace(stamp);
+            #[cfg(test)]
+            super::alt_screen::trace_find_render(
+                &format!("output-refit stamp={previous_stamp:?} -> {stamp:?}"),
+                #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+                output_vte,
+            );
+            if previous_stamp != stamp {
+                // Same columns and same displayed generation means VTE already
+                // holds exactly these bytes wrapped exactly this way; only the
+                // number of rows on screen moved. Re-window it instead of resetting
+                // and re-parsing the transcript.
+                if !stamp_change_needs_refeed(previous_stamp, stamp) {
+                    rewindow_finished_vte(
+                        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+                        output_vte,
+                        effective_cols,
+                        visible_rows,
+                        self.capture_rows.max(output_rows),
+                        (output_rows <= fitted_rows).then_some(fitted_rows),
+                    );
                 } else {
-                    visible_rows
-                },
-            ));
-        }
-        let rows_for_height = visible_rows
-            .saturating_add(if self.widget.has_css_class("chat-turn") {
-                2
+                    render_bytes_into_finished_vte(
+                        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+                        output_vte,
+                        text,
+                        effective_cols,
+                        output_rows,
+                        fitted_rows,
+                        self.capture_rows,
+                        output_rows <= fitted_rows,
+                        &self.render_stamp,
+                    );
+                }
+            }
+            output_vte.set_height_request(finished_vte_height_px(visible_rows, cell_height));
+            self.output_scrollbar.set_visible(output_rows > fitted_rows);
+            output_vte.queue_allocate();
+
+            let command_text = String::from_utf8_lossy(self.command_bytes.as_slice());
+            let unbounded_command_rows = if self.is_background {
+                0
             } else {
-                3
-            })
-            .saturating_add(command_height_rows.saturating_sub(1));
-        Some(
-            finished_card_refit_height(rows_for_height, cell_height, self.compact.get())
-                .saturating_add(if self.widget.has_css_class("chat-turn") {
-                    if self.is_background {
-                        36
+                output_visual_row_count(&command_text, command_effective_cols)
+                    .max(self.command_base_rows)
+            };
+            let (bounded_command_cols, bounded_command_rows, command_scrollback) =
+                bounded_finished_vte_geometry(
+                    command_effective_cols,
+                    unbounded_command_rows.max(1),
+                    0,
+                );
+            if let Some(terminal) = command_needs_refit {
+                self.command_render_cols.set(bounded_command_cols);
+                terminal.set_size(bounded_command_cols, bounded_command_rows);
+                terminal.set_scrollback_lines(command_scrollback);
+                terminal.reset(true, true);
+                terminal.set_size(bounded_command_cols, bounded_command_rows);
+                terminal.set_scrollback_lines(command_scrollback);
+                feed_snapshot_bytes(terminal, self.command_bytes.as_slice());
+                settle_finished_terminal_after_feed(
+                    terminal,
+                    bounded_command_rows,
+                    bounded_command_rows,
+                );
+                terminal
+                    .set_height_request(finished_vte_height_px(bounded_command_rows, cell_height));
+            }
+
+            let command_height_rows = if self.is_background {
+                0
+            } else {
+                bounded_command_rows
+            };
+            if self.widget.has_css_class("block-reference-card") {
+                return Some(super::block_reference::estimated_height(
+                    cell_height,
+                    command_height_rows,
+                    if text.trim().is_empty() {
+                        0
                     } else {
-                        CHAT_CARD_EXTRA_VCHROME_PX
-                    }
+                        visible_rows
+                    },
+                ));
+            }
+            let rows_for_height = visible_rows
+                .saturating_add(if self.widget.has_css_class("chat-turn") {
+                    2
                 } else {
-                    0
-                }),
-        )
+                    3
+                })
+                .saturating_add(command_height_rows.saturating_sub(1));
+            Some(
+                finished_card_refit_height(rows_for_height, cell_height, self.compact.get())
+                    .saturating_add(if self.widget.has_css_class("chat-turn") {
+                        if self.is_background {
+                            36
+                        } else {
+                            CHAT_CARD_EXTRA_VCHROME_PX
+                        }
+                    } else {
+                        0
+                    }),
+            )
+        }
     }
 
     /// Give a long block first refusal on wheel events while the pointer is over
@@ -6703,50 +7069,53 @@ impl FinishedBlock {
             }
         }
 
-        let Some(output_vte) = &self.output_vte else {
-            return;
-        };
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        {
+            let Some(output_vte) = &self.output_vte else {
+                return;
+            };
 
-        let targets: [gtk::Widget; 2] = [
-            output_vte.clone().upcast(),
-            self.output_scrollbar.clone().upcast(),
-        ];
-        for target in targets {
-            let scroll_ctrl =
-                gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
-            // Capture before VTE and the ancestor ScrolledWindow can both react
-            // to the same event. Slider dragging is a pointer gesture and stays
-            // native to gtk::Scrollbar.
-            scroll_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
-            let vte = output_vte.downgrade();
-            let outer_for_vte = outer.downgrade();
-            let debouncer = debouncer.clone();
-            debouncer.watch_gesture(&scroll_ctrl, outer);
-            scroll_ctrl.connect_scroll(move |controller, _dx, dy| {
-                let mut remaining = dy;
-                let (Some(vte), Some(outer_for_vte)) = (vte.upgrade(), outer_for_vte.upgrade())
-                else {
-                    return glib::Propagation::Proceed;
-                };
-                if let Some(inner_adj) = vte.vadjustment() {
-                    remaining = scroll_adjustment_by_input(
-                        &inner_adj,
-                        dy,
-                        controller.unit() == gtk::gdk::ScrollUnit::Surface,
-                        vte.char_height() as f64,
-                    );
-                    if remaining == 0.0 {
-                        return glib::Propagation::Stop;
+            let targets: [gtk::Widget; 2] = [
+                output_vte.clone().upcast(),
+                self.output_scrollbar.clone().upcast(),
+            ];
+            for target in targets {
+                let scroll_ctrl =
+                    gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+                // Capture before VTE and the ancestor ScrolledWindow can both react
+                // to the same event. Slider dragging is a pointer gesture and stays
+                // native to gtk::Scrollbar.
+                scroll_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
+                let vte = output_vte.downgrade();
+                let outer_for_vte = outer.downgrade();
+                let debouncer = debouncer.clone();
+                debouncer.watch_gesture(&scroll_ctrl, outer);
+                scroll_ctrl.connect_scroll(move |controller, _dx, dy| {
+                    let mut remaining = dy;
+                    let (Some(vte), Some(outer_for_vte)) = (vte.upgrade(), outer_for_vte.upgrade())
+                    else {
+                        return glib::Propagation::Proceed;
+                    };
+                    if let Some(inner_adj) = vte.vadjustment() {
+                        remaining = scroll_adjustment_by_input(
+                            &inner_adj,
+                            dy,
+                            controller.unit() == gtk::gdk::ScrollUnit::Surface,
+                            vte.char_height() as f64,
+                        );
+                        if remaining == 0.0 {
+                            return glib::Propagation::Stop;
+                        }
                     }
-                }
-                debouncer.scroll_wheel(
-                    &outer_for_vte,
-                    remaining,
-                    controller.unit() == gtk::gdk::ScrollUnit::Surface,
-                );
-                glib::Propagation::Stop
-            });
-            target.add_controller(scroll_ctrl);
+                    debouncer.scroll_wheel(
+                        &outer_for_vte,
+                        remaining,
+                        controller.unit() == gtk::gdk::ScrollUnit::Surface,
+                    );
+                    glib::Propagation::Stop
+                });
+                target.add_controller(scroll_ctrl);
+            }
         }
     }
 
@@ -6780,16 +7149,33 @@ impl FinishedBlock {
         // transcript there copies a superset, never a wrong block.
         let full_output_for_copy = self.full_output.clone();
         let displayed_output_for_copy = self.displayed_output.clone();
+        let stripped_output_for_copy = self.stripped_output.clone();
+        #[cfg(anvil_shared_terminal)]
+        let document_output = self.output_document.is_some();
+        #[cfg(not(anvil_shared_terminal))]
+        let document_output = false;
         let feedback = ButtonFeedback::new(&self.copy_output_btn);
         self.copy_output_btn.connect_clicked(move |btn| {
             let displayed = displayed_output_for_copy.try_borrow().ok();
             let filtered = displayed
                 .as_ref()
                 .and_then(|displayed| displayed.as_deref())
-                .map(strip_ansi);
+                .map(|text| {
+                    if document_output {
+                        text.to_owned()
+                    } else {
+                        strip_ansi(text)
+                    }
+                });
             let (text, label) = match filtered {
                 Some(text) => (text, "Filtered output copied"),
-                None => (strip_ansi(&full_output_for_copy.borrow()), "Output copied"),
+                None => (
+                    stripped_output_for_copy
+                        .borrow()
+                        .clone()
+                        .unwrap_or_else(|| strip_ansi(&full_output_for_copy.borrow())),
+                    "Output copied",
+                ),
             };
             btn.clipboard().set_text(&text);
             feedback.flash(btn, "emblem-ok-symbolic", label);
@@ -6834,11 +7220,17 @@ impl FinishedBlock {
 /// output all render natively in this one VTE. When a command finishes, its
 /// accumulated output (`raw_output`) is snapshotted into a styled FinishedBlock
 /// stacked above this card.
+#[derive(Clone)]
+pub(super) enum ActiveSurface {
+    #[cfg(anvil_shared_terminal)]
+    Shared(Rc<super::shared_active::SharedActiveTerminal>),
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+    Legacy(Terminal),
+}
+
 pub(crate) struct ActiveBlock {
     pub(crate) widget: gtk::Box,
-    pub(super) active_vte: Option<Terminal>,
-    #[cfg(anvil_shared_terminal)]
-    pub(super) shared_active: Option<Rc<super::shared_active::SharedActiveTerminal>>,
+    pub(super) surface: ActiveSurface,
     /// The measured wrapper around the live VTE. It carries the terminal's
     /// requested pixel size — see [`ActiveBlock::set_live_geometry`], which
     /// keeps the grid at the full viewport while the card shows less.
@@ -6885,6 +7277,7 @@ pub(crate) struct ActiveBlock {
     /// Probe-addressed Kitty image layer used by Unified mode. Added before
     /// the organism surface so inline assistant UI always remains readable.
     /// Hidden in Block mode, whose images move into finished cards instead.
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     pub(crate) unified_image_surface: gtk::Fixed,
     /// Pass-through, non-measuring chrome overlay used only by Unified mode.
     /// It exists (hidden) in Block mode so the widget tree stays mode-neutral.
@@ -6939,6 +7332,7 @@ pub(super) fn append_bounded_output(buffer: &mut VecDeque<u8>, bytes: &[u8], lim
 /// Reserve those insets once in the enclosing clip and grid request. Otherwise
 /// the final row extends past a clip sized only as `rows * char_height`.
 #[allow(deprecated)] // GTK4 has no replacement getters for the computed CSS box.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 pub(super) fn terminal_vertical_insets(vte: &Terminal) -> i32 {
     let style = vte.style_context();
     let padding = style.padding();
@@ -6987,24 +7381,30 @@ impl ActiveBlock {
         // regardless of the requested height.
         widget.set_vexpand(false);
 
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         let create_legacy = || {
             let terminal = create_active_terminal(config);
             terminal.set_hexpand(true);
             terminal.set_vexpand(false);
             terminal
         };
-        #[cfg(anvil_shared_terminal)]
-        let active_vte = shared_active.is_none().then(create_legacy);
+        #[cfg(not(any(anvil_vte_oracle, anvil_legacy_renderer)))]
+        let surface = ActiveSurface::Shared(shared_active.expect("shared active terminal"));
+        #[cfg(all(anvil_shared_terminal, any(anvil_vte_oracle, anvil_legacy_renderer)))]
+        let surface = match shared_active {
+            Some(terminal) => ActiveSurface::Shared(terminal),
+            None => ActiveSurface::Legacy(create_legacy()),
+        };
         #[cfg(not(anvil_shared_terminal))]
-        let active_vte = Some(create_legacy());
+        let surface = ActiveSurface::Legacy(create_legacy());
         let vte_overlay = gtk::Overlay::new();
         vte_overlay.set_hexpand(true);
         vte_overlay.set_vexpand(false);
-
-        vte_overlay.set_child(active_vte.as_ref());
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &shared_active {
-            vte_overlay.set_child(Some(&terminal.widget));
+        match &surface {
+            #[cfg(anvil_shared_terminal)]
+            ActiveSurface::Shared(terminal) => vte_overlay.set_child(Some(&terminal.widget)),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            ActiveSurface::Legacy(terminal) => vte_overlay.set_child(Some(terminal)),
         }
 
         let live_organism_surface = gtk::Fixed::new();
@@ -7017,39 +7417,52 @@ impl ActiveBlock {
         live_organism_surface.set_focusable(false);
         live_organism_surface.set_visible(false);
 
-        let unified_image_surface = gtk::Fixed::new();
-        unified_image_surface.set_hexpand(true);
-        unified_image_surface.set_vexpand(true);
-        unified_image_surface.set_halign(gtk::Align::Fill);
-        unified_image_surface.set_valign(gtk::Align::Fill);
-        unified_image_surface.set_overflow(gtk::Overflow::Hidden);
-        unified_image_surface.set_can_target(false);
-        unified_image_surface.set_focusable(false);
-        unified_image_surface.set_visible(false);
-        // Paint above terminal cells but below the organism and chrome. The
-        // insertion order is load-bearing: Unified's organism has no other
-        // body surface and must never be silently covered by a large image.
-        vte_overlay.add_overlay(&unified_image_surface);
-        vte_overlay.set_measure_overlay(&unified_image_surface, false);
-        vte_overlay.set_clip_overlay(&unified_image_surface, true);
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        let unified_image_surface = {
+            let unified_image_surface = gtk::Fixed::new();
+            unified_image_surface.set_hexpand(true);
+            unified_image_surface.set_vexpand(true);
+            unified_image_surface.set_halign(gtk::Align::Fill);
+            unified_image_surface.set_valign(gtk::Align::Fill);
+            unified_image_surface.set_overflow(gtk::Overflow::Hidden);
+            unified_image_surface.set_can_target(false);
+            unified_image_surface.set_focusable(false);
+            unified_image_surface.set_visible(false);
+            // Paint above terminal cells but below the organism and chrome. The
+            // insertion order is load-bearing: Unified's organism has no other
+            // body surface and must never be silently covered by a large image.
+            vte_overlay.add_overlay(&unified_image_surface);
+            vte_overlay.set_measure_overlay(&unified_image_surface, false);
+            vte_overlay.set_clip_overlay(&unified_image_surface, true);
+            unified_image_surface
+        };
+
         vte_overlay.add_overlay(&live_organism_surface);
         vte_overlay.set_measure_overlay(&live_organism_surface, false);
         vte_overlay.set_clip_overlay(&live_organism_surface, true);
 
-        let unified_chrome_surface = gtk::DrawingArea::new();
-        unified_chrome_surface.set_hexpand(true);
-        unified_chrome_surface.set_vexpand(true);
-        unified_chrome_surface.set_halign(gtk::Align::Fill);
-        unified_chrome_surface.set_valign(gtk::Align::Fill);
-        unified_chrome_surface.set_can_target(false);
-        unified_chrome_surface.set_focusable(false);
-        unified_chrome_surface.set_visible(false);
-        vte_overlay.add_overlay(&unified_chrome_surface);
-        vte_overlay.set_measure_overlay(&unified_chrome_surface, false);
-        vte_overlay.set_clip_overlay(&unified_chrome_surface, true);
+        let unified_chrome_surface = {
+            let unified_chrome_surface = gtk::DrawingArea::new();
+            unified_chrome_surface.set_hexpand(true);
+            unified_chrome_surface.set_vexpand(true);
+            unified_chrome_surface.set_halign(gtk::Align::Fill);
+            unified_chrome_surface.set_valign(gtk::Align::Fill);
+            unified_chrome_surface.set_can_target(false);
+            unified_chrome_surface.set_focusable(false);
+            unified_chrome_surface.set_visible(false);
+            vte_overlay.add_overlay(&unified_chrome_surface);
+            vte_overlay.set_measure_overlay(&unified_chrome_surface, false);
+            vte_overlay.set_clip_overlay(&unified_chrome_surface, true);
+            unified_chrome_surface
+        };
 
-        let legacy_adjustment = active_vte.as_ref().and_then(ScrollableExt::vadjustment);
-        let live_scrollbar = gtk::Scrollbar::new(Orientation::Vertical, legacy_adjustment.as_ref());
+        let adjustment = match &surface {
+            #[cfg(anvil_shared_terminal)]
+            ActiveSurface::Shared(terminal) => Some(terminal.scrollback().clone()),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            ActiveSurface::Legacy(terminal) => terminal.vadjustment(),
+        };
+        let live_scrollbar = gtk::Scrollbar::new(Orientation::Vertical, adjustment.as_ref());
         live_scrollbar.add_css_class("block-output-scrollbar");
         live_scrollbar.set_tooltip_text(Some("Scroll within the running output"));
         live_scrollbar.set_halign(gtk::Align::End);
@@ -7097,22 +7510,36 @@ impl ActiveBlock {
         // against rows the card is not showing and cut off halfway.
         live_clip.add_overlay(&live_scrollbar);
         widget.append(&live_clip);
-        if let Some(adjustment) = legacy_adjustment {
-            let scrollbar = live_scrollbar.downgrade();
-            let sync_visibility = move |adjustment: &gtk::Adjustment| {
-                let Some(scrollbar) = scrollbar.upgrade() else {
-                    return;
-                };
-                let overflows =
-                    adjustment.upper() - adjustment.lower() > adjustment.page_size() + f64::EPSILON;
-                if scrollbar.adjustment() == *adjustment {
-                    scrollbar.set_visible(overflows);
-                }
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        {
+            let legacy_adjustment = match &surface {
+                ActiveSurface::Legacy(terminal) => terminal.vadjustment(),
+                #[cfg(anvil_shared_terminal)]
+                ActiveSurface::Shared(_) => None,
             };
-            sync_visibility(&adjustment);
-            adjustment.connect_changed(sync_visibility);
+            if let Some(adjustment) = legacy_adjustment {
+                let scrollbar = live_scrollbar.downgrade();
+                let sync_visibility = move |adjustment: &gtk::Adjustment| {
+                    let Some(scrollbar) = scrollbar.upgrade() else {
+                        return;
+                    };
+                    let overflows = adjustment.upper() - adjustment.lower()
+                        > adjustment.page_size() + f64::EPSILON;
+                    if scrollbar.adjustment() == *adjustment {
+                        scrollbar.set_visible(overflows);
+                    }
+                };
+                sync_visibility(&adjustment);
+                adjustment.connect_changed(sync_visibility);
+            }
         }
 
+        #[cfg(anvil_shared_terminal)]
+        let shared_active = match &surface {
+            ActiveSurface::Shared(terminal) => Some(terminal),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            ActiveSurface::Legacy(_) => None,
+        };
         #[cfg(anvil_shared_terminal)]
         if let Some(terminal) = &shared_active {
             let adjustment = terminal.scrollback();
@@ -7137,9 +7564,7 @@ impl ActiveBlock {
         }
         ActiveBlock {
             widget,
-            active_vte,
-            #[cfg(anvil_shared_terminal)]
-            shared_active,
+            surface,
             vte_overlay,
             live_spacer,
             live_clip,
@@ -7150,6 +7575,7 @@ impl ActiveBlock {
             live_cursor_high: Rc::new(Cell::new(0)),
             preserve_live_scrollback: Cell::new(config.preserve_live_scrollback),
             live_organism_surface,
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
             unified_image_surface,
             unified_chrome_surface,
             live_scrollbar,
@@ -7159,7 +7585,7 @@ impl ActiveBlock {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, anvil_vte_oracle))]
     pub(super) fn new_legacy(config: &Config, raw_output: Rc<RefCell<VecDeque<u8>>>) -> Self {
         Self::new(
             config,
@@ -7169,26 +7595,47 @@ impl ActiveBlock {
         )
     }
 
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     pub(super) fn legacy_surface(&self) -> &Terminal {
-        self.active_vte.as_ref().expect("legacy live terminal")
+        self.legacy_terminal().expect("legacy live terminal")
+    }
+
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+    pub(super) fn legacy_terminal(&self) -> Option<&Terminal> {
+        match &self.surface {
+            ActiveSurface::Legacy(terminal) => Some(terminal),
+            #[cfg(anvil_shared_terminal)]
+            ActiveSurface::Shared(_) => None,
+        }
+    }
+
+    #[cfg(anvil_shared_terminal)]
+    pub(super) fn shared_terminal(
+        &self,
+    ) -> Option<&Rc<super::shared_active::SharedActiveTerminal>> {
+        match &self.surface {
+            ActiveSurface::Shared(terminal) => Some(terminal),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            ActiveSurface::Legacy(_) => None,
+        }
     }
 
     pub(super) fn focus_widget(&self) -> gtk::Widget {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            return terminal.screen().clone().upcast();
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            ActiveSurface::Shared(terminal) => terminal.screen().clone().upcast(),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            ActiveSurface::Legacy(terminal) => terminal.clone().upcast(),
         }
-        self.legacy_surface().clone().upcast()
     }
 
     pub(super) fn surface_adjustment(&self) -> Option<gtk::Adjustment> {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            return Some(terminal.scrollback().clone());
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            ActiveSurface::Shared(terminal) => Some(terminal.scrollback().clone()),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            ActiveSurface::Legacy(terminal) => terminal.vadjustment(),
         }
-        self.active_vte
-            .as_ref()
-            .and_then(ScrollableExt::vadjustment)
     }
 
     #[cfg(anvil_shared_terminal)]
@@ -7296,11 +7743,12 @@ impl ActiveBlock {
     /// The column count the live VTE is wrapping at — the single source of truth
     /// for pre-wrapping finished blocks so they align with what the user watched.
     pub(crate) fn grid_cols(&self) -> usize {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            return usize::from(terminal.grid_size().0).max(20);
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            ActiveSurface::Shared(terminal) => usize::from(terminal.grid_size().0).max(20),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            ActiveSurface::Legacy(terminal) => terminal.column_count().max(20) as usize,
         }
-        self.legacy_surface().column_count().max(20) as usize
     }
 
     /// Give the live terminal a `grid_px`-tall grid and show `visible_px` of it.
@@ -7315,6 +7763,7 @@ impl ActiveBlock {
     /// the pane width by expanding. Before the first allocation there is no
     /// width to hand out and the request is left alone; the next layout pass
     /// (contents, adjustment or resize settle tick) applies it.
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     pub(crate) fn set_live_geometry(&self, cell_h: i32, grid_rows: i64, visible_rows: i64) -> bool {
         let cell_h = cell_h.max(1);
         let grid_rows = grid_rows.max(1);
@@ -7393,25 +7842,29 @@ impl ActiveBlock {
     }
 
     pub(super) fn live_surface_size(&self) -> (i32, i32) {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            return (
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            ActiveSurface::Shared(terminal) => (
                 terminal.widget.width().max(0),
                 terminal.widget.height().max(0),
-            );
+            ),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            ActiveSurface::Legacy(terminal) => (terminal.width().max(0), terminal.height().max(0)),
         }
-        let terminal = self.legacy_surface();
-        (terminal.width().max(0), terminal.height().max(0))
     }
 
     pub(super) fn live_cell_size(&self) -> (i32, i32) {
-        #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
-            let (_, _, width, height) = terminal.cell_metrics();
-            return (width, height);
+        match &self.surface {
+            #[cfg(anvil_shared_terminal)]
+            ActiveSurface::Shared(terminal) => {
+                let (_, _, width, height) = terminal.cell_metrics();
+                (width, height)
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            ActiveSurface::Legacy(terminal) => {
+                (terminal.char_width() as i32, terminal.char_height() as i32)
+            }
         }
-        let terminal = self.legacy_surface();
-        (terminal.char_width() as i32, terminal.char_height() as i32)
     }
 
     #[cfg(anvil_shared_terminal)]
@@ -7422,7 +7875,7 @@ impl ActiveBlock {
         width: i32,
         height: i32,
     ) -> bool {
-        self.shared_active.as_ref().is_none_or(|terminal| {
+        self.shared_terminal().is_none_or(|terminal| {
             y + f64::from(height) <= f64::from(self.live_visible_height_px())
                 && terminal.embedded().painted_primary_rect_is_blank(
                     &self.vte_overlay,
@@ -7455,21 +7908,24 @@ impl ActiveBlock {
         self.live_cursor_origin.set(None);
         self.live_cursor_high.set(0);
         #[cfg(anvil_shared_terminal)]
-        if let Some(terminal) = &self.shared_active {
+        if let Some(terminal) = self.shared_terminal() {
             terminal.output().reset_prompt(preserve_scrollback);
             return;
         }
-        let terminal = self.legacy_surface();
-        if preserve_scrollback {
-            terminal.feed(b"\x1b[0m");
-            // Kept scrollback means no VTE reset, so a program that died
-            // with mouse or focus reporting on would leave libvte turning the
-            // shell's clicks into reports. Switch them off by hand, as the
-            // reset below does for the default path.
-            terminal.feed(super::MOUSE_AND_FOCUS_REPORTING_OFF);
-        } else {
-            terminal.reset(true, true);
-            terminal.feed(b"\x1b[H\x1b[2J\x1b[3J");
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        {
+            let terminal = self.legacy_surface();
+            if preserve_scrollback {
+                terminal.feed(b"\x1b[0m");
+                // Kept scrollback means no VTE reset, so a program that died
+                // with mouse or focus reporting on would leave libvte turning the
+                // shell's clicks into reports. Switch them off by hand, as the
+                // reset below does for the default path.
+                terminal.feed(super::MOUSE_AND_FOCUS_REPORTING_OFF);
+            } else {
+                terminal.reset(true, true);
+                terminal.feed(b"\x1b[H\x1b[2J\x1b[3J");
+            }
         }
     }
 

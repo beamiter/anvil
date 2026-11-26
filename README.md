@@ -65,13 +65,12 @@ restoration as the only copy of work in progress.
 
 anvil targets a graphical Linux desktop running X11 or Wayland. The source
 installer prefers [Nix with flakes enabled](https://nixos.org/download/) and
-falls back to Cargo when the GTK 4, libadwaita, VTE, and native build
+falls back to Cargo when the GTK 4, libadwaita, and native build
 dependencies are already available through the system toolchain.
 
 The GTK 4 stack must be recent (glib >= 2.80, pango >= 1.52, gtk4 >= 4.14,
-libadwaita >= 1.5, and the GTK 4 build of VTE, `vte-2.91-gtk4` >= 0.76). Stable
-distributions such as Ubuntu 22.04 ship these too old or omit `vte-2.91-gtk4`
-entirely, so `cargo install --path .` fails in the `*-sys` build scripts. Run
+libadwaita >= 1.5). Stable distributions such as Ubuntu 22.04 ship older
+versions, so `cargo install --path .` fails in the `*-sys` build scripts. Run
 `./scripts/bootstrap_deps.sh` to provision them:
 
 ```bash
@@ -286,13 +285,16 @@ The command preserves the replaced live file as `config.toml.before-restore`.
 
 ## Terminal modes
 
-Native Linux packages built with `shared-terminal` default to the shared
-terminal for new Block, Chat, and Unified panes. Each pane keeps its PTY,
-renderer, and input method for its lifetime. To start with VTE, quit Anvil and
-set `JTERM_SHARED_ACTIVE_TERMINAL=0` for Block and Chat or
-`JTERM_SHARED_TRANSCRIPT=0` for Unified. Ordinary panes with supported local
-shells use `JTERM_SHARED_RUNTIME=0` to select VTE. Flatpak host shells use the
-compatibility path.
+Cargo builds enable `shared-terminal` by default. Native Linux builds use the
+shared runtime for ordinary shells, explicit commands, Block, Chat and Unified
+panes. Flatpak host launches use the host bridge with the same runtime owner.
+Each pane keeps its PTY, renderer and input method for its lifetime. An unavailable
+launch displays its failure in the shared pane.
+
+Legacy renderer comparisons use test builds and builds using
+`--no-default-features`. Production shared builds keep the shared owner when
+older `JTERM_SHARED_RUNTIME`, `JTERM_SHARED_ACTIVE_TERMINAL` or
+`JTERM_SHARED_TRANSCRIPT` environment values are present.
 
 Chat mode is an independent opt-in presentation with right command capsules,
 wide result cards, and a bottom-docked live shell. Select `--mode chat` or

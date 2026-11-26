@@ -704,6 +704,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires private GTK/DBus, Linux PTY and isolated real children; run alone with one test thread"]
+    #[cfg(anvil_vte_oracle)]
     fn pending_launch_close_failure_retry_and_window_isolation() {
         vte4::gtk::init().expect("private GTK display");
         let main = glib::MainContext::default();

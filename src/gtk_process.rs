@@ -1,25 +1,23 @@
 //! GTK backend integration for the canonical, bounded PTY process observer.
-//! VTE owns I/O; this adapter owns waiting. The child remains unreaped until
-//! its attached session has drained, including jobs in other process groups.
+//! The runtime owns I/O; this adapter retains exact children until their
+//! attached sessions drain, including jobs in other process groups.
 use companion_process::{
     pty_session::{Activity, PtySession},
     shell_identity::ShellIdentity,
 };
 use jterm_core::process::ChildLifecycle;
+use relm4::gtk::{self, glib, prelude::*};
+#[cfg(anvil_legacy_renderer)]
 use std::{
-    cell::{Cell, RefCell},
-    path::Path,
-    rc::Rc,
+    cell::Cell,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
+        mpsc,
     },
-    time::Duration,
 };
-use vte4::{
-    gtk::{glib, prelude::*},
-    Terminal, TerminalExt,
-};
+use std::{cell::RefCell, path::Path, rc::Rc, sync::Arc, time::Duration};
+#[cfg(anvil_legacy_renderer)]
+use vte4::{Terminal, TerminalExt};
 
 /// EOF on this close-on-exec pipe proves the forked child has completed its
 /// session/PTY setup and entered exec (or exited). Do not capture SID before it.
@@ -138,6 +136,7 @@ impl Guard {
 /// One launch exists before fork and stays attached to its window until the
 /// outcome was delivered AND any created child completed the owned drain.
 /// Cancellation is intent; it is never a reaping or completion receipt.
+#[cfg(anvil_legacy_renderer)]
 pub(crate) struct PendingLaunch {
     closing: Arc<AtomicBool>,
     settled: Cell<bool>,
@@ -145,6 +144,7 @@ pub(crate) struct PendingLaunch {
     terminal: glib::WeakRef<Terminal>,
 }
 
+#[cfg(anvil_legacy_renderer)]
 impl PendingLaunch {
     pub(crate) fn begin(terminal: &Terminal) -> Rc<Self> {
         let closed = vte_closed(terminal);
@@ -212,6 +212,7 @@ impl PendingLaunch {
     }
 }
 
+#[cfg(anvil_legacy_renderer)]
 pub(crate) fn vte_launch(terminal: &Terminal) -> Option<Rc<PendingLaunch>> {
     unsafe {
         terminal
@@ -220,6 +221,7 @@ pub(crate) fn vte_launch(terminal: &Terminal) -> Option<Rc<PendingLaunch>> {
     }
 }
 
+#[cfg(anvil_legacy_renderer)]
 pub(crate) fn vte_closed(terminal: &Terminal) -> bool {
     unsafe {
         terminal
@@ -231,6 +233,7 @@ pub(crate) fn vte_closed(terminal: &Terminal) -> bool {
 #[derive(Clone)]
 pub(crate) enum ChildDrain {
     Owned(Arc<ChildLifecycle>),
+    #[cfg(anvil_legacy_renderer)]
     Launch(Rc<PendingLaunch>),
     #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
     SharedRuntime(Rc<jterm_gtk_view::RuntimeShell>),
@@ -246,6 +249,7 @@ impl ChildDrain {
     fn ready(&self) -> bool {
         match self {
             Self::Owned(child) => child.exit_code().is_some(),
+            #[cfg(anvil_legacy_renderer)]
             Self::Launch(launch) => launch.ready(),
             #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
             Self::SharedRuntime(runtime) => runtime.ready_to_discard(),
@@ -255,6 +259,7 @@ impl ChildDrain {
     fn same(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Owned(a), Self::Owned(b)) => Arc::ptr_eq(a, b),
+            #[cfg(anvil_legacy_renderer)]
             (Self::Launch(a), Self::Launch(b)) => Rc::ptr_eq(a, b),
             #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
             (Self::SharedRuntime(a), Self::SharedRuntime(b)) => Rc::ptr_eq(a, b),
@@ -267,6 +272,7 @@ impl ChildDrain {
             Self::Owned(child) => {
                 child.terminate(jterm_core::process::EscalationPolicy::SESSION_DRAIN);
             }
+            #[cfg(anvil_legacy_renderer)]
             Self::Launch(launch) => launch.close(),
             #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
             Self::SharedRuntime(runtime) => runtime.close(),
@@ -274,6 +280,7 @@ impl ChildDrain {
     }
 }
 
+#[cfg(anvil_legacy_renderer)]
 pub(crate) fn vte_cleanup(terminal: &Terminal) -> Option<ChildDrain> {
     vte_launch(terminal)
         .map(ChildDrain::Launch)
@@ -300,7 +307,7 @@ impl PendingChildren {
     }
 }
 
-fn pending_children(window: &vte4::gtk::Window) -> Rc<RefCell<PendingChildren>> {
+fn pending_children(window: &gtk::Window) -> Rc<RefCell<PendingChildren>> {
     const KEY: &str = "eva-pending-children";
     // The only object-data boundary for this exact type/key. GTK access and
     // registry mutation stay on the window's main context.
@@ -314,7 +321,7 @@ fn pending_children(window: &vte4::gtk::Window) -> Rc<RefCell<PendingChildren>> 
     }
 }
 
-pub(crate) fn retain_children(window: &vte4::gtk::Window, children: Vec<ChildDrain>) {
+pub(crate) fn retain_children(window: &gtk::Window, children: Vec<ChildDrain>) {
     let state = pending_children(window);
     state.borrow_mut().retain(children);
     log::debug!(target: "eva_native_host", "GTK child handles retained count={}", state.borrow().children.len());
@@ -325,7 +332,7 @@ pub(crate) fn retain_children(window: &vte4::gtk::Window, children: Vec<ChildDra
 /// A second close request joins the existing wait; its callback is not run in
 /// parallel. Newly detached panes join the same per-window collection.
 pub(crate) fn defer_children(
-    window: &vte4::gtk::Window,
+    window: &gtk::Window,
     children: Vec<ChildDrain>,
     on_ready: impl FnOnce() + 'static,
 ) -> bool {
@@ -378,6 +385,7 @@ pub(crate) fn defer_children(
     true
 }
 
+#[cfg(anvil_legacy_renderer)]
 pub(crate) fn vte_child(terminal: &Terminal) -> Option<Arc<ChildLifecycle>> {
     unsafe {
         terminal
@@ -388,6 +396,7 @@ pub(crate) fn vte_child(terminal: &Terminal) -> Option<Arc<ChildLifecycle>> {
 
 /// Startup input belongs to the exact admitted child, even when a terminal
 /// widget survives a failed launch or is reused for another generation.
+#[cfg(anvil_legacy_renderer)]
 pub(crate) fn can_feed(terminal: &Terminal, child: &Arc<ChildLifecycle>) -> bool {
     !vte_closed(terminal)
         && terminal.root().is_some()
@@ -395,6 +404,7 @@ pub(crate) fn can_feed(terminal: &Terminal, child: &Arc<ChildLifecycle>) -> bool
         && vte_child(terminal).is_some_and(|current| Arc::ptr_eq(&current, child))
 }
 
+#[cfg(anvil_legacy_renderer)]
 pub(crate) fn schedule_initial_commands(
     terminal: &Terminal,
     child: Arc<ChildLifecycle>,
@@ -417,6 +427,7 @@ pub(crate) fn schedule_initial_commands(
 /// Emit the same raw wait-status-shaped signal the VTE watcher exposed, after
 /// our exclusive reaper finishes. VTE must NOT also watch this child. Only the
 /// family's normalized code is public, so encode it as a normal exit status.
+#[cfg(anvil_legacy_renderer)]
 pub(crate) fn watch_vte(terminal: &Terminal, child: Arc<ChildLifecycle>, guard: Arc<Guard>) {
     let watched_launch = vte_launch(terminal).as_ref().map(Rc::downgrade);
     // Only a successfully acquired, still-owned child enters these slots.
@@ -475,6 +486,7 @@ pub(crate) fn watch_vte(terminal: &Terminal, child: Arc<ChildLifecycle>, guard: 
     });
 }
 
+#[cfg(anvil_legacy_renderer)]
 pub(crate) fn vte_blocker(terminal: &Terminal, foreground: Option<String>) -> Option<String> {
     vte_activity(terminal, foreground, false)
 }
@@ -482,6 +494,7 @@ pub(crate) fn vte_blocker(terminal: &Terminal, foreground: Option<String>) -> Op
 /// Only after the application's normal confirmation: detect new attached
 /// work during withdrawal. This never grants ordinary VTE close permission;
 /// an uninstrumented prompt still requires the existing confirmation.
+#[cfg(anvil_legacy_renderer)]
 pub(crate) fn vte_withdrawal_work_probe(terminal: &Terminal) -> Box<dyn Fn() -> bool> {
     let probe = unsafe {
         terminal
@@ -501,6 +514,7 @@ pub(crate) fn vte_withdrawal_work_probe(terminal: &Terminal) -> Box<dyn Fn() -> 
     })
 }
 
+#[cfg(anvil_legacy_renderer)]
 fn vte_activity(
     terminal: &Terminal,
     foreground: Option<String>,
@@ -537,6 +551,7 @@ fn vte_activity(
     }
 }
 
+#[cfg(anvil_legacy_renderer)]
 pub(crate) fn close_vte(terminal: &Terminal) {
     if let Some(launch) = vte_launch(terminal) {
         launch.close();
@@ -613,6 +628,7 @@ mod tests {
         clippy::zombie_processes,
         reason = "ChildLifecycle is the exclusive wait owner"
     )]
+    #[cfg(anvil_vte_oracle)]
     fn detached_children_join_one_window_drain_without_reentering_or_crossing_windows() {
         vte4::gtk::init().expect("private GTK display");
         let main = glib::MainContext::default();
@@ -654,8 +670,8 @@ mod tests {
                 child,
             }
         }
-        let first = vte4::gtk::Window::new();
-        let other = vte4::gtk::Window::new();
+        let first = gtk::Window::new();
+        let other = gtk::Window::new();
         let a = live();
         let b = live();
         let unrelated = live();

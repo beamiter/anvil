@@ -32,16 +32,29 @@ impl AppModel {
             .map(|pane| pane.id)
     }
 
-    pub(crate) fn insert_workflow_command(&self, pane_id: u64, command: &str) {
-        if available_workflow_target(Some(pane_id), |id| self.find_pane(id).is_some()).is_none() {
+    pub(crate) fn insert_workflow_command(
+        &mut self,
+        pane_id: u64,
+        command: &str,
+        sender: &ComponentSender<AppModel>,
+    ) {
+        let Some((tab, pane)) = self.find_pane(pane_id) else {
             self.show_toast(
                 "Workflow was not inserted: its original terminal is no longer available.",
             );
             return;
-        }
+        };
         // This only dispatches validated review text to the original component;
         // it is not an acknowledgment of PTY queue admission or delivery.
-        self.insert_review_text_into_pane(pane_id, command);
+        if self.insert_review_text_into_pane(pane_id, command) {
+            if tab != self.active {
+                self.select_tab(self.tabs[tab].id, sender);
+            }
+            let current_pane = self.tabs[tab].active_pane;
+            if pane != current_pane {
+                self.cycle_pane_focus(pane as i32 - current_pane as i32);
+            }
+        }
     }
 
     /// Refresh the shared workflow cache without delaying palette presentation.
@@ -259,7 +272,7 @@ mod tests {
         let main = include_str!("main.rs");
         assert!(main.contains("AppMsg::PaletteRunWorkflow(path, pane_id)"));
         assert!(main.contains("self.run_workflow_from_path(path, pane_id, &sender)"));
-        assert!(main.contains("self.insert_workflow_command(pane_id, &command)"));
+        assert!(main.contains("self.insert_workflow_command(pane_id, &command, &sender)"));
         let workflow = include_str!("dialogs/workflow.rs")
             .split("#[cfg(test)]\nmod tests {")
             .next()
@@ -278,9 +291,12 @@ mod tests {
             .split("pub(crate) fn refresh_workflows_async(")
             .next()
             .unwrap();
-        assert!(dispatch.contains("available_workflow_target(Some(pane_id)"));
+        assert!(dispatch.contains("self.find_pane(pane_id)"));
         assert!(dispatch.contains("self.insert_review_text_into_pane(pane_id, command)"));
-        assert!(!dispatch.contains("self.active"));
+        assert!(
+            dispatch.find("self.insert_review_text_into_pane").unwrap()
+                < dispatch.find("self.select_tab").unwrap()
+        );
         let run = source
             .split("pub(crate) fn run_workflow_from_path(")
             .nth(1)

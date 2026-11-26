@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 use vte4::TerminalExt;
 
 pub(crate) const CAPABILITY_DETAIL: &str = "Traditional VTE shows a neutral companion outside the terminal grid. Command activity and alternate-screen state are unavailable, so hover greetings and Hello are unavailable. Sent input briefly hides the companion without moving the terminal. Use the command palette to expand or collapse this neutral companion.";
-pub(crate) const HELLO_UNAVAILABLE: &str = "Hello is unavailable in traditional VTE: command activity and alternate-screen state cannot be verified.";
 
 pub(super) fn display_frame(motion: OrganismMotion, frame: u64) -> u64 {
     super::surface_time::display_frame(motion == OrganismMotion::Full, frame)
@@ -2444,10 +2443,10 @@ mod tests {
             .split("fn emit_block_action(")
             .next()
             .unwrap();
-        assert!(greeting.contains("vte_surface::HELLO_UNAVAILABLE"));
+        assert!(greeting.contains("ORDINARY_HELLO_UNAVAILABLE"));
         assert!(
             greeting.find("hello_target_is_current").unwrap()
-                < greeting.find("vte_surface::HELLO_UNAVAILABLE").unwrap()
+                < greeting.find("ORDINARY_HELLO_UNAVAILABLE").unwrap()
         );
     }
 }

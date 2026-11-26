@@ -9,10 +9,12 @@ use jterm_core::vim9::{
 };
 use relm4::{adw, gtk};
 use std::cell::{Cell, RefCell};
+#[cfg(anvil_legacy_renderer)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
+#[cfg(anvil_legacy_renderer)]
 use vte4::prelude::*;
 
 #[path = "vim9_ide_buffer.rs"]
@@ -607,6 +609,7 @@ fn shell_source(
     if let Some(source) = crate::shared_terminal::SharedTerminal::vim_source(root, request) {
         return Some(source);
     }
+    #[cfg(anvil_legacy_renderer)]
     if let Some(terminal) = root.downcast_ref::<vte4::Terminal>() {
         let shell_pid = unsafe { terminal.data::<i32>("child-pid").map(|pid| *pid.as_ref()) };
         if terminal

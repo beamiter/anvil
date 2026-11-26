@@ -11,6 +11,7 @@ use relm4::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
+#[cfg(anvil_legacy_renderer)]
 use vte4::prelude::TerminalExt;
 
 use crate::block_view::{
@@ -21,7 +22,7 @@ use crate::search::SearchStatus;
 
 use super::{cross_block_search, record_snapshot};
 
-pub use super::vte::{VteInit, VteInput, VteOutput};
+pub use super::{VteInit, VteInput, VteOutput};
 
 /// Inactive-tab styling for a finished command: failures get the bell style,
 /// everything else the lighter activity style.
@@ -480,6 +481,7 @@ fn search_in_scope(
     case_sensitive: bool,
 ) -> (SearchStatus, bool) {
     view.clear_unified_navigation_cursor();
+    #[cfg(anvil_legacy_renderer)]
     if let Some(terminal) = view
         .legacy_terminal()
         .filter(|_| view.find_scope() == FindScope::LiveScreen)
@@ -491,7 +493,7 @@ fn search_in_scope(
             true,
         );
     }
-    let pattern = super::vte::search_pattern(query, use_regex);
+    let pattern = super::search::search_pattern(query, use_regex);
     let status = match validate_block_search_pattern(&pattern, case_sensitive) {
         Ok(_) => block_result_status(
             view.find_in_blocks(query, use_regex, case_sensitive),
@@ -506,10 +508,17 @@ fn search_in_scope(
 }
 
 fn validate_block_search_pattern(pattern: &str, case_sensitive: bool) -> Result<(), String> {
-    super::vte::compile_count_regex(pattern, case_sensitive)?;
-    vte4::Regex::for_search(pattern, super::vte::search_pcre2_flags(case_sensitive))
-        .map(|_| ())
-        .map_err(crate::search::invalid_regex_message)
+    super::search::compile_count_regex(pattern, case_sensitive)?;
+    #[cfg(anvil_legacy_renderer)]
+    {
+        vte4::Regex::for_search(pattern, super::vte::search_pcre2_flags(case_sensitive))
+            .map(|_| ())
+            .map_err(crate::search::invalid_regex_message)
+    }
+    #[cfg(not(anvil_legacy_renderer))]
+    {
+        Ok(())
+    }
 }
 
 fn progress_status(progress: FindProgress, use_regex: bool) -> SearchStatus {
@@ -943,8 +952,9 @@ impl Component for BlockTerminal {
                 // URLs and claude's OSC 8 links underlined on hover and did
                 // nothing. The handler denies every other click, so selection,
                 // click-to-move and a program's mouse reporting are untouched.
+                #[cfg(anvil_legacy_renderer)]
                 if let Some(terminal) = view.legacy_terminal() {
-                    super::vte::setup_terminal_click_handler(terminal);
+                    super::legacy_view::setup_terminal_click_handler(terminal);
                 }
                 TermView::arm_shell_integration_notice(&view, init.shell_argv.as_ref());
                 if let Some(container) = root.downcast_ref::<gtk::Box>() {
@@ -1037,13 +1047,13 @@ impl Component for BlockTerminal {
             VteInput::Resize(cols, rows) => view.resize(cols, rows),
             VteInput::GrabFocus => view.grab_focus(),
             VteInput::Copy => {
-                if let Some(message) = super::vte::copy_empty_notice(view.copy_to_clipboard()) {
+                if let Some(message) = super::copy_empty_notice(view.copy_to_clipboard()) {
                     let _ = sender.output(VteOutput::Notice(message.to_string()));
                 }
             }
             VteInput::CopyOutputOnly => {
                 if let Some(message) =
-                    super::vte::copy_empty_notice(view.copy_to_clipboard_with_modifier(true))
+                    super::copy_empty_notice(view.copy_to_clipboard_with_modifier(true))
                 {
                     let _ = sender.output(VteOutput::Notice(message.to_string()));
                 }
@@ -1225,15 +1235,20 @@ impl Component for BlockTerminal {
                     self.search_query.is_some(),
                 );
                 if plan == FindStep::Native {
-                    // The alternate-screen app's screen, searched natively.
-                    let found = view.legacy_terminal().is_some_and(|terminal| {
-                        if step > 0 {
-                            terminal.search_find_next()
-                        } else {
-                            terminal.search_find_previous()
-                        }
-                    });
-                    self.search_status = self.search_status.stepped(step, found);
+                    #[cfg(anvil_legacy_renderer)]
+                    {
+                        // The alternate-screen app's screen, searched natively.
+                        let found = view.legacy_terminal().is_some_and(|terminal| {
+                            if step > 0 {
+                                terminal.search_find_next()
+                            } else {
+                                terminal.search_find_previous()
+                            }
+                        });
+                        self.search_status = self.search_status.stepped(step, found);
+                    }
+                    #[cfg(not(anvil_legacy_renderer))]
+                    unreachable!("shared search cannot select a native VTE cursor");
                 } else if plan == FindStep::Rescope {
                     // The app left and the blocks are back, or it arrived while
                     // the blocks had nothing to step: search the pane's scope.
@@ -1301,9 +1316,8 @@ impl Component for BlockTerminal {
                         crate::ai::BlockAiIntent::Ask,
                     ));
                 } else {
-                    let _ = sender.output(VteOutput::Notice(
-                        super::vte::ask_ai_empty_notice().to_string(),
-                    ));
+                    let _ =
+                        sender.output(VteOutput::Notice(super::ask_ai_empty_notice().to_string()));
                 }
             }
         }
@@ -1889,7 +1903,7 @@ mod tests {
     fn block_search_validates_the_native_pcre_pattern_too() {
         // Rust regex permits locally disabling Unicode for an ASCII-only
         // subexpression; PCRE2 does not recognize that inline `u` flag.
-        assert!(super::super::vte::compile_count_regex("(?-u:a)", false).is_ok());
+        assert!(super::super::search::compile_count_regex("(?-u:a)", false).is_ok());
         let error = validate_block_search_pattern("(?-u:a)", false).unwrap_err();
         assert!(error.starts_with("Invalid regex:"));
     }

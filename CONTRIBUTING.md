@@ -1,6 +1,6 @@
 # Contributing to anvil
 
-anvil is a Rust/GTK application with two terminal backends and a deliberately
+anvil is a Rust/GTK application using the shared terminal runtime and a deliberately
 strict boundary between terminal I/O, persisted state, and Relm4 UI operations.
 Small, reviewable changes are preferred over broad rewrites.
 
@@ -24,6 +24,24 @@ checksum for those. When you repin either revision, update the matching entry
 in `cargoLock.outputHashes` in `flake.nix` as well, otherwise `nix develop`
 and `nix build` fail to evaluate. Set the entry to `pkgs.lib.fakeHash`, run
 `nix build .#default`, and copy the `got:` hash from the mismatch error.
+
+## Historical renderer oracle
+
+Production Cargo.toml, Cargo.lock, Nix and Flatpak packages contain no libvte.
+`cargo check --all-targets --locked` checks the production binary and standalone integration targets. Inline
+application fixtures run only in the independent oracle, including pure/shared
+fixtures alongside historical renderer comparisons. `python3 scripts/check-no-vte.py target/release/anvil`
+checks the resolved graph and linked ELF boundary.
+
+The old renderer exists only as an independent comparison fixture. Run
+`python3 tools/vte-oracle/run.py test --all-targets --offline` for its full inline
+suite, or `make test-display` for the registered display fixtures. The runner
+creates a source overlay under the target cache, injects exact vte4 0.10.0 using
+its separate lockfile, and explicitly enables `anvil_vte_oracle` and the legacy
+renderer cfg. Production launches cannot fall back to this fixture. Nix's dev
+shell retains VTE development libraries solely for that comparison suite.
+After changing a shared Git pin, update the oracle lockfile deliberately as well
+as the production lock; `--locked` rejects a stale fixture lock.
 
 ## Quality gate
 

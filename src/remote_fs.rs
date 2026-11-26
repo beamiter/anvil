@@ -183,6 +183,48 @@ case "$op" in
     cp -a -- "$s" "$stage/payload" || exit 4
     publish_noreplace "$stage/payload" "$n" || exit $?
     ;;
+  preview)
+    p=${2:-}; limit=${3:-}
+    case "$p" in /*) ;; *) exit 2 ;; esac
+    case "$limit" in ''|0|*[!0-9]*) exit 2 ;; esac
+    python3 -I -c '
+import os
+import stat
+import sys
+
+path, limit = sys.argv[1], int(sys.argv[2])
+parts = path.split("/")[1:]
+if not parts or any(part in ("", ".", "..") for part in parts):
+    sys.exit(2)
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+directory = os.open("/", directory_flags)
+try:
+    for part in parts[:-1]:
+        next_directory = os.open(part, directory_flags, dir_fd=directory)
+        os.close(directory)
+        directory = next_directory
+    handle = os.open(parts[-1], os.O_PATH | os.O_NOFOLLOW, dir_fd=directory)
+    try:
+        if not stat.S_ISREG(os.fstat(handle).st_mode):
+            print("Preview requires a regular file", file=sys.stderr)
+            sys.exit(4)
+        reader = os.open("/proc/self/fd/" + str(handle), os.O_RDONLY | os.O_NONBLOCK)
+    finally:
+        os.close(handle)
+    with os.fdopen(reader, "rb") as source:
+        info = os.fstat(source.fileno())
+        if info.st_size > limit:
+            print("File exceeds the preview byte limit", file=sys.stderr)
+            sys.exit(4)
+        data = source.read(limit + 1)
+        if len(data) > limit:
+            print("File exceeds the preview byte limit", file=sys.stderr)
+            sys.exit(4)
+        sys.stdout.buffer.write(data)
+finally:
+    os.close(directory)
+' "$p" "$limit" || exit $?
+    ;;
   cat)
     p=${2:-}
     case "$p" in /*) ;; *) exit 2 ;; esac
@@ -1007,6 +1049,32 @@ pub(crate) fn start_dir_with_cancellation(
             parse_home_output(&stdout)
         }
     }
+}
+
+/// Freeze the checked execution endpoint; subsequent selection cannot retarget it.
+pub(crate) fn preview_host(loc: &FsLocation, hosts: &[RemoteHost]) -> io::Result<RemoteHost> {
+    remote_host(loc, hosts).cloned()
+}
+
+pub(crate) fn read_preview(host: &RemoteHost, path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+    require_absolute(path)?;
+    if limit == 0 || limit > crate::local_preview_image::MAX_IMAGE_BYTES as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid preview byte limit",
+        ));
+    }
+    let cap = limit.to_string();
+    let argv = checked_probe_argv(
+        host,
+        "preview",
+        &[path.as_os_str(), OsStr::new(&cap)],
+        ScriptDelivery::Stdin,
+    )?;
+    probe_result(
+        "preview",
+        run_capture(&argv, PROBE_SCRIPT.as_bytes(), PROBE_LIST_TIMEOUT, limit)?,
+    )
 }
 
 pub(crate) fn start_dir(loc: &FsLocation, hosts: &[RemoteHost]) -> io::Result<PathBuf> {

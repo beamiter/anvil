@@ -29,11 +29,116 @@ pub(crate) enum HandoffReport {
     Created(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShellStatus {
+    Running,
+    Succeeded,
+    Failed,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ShellFact {
+    sequence: u64,
+    status: ShellStatus,
+}
+
+#[derive(Default)]
+struct ShellLifecycle {
+    sequence: u64,
+    latest: Option<ShellFact>,
+    exhausted: bool,
+}
+
+impl ShellLifecycle {
+    fn start(&mut self) -> Option<ShellFact> {
+        if self.exhausted {
+            return None;
+        }
+        let Some(sequence) = self.sequence.checked_add(1) else {
+            self.exhausted = true;
+            self.latest = None;
+            return None;
+        };
+        self.sequence = sequence;
+        let fact = ShellFact {
+            sequence,
+            status: ShellStatus::Running,
+        };
+        self.latest = Some(fact);
+        Some(fact)
+    }
+
+    fn finish(&mut self, exit_code: Option<i32>, shell_reported: bool) -> Option<ShellFact> {
+        let mut fact = self
+            .latest
+            .filter(|fact| fact.status == ShellStatus::Running)?;
+        fact.status = match (shell_reported, exit_code) {
+            (true, Some(0)) => ShellStatus::Succeeded,
+            (true, Some(_)) => ShellStatus::Failed,
+            _ => ShellStatus::Unknown,
+        };
+        self.latest = Some(fact);
+        Some(fact)
+    }
+}
+
+struct ShellPane {
+    widget: gtk::glib::WeakRef<gtk::Widget>,
+    lifecycle: Rc<RefCell<ShellLifecycle>>,
+    reported: Option<ShellFact>,
+}
+
+const MAX_SHELL_PANES: usize = 128;
+
+fn shell_task_id(host: &str, pane: &str, sequence: u64) -> String {
+    format!("gtk-shell:{host}:{pane}:{sequence}")
+}
+
+fn active_shell_fact(
+    pane: &str,
+    current: Option<&str>,
+    mapped: bool,
+    fact: Option<ShellFact>,
+) -> Option<ShellFact> {
+    if mapped && current == Some(pane) {
+        fact
+    } else {
+        None
+    }
+}
+
+fn focus_blocks_body(entry: bool, text_view: bool, terminal: bool, editable: bool) -> bool {
+    if entry {
+        return true;
+    }
+    if !text_view {
+        return false;
+    }
+    !terminal || editable
+}
+
+fn focused_widget_blocks_body(widget: &gtk::Widget) -> bool {
+    #[cfg(anvil_shared_terminal)]
+    let terminal = jterm_gtk_view::is_terminal_text_view(widget);
+    #[cfg(not(anvil_shared_terminal))]
+    let terminal = false;
+    focus_blocks_body(
+        widget.is::<gtk::Entry>(),
+        widget.is::<gtk::TextView>(),
+        terminal,
+        widget
+            .downcast_ref::<gtk::TextView>()
+            .is_some_and(|view| view.is_editable()),
+    )
+}
+
 struct State {
     client: host::SharedHost,
     handoff_sink: Option<HandoffSink>,
     generation: u64,
     last_task: Option<(String, u64, host::TaskStatus)>,
+    shell_panes: std::collections::HashMap<String, ShellPane>,
     active_turn: Option<(String, host::ContextRef)>,
     dialogue_save: host::DialogueSave,
     history_rendered: u64,
@@ -237,6 +342,7 @@ pub(crate) fn install_with_handoffs(
         handoff_sink,
         generation: 0,
         last_task: None,
+        shell_panes: std::collections::HashMap::new(),
         active_turn: None,
         dialogue_save: Default::default(),
         history_rendered: 0,
@@ -310,7 +416,7 @@ pub(crate) fn install_with_handoffs(
             let Some(state) = weak.upgrade() else {
                 return;
             };
-            let Some(focus) = gtk::prelude::GtkWindowExt::focus(window) else {
+            let Some(focus) = gtk::prelude::GtkWindowExt::focus(window).filter(|focus| focus.is_mapped()) else {
                 return;
             };
             let pane = if has_remote_ancestor(&focus) {
@@ -322,16 +428,17 @@ pub(crate) fn install_with_handoffs(
                 pane
             };
             let mut s = state.borrow_mut();
+            let task_id = s.shell_task_id(&pane, window);
             if s.current_context
                 .as_ref()
-                .is_some_and(|c| c.pane_id == pane)
+                .is_some_and(|c| c.pane_id == pane && c.task_id == task_id)
             {
                 return;
             }
             let context = host::ContextRef {
                 host_id: s.client.gate.host_id().into(),
                 pane_id: pane,
-                task_id: None,
+                task_id,
                 project_id: None,
                 revision: 0,
             };
@@ -608,7 +715,7 @@ pub(crate) fn install_with_handoffs(
         let overlay = overlay.downgrade();
         let label = selection_label.clone();
         read_selection.connect_clicked(move |_|{
-        let Some(overlay)=overlay.upgrade()else{return;};let Some((pane_id,text))=capture_one_selection(overlay.upcast_ref())else{label.set_text("Select text in exactly one visible local VTE surface. Remote or ambiguous selections are unavailable.");return;};
+        let Some(overlay)=overlay.upgrade()else{return;};let Some((pane_id,text))=capture_one_selection(overlay.upcast_ref())else{label.set_text("Select text in exactly one visible local terminal surface. Remote or ambiguous selections are unavailable.");return;};
         let mut s=state.borrow_mut();let context=host::ContextRef{host_id:s.client.gate.host_id().into(),pane_id,task_id:None,project_id:None,revision:s.revision};let source_event_id=uuid::Uuid::new_v4().to_string();s.current_context=None;let context=s.register_context(context);s.selection_request=Some((context.clone(),source_event_id.clone()));s.approved_selection=None;s.selection_review=None;
         let captured_at_ms=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         s.client.send(Request::ContextAccessRequested{context,text,source_event_id,captured_at_ms});label.set_text("Preparing exact selection review — not sent to a model.");
@@ -1122,15 +1229,17 @@ pub(crate) fn install_with_handoffs(
             s.geometry = (0, 0, false, 0, 0, 0, 0);
             s.last_exclusions.clear();
             s.last_task = None;
+            for pane in s.shell_panes.values_mut() { pane.reported = None; }
             s.current_context = None;
             s.dialogue_save.clear();
             if let Some(pane_id) =
-                gtk::prelude::GtkWindowExt::focus(&window).and_then(|focus| native_pane_id(&focus))
+                gtk::prelude::GtkWindowExt::focus(&window).filter(|focus| focus.is_mapped()).and_then(|focus| native_pane_id(&focus))
             {
+                let task_id = s.shell_task_id(&pane_id, &window);
                 let context = host::ContextRef {
                     host_id: s.client.gate.host_id().into(),
                     pane_id,
-                    task_id: None,
+                    task_id,
                     project_id: None,
                     revision: 0,
                 };
@@ -1151,6 +1260,7 @@ pub(crate) fn install_with_handoffs(
             });
             s.blocked = true;
         }
+        s.sync_shell_panes(&window);
         if changed {
             s.skin = atlas::Skin::from_key(s.client.gate.skin()).unwrap_or(atlas::Skin::Cat);
             s.motion = match s.client.gate.motion() {
@@ -1272,7 +1382,7 @@ pub(crate) fn install_with_handoffs(
         let compact_size = measured_extent(&compact_layout);
         let size = (overlay.width(), overlay.height());
         let editable = gtk::prelude::GtkWindowExt::focus(&window)
-            .is_some_and(|w| w.is::<gtk::TextView>() || w.is::<gtk::Entry>());
+            .is_some_and(|w| focused_widget_blocks_body(&w));
         let (protected, exclusions) = protections(overlay.upcast_ref(), &overlay);
         let surface_conflict = s.client.gate.possible_body_token().is_some_and(|token| {
             s.frame_clock_binding
@@ -1612,6 +1722,7 @@ fn widget_bounds(widget: &gtk::Widget, overlay: &gtk::Overlay, clip: Option<Rect
 
 /// Conservative metadata-only native exclusion scan. Never reads label/text contents.
 fn protections(root: &gtk::Widget, overlay: &gtk::Overlay) -> (bool, Vec<Rect>) {
+    #[cfg(anvil_legacy_renderer)]
     use vte4::prelude::TerminalExt;
     let root_clip = (overlay.width() > 0 && overlay.height() > 0).then_some(Rect {
         x: 0.,
@@ -1639,9 +1750,25 @@ fn protections(root: &gtk::Widget, overlay: &gtk::Overlay) -> (bool, Vec<Rect>) 
             || w.has_css_class("block-alt-screen")
             || w.has_css_class("command-review-standalone")
             || w.has_css_class("command-review-body");
-        if let Some(vte) = w.downcast_ref::<vte4::Terminal>() {
-            blocked |= vte.has_selection();
+        #[cfg(anvil_shared_terminal)]
+        let shared_terminal = jterm_gtk_view::is_terminal_text_view(&w);
+        #[cfg(not(anvil_shared_terminal))]
+        let shared_terminal = false;
+        if shared_terminal {
+            blocked |= w
+                .downcast_ref::<gtk::TextView>()
+                .is_some_and(|view| view.buffer().has_selection());
         }
+        #[cfg(anvil_legacy_renderer)]
+        let legacy_terminal = if let Some(vte) = w.downcast_ref::<vte4::Terminal>() {
+            blocked |= vte.has_selection();
+            true
+        } else {
+            false
+        };
+        #[cfg(not(anvil_legacy_renderer))]
+        let legacy_terminal = false;
+        let terminal_surface = shared_terminal || legacy_terminal;
         let clips = w.overflow() == gtk::Overflow::Hidden
             || w.is::<gtk::ScrolledWindow>()
             || w.is::<gtk::Viewport>();
@@ -1669,7 +1796,7 @@ fn protections(root: &gtk::Widget, overlay: &gtk::Overlay) -> (bool, Vec<Rect>) 
         if !excluded
             && (chrome
                 || card
-                || w.is::<vte4::Terminal>()
+                || terminal_surface
                 || w.is::<gtk::Label>()
                 || w.is::<gtk::Entry>()
                 || w.is::<gtk::TextView>()
@@ -1691,7 +1818,7 @@ fn protections(root: &gtk::Widget, overlay: &gtk::Overlay) -> (bool, Vec<Rect>) 
                 }
             }
         }
-        if chrome || w.is::<vte4::Terminal>() || w.is::<gtk::Button>() {
+        if chrome || terminal_surface || w.is::<gtk::Button>() {
             continue;
         }
         let child_excluded = excluded || card;
@@ -2455,6 +2582,109 @@ pub(crate) fn tag_pane(widget: &impl IsA<gtk::Widget>) {
         widget.add_css_class(&format!("eva-pane-id-{}", uuid::Uuid::new_v4()));
     }
 }
+/// Observe only the existing accepted foreground-shell lifecycle. The payload
+/// stays in the GUI: IPC receives opaque pane/sequence IDs and result enums.
+pub(crate) fn observe_shell_view(view: &Rc<crate::block_view::TermView>) {
+    let widget = view.widget();
+    if !shared_mode_requested() || widget.has_css_class("eva-shell-observer") {
+        return;
+    }
+    widget.add_css_class("eva-shell-observer");
+    let lifecycle = Rc::new(RefCell::new(ShellLifecycle::default()));
+    {
+        let lifecycle = lifecycle.clone();
+        widget.connect_map(move |widget| publish_shell_view(widget, &lifecycle));
+    }
+    {
+        let weak = widget.downgrade();
+        let lifecycle = lifecycle.clone();
+        let focus = gtk::EventControllerFocus::new();
+        focus.connect_enter(move |_| {
+            if let Some(widget) = weak.upgrade() {
+                publish_shell_view(&widget, &lifecycle);
+            }
+        });
+        widget.add_controller(focus);
+    }
+    {
+        let weak = widget.downgrade();
+        let lifecycle = lifecycle.clone();
+        view.connect_command_started(move |_| {
+            let Some(widget) = weak.upgrade() else {
+                return;
+            };
+            if has_remote_ancestor(&widget) {
+                return;
+            }
+            let _ = lifecycle.borrow_mut().start();
+            publish_shell_view(&widget, &lifecycle);
+        });
+    }
+    {
+        let weak = widget.downgrade();
+        let lifecycle = lifecycle.clone();
+        view.connect_command_finished(move |event| {
+            let Some(widget) = weak.upgrade() else {
+                return;
+            };
+            if has_remote_ancestor(&widget) {
+                return;
+            }
+            let _ = lifecycle.borrow_mut().finish(
+                event.exit_code,
+                event.completion_provenance
+                    == crate::block_view::CompletionProvenance::ShellReported,
+            );
+            publish_shell_view(&widget, &lifecycle);
+        });
+    }
+    publish_shell_view(&widget, &lifecycle);
+}
+
+fn shell_window(widget: &gtk::Widget) -> Option<gtk::Window> {
+    widget.root()?.downcast::<gtk::Window>().ok()
+}
+
+fn publish_shell_view(widget: &gtk::Widget, lifecycle: &Rc<RefCell<ShellLifecycle>>) {
+    let (Some(window), Some(pane)) = (shell_window(widget), native_pane_id(widget)) else {
+        return;
+    };
+    let state = HOSTS.with(|hosts| {
+        hosts.borrow().iter().find_map(|(host, state)| {
+            (host.upgrade().as_ref() == Some(&window))
+                .then(|| state.upgrade())
+                .flatten()
+        })
+    });
+    let Some(state) = state else {
+        return;
+    };
+    // Map/focus notifications can be synchronous with GTK layout. The local
+    // lifecycle remains available for the regular poll if this state is busy.
+    let Ok(mut state) = state.try_borrow_mut() else {
+        return;
+    };
+    state.sync_shell_panes(&window);
+    if let Some(existing) = state.shell_panes.get(&pane) {
+        if existing.widget.upgrade().as_ref() != Some(widget) {
+            return;
+        }
+    } else {
+        if state.shell_panes.len() >= MAX_SHELL_PANES {
+            return;
+        }
+        state.shell_panes.insert(
+            pane,
+            ShellPane {
+                widget: widget.downgrade(),
+                lifecycle: lifecycle.clone(),
+                reported: None,
+            },
+        );
+    }
+    state.sync_shell_panes(&window);
+}
+
 fn has_remote_ancestor(widget: &gtk::Widget) -> bool {
     let mut next = Some(widget.clone());
     while let Some(w) = next {
@@ -2486,6 +2716,7 @@ fn native_pane_id(widget: &gtk::Widget) -> Option<String> {
 
 /// Explicit button-only selection read. No output fetch occurs in the frame loop.
 fn capture_one_selection(root: &gtk::Widget) -> Option<(String, String)> {
+    #[cfg(anvil_legacy_renderer)]
     use vte4::prelude::TerminalExt;
     let mut pending = vec![root.clone()];
     let mut found = None;
@@ -2495,28 +2726,37 @@ fn capture_one_selection(root: &gtk::Widget) -> Option<(String, String)> {
         if visited > 2048 {
             return None;
         }
-        if !w.is_mapped() {
+        if !w.is_mapped() || w.has_css_class("eva-remote-surface") {
             continue;
         }
-        if w.has_css_class("eva-remote-surface") {
-            continue;
-        }
-        if let Some(vte) = w.downcast_ref::<vte4::Terminal>() {
-            if vte.has_selection() {
-                if found.is_some() {
-                    return None;
-                }
-                let mut text = vte.text_selected(vte4::Format::Text)?.to_string();
-                let mut end = text.len().min(4096);
-                while !text.is_char_boundary(end) {
-                    end -= 1;
-                }
-                text.truncate(end);
-                if text.is_empty() {
-                    return None;
-                }
-                found = Some((native_pane_id(vte.upcast_ref())?, text));
+        #[cfg(anvil_shared_terminal)]
+        let selection = jterm_gtk_view::terminal_view_selection(&w);
+        #[cfg(not(anvil_shared_terminal))]
+        let selection = None;
+        #[cfg(anvil_legacy_renderer)]
+        let selection = if let Some(vte) = w.downcast_ref::<vte4::Terminal>() {
+            vte.has_selection()
+                .then(|| {
+                    vte.text_selected(vte4::Format::Text)
+                        .map(|text| text.to_string())
+                })
+                .flatten()
+        } else {
+            selection
+        };
+        if let Some(mut text) = selection {
+            if found.is_some() {
+                return None;
             }
+            let mut end = text.len().min(4096);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            if text.is_empty() {
+                return None;
+            }
+            found = Some((native_pane_id(&w)?, text));
         }
         let mut child = w.first_child();
         while let Some(c) = child {
@@ -2527,6 +2767,111 @@ fn capture_one_selection(root: &gtk::Widget) -> Option<(String, String)> {
     found
 }
 impl State {
+    fn prune_shell_panes(&mut self, window: &gtk::Window) -> Vec<String> {
+        let mut removed = Vec::new();
+        self.shell_panes.retain(|pane, entry| {
+            let valid = entry.widget.upgrade().is_some_and(|widget| {
+                shell_window(&widget).as_ref() == Some(window)
+                    && native_pane_id(&widget).as_ref() == Some(pane)
+            });
+            if !valid {
+                removed.push(pane.clone());
+            }
+            valid
+        });
+        removed
+    }
+
+    fn shell_task_id(&self, pane: &str, window: &gtk::Window) -> Option<String> {
+        let entry = self.shell_panes.get(pane)?;
+        let widget = entry.widget.upgrade()?;
+        if !widget.is_mapped()
+            || shell_window(&widget).as_ref() != Some(window)
+            || native_pane_id(&widget).as_deref() != Some(pane)
+        {
+            return None;
+        }
+        entry
+            .lifecycle
+            .borrow()
+            .latest
+            .map(|fact| shell_task_id(self.client.gate.host_id(), pane, fact.sequence))
+    }
+
+    fn sync_shell_panes(&mut self, window: &gtk::Window) {
+        let removed = self.prune_shell_panes(window);
+        let pane = gtk::prelude::GtkWindowExt::focus(window)
+            .filter(|focus| focus.is_mapped())
+            .and_then(|focus| {
+                if has_remote_ancestor(&focus) {
+                    Some("remote-unavailable".to_owned())
+                } else {
+                    native_pane_id(&focus)
+                }
+            });
+        if let Some(pane) = pane {
+            let task_id = self.shell_task_id(&pane, window);
+            if !self
+                .current_context
+                .as_ref()
+                .is_some_and(|context| context.pane_id == pane && context.task_id == task_id)
+            {
+                self.register_context(host::ContextRef {
+                    host_id: self.client.gate.host_id().into(),
+                    pane_id: pane,
+                    task_id,
+                    project_id: None,
+                    revision: 0,
+                });
+            }
+        } else if self
+            .current_context
+            .as_ref()
+            .is_some_and(|context| removed.contains(&context.pane_id))
+        {
+            self.register_context(host::ContextRef {
+                host_id: self.client.gate.host_id().into(),
+                pane_id: "companion-card".into(),
+                task_id: None,
+                project_id: None,
+                revision: 0,
+            });
+        }
+        let current = self
+            .current_context
+            .as_ref()
+            .map(|context| context.pane_id.clone());
+        let mut updates = Vec::new();
+        for (pane, entry) in &mut self.shell_panes {
+            let mapped = entry
+                .widget
+                .upgrade()
+                .is_some_and(|widget| widget.is_mapped());
+            let latest = active_shell_fact(
+                pane,
+                current.as_deref(),
+                mapped,
+                entry.lifecycle.borrow().latest,
+            );
+            if let Some(fact) = latest.filter(|fact| entry.reported != Some(*fact)) {
+                entry.reported = Some(fact);
+                updates.push((pane.clone(), fact));
+            }
+        }
+        for (pane, fact) in updates {
+            let status = match fact.status {
+                ShellStatus::Running => host::TaskStatus::Running,
+                ShellStatus::Succeeded => host::TaskStatus::Succeeded,
+                ShellStatus::Failed => host::TaskStatus::Failed,
+                ShellStatus::Unknown => host::TaskStatus::Unknown,
+            };
+            self.client.send(Request::TaskObservation {
+                task_id: shell_task_id(self.client.gate.host_id(), &pane, fact.sequence),
+                context_revision: fact.sequence,
+                status,
+            });
+        }
+    }
     fn ready_to_close(&self) -> bool {
         self.client.gate.withdrawal_accepted()
             || (!self.client.gate.has_connection()
@@ -2742,6 +3087,57 @@ fn restore_close_focus(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn read_only_registered_terminal_focus_is_not_an_editor() {
+        assert!(!focus_blocks_body(false, true, true, false));
+        assert!(focus_blocks_body(false, true, true, true));
+        assert!(focus_blocks_body(false, true, false, false));
+        assert!(focus_blocks_body(false, true, false, true));
+        assert!(focus_blocks_body(true, false, true, false));
+        assert!(!focus_blocks_body(false, false, false, false));
+    }
+
+    #[test]
+    fn shell_facts_require_start_and_report_only_real_exit_outcomes() {
+        let mut shell = ShellLifecycle::default();
+        assert_eq!(shell.finish(Some(0), true), None);
+        let started = shell.start().unwrap();
+        assert_eq!(started.status, ShellStatus::Running);
+        let finished = shell.finish(Some(0), true).unwrap();
+        assert_eq!(finished.sequence, started.sequence);
+        assert_eq!(finished.status, ShellStatus::Succeeded);
+        assert_eq!(shell.finish(Some(7), true), None);
+        assert_eq!(shell.latest, Some(finished));
+        assert!(shell.start().unwrap().sequence > started.sequence);
+        assert_eq!(shell.finish(Some(7), true).unwrap().status, ShellStatus::Failed);
+        let _ = shell.start();
+        assert_eq!(shell.finish(Some(0), false).unwrap().status, ShellStatus::Unknown);
+        let _ = shell.start();
+        assert_eq!(shell.finish(None, true).unwrap().status, ShellStatus::Unknown);
+    }
+
+    #[test]
+    fn pane_shell_results_survive_other_pane_completion_without_identity_reuse() {
+        let mut a = ShellLifecycle::default();
+        let mut b = ShellLifecycle::default();
+        let _ = a.start();
+        let _ = b.start();
+        let b_fact = b.finish(Some(1), true).unwrap();
+        let _ = a.finish(Some(0), true);
+        assert_eq!(b.latest, Some(b_fact));
+        assert_eq!(active_shell_fact("A", Some("B"), true, a.latest), None);
+        assert_eq!(active_shell_fact("B", Some("B"), true, b.latest), Some(b_fact));
+        assert_eq!(active_shell_fact("B", Some("B"), false, b.latest), None);
+        assert_ne!(shell_task_id("host", "A", 1), shell_task_id("host", "B", 1));
+        assert_ne!(shell_task_id("host", "B", 1), shell_task_id("other", "B", 1));
+        drop(a);
+        assert_eq!(b.latest, Some(b_fact));
+        b.sequence = u64::MAX;
+        assert_eq!(b.start(), None);
+        assert_eq!(b.latest, None);
+        assert_eq!(b.start(), None);
+    }
+
     #[test]
     fn every_skin_pose_is_colored_and_escaped_without_emoji() {
         for skin in atlas::Skin::ALL {

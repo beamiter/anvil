@@ -52,6 +52,10 @@ if production.exists():
     source = json.loads(production.read_text())
     if source.get("revision") == revision and source.get("tree") == receipt["published_core_tree"]:
         receipt["source_nar_sha256"] = source["source_nar_sha256"]
-        receipt["publication_boundary"] = "Public source verified at " + source["publication_verified_at"] + "; no native acceptance implied."
+        if "publication_verified_at" in source:
+            receipt["publication_boundary"] = "Public source verified at " + source["publication_verified_at"] + "; no native acceptance implied."
+        else:
+            receipt["publication_claimed"] = False
+            receipt["publication_boundary"] = "Exact local Git source verified at " + source["local_verification_at"] + "; public publication was not performed or claimed. Legacy published_core_* keys name the audit source identity only."
 (p / "jterm-core-origin.json").write_text(json.dumps(receipt, indent=2) + "\n")
 PYRECEIPT

@@ -14,6 +14,7 @@ use std::rc::Rc;
 use jterm_core::terminal_report::classify_terminal_report;
 #[cfg(anvil_shared_terminal)]
 use relm4::gtk;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use vte4::TerminalExt;
 
 use super::{BlockState, MouseReporting};
@@ -107,6 +108,7 @@ impl SelectionFeedHold {
     /// to the live VTE: only while one is open is a `CSI row;col R` commit its
     /// answer rather than a modified F3. The caller installs this hook before
     /// the commit handler that settles the count.
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     pub(crate) fn install_vte_hooks(
         self: &Rc<Self>,
         vte: &vte4::Terminal,

@@ -1,15 +1,20 @@
 use gtk4::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
+#[cfg(anvil_legacy_renderer)]
 use unicode_width::UnicodeWidthStr;
+#[cfg(anvil_legacy_renderer)]
 use vte4::{Format, Terminal, TerminalExt};
 
+#[cfg(anvil_legacy_renderer)]
 use jterm_core::link::{detect_delimited_references, DelimitedReference};
 
 use relm4::gtk as gtk4;
 
+#[cfg(anvil_legacy_renderer)]
 const CONTEXT_ROWS: i64 = 7;
 
+#[cfg(anvil_legacy_renderer)]
 fn rows(terminal: &Terminal, first: i64, last: i64) -> Vec<String> {
     (first..=last)
         .map(|row| {
@@ -21,6 +26,7 @@ fn rows(terminal: &Terminal, first: i64, last: i64) -> Vec<String> {
         .collect()
 }
 
+#[cfg(anvil_legacy_renderer)]
 pub(crate) fn hit(terminal: &Terminal, x: f64, y: f64) -> Option<DelimitedReference> {
     let border = terminal.border();
     let (left, top) = border.map_or((0.0, 0.0), |border| {
@@ -43,15 +49,18 @@ pub(crate) fn hit(terminal: &Terminal, x: f64, y: f64) -> Option<DelimitedRefere
     let selected_row = (row - first) as usize;
     let col = dx.floor() as usize;
     let rows: Vec<_> = lines.iter().map(String::as_str).collect();
-    detect_delimited_references(&rows).into_iter().find(|reference| {
-        reference.spans.iter().any(|(row, bytes)| {
-            *row == selected_row
-                && (lines[*row][..bytes.start].width()..lines[*row][..bytes.end].width())
-                    .contains(&col)
+    detect_delimited_references(&rows)
+        .into_iter()
+        .find(|reference| {
+            reference.spans.iter().any(|(row, bytes)| {
+                *row == selected_row
+                    && (lines[*row][..bytes.start].width()..lines[*row][..bytes.end].width())
+                        .contains(&col)
+            })
         })
-    })
 }
 
+#[cfg(anvil_legacy_renderer)]
 pub(crate) fn web_match(terminal: &Terminal, x: f64, y: f64) -> Option<String> {
     if let Some(reference) = hit(terminal, x, y) {
         return (reference.web && !reference.blocked).then_some(reference.target);
@@ -70,6 +79,7 @@ pub(crate) fn web_match(terminal: &Terminal, x: f64, y: f64) -> Option<String> {
     )
 }
 
+#[cfg(anvil_legacy_renderer)]
 pub(crate) fn selected_text(terminal: &Terminal) -> Option<String> {
     // VTE owns selection boundaries and genuine soft-wrap handling. In
     // particular, do not trim or join hard-line fragments into another name.
@@ -78,6 +88,7 @@ pub(crate) fn selected_text(terminal: &Terminal) -> Option<String> {
         .map(|text| text.to_string())
 }
 
+#[cfg(anvil_legacy_renderer)]
 pub(crate) fn copy_selection(terminal: &Terminal) {
     if let Some(text) = selected_text(terminal) {
         terminal.clipboard().set_text(&text);
@@ -136,6 +147,7 @@ pub(crate) fn click<T: PartialEq + 'static>(
     widget.add_controller(gesture);
 }
 
+#[cfg(anvil_legacy_renderer)]
 pub(crate) fn install_hover(terminal: &Terminal) {
     terminal.set_word_char_exceptions("-_./~:+?&=#%@");
     let motion = gtk4::EventControllerMotion::new();
@@ -166,7 +178,7 @@ pub(crate) fn install_hover(terminal: &Terminal) {
     terminal.add_controller(motion);
 }
 
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 mod tests {
     use super::*;
 

@@ -1,17 +1,17 @@
 //! Bounded find/search state and navigation for Block-mode terminal history.
 //!
-//! Find-within-blocks: VTE's native PCRE2 highlighter paints every hit inside
-//! each finished block's command/output VTE; we only track which (block, surface)
-//! each hit belongs to so Next/Prev can step the per-VTE search cursor across
-//! block boundaries. Also hosts the metadata-only filter pass used by the
-//! command palette's failed/slow toggles and by the debug dashboard counts.
+//! Find combines shared live/history frames and completed text documents.
+//! Compatibility builds retain VTE highlighting and cursor replay. The
+//! metadata filter pass supports the command palette and dashboard counts.
 
 use gtk::glib;
 use gtk::prelude::*;
 use relm4::gtk;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 use vte4::TerminalExt;
 
 use super::{
@@ -71,10 +71,21 @@ pub(crate) use jterm_core::cross_block_search::{
 /// VTE uses PCRE2 while match counting uses Rust's Unicode-aware regex engine.
 /// UTF validates/decodes the subject as Unicode and UCP makes shorthand classes
 /// such as `\d`, `\s`, and `\w` use Unicode properties on the VTE side too.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 const VTE_SEARCH_FLAGS: u32 = pcre2_sys::PCRE2_CASELESS
     | pcre2_sys::PCRE2_MULTILINE
     | pcre2_sys::PCRE2_UTF
     | pcre2_sys::PCRE2_UCP;
+
+fn valid_search_pattern(pattern: &str, case_sensitive: bool) -> bool {
+    pcre2::bytes::RegexBuilder::new()
+        .utf(true)
+        .ucp(true)
+        .multi_line(true)
+        .caseless(!case_sensitive)
+        .build(pattern)
+        .is_ok()
+}
 
 /// One searchable VTE surface. VTE owns the exact match positions and paints
 /// every occurrence; Forge needs only the number of occurrences on each
@@ -176,6 +187,7 @@ fn resumed_find_cursor(surfaces: &[FindSurface], resume: FindResume) -> Option<F
 /// A single own-reveal replay, never a general selection-loss listener.
 /// Signal closures hold weak references; dropping the find pass disconnects all
 /// handlers even when the view disappears before VTE processes its queued feed.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 struct FindReplayRepair {
     active: Cell<bool>,
     terminal: glib::WeakRef<vte4::Terminal>,
@@ -186,6 +198,7 @@ struct FindReplayRepair {
     edit_handler: RefCell<Option<glib::SignalHandlerId>>,
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 impl FindReplayRepair {
     fn retire(&self) {
         self.active.set(false);
@@ -210,14 +223,17 @@ impl FindReplayRepair {
     }
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 struct RetireFindReplay(Rc<FindReplayRepair>);
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 impl Drop for RetireFindReplay {
     fn drop(&mut self) {
         self.0.retire();
     }
 }
 
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 impl Drop for FindReplayRepair {
     fn drop(&mut self) {
         self.retire();
@@ -289,6 +305,7 @@ pub(crate) struct FindState {
     /// An asynchronous exact step failed; the next action must rebuild rather
     /// than falling through to an unrelated live-terminal search.
     invalidated: bool,
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     replay_repair: Option<Rc<FindReplayRepair>>,
     query: Option<FindQuery>,
     scope: Option<FindScope>,
@@ -301,6 +318,7 @@ pub(crate) struct FindState {
     /// logical Unified records can map to the same persistent VTE, so cleanup
     /// must deduplicate these handles rather than reconstructing them from the
     /// Block-only finished-widget list.
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     highlighted_terminals: Vec<vte4::Terminal>,
     #[cfg(anvil_shared_terminal)]
     highlighted_commands: Vec<gtk::TextView>,
@@ -461,6 +479,7 @@ fn regex_consumption(pattern: &str) -> Result<RegexConsumption, ()> {
 /// The dump is bounded by the configured scrollback and is only taken for an
 /// explicit search. `None` when VTE cannot write it; the caller then falls
 /// back to the raw capture.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn live_vte_search_text(vte: &vte4::Terminal, from_row: i64) -> Option<String> {
     use gtk::prelude::*;
 
@@ -514,6 +533,7 @@ fn live_search_rows(lower: f64, upper: f64, page_size: f64, origin: Option<i64>)
 /// Point the live VTE's native search at the ends of the counted range before
 /// the first step into the live surface: a forward step starts at the view's
 /// top row (`anchor`), a backward one at the view's bottom (the buffer's end).
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn anchor_live_native_search(
     vte: &vte4::Terminal,
     direction: FindDirection,
@@ -543,6 +563,7 @@ fn anchor_live_native_search(
 
 /// Matches in the live rows `view_row..from_row`: on the view's last page,
 /// above the running command, and not counted (see [`LiveAnchor`]).
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn live_rows_skipped(
     vte: &vte4::Terminal,
     regex: &regex::Regex,
@@ -634,6 +655,7 @@ fn plan_matching_windows(
 /// Select one forward native hit from the current viewport, without wrapping.
 /// Used when absolute ring rows are temporarily untrusted: the selected match
 /// is real, while its total and any further navigation remain fail-closed.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn focus_one_native_forward_match(terminal: &vte4::Terminal, regex: &vte4::Regex) -> bool {
     terminal.search_set_regex(None::<&vte4::Regex>, 0);
     terminal.unselect_all();
@@ -913,6 +935,7 @@ fn step_to_occurrence_exact(occurrence: usize, mut step: impl FnMut() -> bool) -
 /// earlier steps selected a real (but wrong) match; removing the regex alone
 /// leaves that partial selection behind in VTE. Roll the whole native cursor
 /// state back so a failed palette activation cannot strand a stale highlight.
+#[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
 fn step_vte_to_occurrence_exact(terminal: &vte4::Terminal, occurrence: usize) -> bool {
     if step_to_occurrence_exact(occurrence, || terminal.search_find_next()) {
         true
@@ -1634,13 +1657,17 @@ impl TermView {
             Err(_) => return FindSearchResult::InvalidRegex,
         };
 
-        // Compile the same pattern for VTE (PCRE2) so its native highlighter
-        // paints every hit and its search cursor can step within each block.
+        // Retain the historical PCRE2 syntax contract for completed text.
+        if !valid_search_pattern(&pattern, case_sensitive) {
+            return FindSearchResult::InvalidRegex;
+        }
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         let flags = if case_sensitive {
             VTE_SEARCH_FLAGS & !pcre2_sys::PCRE2_CASELESS
         } else {
             VTE_SEARCH_FLAGS
         };
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         let vte_re = match vte4::Regex::for_search(&pattern, flags) {
             Ok(r) => r,
             Err(_) => return FindSearchResult::InvalidRegex,
@@ -1648,18 +1675,21 @@ impl TermView {
 
         let live_stamp_at_start = self.live_find_stamp();
         let mut surfaces = Vec::new();
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         let mut highlighted_terminals = Vec::new();
         #[cfg(anvil_shared_terminal)]
         let mut highlighted_commands = Vec::new();
         let mut total = 0usize;
         let mut match_limited = false;
         let mut scan_limited = false;
+        #[allow(unused_mut)]
         let mut live_anchor = None;
         let mut scan_budget = FindScanBudget::new();
         let completed_batch = if scope == FindScope::LiveScreen {
             super::BackendSearchBatch {
                 surfaces: Vec::new(),
                 incomplete: false,
+                #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                 native_fallback: None,
             }
         } else {
@@ -1670,13 +1700,16 @@ impl TermView {
         let completed_owns_live_surface = completed_batch
             .surfaces
             .iter()
-            .any(|surface| surface.is_live)
+            .any(|surface| surface.is_live);
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        let completed_owns_live_surface = completed_owns_live_surface
             || completed_batch
                 .native_fallback
                 .as_ref()
                 .is_some_and(|fallback| fallback.is_live);
         let mut live_observed = completed_owns_live_surface;
         let completed_incomplete = completed_batch.incomplete;
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         let native_fallback = completed_batch.native_fallback;
         for backend_surface in completed_batch.surfaces {
             scan_budget.consume_bytes(backend_surface.scanned_bytes);
@@ -1689,6 +1722,7 @@ impl TermView {
                 if backend_surface.reset_cursor {
                     backend_surface.presentation.clear_selection();
                 }
+                #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                 if let Some(terminal) = backend_surface.presentation.native() {
                     terminal.search_set_regex(Some(&vte_re), 0);
                     terminal.search_set_wrap_around(false);
@@ -1697,7 +1731,7 @@ impl TermView {
                     }
                 }
                 #[cfg(anvil_shared_terminal)]
-                if let super::TerminalTextSurface::Document(command) = &backend_surface.presentation
+                if let Some(command) = backend_surface.presentation.document()
                 {
                     paint_completed_command_matches(command, &re, false, plan.count);
                     highlighted_commands.push(command.clone());
@@ -1744,6 +1778,7 @@ impl TermView {
         // If trusted rows are unavailable (or a bounded snapshot stopped
         // before finding anything), let the persistent VTE prove one visible
         // forward hit. Represent it as a capped 1+ result with no wrap.
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if surfaces.is_empty() && scan_limited {
             if let Some(fallback) = native_fallback {
                 if focus_one_native_forward_match(&fallback.terminal, &vte_re) {
@@ -1788,7 +1823,7 @@ impl TermView {
             && !scan_limited
             && (running || self.is_unified() || scope == FindScope::LiveScreen)
         {
-            let terminal = self.active.borrow().shared_active.clone();
+            let terminal = self.active.borrow().shared_terminal().cloned();
             terminal.and_then(|terminal| {
                 live_observed = true;
                 let limit = FIND_MATCH_LIMIT.saturating_sub(total);
@@ -1823,6 +1858,7 @@ impl TermView {
         } else {
             None
         };
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         if let Some(terminal) = self
             .legacy_terminal()
             .filter(|_| !match_limited && !scan_limited && !completed_owns_live_surface && running)
@@ -1912,7 +1948,10 @@ impl TermView {
             st.total = total;
             st.capped = capped;
             st.scan_limited = scan_limited;
-            st.highlighted_terminals = highlighted_terminals;
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            {
+                st.highlighted_terminals = highlighted_terminals;
+            }
             #[cfg(anvil_shared_terminal)]
             {
                 st.highlighted_commands = highlighted_commands;
@@ -1957,6 +1996,8 @@ impl TermView {
             }
         }
         self.scroll_to_current_match();
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         self.arm_find_replay_repair();
         FindSearchResult::Matches(FindProgress {
             current: cursor.global + 1,
@@ -1997,6 +2038,8 @@ impl TermView {
     /// emitting contents-changed (vte.cc, process_incoming). Finished outputs
     /// have no PTY. This one-shot boundary repairs a selection confirmed before
     /// our own reveal's queued replay; it is not a public VTE completion API.
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     fn arm_find_replay_repair(&self) {
         let (surface, query) = {
             let state = self.find_state.borrow();
@@ -2245,11 +2288,54 @@ impl TermView {
         self.step_find(FindDirection::Previous)
     }
 
+    /// A live append may retire the shared frame without changing a completed
+    /// result's identity. Only that immutable result can anchor one rebuild;
+    /// live ordinals, replaced cards, scope changes and invalidations stay closed.
+    fn completed_find_cursor_is_current(&self) -> bool {
+        let same_scope = self.find_state.borrow().scope == Some(self.find_scope());
+        if !same_scope {
+            return false;
+        }
+        let surface = {
+            let state = self.find_state.borrow();
+            if state.invalidated {
+                return false;
+            }
+            state.surfaces.get(state.cursor.surface).cloned()
+        };
+        let Some(surface) = surface.filter(|surface| !surface.is_live) else {
+            return false;
+        };
+        self.render_backend
+            .record_search_target(surface.block_id, surface.is_output)
+            .is_some_and(|target| target.render_stamp == surface.render_stamp)
+    }
+
     fn step_find(&self, direction: FindDirection) -> FindNavigationResult {
+        self.step_find_with_refresh(direction, true)
+    }
+
+    fn step_find_with_refresh(
+        &self,
+        direction: FindDirection,
+        allow_refresh: bool,
+    ) -> FindNavigationResult {
         self.clear_unified_navigation_cursor();
         // Invalidate before the one-hit/at-boundary shortcut: native output
         // can erase its selection or add hits without moving our old cursor.
         if !self.live_find_is_current() {
+            if allow_refresh && self.completed_find_cursor_is_current() {
+                let cursor = self.find_state.borrow().cursor;
+                if matches!(
+                    self.rebuild_find_after_reveal(cursor),
+                    FindSearchResult::Matches(_)
+                ) {
+                    // Reconcile the same block/occurrence before applying this
+                    // key once. Do not recursively retry a continually changing
+                    // live frame or substitute its first result.
+                    return self.step_find_with_refresh(direction, false);
+                }
+            }
             self.clear_find();
             return FindNavigationResult::Invalidated;
         }
@@ -2306,6 +2392,8 @@ impl TermView {
                 .is_some_and(|surface| surface.is_output && !surface.is_live)
             {
                 self.scroll_to_current_match();
+                #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+                #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
                 self.arm_find_replay_repair();
             }
             return FindNavigationResult::Progress(current_progress);
@@ -2329,6 +2417,8 @@ impl TermView {
             state.cursor = next;
         }
         self.scroll_to_current_match();
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         self.arm_find_replay_repair();
         let progress = {
             let state = self.find_state.borrow();
@@ -2352,6 +2442,8 @@ impl TermView {
         direction: FindDirection,
         restart: bool,
     ) -> FindFocusResult {
+        #[cfg(not(any(anvil_vte_oracle, anvil_legacy_renderer)))]
+        let _ = (direction, restart);
         if !self.live_find_is_current() {
             return FindFocusResult::Invalidated;
         }
@@ -2383,11 +2475,8 @@ impl TermView {
                 find.terminal.highlight_find(&find.frame, find.hits);
             }
         }
-        let (vte, current_render_stamp) = if surface.is_live && surface.block_id == 0 {
-            let Some(terminal) = self.legacy_terminal() else {
-                return FindFocusResult::Invalidated;
-            };
-            (terminal.clone(), None)
+        let target = if surface.is_live && surface.block_id == 0 {
+            None
         } else {
             let Some(target) = self
                 .render_backend
@@ -2419,8 +2508,12 @@ impl TermView {
                     return FindFocusResult::Revealed;
                 }
             }
+            Some(target)
+        };
+        #[cfg(anvil_shared_terminal)]
+        if let Some(target) = &target {
             #[cfg(anvil_shared_terminal)]
-            if let super::TerminalTextSurface::Document(command) = &target.presentation {
+            if let Some(command) = target.presentation.document() {
                 let expression = self.find_state.borrow().command_pattern.clone();
                 let Some(expression) = expression else {
                     return FindFocusResult::Invalidated;
@@ -2440,121 +2533,136 @@ impl TermView {
                 state.surfaces[surface_index].vte_cursor = Some(occurrence);
                 return FindFocusResult::Selected;
             }
-            let Some(terminal) = target.presentation.native() else {
-                return FindFocusResult::Invalidated;
+        }
+        #[cfg(not(any(anvil_vte_oracle, anvil_legacy_renderer)))]
+        {
+            FindFocusResult::Invalidated
+        }
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        {
+            let (vte, current_render_stamp) = if surface.is_live && surface.block_id == 0 {
+                let Some(terminal) = self.legacy_terminal() else {
+                    return FindFocusResult::Invalidated;
+                };
+                (terminal.clone(), None)
+            } else {
+                let target = target.expect("retained search surface was resolved");
+                let Some(terminal) = target.presentation.native() else {
+                    return FindFocusResult::Invalidated;
+                };
+                (terminal.clone(), Some(target.render_stamp))
             };
-            (terminal.clone(), Some(target.render_stamp))
-        };
-        let pending_replay = if surface.is_output && !surface.is_live {
-            let blocks = self.finished_blocks.borrow();
-            let Some(block) = blocks.iter().find(|block| block.id == surface.block_id) else {
-                return FindFocusResult::Invalidated;
+            let pending_replay = if surface.is_output && !surface.is_live {
+                let blocks = self.finished_blocks.borrow();
+                let Some(block) = blocks.iter().find(|block| block.id == surface.block_id) else {
+                    return FindFocusResult::Invalidated;
+                };
+                if surface
+                    .pending_replay
+                    .is_some_and(|revision| revision != block.render_revision())
+                {
+                    return FindFocusResult::Invalidated;
+                }
+                block.pending_render_revision()
+            } else {
+                None
             };
-            if surface
-                .pending_replay
-                .is_some_and(|revision| revision != block.render_revision())
-            {
-                return FindFocusResult::Invalidated;
-            }
-            block.pending_render_revision()
-        } else {
-            None
-        };
-        // A different native surface can take the selection while this surface
-        // retains its logical cursor. Returning to that ordinal must actually
-        // select it again rather than treating the cached cursor as proof.
-        let lost_selection =
-            !surface.is_live && surface.vte_cursor.is_some() && !vte.has_selection();
-        let restart = restart
-            || lost_selection
-            || (surface.pending_replay.is_some() && pending_replay.is_none());
-        let mut wrap_once = if restart {
+            // A different native surface can take the selection while this surface
+            // retains its logical cursor. Returning to that ordinal must actually
+            // select it again rather than treating the cached cursor as proof.
+            let lost_selection =
+                !surface.is_live && surface.vte_cursor.is_some() && !vte.has_selection();
+            let restart = restart
+                || lost_selection
+                || (surface.pending_replay.is_some() && pending_replay.is_none());
+            let mut wrap_once = if restart {
+                if surface.is_live
+                    || occurrence >= surface.count
+                    || current_render_stamp != Some(surface.render_stamp)
+                {
+                    return FindFocusResult::Invalidated;
+                }
+                false
+            } else {
+                match validated_native_cursor_action(
+                    &surface,
+                    occurrence,
+                    direction,
+                    current_render_stamp,
+                ) {
+                    Some(NativeCursorAction::AlreadySelected) => return FindFocusResult::Selected,
+                    Some(NativeCursorAction::Step { wrap_once }) => wrap_once,
+                    None => return FindFocusResult::Invalidated,
+                }
+            };
+            // Block/Chat's running surface must exclude older native scrollback.
+            // Unified already planned the whole authenticated native domain above,
+            // including its viewport/history wrap; it has no running-card anchor.
             if surface.is_live
-                || occurrence >= surface.count
-                || current_render_stamp != Some(surface.render_stamp)
+                && surface.block_id == 0
+                && !self.is_unified()
+                && (surface.vte_cursor.is_none() || wrap_once)
+            {
+                let anchor = self.find_state.borrow().live_anchor;
+                let Some(anchor) = anchor else {
+                    return FindFocusResult::Invalidated;
+                };
+                if !anchor_live_native_search(&vte, direction, anchor) {
+                    return FindFocusResult::Invalidated;
+                }
+                // Native wrapping spans the whole ring, including prior commands.
+                wrap_once = false;
+            }
+            #[cfg(test)]
+        super::alt_screen::trace_find_render(&format!("find-before-select block={} output={} occurrence={occurrence} stamp={current_render_stamp:?}", surface.block_id, surface.is_output), &vte);
+            let still_current = || {
+                self.live_find_is_current()
+                    && self.find_state.try_borrow().is_ok_and(|state| {
+                        state.query == query_at_start
+                            && state.cursor == cursor_at_start
+                            && state.surfaces.get(surface_index) == Some(&surface)
+                    })
+            };
+            vte.search_set_wrap_around(wrap_once);
+            let found = if restart {
+                if let Some(adj) = vte.vadjustment() {
+                    adj.set_value(adj.lower());
+                }
+                if !still_current() {
+                    return FindFocusResult::Invalidated;
+                }
+                vte.unselect_all();
+                step_incremental_occurrence_exact(occurrence, || {
+                    still_current() && vte.search_find_next()
+                })
+            } else {
+                match direction {
+                    FindDirection::Next => vte.search_find_next(),
+                    FindDirection::Previous => vte.search_find_previous(),
+                }
+            };
+            vte.search_set_wrap_around(false);
+            #[cfg(test)]
+            super::alt_screen::trace_find_render(&format!("find-after-select found={found}"), &vte);
+            if !found || !still_current() {
+                return FindFocusResult::Invalidated;
+            }
+
+            let mut state = self.find_state.borrow_mut();
+            let Some(target) = state.surfaces.get_mut(surface_index) else {
+                return FindFocusResult::Invalidated;
+            };
+            if target.block_id != surface.block_id
+                || target.is_output != surface.is_output
+                || target.is_live != surface.is_live
+                || target.count != surface.count
             {
                 return FindFocusResult::Invalidated;
             }
-            false
-        } else {
-            match validated_native_cursor_action(
-                &surface,
-                occurrence,
-                direction,
-                current_render_stamp,
-            ) {
-                Some(NativeCursorAction::AlreadySelected) => return FindFocusResult::Selected,
-                Some(NativeCursorAction::Step { wrap_once }) => wrap_once,
-                None => return FindFocusResult::Invalidated,
-            }
-        };
-        // Block/Chat's running surface must exclude older native scrollback.
-        // Unified already planned the whole authenticated native domain above,
-        // including its viewport/history wrap; it has no running-card anchor.
-        if surface.is_live
-            && surface.block_id == 0
-            && !self.is_unified()
-            && (surface.vte_cursor.is_none() || wrap_once)
-        {
-            let anchor = self.find_state.borrow().live_anchor;
-            let Some(anchor) = anchor else {
-                return FindFocusResult::Invalidated;
-            };
-            if !anchor_live_native_search(&vte, direction, anchor) {
-                return FindFocusResult::Invalidated;
-            }
-            // Native wrapping spans the whole ring, including prior commands.
-            wrap_once = false;
+            target.vte_cursor = Some(occurrence);
+            target.pending_replay = pending_replay;
+            FindFocusResult::Selected
         }
-        #[cfg(test)]
-        super::alt_screen::trace_find_render(&format!("find-before-select block={} output={} occurrence={occurrence} stamp={current_render_stamp:?}", surface.block_id, surface.is_output), &vte);
-        let still_current = || {
-            self.live_find_is_current()
-                && self.find_state.try_borrow().is_ok_and(|state| {
-                    state.query == query_at_start
-                        && state.cursor == cursor_at_start
-                        && state.surfaces.get(surface_index) == Some(&surface)
-                })
-        };
-        vte.search_set_wrap_around(wrap_once);
-        let found = if restart {
-            if let Some(adj) = vte.vadjustment() {
-                adj.set_value(adj.lower());
-            }
-            if !still_current() {
-                return FindFocusResult::Invalidated;
-            }
-            vte.unselect_all();
-            step_incremental_occurrence_exact(occurrence, || {
-                still_current() && vte.search_find_next()
-            })
-        } else {
-            match direction {
-                FindDirection::Next => vte.search_find_next(),
-                FindDirection::Previous => vte.search_find_previous(),
-            }
-        };
-        vte.search_set_wrap_around(false);
-        #[cfg(test)]
-        super::alt_screen::trace_find_render(&format!("find-after-select found={found}"), &vte);
-        if !found || !still_current() {
-            return FindFocusResult::Invalidated;
-        }
-
-        let mut state = self.find_state.borrow_mut();
-        let Some(target) = state.surfaces.get_mut(surface_index) else {
-            return FindFocusResult::Invalidated;
-        };
-        if target.block_id != surface.block_id
-            || target.is_output != surface.is_output
-            || target.is_live != surface.is_live
-            || target.count != surface.count
-        {
-            return FindFocusResult::Invalidated;
-        }
-        target.vte_cursor = Some(occurrence);
-        target.pending_replay = pending_replay;
-        FindFocusResult::Selected
     }
 
     fn scroll_to_current_match(&self) {
@@ -2863,11 +2971,16 @@ impl TermView {
             return false;
         }
         let compiled = vte_cross_block_pattern(pattern, options);
+        if !valid_search_pattern(&compiled, options.case_sensitive) {
+            return false;
+        }
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         let flags = if options.case_sensitive {
             VTE_SEARCH_FLAGS & !pcre2_sys::PCRE2_CASELESS
         } else {
             VTE_SEARCH_FLAGS
         };
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         let Ok(vte_re) = vte4::Regex::for_search(&compiled, flags) else {
             return false;
         };
@@ -2883,7 +2996,7 @@ impl TermView {
             return false;
         };
         #[cfg(anvil_shared_terminal)]
-        if let super::TerminalTextSurface::Document(command) = &target.presentation {
+        if let Some(command) = target.presentation.document() {
             let Ok(expression) = regex::RegexBuilder::new(&cross_block_pattern(pattern, options))
                 .case_insensitive(!options.case_sensitive)
                 .multi_line(true)
@@ -2915,40 +3028,53 @@ impl TermView {
             }
             return true;
         }
-        let Some(vte) = target.presentation.native().cloned() else {
-            return false;
-        };
-        // Re-establish the cursor from the top of this surface. Reusing VTE's
-        // previous selection made repeated activation walk forward and made a
-        // row labelled L482 land on an unrelated next hit.
-        vte.unselect_all();
-        vte.search_set_regex(Some(&vte_re), 0);
-        vte.search_set_wrap_around(false);
-        if !step_vte_to_occurrence_exact(&vte, occurrence) {
-            return false;
-        }
-        let highlight = FindHighlight {
-            block_id,
-            block_index,
-            is_output,
-        };
-        let mut state = self.find_state.borrow_mut();
-        if !state
-            .highlighted_terminals
-            .iter()
-            .any(|terminal| terminal == &vte)
+        #[cfg(not(any(anvil_vte_oracle, anvil_legacy_renderer)))]
         {
-            state.highlighted_terminals.push(vte);
+            false
         }
-        if !state.extra_highlights.contains(&highlight) {
-            state.extra_highlights.push(highlight);
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        {
+            let Some(vte) = target.presentation.native().cloned() else {
+                return false;
+            };
+            // Re-establish the cursor from the top of this surface. Reusing VTE's
+            // previous selection made repeated activation walk forward and made a
+            // row labelled L482 land on an unrelated next hit.
+            vte.unselect_all();
+            vte.search_set_regex(Some(&vte_re), 0);
+            vte.search_set_wrap_around(false);
+            if !step_vte_to_occurrence_exact(&vte, occurrence) {
+                return false;
+            }
+            let highlight = FindHighlight {
+                block_id,
+                block_index,
+                is_output,
+            };
+            let mut state = self.find_state.borrow_mut();
+            if !state
+                .highlighted_terminals
+                .iter()
+                .any(|terminal| terminal == &vte)
+            {
+                state.highlighted_terminals.push(vte);
+            }
+            if !state.extra_highlights.contains(&highlight) {
+                state.extra_highlights.push(highlight);
+            }
+            true
         }
-        true
     }
 
     /// Remove all find highlights and reset the find cursor (call on close).
     pub fn clear_find(&self) {
-        clear_find_state(self.find_state.as_ref(), self.legacy_terminal());
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        let terminal = self.legacy_terminal();
+        clear_find_state(
+            self.find_state.as_ref(),
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            terminal,
+        );
     }
 
     /// Stable ids of failed completed records.
@@ -2992,7 +3118,7 @@ pub(super) fn scroll_widget_to_block_scroller_top(
 /// a structural path and panic on the `RefCell`.
 pub(super) fn clear_find_state(
     find_state: &std::cell::RefCell<FindState>,
-    active_vte: Option<&vte4::Terminal>,
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))] active_vte: Option<&vte4::Terminal>,
 ) {
     let state = std::mem::take(&mut *find_state.borrow_mut());
     #[cfg(anvil_shared_terminal)]
@@ -3004,6 +3130,7 @@ pub(super) fn clear_find_state(
         jterm_gtk_view::clear_finished_text_matches(&command);
         super::TerminalTextSurface::Document(command).clear_selection();
     }
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     for vte in state.highlighted_terminals {
         vte.search_set_regex(None::<&vte4::Regex>, 0);
         // VTE retains its last match as the next search anchor even after the
@@ -3013,6 +3140,7 @@ pub(super) fn clear_find_state(
     }
     // The UI's no-record fallback installs a regex directly on the live VTE,
     // outside `FindState`; always clear it before a new structured pass too.
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
     if let Some(terminal) = active_vte {
         terminal.search_set_regex(None::<&vte4::Regex>, 0);
     }
@@ -3022,20 +3150,50 @@ pub(super) fn clear_find_state(
 /// regex must still tell the next step to rebuild the retained UI query.
 pub(super) fn invalidate_find_state(
     find_state: &std::cell::RefCell<FindState>,
-    active_vte: Option<&vte4::Terminal>,
+    #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))] active_vte: Option<&vte4::Terminal>,
 ) {
     let active = {
         let state = find_state.borrow();
-        state.query.is_some()
-            || state.invalidated
-            || active_vte.is_some_and(|terminal| terminal.search_get_regex().is_some())
+        state.query.is_some() || state.invalidated || {
+            #[cfg(not(any(anvil_vte_oracle, anvil_legacy_renderer)))]
+            {
+                false
+            }
+            #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+            {
+                active_vte.is_some_and(|terminal| terminal.search_get_regex().is_some())
+            }
+        }
     };
-    clear_find_state(find_state, active_vte);
+    clear_find_state(
+        find_state,
+        #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
+        active_vte,
+    );
     find_state.borrow_mut().invalidated = active;
 }
 
-#[cfg(test)]
+#[cfg(all(test, anvil_vte_oracle))]
 mod tests {
+    #[cfg(anvil_vte_oracle)]
+    #[test]
+    fn pcre_validation_keeps_the_legacy_search_syntax_contract() {
+        for pattern in [r"\w+", r"(word)\s+\1", r"(?<=x)y", r"(?u:x)", "[", r"\q"] {
+            for case_sensitive in [false, true] {
+                let flags = if case_sensitive {
+                    super::VTE_SEARCH_FLAGS & !pcre2_sys::PCRE2_CASELESS
+                } else {
+                    super::VTE_SEARCH_FLAGS
+                };
+                assert_eq!(
+                    super::valid_search_pattern(pattern, case_sensitive),
+                    vte4::Regex::for_search(pattern, flags).is_ok(),
+                    "pattern {pattern:?} case_sensitive={case_sensitive}",
+                );
+            }
+        }
+    }
+
     include!("metadata_browse_tests.rs");
     use super::metadata_filter_line;
     #[test]

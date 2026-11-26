@@ -1,6 +1,8 @@
 //! Bounded Linux observation of one owned PTY session. This is local process
 //! lifecycle evidence, never a presentation/retirement proof or shell attestation.
-use std::io;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicBool;
+use std::{io, time::Duration};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Activity {
@@ -13,6 +15,8 @@ pub enum Activity {
 pub struct PtySession {
     pid: i32,
     start: Option<u64>,
+    #[cfg(target_os = "linux")]
+    previous_exit_scan_empty: AtomicBool,
 }
 
 impl PtySession {
@@ -25,6 +29,8 @@ impl PtySession {
                 .ok()
                 .filter(|state| state.pid == pid && state.session == pid && pid > 1)
                 .map(|state| state.start),
+            #[cfg(target_os = "linux")]
+            previous_exit_scan_empty: AtomicBool::new(false),
         }
     }
 
@@ -44,7 +50,7 @@ impl PtySession {
     /// anchor, and use pidfds for each member. A failed/incomplete drain leaves
     /// the anchor unreaped for a later poll; it never publishes a clean exit.
     pub fn drain_after_exit(&self) -> io::Result<()> {
-        linux::drain(self)
+        linux::drain(self, Duration::from_millis(25))
     }
 }
 
@@ -55,7 +61,8 @@ mod linux {
     use std::io::Read;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::path::Path;
-    use std::time::{Duration, Instant};
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
 
     const MAX_PROCESSES: usize = 16_384;
     const MAX_STAT: u64 = 16 * 1024;
@@ -210,16 +217,30 @@ mod linux {
         }
     }
 
-    pub(super) fn drain(session: &PtySession) -> io::Result<()> {
-        confirm_owned_exit(session)?;
-        let deadline = Instant::now() + Duration::from_millis(25);
-        let mut empty = false;
+    pub(super) fn drain(session: &PtySession, budget: Duration) -> io::Result<()> {
+        confirm_owned_exit(session).inspect_err(|_| {
+            session
+                .previous_exit_scan_empty
+                .store(false, Ordering::Relaxed);
+        })?;
+        let deadline = Instant::now() + budget;
         loop {
-            let current = members(session, Path::new("/proc"), true)?;
-            if current.is_empty() && empty {
+            let current = members(session, Path::new("/proc"), true).inspect_err(|_| {
+                session
+                    .previous_exit_scan_empty
+                    .store(false, Ordering::Relaxed);
+            })?;
+            // A full procfs census can exceed one retry's budget. The same
+            // unreaped leader anchors the next census, so a completed empty
+            // scan still counts. Any error or live member breaks the sequence.
+            let empty = current.is_empty();
+            if session
+                .previous_exit_scan_empty
+                .swap(empty, Ordering::Relaxed)
+                && empty
+            {
                 return Ok(());
             }
-            empty = current.is_empty();
             for member in current {
                 if let Err(error) = kill_member(session, member) {
                     if !matches!(error.kind(), io::ErrorKind::NotFound)
@@ -350,6 +371,43 @@ mod linux {
             assert!(child.0.wait().unwrap().success());
         }
         #[test]
+        fn single_scan_budgets_make_progress_without_reaping_or_reusing_an_invalid_census() {
+            let mut child = shell("printf 'ready\n'; read answer; exit 17");
+            let mut identity = PtySession::capture(child.0.id() as i32);
+            child
+                .0
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"finish\n")
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while confirm_owned_exit(&identity).is_err() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+
+            let one_scan = Duration::ZERO;
+            assert_eq!(
+                drain(&identity, one_scan).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            let start = identity.start.take();
+            assert_eq!(
+                drain(&identity, one_scan).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            identity.start = start;
+            assert_eq!(
+                drain(&identity, one_scan).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            drain(&identity, one_scan).unwrap();
+            confirm_owned_exit(&identity).unwrap();
+            assert_eq!(child.0.wait().unwrap().code(), Some(17));
+        }
+
+        #[test]
         fn stat_parser_uses_last_parenthesis_and_rejects_truncation() {
             let text = format!("77 (a ) tricky) S 1 77 77 {} 900", "0 ".repeat(15));
             let state = parse(&text).unwrap();
@@ -372,6 +430,7 @@ mod linux {
             let identity = PtySession {
                 pid: 77,
                 start: Some(900),
+                previous_exit_scan_empty: AtomicBool::new(false),
             };
             std::fs::write(root.join("78/stat"), record(78, 'Z')).unwrap();
             assert!(members(&identity, &root, false).unwrap().is_empty());
@@ -406,7 +465,7 @@ mod linux {
         let _ = (session.pid, session.start);
         Err(io::Error::other("PTY session observation unavailable"))
     }
-    pub(super) fn drain(session: &PtySession) -> io::Result<()> {
+    pub(super) fn drain(session: &PtySession, _budget: Duration) -> io::Result<()> {
         let _ = (session.pid, session.start);
         Ok(())
     }
