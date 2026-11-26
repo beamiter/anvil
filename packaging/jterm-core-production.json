@@ -1,9 +1,10 @@
 {
   "repository": "https://github.com/beamiter/jterm_core.git",
-  "revision": "06bbe8c45bab2a51525116f2f4dabb4efc3e9c7e",
-  "tree": "1708165ed4d4a77962fdab630ea81ef61330003e",
-  "source_nar_sha256": "sha256-wl9nuwe8rHngycQsFVBOV3vkMeuLf5we2xx0Pj4WQBg=",
-  "source_policy": "Cargo, Nix and Flatpak use the GitHub release core addressed by revision. The published source tree matches the validated candidate tree. Audit archives are separate from production build inputs.",
-  "nar_verification": "Independent Nix builtins.fetchGit of the exact local commit and canonical Git archive tree hashing agree; archive paths match git ls-tree. See candidate evidence/forge-ascii-core-nar.json.",
-  "local_verification_at": "2026-11-26T01:14:35.854667+00:00"
+  "revision": "4473c65b39244e67d4edd8a00a22728f8ef6c8dc",
+  "tree": "0c76a025582fd6e997fd5752edc6510f24409504",
+  "source_nar_sha256": "sha256-sgEZToUoYo9KhiUKU09dmMYJqRmVxn5NHbfyll5+bSs=",
+  "source_policy": "Cargo, Nix and Flatpak resolve the published Git revision. The bundled audit archive is historical and is not a production build input.",
+  "nar_verification": "Canonical NAR serialization agrees for the Git archive and Git index checkout of the exact published tree. The same serialization reproduces the previous published hash.",
+  "local_verification_at": "2026-11-26T12:26:35.396755+00:00",
+  "publication_verified_at": "2026-11-26T12:26:35.396755+00:00"
 }
