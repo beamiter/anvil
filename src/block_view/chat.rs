@@ -11,10 +11,9 @@ use vte4::{Terminal, TerminalExt};
 
 pub(super) const CONTROLS_HEIGHT: i32 = 28;
 
-/// Three usable input rows plus one row of breathing room. Both layouts use
-/// the native cell height, so the floor follows font zoom instead of relying
-/// on a fixed pixel height in the surrounding chrome.
-pub(super) const BLOCK_INPUT_MIN_ROWS: i64 = 4;
+/// Four editable rows and one row for a two-line shell prompt's heading.
+/// Both layouts use the native cell height so the floor follows font zoom.
+pub(super) const BLOCK_INPUT_MIN_ROWS: i64 = 5;
 #[cfg(anvil_shared_terminal)]
 pub(super) const COMPOSER_HORIZONTAL_CHROME: i32 = 20;
 
@@ -690,14 +689,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn block_input_rows_keep_four_lines_and_bottom_space() {
-        // An empty prompt, a one-line prompt and a two-line prompt all leave
-        // four full lines of room to type into in Block.
+    fn block_input_rows_keep_four_editable_lines_with_a_two_line_prompt() {
         assert_eq!(block_composer_rows(1, 1, 30), BLOCK_INPUT_MIN_ROWS);
         assert_eq!(block_composer_rows(1, 2, 30), BLOCK_INPUT_MIN_ROWS);
         assert_eq!(block_composer_rows(2, 1, 30), BLOCK_INPUT_MIN_ROWS);
         // Beyond the floor the editor keeps a blank row below the content.
-        assert_eq!(block_composer_rows(4, 1, 30), 5);
+        assert_eq!(block_composer_rows(5, 1, 30), 6);
         assert_eq!(block_composer_rows(1, 12, 30), 13);
         assert_eq!(block_composer_rows(1, 100, 30), 30);
         // A pane shorter than the floor never asks for more than it has.
@@ -705,8 +702,8 @@ mod tests {
         assert_eq!(block_composer_rows(1, 1, 0), 1);
         // Chat retains exactly the same room when the user changes layouts.
         for (input, drawn, viewport, expected) in [
-            (1, 1, 30, 4),
-            (1, 2, 30, 4),
+            (1, 1, 30, 5),
+            (1, 2, 30, 5),
             (4, 1, 30, 5),
             (1, 12, 30, 13),
             (1, 100, 30, 30),

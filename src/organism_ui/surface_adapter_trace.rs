@@ -327,8 +327,7 @@ fn idle_fit_oracle_checks_native_size_and_grid_margins() {
 
 #[test]
 fn large_font_positive_control_requires_two_real_grid_margins() {
-    // The narrow 500px window leaves 176px after Chat's four 57px
-    // composer rows. A fixed64 body plus two grid margins needs 178px.
+    // At this font size a fixed64 body plus two grid margins needs 178px.
     let measured = SurfaceBox {
         width: 370,
         height: 176,
@@ -425,7 +424,7 @@ pub(super) fn exercise_mounted_modes(
         (TerminalMode::Chat, Host::Chat, Some("monospace 32"), false),
     ] {
         // This is the required-visible large-font control, not the cramped
-        // canvas case. Chat's composer reserves four actual font rows, so
+        // canvas case. Chat's composer reserves five actual font rows, so
         // increasing the font alone can remove the body's safe idle area.
         // Keep the narrow width, provide explicit vertical room, and retain
         // the unchanged native fit assertion below. Constrained and 59px
