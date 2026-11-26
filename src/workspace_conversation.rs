@@ -118,9 +118,24 @@ fn diff_view(diff: &CodeDiff) -> gtk::Box {
     copy.set_focus_on_click(false);
     copy.add_css_class("conversation-code-action");
     let content = diff_text(diff);
+    let copy_epoch = std::rc::Rc::new(std::cell::Cell::new(0_u64));
     copy.connect_clicked(move |button| {
         log::debug!(target: "anvil::workspace_shell", "diff_copy_activated");
         button.clipboard().set_text(&content);
+        let epoch = copy_epoch.get().wrapping_add(1);
+        copy_epoch.set(epoch);
+        button.set_label("Copied");
+        button.add_css_class("conversation-code-copied");
+        let weak = button.downgrade();
+        let copy_epoch = copy_epoch.clone();
+        gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+            if copy_epoch.get() == epoch {
+                if let Some(button) = weak.upgrade() {
+                    button.set_label("Copy");
+                    button.remove_css_class("conversation-code-copied");
+                }
+            }
+        });
     });
     header.append(&copy);
     let apply = gtk::Button::with_label("Apply");

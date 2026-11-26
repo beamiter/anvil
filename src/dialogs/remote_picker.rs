@@ -180,6 +180,19 @@ impl Component for RemotePickerModel {
                         },
                     },
 
+                    #[name(empty_state)]
+                    gtk::Label {
+                        set_label: "No matching remote hosts",
+                        set_visible: false,
+                        set_halign: gtk::Align::Center,
+                        set_valign: gtk::Align::Center,
+                        set_vexpand: true,
+                        set_wrap: true,
+                        add_css_class: "dim-label",
+                        add_css_class: "dialog-empty-state",
+                    },
+
+                    #[name(list_scroll)]
                     gtk::ScrolledWindow {
                         set_hexpand: true,
                         set_vexpand: true,
@@ -191,6 +204,17 @@ impl Component for RemotePickerModel {
                             set_margin_start: 12,
                             set_margin_end: 12,
                             set_margin_bottom: 12,
+                        },
+                    },
+
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Horizontal,
+                        add_css_class: "dialog-footer-hints",
+
+                        gtk::Label {
+                            set_label: "↑↓ Navigate  ·  ↵ Connect  ·  Esc Close",
+                            set_hexpand: true,
+                            set_xalign: 0.0,
                         },
                     },
                 },
@@ -205,6 +229,8 @@ impl Component for RemotePickerModel {
                         Key::Return | Key::KP_Enter => Some(RemotePickerMsg::Accept),
                         Key::Down => Some(RemotePickerMsg::Move(1)),
                         Key::Up => Some(RemotePickerMsg::Move(-1)),
+                        Key::Page_Down => Some(RemotePickerMsg::Move(8)),
+                        Key::Page_Up => Some(RemotePickerMsg::Move(-8)),
                         _ => None,
                     };
                     if let Some(message) = message {
@@ -291,6 +317,7 @@ impl Component for RemotePickerModel {
                 let next = (current + delta).clamp(0, len - 1);
                 if let Some(row) = widgets.list_box.row_at_index(next) {
                     widgets.list_box.select_row(Some(&row));
+                    scroll_row_into_view(&widgets.list_scroll, &widgets.list_box, &row);
                 }
             }
             RemotePickerMsg::Accept => {
@@ -336,9 +363,36 @@ impl RemotePickerModel {
     }
 
     fn select_first(&self, widgets: &RemotePickerModelWidgets) {
+        let empty = self.rows.is_empty();
+        widgets.empty_state.set_visible(empty);
+        widgets.list_scroll.set_visible(!empty);
         widgets
             .list_box
             .select_row(widgets.list_box.row_at_index(0).as_ref());
+        widgets
+            .list_scroll
+            .vadjustment()
+            .set_value(widgets.list_scroll.vadjustment().lower());
+    }
+}
+
+fn scroll_row_into_view(
+    scroll: &gtk::ScrolledWindow,
+    list_box: &gtk::ListBox,
+    row: &gtk::ListBoxRow,
+) {
+    let Some(bounds) = row.compute_bounds(list_box) else {
+        return;
+    };
+    let adj = scroll.vadjustment();
+    let top = f64::from(bounds.y());
+    let bottom = f64::from(bounds.y() + bounds.height());
+    let view_top = adj.value();
+    let view_bottom = view_top + adj.page_size();
+    if top < view_top {
+        adj.set_value(top);
+    } else if bottom > view_bottom {
+        adj.set_value((bottom - adj.page_size()).max(adj.lower()));
     }
 }
 

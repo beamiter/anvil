@@ -66,18 +66,20 @@ pub(crate) fn install_static_css() {
         "{}{}
          .bottom-bar {{ min-height: {bar_height}px; padding: 0 8px; font-size: 0.85em; border-top: 1px solid rgba(127,127,127,0.4); }}",
         crate::pane_header::PANE_HEADER_CSS,
-        ".tab-strip-btn { padding: 4px 8px; border-radius: 4px; border-bottom: 1px solid alpha(currentColor, 0.1); margin-bottom: 2px; color: #ffffff; }
+        ".tab-strip-btn { padding: 4px 8px; border-radius: 4px; border-bottom: 1px solid alpha(currentColor, 0.1); margin-bottom: 2px; color: #ffffff; transition: background-color 110ms ease, color 110ms ease; }
+         .tab-strip-btn:hover { background-color: alpha(currentColor, 0.08); }
          .tab-strip-btn:checked { font-weight: bold; border-radius: 4px; background-color: alpha(currentColor, 0.14); outline: 2px solid alpha(currentColor, 0.8); outline-offset: -2px; }
-         .tab-strip-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0; color: #ffffff; }
-         .tab-resize-handle { min-width: 8px; margin-left: 2px; border-left: 1px solid alpha(currentColor, 0.24); }
+         .tab-strip-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0; color: #ffffff; border-radius: 4px; transition: opacity 110ms ease, color 110ms ease, background-color 110ms ease; }
+         .tab-strip-close:hover { color: #ff8d95; background-color: rgba(255, 100, 111, 0.18); }
+         .tab-resize-handle { min-width: 8px; margin-left: 2px; border-left: 1px solid alpha(currentColor, 0.24); transition: border-left-color 110ms ease; }
          .tab-resize-handle:hover { border-left-color: currentColor; }
          .tab-strip { min-width: 140px; padding: 2px 4px; }
          .file-tree { padding: 2px; }
-         .sidebar-toggle { color: #ffffff; }
+         .sidebar-toggle { color: #ffffff; transition: background-color 110ms ease, color 110ms ease; }
          .top-bar { padding: 2px 4px; }
  .window-controls { margin-left: 2px; }
-         .window-control { min-width: 24px; min-height: 24px; padding: 0; border-radius: 999px; }
-         .terminal-box scrollbar slider { min-width: 6px; border-radius: 3px; }
+         .window-control { min-width: 24px; min-height: 24px; padding: 0; border-radius: 999px; transition: background-color 110ms ease; }
+         .terminal-box scrollbar slider { min-width: 6px; border-radius: 3px; transition: background-color 120ms ease; }
          .terminal-box scrollbar { padding: 0; }
          .tab-activity { font-style: italic; }
          .tab-bell { color: #f1fa8c; }

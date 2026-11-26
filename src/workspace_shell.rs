@@ -917,6 +917,9 @@ impl Chrome {
         ] {
             let control = button(icon, title, sender, msg);
             control.add_css_class("shell-window-control");
+            if icon == "window-close-symbolic" {
+                control.add_css_class("shell-window-close");
+            }
             control.set_size_request(24, 24);
             control.set_valign(gtk::Align::Center);
             identity.append(&control);
@@ -1432,9 +1435,26 @@ impl Chrome {
         context_page.append(&context_state);
         let context_value = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
         let context_copy = gtk::Button::with_label("Copy session context");
+        context_copy.add_css_class("shell-context-copy");
         let copy_value = context_value.clone();
-        context_copy
-            .connect_clicked(move |button| button.clipboard().set_text(&copy_value.borrow()));
+        let copy_epoch = std::rc::Rc::new(std::cell::Cell::new(0_u64));
+        context_copy.connect_clicked(move |button| {
+            button.clipboard().set_text(&copy_value.borrow());
+            let epoch = copy_epoch.get().wrapping_add(1);
+            copy_epoch.set(epoch);
+            button.set_label("Copied session context");
+            button.add_css_class("shell-copied-feedback");
+            let weak = button.downgrade();
+            let copy_epoch = copy_epoch.clone();
+            gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(1600), move || {
+                if copy_epoch.get() == epoch {
+                    if let Some(button) = weak.upgrade() {
+                        button.set_label("Copy session context");
+                        button.remove_css_class("shell-copied-feedback");
+                    }
+                }
+            });
+        });
         context_page.append(&context_copy);
         let browse = action_row(
             "folder",

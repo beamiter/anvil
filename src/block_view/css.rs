@@ -430,6 +430,7 @@ fn block_css(config: &Config) -> String {
             min-height: 22px;
             padding: 3px 4px;
             border-radius: 6px;
+            transition: background-color 110ms ease, color 110ms ease;
         }}
         .unified-navigation button:disabled {{
             color: rgba({fg_r},{fg_g},{fg_b},0.30);
@@ -437,6 +438,13 @@ fn block_css(config: &Config) -> String {
         .unified-navigation button:hover {{
             color: {fg_hex};
             background-color: rgba({fg_r},{fg_g},{fg_b},0.10);
+        }}
+        .unified-navigation button:active {{
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.18);
+        }}
+        .unified-navigation button:focus-visible {{
+            outline: 2px solid {accent};
+            outline-offset: -2px;
         }}
         .unified-navigation-status {{
             color: {ok_hex};
@@ -1170,6 +1178,10 @@ fn block_css(config: &Config) -> String {
             color: {fg_hex};
             background-color: rgba({fg_r},{fg_g},{fg_b},0.12);
         }}
+        .block-action-btn:active {{
+            color: {fg_hex};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.20);
+        }}
         .block-action-active {{
             color: {accent};
             background-color: rgba({acc_r},{acc_g},{acc_b},0.18);
@@ -1186,10 +1198,19 @@ fn block_css(config: &Config) -> String {
             border-radius: 6px;
             font-family: {font_stack};
             font-size: 0.8em;
+            transition: background-color 110ms ease, color 110ms ease;
+        }}
+        .block-filter-toggle:hover {{
+            color: {fg_hex};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.10);
         }}
         .block-filter-toggle:checked {{
             color: {fg_hex};
             background-color: rgba({acc_r},{acc_g},{acc_b},0.35);
+        }}
+        .block-filter-toggle:focus-visible {{
+            outline: 2px solid {accent};
+            outline-offset: -2px;
         }}
         .block-filter-status {{
             color: {dim_fg};
@@ -1255,12 +1276,17 @@ fn block_css(config: &Config) -> String {
             color: {fg_hex};
             background-color: rgba({fg_r},{fg_g},{fg_b},0.12);
         }}
+        .block-collapse-btn:active {{
+            color: {fg_hex};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.20);
+        }}
         .block-output-summary {{
             color: {dim_fg};
             font-family: {font_stack};
             font-size: 0.82em;
             padding: 2px 4px;
             border-radius: 5px;
+            transition: background-color 110ms ease, color 110ms ease;
         }}
         .block-output-notice {{
             color: {dim_fg};
@@ -1381,6 +1407,13 @@ fn block_css(config: &Config) -> String {
         .block-show-more:hover {{
             background-color: rgba({acc_r},{acc_g},{acc_b},0.18);
         }}
+        .block-show-more:active {{
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.26);
+        }}
+        .block-show-more:focus-visible {{
+            outline: 2px solid {accent};
+            outline-offset: 1px;
+        }}
         .jump-bottom-fab {{
             color: {bg_hex};
             background-color: {accent};
@@ -1399,6 +1432,13 @@ fn block_css(config: &Config) -> String {
         .jump-bottom-fab:hover {{
             background-color: rgba({acc_r},{acc_g},{acc_b},0.85);
             box-shadow: 0 6px 18px rgba(0,0,0,0.45);
+        }}
+        .jump-bottom-fab:active {{
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.72);
+        }}
+        .jump-bottom-fab:focus-visible {{
+            outline: 2px solid {fg_hex};
+            outline-offset: 2px;
         }}
         .sticky-running-header {{
             background-color: {block_bg_hex};
@@ -1420,10 +1460,19 @@ fn block_css(config: &Config) -> String {
             border-radius: 999px;
             font-family: {font_stack};
             font-size: 0.82em;
+            transition: background-color 110ms ease, color 110ms ease;
         }}
         .sticky-header-control:hover {{
             color: {fg_hex};
             background-color: rgba({fg_r},{fg_g},{fg_b},0.12);
+        }}
+        .sticky-header-control:active {{
+            color: {fg_hex};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.20);
+        }}
+        .sticky-header-control:focus-visible {{
+            outline: 2px solid {accent};
+            outline-offset: 1px;
         }}
         .sticky-running-header.sticky-minimized {{
             padding: 2px 8px;

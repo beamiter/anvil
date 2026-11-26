@@ -148,14 +148,19 @@ impl Component for WorkflowModel {
 
                     #[name(preview)]
                     gtk::Label {
-                        set_halign: gtk::Align::Start,
+                        set_halign: gtk::Align::Fill,
+                        set_xalign: 0.0,
+                        set_hexpand: true,
                         set_wrap: true,
                         set_selectable: true,
+                        add_css_class: "workflow-preview-code",
                     },
 
                     #[local_ref]
                     args_box -> gtk::Box {
                         set_orientation: gtk::Orientation::Vertical,
+                        set_spacing: 6,
+                        add_css_class: "workflow-args-box",
                     },
 
                     #[name(empty_label)]

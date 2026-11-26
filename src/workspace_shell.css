@@ -460,3 +460,283 @@ menubutton.eva-companion-dock label { color:inherit; font-size:11px; }
 .workspace-surface button:not(.suggested-action):not(.destructive-action) { background:#19283c; color:#d4e2f8; border-color:#354a6b; }
 .workspace-surface button:not(.suggested-action):not(.destructive-action):hover { background:#283d6f; }
 .workspace-surface scrolledwindow,.workspace-surface viewport { background:transparent; }
+
+/* Refined interactive states, visual depth, and scrollbar finish.
+   Strictly paint/transition-only: preserves every four-native outer shell
+   geometry contract, fixed footer slot width, and role_font_css base size. */
+.workspace-titlebar button,
+.workspace-rail button,
+.workspace-navigation .shell-navigation-row,
+.workspace-navigation .shell-workspace-selector,
+.workspace-navigation .tab-strip-btn,
+.workspace-navigation .sidebar-toggle,
+.workspace-canvas-header button,
+.shell-inspector-tabs button,
+.workspace-inspector .reference-agent-actions button,
+.workspace-inspector .shell-agent-card .shell-navigation-row,
+.workspace-inspector .shell-agent-card .shell-context-copy,
+.workspace-center .chat-controls button,
+.workspace-center .chat-controls .chat-terminal-capsule,
+.shell-block-composer button,
+.conversation-code-header button.conversation-code-action,
+.block-command-canvas .block-reference-more,
+.block-command-canvas .block-reference-toolbar button,
+menubutton.eva-companion-dock > button,
+.workspace-center .ai-panel button,
+.workspace-surface button {
+  transition: background-color 110ms ease, color 110ms ease, border-color 110ms ease, box-shadow 110ms ease, opacity 110ms ease;
+}
+
+/* Titlebar: crisp hover/active feedback on controls, close button, and command launcher */
+.workspace-titlebar button:not(.shell-current-mode):not(.shell-window-control):not(.shell-search):not(.shell-inspector-toggle):hover {
+  background:#22314a;
+  color:#edf3ff;
+}
+.workspace-titlebar button:not(.shell-current-mode):not(.shell-window-control):not(.shell-search):not(.shell-inspector-toggle):active {
+  background:#2c4063;
+}
+.workspace-titlebar .shell-window-control:hover { opacity:1; background:#28364f; color:#eff4ff; }
+.workspace-titlebar .shell-window-control:active { opacity:1; background:#334668; }
+.workspace-titlebar .shell-window-control.shell-window-close:hover { background:#4b2330; color:#ff8089; }
+.workspace-titlebar .shell-window-control.shell-window-close:active { background:#5e293a; color:#ffa2a8; }
+.shell-search:hover { background:#223047; border-color:#445878; color:#c8d5ea; }
+.shell-search:active { background:#273854; border-color:#5c7ef0; }
+.shell-search:hover .shell-keycap { border-color:#556a8d; color:#b8c8e2; }
+.shell-modes { border:1px solid #24334a; }
+.shell-modes button.shell-current-mode:hover { background:#6989f3; color:white; }
+.shell-modes button.shell-current-mode:active { background:#4f71e5; color:white; }
+.workspace-titlebar button.shell-inspector-toggle:checked:hover { background:#324a84; color:#eff4ff; }
+
+/* Rail & left navigation sidebar */
+.workspace-rail button:hover { background:#1c2940; color:#d7e3f7; }
+.workspace-rail button:active { background:#243656; color:#eef4ff; }
+.workspace-rail button.shell-selected { box-shadow:inset 0 0 0 1px rgba(143,164,255,0.30); }
+.workspace-rail button.shell-selected:hover { background:#314a84; color:#eef4ff; }
+.workspace-navigation .shell-workspace-selector:hover { background:#243550; border-color:#495c7e; color:#e6eefc; }
+.workspace-navigation .shell-workspace-selector:active { background:#293d5d; border-color:#5c7ef0; }
+.workspace-navigation .shell-navigation-row:not(.shell-selected):hover { background:#1e2d45; color:#dce7fa; }
+.workspace-navigation .shell-navigation-row:not(.shell-selected):active { background:#253858; }
+.workspace-navigation .shell-navigation-row.shell-selected:hover { background:#304982; }
+.workspace-navigation .sidebar-toggle:hover { background:#1e2d45; color:#d8e4f8; border-radius:5px; }
+.workspace-navigation .tab-strip-btn:not(:checked):hover { background:rgba(145,164,191,0.11); color:#d8e4f8; }
+.workspace-navigation .tab-strip-btn:checked { box-shadow:inset 2px 0 0 #5c7ef0; }
+.workspace-navigation .tab-strip-btn:checked:hover { background:#2d4370; }
+.workspace-navigation .tab-strip-close { border-radius:4px; transition:opacity 110ms ease, color 110ms ease, background-color 110ms ease; }
+.workspace-navigation .tab-strip-close:hover { color:#ff8d95; background:rgba(255,100,111,0.16); }
+.workspace-navigation searchentry:focus-within { border-color:#5c7ef0; box-shadow:0 0 0 1px rgba(92,126,240,0.35); }
+
+/* Sidebar splitters and drawer resize handles */
+.workspace-body paned.workspace-sidebar-split > separator,
+.workspace-drawer-resize-handle {
+  transition: background-color 120ms ease;
+}
+
+/* Canvas header buttons in both Chat (light) and Block (dark) modes */
+.workspace-canvas-header button:hover { background:rgba(57,80,135,0.10); color:#27364f; }
+.workspace-canvas-header button:active { background:rgba(57,80,135,0.18); color:#1a273c; }
+.workspace-canvas-header button:focus-visible { outline:2px solid #5c7ef0; outline-offset:-2px; }
+.block-workspace .workspace-canvas-header button:hover { background:#1d304d; color:#e5eefc; }
+.block-workspace .workspace-canvas-header button:active { background:#263e63; color:#ffffff; }
+.block-workspace .workspace-canvas-header button:focus-visible { outline:2px solid #4199ff; outline-offset:-2px; }
+
+/* Chat composer controls & code diff actions (light surface) */
+.workspace-center:not(.block-workspace) .chat-controls button:not(.chat-send):not(.chat-stop):not(:disabled):hover,
+.workspace-center:not(.block-workspace) .chat-controls .chat-terminal-capsule:hover {
+  background:#eaf1fd;
+  border-color:#a8bfe2;
+  color:#2b3c59;
+}
+.workspace-center:not(.block-workspace) .chat-controls button:not(.chat-send):not(.chat-stop):not(:disabled):active,
+.workspace-center:not(.block-workspace) .chat-controls .chat-terminal-capsule:active {
+  background:#dde8fb;
+  border-color:#7d9be0;
+}
+.workspace-center:not(.block-workspace) .chat-controls .chat-send:not(:disabled):hover { background:#4b6feb; color:white; }
+.workspace-center:not(.block-workspace) .chat-controls .chat-send:not(:disabled):active { background:#3e61dc; color:white; }
+.workspace-center:not(.block-workspace) .chat-controls button:focus-visible { outline:2px solid #5c7ef0; outline-offset:-2px; }
+.conversation-code-header button.conversation-code-action:not(:disabled):hover {
+  background:#e7effc;
+  border-color:#9fb6da;
+  color:#2b3c59;
+}
+.conversation-code-header button.conversation-code-action:not(:disabled):active { background:#d7e4fa; }
+.conversation-code-header button.conversation-code-action.conversation-code-copied {
+  background:#e2f3ea;
+  border-color:#9ed0b7;
+  color:#2d7a56;
+}
+
+/* Block canvas, command cards, badges, toolbar, and dark composer */
+.block-command-canvas .block-reference-card-surface {
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+}
+.block-command-canvas .block-reference-card.block-hovered .block-reference-card-surface {
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.05);
+}
+.block-command-canvas .block-reference-status {
+  box-shadow: inset 0 0 0 1px rgba(145,164,191,0.18);
+}
+.block-command-canvas .block-reference-status.completed {
+  box-shadow: inset 0 0 0 1px rgba(57,221,160,0.28);
+}
+.block-command-canvas .block-reference-status.failed {
+  box-shadow: inset 0 0 0 1px rgba(255,100,111,0.32);
+}
+.block-command-canvas .block-reference-status.running {
+  box-shadow: inset 0 0 0 1px rgba(65,153,255,0.36);
+}
+.block-command-canvas .block-reference-more:active { background:#2e466a; color:#e5eefc; }
+.block-command-canvas .block-reference-toolbar button:active { background:#263e63; color:#e5eefc; border-radius:6px; }
+.block-command-canvas .block-reference-toolbar button:focus-visible { outline:1px solid #4199ff; outline-offset:-1px; border-radius:6px; }
+.block-command-canvas .block-list .block-reference-live {
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+.workspace-center.block-workspace .shell-block-composer:focus-within,
+.workspace-center .block-command-canvas .chat-composer:focus-within {
+  outline:1px solid #4199ff;
+  outline-offset:-1px;
+}
+.workspace-center .block-command-canvas .chat-controls button:not(.chat-send):not(.chat-stop):not(:disabled):hover,
+.workspace-center .block-command-canvas .chat-controls .chat-terminal-capsule:hover,
+.workspace-center.block-workspace .shell-block-composer .chat-controls button:not(.chat-send):not(.chat-stop):not(:disabled):hover {
+  background:#223550;
+  border-color:#49668e;
+  color:#dce8fa;
+}
+.workspace-center .block-command-canvas .chat-controls button:not(.chat-send):not(.chat-stop):not(:disabled):active,
+.workspace-center .block-command-canvas .chat-controls .chat-terminal-capsule:active,
+.workspace-center.block-workspace .shell-block-composer .chat-controls button:not(.chat-send):not(.chat-stop):not(:disabled):active {
+  background:#2a4163;
+  border-color:#5a7eb0;
+}
+.workspace-center .block-command-canvas .chat-controls .chat-send:not(:disabled):hover,
+.workspace-center.block-workspace .shell-block-composer .chat-controls button.chat-send:not(:disabled):hover {
+  background:#4782ec;
+  border-color:#689ef8;
+  color:#ffffff;
+}
+.workspace-center .block-command-canvas .chat-controls .chat-send:not(:disabled):active,
+.workspace-center.block-workspace .shell-block-composer .chat-controls button.chat-send:not(:disabled):active {
+  background:#2c61cb;
+}
+.workspace-center .block-command-canvas .chat-controls .chat-stop:active { background:#342231; border-color:#78424d; }
+.workspace-center .block-command-canvas .chat-controls button:focus-visible,
+.workspace-center.block-workspace .shell-block-composer button:focus-visible {
+  outline:2px solid #4199ff;
+  outline-offset:-2px;
+}
+
+/* Right Inspector: tabs, overview actions, context actions, and copy confirmation */
+.shell-inspector-tabs button:not(.shell-selected):hover { background:#1a2840; color:#d2dff5; }
+.shell-inspector-tabs button:not(.shell-selected):active { background:#223350; }
+.shell-inspector-tabs button.shell-selected { box-shadow:inset 0 0 0 1px rgba(143,164,255,0.22); }
+.workspace-inspector .reference-agent-actions button {
+  background:#1c293a;
+  border:1px solid #314056;
+  color:#d6e2f6;
+  box-shadow:none;
+}
+.workspace-inspector .reference-agent-actions button:not(:disabled):hover {
+  background:#26395f;
+  border-color:#4b6796;
+  color:#eef4ff;
+}
+.workspace-inspector .reference-agent-actions button:not(:disabled):active {
+  background:#2e4675;
+  border-color:#6385c4;
+}
+.workspace-inspector .reference-agent-actions button:disabled {
+  background:#152030;
+  border-color:#263348;
+  color:#7e90aa;
+  opacity:1;
+}
+.shell-agent-card .shell-navigation-row:hover {
+  background:#2d405c;
+  border-color:#4c6384;
+  color:#e8f0fe;
+}
+.shell-agent-card .shell-navigation-row:active { background:#354c6e; }
+.shell-agent-card .shell-context-copy {
+  background:#243652;
+  border:1px solid #3c5376;
+  border-radius:7px;
+  color:#dce8fa;
+  min-height:28px;
+  box-shadow:none;
+}
+.shell-agent-card .shell-context-copy:not(:disabled):hover {
+  background:#2d456b;
+  border-color:#5676a8;
+  color:#ffffff;
+}
+.shell-agent-card .shell-context-copy:not(:disabled):active { background:#365280; }
+.shell-agent-card .shell-context-copy.shell-copied-feedback {
+  background:#12352e;
+  border-color:#2c7a64;
+  color:#39dda0;
+}
+
+/* AI panel refinements (both docked in Inspector and in center) */
+.ai-panel { background:#101927; color:#d4e2f8; }
+.ai-panel .ai-panel-topbar { border-bottom:1px solid #26364d; padding:6px 8px; }
+.ai-panel .ai-panel-context-pill {
+  background:#17253a;
+  border:1px solid #2e4260;
+  border-radius:7px;
+  padding:3px 6px 3px 8px;
+}
+.ai-panel .ai-panel-entry {
+  background:#16243a;
+  border:1px solid #354a6b;
+  border-radius:9px;
+  transition:border-color 110ms ease, box-shadow 110ms ease;
+}
+.ai-panel .ai-panel-entry:focus-within {
+  border-color:#5c7ef0;
+  box-shadow:0 0 0 1px rgba(92,126,240,0.35);
+}
+.ai-panel button:not(.suggested-action):not(.destructive-action):hover {
+  background:#233554;
+  color:#eef4ff;
+}
+.ai-panel button.suggested-action:not(:disabled) { background:#5c7ef0; color:#ffffff; border:0; }
+.ai-panel button.suggested-action:not(:disabled):hover { background:#6b8bf5; }
+.ai-panel button.suggested-action:not(:disabled):active { background:#4c6ee0; }
+.ai-panel button.destructive-action:not(:disabled) { background:#3b222e; color:#ff7680; }
+.ai-panel button.destructive-action:not(:disabled):hover { background:#4b2839; color:#ff959d; }
+.ai-panel button:focus-visible { outline:2px solid #8fa4ff; outline-offset:-2px; }
+
+/* Consistent sleek dark scrollbars across workspace surfaces */
+.workspace-navigation scrollbar,
+.workspace-inspector scrollbar,
+.block-command-canvas scrollbar,
+.ai-panel scrollbar,
+.workspace-surface scrollbar {
+  background:transparent;
+}
+.workspace-navigation scrollbar slider,
+.workspace-inspector scrollbar slider,
+.block-command-canvas scrollbar slider,
+.ai-panel scrollbar slider,
+.workspace-surface scrollbar slider {
+  min-width:6px;
+  min-height:24px;
+  border-radius:999px;
+  background:rgba(145,164,191,0.26);
+  transition:background-color 120ms ease;
+}
+.workspace-navigation scrollbar slider:hover,
+.workspace-inspector scrollbar slider:hover,
+.block-command-canvas scrollbar slider:hover,
+.ai-panel scrollbar slider:hover,
+.workspace-surface scrollbar slider:hover {
+  background:rgba(145,164,191,0.48);
+}
+.workspace-navigation scrollbar slider:active,
+.workspace-inspector scrollbar slider:active,
+.block-command-canvas scrollbar slider:active,
+.ai-panel scrollbar slider:active,
+.workspace-surface scrollbar slider:active {
+  background:rgba(92,126,240,0.72);
+}

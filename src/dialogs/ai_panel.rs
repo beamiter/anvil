@@ -243,7 +243,7 @@ impl Component for AiPanelModel {
             gtk::Box {
                 set_orientation: gtk::Orientation::Horizontal,
                 set_spacing: 4,
-                set_margin_all: 6,
+                add_css_class: "ai-panel-topbar",
 
                 gtk::Button {
                     set_label: "Chats",
@@ -311,8 +311,9 @@ impl Component for AiPanelModel {
                     #[name(context_row)]
                     gtk::Box {
                         set_orientation: gtk::Orientation::Horizontal,
-                        set_spacing: 4,
+                        set_spacing: 6,
                         set_visible: false,
+                        add_css_class: "ai-panel-context-pill",
 
                         #[name(context_label)]
                         gtk::Label {
@@ -345,6 +346,8 @@ impl Component for AiPanelModel {
                             set_wrap_mode: gtk::WrapMode::WordChar,
                             set_left_margin: 6,
                             set_right_margin: 6,
+                            set_top_margin: 4,
+                            set_bottom_margin: 6,
                             add_css_class: "ai-explain-body",
                         },
                     },
@@ -369,6 +372,10 @@ impl Component for AiPanelModel {
                         gtk::TextView {
                             set_wrap_mode: gtk::WrapMode::WordChar,
                             set_height_request: 104,
+                            set_left_margin: 8,
+                            set_right_margin: 8,
+                            set_top_margin: 6,
+                            set_bottom_margin: 6,
                             add_css_class: "ai-panel-entry",
                         },
                     },

@@ -105,23 +105,41 @@ fn workspace_drop_preview(
 /// static CSS.
 pub(crate) const PANE_HEADER_CSS: &str = "
     .pane-header {
-        padding: 1px 6px;
-        border-bottom: 1px solid rgba(255,255,255,0.12);
-        background-color: rgba(255,255,255,0.05);
+        padding: 2px 8px;
+        border-bottom: 1px solid rgba(145,164,191,0.18);
+        background-color: rgba(16,28,48,0.72);
+        transition: background-color 120ms ease, border-bottom-color 120ms ease;
+    }
+    .pane-header:hover {
+        background-color: rgba(29,48,77,0.78);
+        border-bottom-color: rgba(145,164,191,0.34);
     }
     .pane-header.pane-header-focused {
-        background-color: rgba(80,160,255,0.20);
-        border-bottom-color: rgba(80,160,255,0.65);
+        background-color: rgba(40,61,111,0.52);
+        border-bottom-color: rgba(92,126,240,0.78);
+    }
+    .pane-header.pane-header-focused:hover {
+        background-color: rgba(48,74,132,0.62);
     }
     .pane-header.pane-header-drop {
-        background-color: rgba(80,160,255,0.45);
-        border-bottom-color: rgba(120,190,255,0.95);
+        background-color: rgba(65,153,255,0.42);
+        border-bottom-color: rgba(143,196,255,0.95);
     }
     .pane-header label { font-size: 9pt; }
-    .pane-header-index { font-weight: bold; opacity: 0.9; }
-    .pane-header-title { font-weight: bold; }
-    .pane-header-cwd { opacity: 0.65; }
-    .pane-header-command { color: #8be9fd; }
+    .pane-header-index {
+        font-weight: 700;
+        opacity: 0.92;
+        padding: 0 5px;
+        border-radius: 4px;
+        background-color: rgba(145,164,191,0.16);
+    }
+    .pane-header.pane-header-focused .pane-header-index {
+        background-color: rgba(92,126,240,0.42);
+        color: #eff4ff;
+    }
+    .pane-header-title { font-weight: 600; }
+    .pane-header-cwd { opacity: 0.68; }
+    .pane-header-command { color: #7cc4ff; font-weight: 500; }
     .pane-frame-drop { outline: 2px solid rgba(120,190,255,0.9); outline-offset: -2px; }
     .pane-frame-drop-left { box-shadow: inset 6px 0 rgba(120,190,255,0.85); }
     .pane-frame-drop-right { box-shadow: inset -6px 0 rgba(120,190,255,0.85); }

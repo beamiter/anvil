@@ -54,7 +54,9 @@ impl FactoryComponent for PaletteRow {
             add_suffix = &gtk::Label {
                 set_label: self.right.as_deref().unwrap_or(""),
                 set_visible: self.right.is_some(),
+                set_valign: gtk::Align::Center,
                 add_css_class: "dim-label",
+                add_css_class: "palette-shortcut",
             },
         }
     }
@@ -276,6 +278,20 @@ impl Component for PaletteModel {
                         add_css_class: "dim-label",
                     },
 
+                    #[name(empty_state)]
+                    gtk::Label {
+                        set_label: "No matching results — try > commands, @ history, : workflows, or ? AI",
+                        set_visible: false,
+                        set_halign: gtk::Align::Center,
+                        set_valign: gtk::Align::Center,
+                        set_vexpand: true,
+                        set_wrap: true,
+                        set_justify: gtk::Justification::Center,
+                        add_css_class: "dim-label",
+                        add_css_class: "dialog-empty-state",
+                    },
+
+                    #[name(list_scroll)]
                     gtk::ScrolledWindow {
                         set_hexpand: true,
                         set_vexpand: true,
@@ -287,6 +303,22 @@ impl Component for PaletteModel {
                             set_margin_start: 12,
                             set_margin_end: 12,
                             set_margin_bottom: 12,
+                        },
+                    },
+
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Horizontal,
+                        add_css_class: "dialog-footer-hints",
+
+                        gtk::Label {
+                            set_label: "↑↓ Navigate  ·  ↵ Run  ·  Esc Close",
+                            set_hexpand: true,
+                            set_xalign: 0.0,
+                        },
+
+                        gtk::Label {
+                            set_label: "> cmd  @ hist  : flow  ? AI",
+                            set_xalign: 1.0,
                         },
                     },
                 },
@@ -304,11 +336,21 @@ impl Component for PaletteModel {
                         && state.contains(
                             ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK
                         );
+                    let ctrl_only = state.contains(ModifierType::CONTROL_MASK)
+                        && !state.intersects(
+                            ModifierType::SHIFT_MASK
+                                | ModifierType::ALT_MASK
+                                | ModifierType::SUPER_MASK,
+                        );
                     let message = match key {
                         Key::Escape => Some(PaletteMsg::Close(generation)),
                         Key::Return | Key::KP_Enter => Some(PaletteMsg::AcceptSelected(generation)),
                         Key::Down => Some(PaletteMsg::Move(generation, 1)),
                         Key::Up => Some(PaletteMsg::Move(generation, -1)),
+                        Key::Page_Down => Some(PaletteMsg::Move(generation, 8)),
+                        Key::Page_Up => Some(PaletteMsg::Move(generation, -8)),
+                        Key::n | Key::N if ctrl_only => Some(PaletteMsg::Move(generation, 1)),
+                        Key::p | Key::P if ctrl_only => Some(PaletteMsg::Move(generation, -1)),
                         _ if close_shortcut => Some(PaletteMsg::Close(generation)),
                         _ => None,
                     };
@@ -471,6 +513,7 @@ impl Component for PaletteModel {
                 let next = (current + delta).clamp(0, len - 1);
                 if let Some(row) = widgets.list_box.row_at_index(next) {
                     widgets.list_box.select_row(Some(&row));
+                    scroll_row_into_view(&widgets.list_scroll, &widgets.list_box, &row);
                 }
             }
             PaletteMsg::AcceptSelected(_) => {
@@ -558,16 +601,28 @@ impl PaletteModel {
         let index =
             preserved_selection_index(selected.as_ref(), self.rows.iter().map(|row| &row.accept));
         if let Some(row) = index.and_then(|index| widgets.list_box.row_at_index(index as i32)) {
+            self.sync_empty_state(widgets);
             widgets.list_box.select_row(Some(&row));
+            scroll_row_into_view(&widgets.list_scroll, &widgets.list_box, &row);
         } else {
             self.select_first(widgets);
         }
     }
 
+    fn sync_empty_state(&self, widgets: &PaletteModelWidgets) {
+        let empty = self.rows.is_empty();
+        widgets.empty_state.set_visible(empty);
+        widgets.list_scroll.set_visible(!empty);
+    }
+
     fn select_first(&self, widgets: &PaletteModelWidgets) {
+        self.sync_empty_state(widgets);
+        let first = widgets.list_box.row_at_index(0);
+        widgets.list_box.select_row(first.as_ref());
         widgets
-            .list_box
-            .select_row(widgets.list_box.row_at_index(0).as_ref());
+            .list_scroll
+            .vadjustment()
+            .set_value(widgets.list_scroll.vadjustment().lower());
     }
 
     fn close_opening(&mut self, widgets: &PaletteModelWidgets) {
@@ -656,6 +711,26 @@ fn placeholder(mode: PaletteMode) -> &'static str {
         PaletteMode::History => "Search history…  (> commands, : workflows, ? AI)",
         PaletteMode::Ai => "Describe what you want…",
         PaletteMode::Workflows => "Search workflows…  (> commands, @ history)",
+    }
+}
+
+fn scroll_row_into_view(
+    scroll: &gtk::ScrolledWindow,
+    list_box: &gtk::ListBox,
+    row: &gtk::ListBoxRow,
+) {
+    let Some(bounds) = row.compute_bounds(list_box) else {
+        return;
+    };
+    let adj = scroll.vadjustment();
+    let top = f64::from(bounds.y());
+    let bottom = f64::from(bounds.y() + bounds.height());
+    let view_top = adj.value();
+    let view_bottom = view_top + adj.page_size();
+    if top < view_top {
+        adj.set_value(top);
+    } else if bottom > view_bottom {
+        adj.set_value((bottom - adj.page_size()).max(adj.lower()));
     }
 }
 
