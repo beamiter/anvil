@@ -4817,6 +4817,22 @@ pub struct TermView {
     render_backend: Rc<dyn RenderBackend>,
 }
 
+const VIM_SOURCE_DATA: &str = "anvil-block-vim-source";
+type VimSource = (std::rc::Weak<OwnedPty>, glib::WeakRef<gtk::Widget>);
+
+pub(crate) fn vim_source(
+    widget: &gtk::Widget,
+    invocation: &jterm_core::vim9::Vim9ShellInvocation,
+) -> Option<(gtk::Box, gtk::Widget)> {
+    // The pane root stores these weak references for its own PTY and input seat.
+    let (pty, focus) = unsafe { widget.data::<VimSource>(VIM_SOURCE_DATA)?.as_ref() };
+    let pty = pty.upgrade()?;
+    if !invocation.matches_pty(pty.master_fd_raw()) {
+        return None;
+    }
+    Some((widget.clone().downcast().ok()?, focus.upgrade()?))
+}
+
 impl Drop for TermView {
     fn drop(&mut self) {
         self.save_history_before_close();
@@ -13310,6 +13326,15 @@ impl TermView {
         #[cfg(any(anvil_vte_oracle, anvil_legacy_renderer))]
         let active_vte = active.borrow().legacy_terminal().cloned();
         let live_focus = active.borrow().focus_widget();
+        if config.vim9.auto_gui && !vim_environment.is_empty() {
+            // SAFETY: vim_source reads this key with the same weak types.
+            unsafe {
+                root.set_data(
+                    VIM_SOURCE_DATA,
+                    (Rc::downgrade(&pty), live_focus.downgrade()),
+                );
+            }
+        }
         let block_live_chrome = (*mode == crate::config::TerminalMode::Block).then(|| {
             let chrome = block_reference::LiveChrome::new();
             active

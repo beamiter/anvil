@@ -605,6 +605,9 @@ fn shell_source(
     root: &gtk::Widget,
     request: &jterm_core::vim9::Vim9ShellInvocation,
 ) -> Option<(gtk::Box, gtk::Widget)> {
+    if let Some(source) = crate::block_view::vim_source(root, request) {
+        return Some(source);
+    }
     #[cfg(all(anvil_shared_terminal, target_os = "linux"))]
     if let Some(source) = crate::shared_terminal::SharedTerminal::vim_source(root, request) {
         return Some(source);
