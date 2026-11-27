@@ -449,7 +449,7 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.2.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=aee12fc25835a442b08527b8b9642b3944fe36d4#aee12fc25835a442b08527b8b9642b3944fe36d4"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=4ddacbbf7f557e5d68681fa4ffef50e218480542#4ddacbbf7f557e5d68681fa4ffef50e218480542"
 dependencies = [
  "companion-client",
  "companion-core",
@@ -484,7 +484,7 @@ dependencies = [
 [[package]]
 name = "jterm_engine"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=aee12fc25835a442b08527b8b9642b3944fe36d4#aee12fc25835a442b08527b8b9642b3944fe36d4"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=4ddacbbf7f557e5d68681fa4ffef50e218480542#4ddacbbf7f557e5d68681fa4ffef50e218480542"
 dependencies = [
  "smallvec",
  "unicode-normalization",
@@ -495,7 +495,7 @@ dependencies = [
 [[package]]
 name = "jterm_protocol"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=aee12fc25835a442b08527b8b9642b3944fe36d4#aee12fc25835a442b08527b8b9642b3944fe36d4"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=4ddacbbf7f557e5d68681fa4ffef50e218480542#4ddacbbf7f557e5d68681fa4ffef50e218480542"
 dependencies = [
  "jterm_engine",
  "serde",
@@ -504,7 +504,7 @@ dependencies = [
 [[package]]
 name = "jterm_remote_client"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=aee12fc25835a442b08527b8b9642b3944fe36d4#aee12fc25835a442b08527b8b9642b3944fe36d4"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=4ddacbbf7f557e5d68681fa4ffef50e218480542#4ddacbbf7f557e5d68681fa4ffef50e218480542"
 dependencies = [
  "serde",
  "serde_json",
@@ -513,7 +513,7 @@ dependencies = [
 [[package]]
 name = "jterm_runtime"
 version = "0.1.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=aee12fc25835a442b08527b8b9642b3944fe36d4#aee12fc25835a442b08527b8b9642b3944fe36d4"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=4ddacbbf7f557e5d68681fa4ffef50e218480542#4ddacbbf7f557e5d68681fa4ffef50e218480542"
 dependencies = [
  "crossbeam-channel",
  "libc",
