@@ -943,6 +943,15 @@ impl OwnedPty {
         }
     }
 
+    #[cfg(anvil_shared_terminal)]
+    pub(crate) fn foreground_is_codex(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(session) = &self.shared_session {
+            return session.foreground_is_codex();
+        }
+        false
+    }
+
     fn spawn_inner(
         argv: &[&str],
         cwd: Option<&str>,

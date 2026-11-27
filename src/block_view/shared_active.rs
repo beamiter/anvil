@@ -56,6 +56,10 @@ struct InputBinding {
 }
 
 impl Pty for Transport {
+    fn foreground_is_codex(&self) -> bool {
+        self.pty.foreground_is_codex()
+    }
+
     fn before_input(&self) {
         if let Some(input) = self.input.get() {
             input.hold.flush_now();
