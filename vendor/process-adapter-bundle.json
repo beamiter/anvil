@@ -16,7 +16,7 @@
     "src/gtk_process.rs": "Frontend shared-runtime lifecycle integration and explicit historical-oracle cfg isolation; this hash identifies the adapted consumer source, not an unchanged upstream export.",
     "src/gtk_spawn.rs": "Frontend ordinary legacy spawn controller isolated as a historical oracle; original adapter source base retained."
   },
-  "public_core_base": "7739dbd46c4da65ddaf171ab6f83498180a6c8be",
+  "public_core_base": "b41cafae09f99d24d8f03995d8ec88e61bc7575d",
   "schema": 1,
   "scope": "Versioned process observer and GTK launch ownership. The GTK adapter also tracks child drain in the opt-in shared runtime. The file hashes identify these exact adapter sources.",
   "version": "0.1.0"
