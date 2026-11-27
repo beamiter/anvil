@@ -1,10 +1,10 @@
 {
   "repository": "https://github.com/beamiter/jterm_core.git",
-  "revision": "f994757b68e00d94089cf195d376add31e392992",
-  "tree": "46cf996f684bb956514d083cfec54658a6c454e2",
-  "source_nar_sha256": "sha256-vXnE8gHs/Rrh6tHEpLVgy3RlKdh/N/EEgThZxv192Kw=",
+  "revision": "81ba3639568edc7e764a3402ad038a1e016b1ab1",
+  "tree": "e5288639b1e03752d2e02913a08019e7fcb5c67c",
+  "source_nar_sha256": "sha256-RcybHSDCC9qJp3DxdKWjA4AgKzxnfKcvSL/C7Zb6D6Y=",
   "source_policy": "Cargo, Nix and Flatpak resolve the published Git revision. The bundled audit archive is historical and is not a production build input.",
   "nar_verification": "Canonical NAR serialization agrees for the Git archive and Git index checkout of the exact published tree. The same serialization reproduces the previous published hash.",
-  "local_verification_at": "2026-11-27T06:06:54.517646+00:00",
-  "publication_verified_at": "2026-11-27T06:06:54.517646+00:00"
+  "local_verification_at": "2026-11-27T06:31:54.287050+00:00",
+  "publication_verified_at": "2026-11-27T06:31:54.287050+00:00"
 }
