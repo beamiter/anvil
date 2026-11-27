@@ -34,8 +34,8 @@
               # then run `nix flake check --no-write-lock-file` and copy `got:`.
               # Full revisions beside the hashes make a stale repin conspicuous.
               outputHashes = {
-                # git+https://github.com/beamiter/jterm_core.git?rev=a17fa47f508a024521b11748760742750708609c#a17fa47f508a024521b11748760742750708609c
-                "jterm_core-0.2.0" = "sha256-4MLYbyTGtXIr9Jj6R8szgCqYIgS4tdJv295COwBxCMY=";
+                # git+https://github.com/beamiter/jterm_core.git?rev=217f7e34f58b1f6bc39fe9b939ea8ac06b5083b2#217f7e34f58b1f6bc39fe9b939ea8ac06b5083b2
+                "jterm_core-0.2.0" = "sha256-CMnopgKdhxOuIdfWRQINABwI2oYHdjcbWqtN3JUBdus=";
                 # git+https://github.com/beamiter/jagent.git?rev=f269c3c6afafcf9b6d60b3cccd741649fdb74576#f269c3c6afafcf9b6d60b3cccd741649fdb74576
                 "jagent-0.7.0" = "sha256-2PO6UiTrhwa2JUBznPTXFV42KxJ3H8qctBTg7WNxZfA=";
                 # git+https://github.com/beamiter/jcompanion.git?rev=9aa569540091524d637a7115b64c587b9177a55b#9aa569540091524d637a7115b64c587b9177a55b
