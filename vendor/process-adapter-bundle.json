@@ -1,7 +1,7 @@
 {
   "adapter_source_core_base": "10120c3aa690ff5e1a66ae15f2418b753e2053f1",
   "bundle": "pty-process-v1",
-  "core_pin_verification": "The application lock resolves the exact frozen candidate jterm_core revision named by the legacy public_core_base field. Publication is not asserted. Bundled source origins remain separately recorded.",
+  "core_pin_verification": "The application lock resolves the exact published jterm_core revision named by the legacy public_core_base field. Bundled source origins remain separately recorded.",
   "files_sha256": {
     "src/gtk_process.rs": "2b146882c1f85cecfba95d17398d8dab4926c06a00a6ace3c65219d408d4e440",
     "src/gtk_spawn.rs": "fe11e7b712b9141a0c178e034dc134c13c303625f4700db8377369efea1dfb5a",
@@ -16,7 +16,7 @@
     "src/gtk_process.rs": "Frontend shared-runtime lifecycle integration and explicit historical-oracle cfg isolation; this hash identifies the adapted consumer source, not an unchanged upstream export.",
     "src/gtk_spawn.rs": "Frontend ordinary legacy spawn controller isolated as a historical oracle; original adapter source base retained."
   },
-  "public_core_base": "4473c65b39244e67d4edd8a00a22728f8ef6c8dc",
+  "public_core_base": "f8b35ef9fdea051a70656976b0d38fe01f37a889",
   "schema": 1,
   "scope": "Versioned process observer and GTK launch ownership. The GTK adapter also tracks child drain in the opt-in shared runtime. The file hashes identify these exact adapter sources.",
   "version": "0.1.0"
